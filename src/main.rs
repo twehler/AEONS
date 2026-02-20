@@ -4,11 +4,13 @@ mod viewport_settings;
 
 use bevy::{
     prelude::*,
-    pbr::wireframe::{WireframePlugin, WireframeConfig}, // Path for 0.18.0
+    pbr::wireframe::{WireframePlugin, WireframeConfig},
     render::{RenderPlugin, settings::{WgpuSettings, WgpuFeatures}},
+    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin} 
 };
 use bevy_inspector_egui::{bevy_egui::EguiPlugin, prelude::*};
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
+
 use std::env;
 use std::path::Path;
 
@@ -46,12 +48,12 @@ fn main() {
             map_path: map_path_input.to_string_lossy().into_owned(),
         })
         .add_plugins(bevy_flycam::PlayerPlugin)
-        .add_plugins(EguiPlugin::default())
-        .add_plugins(WorldInspectorPlugin::new())
-        .add_systems(Startup, setup)
-        .init_resource::<viewport_settings::GizmoSettings>()
-        .add_systems(Update, viewport_settings::toggle_orientation_gizmos)
-        .add_systems(Update, viewport_settings::draw_orientation_gizmos);
+        .add_plugins(viewport_settings::ViewportSettingsPlugin)
+
+        //.add_plugins(EguiPlugin::default())
+        //.add_plugins(WorldInspectorPlugin::new())
+        .add_systems(Startup, setup);
+        
 
     if show_wireframe {
         app.add_plugins(WireframePlugin::default());

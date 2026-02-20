@@ -131,34 +131,21 @@ fn add_greedy_quad(
     height: i32,
 ) {
     let vertex_offset = buffer.positions.len() as u32;
-
-    // predefining coords of vertices of current quad
-    let mut v0 = [0.0; 3]; 
-    let mut v1 = [0.0; 3];
-    let mut v2 = [0.0; 3]; 
-    let mut v3 = [0.0; 3];
-
     let u = (axis + 1) % 3;
     let v = (axis + 2) % 3;
 
-    // defining vertex-coords based on the current sweep axis
-    let offset = if is_front { 1.0 } else { 0.0 };
+    // FIX: Both front and back faces detected at slice 'i' 
+    // refer to the boundary between voxel 'i' and 'i+1'.
+    // They should both be placed at slice_coord + 1.0.
+    let plane_pos = slice_coord as f32 + 1.0; 
 
-    v0[axis] = slice_coord as f32 + offset; 
-    v0[u] = u_coord as f32; 
-    v0[v] = v_coord as f32;
+    let mut v0 = [0.0; 3]; let mut v1 = [0.0; 3];
+    let mut v2 = [0.0; 3]; let mut v3 = [0.0; 3];
 
-    v1[axis] = slice_coord as f32 + offset; 
-    v1[u] = (u_coord + width) as f32; 
-    v1[v] = v_coord as f32;
-
-    v2[axis] = slice_coord as f32 + offset; 
-    v2[u] = (u_coord + width) as f32; 
-    v2[v] = (v_coord + height) as f32;
-
-    v3[axis] = slice_coord as f32 + offset; 
-    v3[u] = u_coord as f32; 
-    v3[v] = (v_coord + height) as f32;
+    v0[axis] = plane_pos; v0[u] = u_coord as f32; v0[v] = v_coord as f32;
+    v1[axis] = plane_pos; v1[u] = (u_coord + width) as f32; v1[v] = v_coord as f32;
+    v2[axis] = plane_pos; v2[u] = (u_coord + width) as f32; v2[v] = (v_coord + height) as f32;
+    v3[axis] = plane_pos; v3[u] = u_coord as f32; v3[v] = (v_coord + height) as f32; 
 
     buffer.positions.extend([v0, v1, v2, v3]);
 
@@ -324,7 +311,7 @@ fn main() {
 
     // save the result as a binary cache
 
-    println!("Saving world as binary file...");
+
 
     let cache = WorldCache {
         positions: buffer.positions,
@@ -336,6 +323,8 @@ fn main() {
 
     let duration_greedy_meshing = start_greedy_meshing.elapsed();
     println!("Greedy-Meshing complete. Time taken: {:?}", duration_greedy_meshing);
+
+    println!("Saving world as binary file...");
 
     let file = File::create(output_path).expect("Failed to create output file.");
     let writer = BufWriter::new(file);
