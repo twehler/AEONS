@@ -1,0 +1,940 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="210mm"
+   height="297mm"
+   viewBox="0 0 210 297"
+   version="1.1"
+   id="svg5"
+   sodipodi:docname="Central_Functionality.svg"
+   inkscape:version="1.2.2 (b0a8486541, 2022-12-01)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview7"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:document-units="mm"
+     showgrid="false"
+     inkscape:zoom="2.982885"
+     inkscape:cx="643.33691"
+     inkscape:cy="427.43854"
+     inkscape:window-width="1600"
+     inkscape:window-height="790"
+     inkscape:window-x="0"
+     inkscape:window-y="36"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs2">
+    <linearGradient
+       id="linearGradient3278"
+       inkscape:swatch="solid">
+      <stop
+         style="stop-color:#a9a9a9;stop-opacity:1;"
+         offset="0"
+         id="stop3276" />
+    </linearGradient>
+  </defs>
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1">
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="120.90219"
+       y="90.902832"
+       id="text4062"><tspan
+         sodipodi:role="line"
+         style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+         x="120.90219"
+         y="90.902832"
+         id="tspan7938">If terrestrial</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="103.04874"
+       y="107.83275"
+       id="text4062-0"><tspan
+         sodipodi:role="line"
+         style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+         x="103.04874"
+         y="107.83275"
+         id="tspan7938-2">Type 1: Hard-coded behaviour</tspan><tspan
+         sodipodi:role="line"
+         style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+         x="103.04874"
+         y="109.26384"
+         id="tspan8079">Type 2: Regression Models</tspan><tspan
+         sodipodi:role="line"
+         style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+         x="103.04874"
+         y="110.69492"
+         id="tspan8081">Type 3: Dynamic-Topology Neural Networks</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="101.99882"
+       y="91.252892"
+       id="text4062-67"><tspan
+         sodipodi:role="line"
+         style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+         x="101.99882"
+         y="91.252892"
+         id="tspan7938-5">If aquatic</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="120.68631"
+       y="79.114952"
+       id="text4062-6-2"><tspan
+         sodipodi:role="line"
+         id="tspan4060-1-9"
+         style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+         x="120.68631"
+         y="79.114952">Block attributes</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:3.52778px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0595305;stroke-dasharray:none;stroke-opacity:1"
+       x="55.072876"
+       y="112.10591"
+       id="text4688"><tspan
+         sodipodi:role="line"
+         id="tspan4686"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:3.52778px;font-family:sans-serif;-inkscape-font-specification:'sans-serif Bold';stroke-width:0.0595305;stroke-dasharray:none"
+         x="55.072876"
+         y="112.10591">Organism</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0595305;stroke-dasharray:none;stroke-opacity:1"
+       x="56.409737"
+       y="101.23017"
+       id="text4688-3"><tspan
+         sodipodi:role="line"
+         id="tspan4686-6"
+         style="stroke-width:0.0595305;stroke-dasharray:none"
+         x="56.409737"
+         y="101.23017">DNA-Vector</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0595305;stroke-dasharray:none;stroke-opacity:1"
+       x="52.070847"
+       y="64.380768"
+       id="text4688-3-2"><tspan
+         sodipodi:role="line"
+         id="tspan4686-6-9"
+         style="stroke-width:0.0595305;stroke-dasharray:none"
+         x="52.070847"
+         y="64.380768">Stores:</tspan><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0595305;stroke-dasharray:none"
+         x="52.070847"
+         y="65.811859"
+         id="tspan3560" /><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0595305;stroke-dasharray:none"
+         x="52.070847"
+         y="67.242943"
+         id="tspan3554">1. Cell Positions</tspan><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0595305;stroke-dasharray:none"
+         x="52.070847"
+         y="68.674034"
+         id="tspan3556">2. Cell types</tspan><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0595305;stroke-dasharray:none"
+         x="52.070847"
+         y="70.105118"
+         id="tspan3558">3. chronological cell growth order</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0595305;stroke-dasharray:none;stroke-opacity:1"
+       x="60.448196"
+       y="78.957245"
+       id="text4688-3-7"><tspan
+         sodipodi:role="line"
+         id="tspan4686-6-5"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0595305;stroke-dasharray:none"
+         x="60.448196"
+         y="78.957245">OCG-Vector </tspan><tspan
+         sodipodi:role="line"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0595305;stroke-dasharray:none"
+         x="60.448196"
+         y="80.388336"
+         id="tspan3423">(Vector of cell structs )</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0595305;stroke-dasharray:none;stroke-opacity:1"
+       x="42.798225"
+       y="89.681244"
+       id="text4688-3-7-3"><tspan
+         sodipodi:role="line"
+         id="tspan4686-6-5-7"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0595305;stroke-dasharray:none"
+         x="42.798225"
+         y="89.681244">If behaviour type 3: </tspan><tspan
+         sodipodi:role="line"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0595305;stroke-dasharray:none"
+         x="42.798225"
+         y="91.112335"
+         id="tspan3423-5">Store weights &amp; nodes of NN</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.96162px;white-space:pre;inline-size:19.9326;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.102;stroke-dasharray:none;stroke-opacity:1"
+       x="52.976768"
+       y="95.244385"
+       id="text4688-70"
+       transform="matrix(0.58363281,0,0,0.58363281,0.45585443,66.143911)"><tspan
+         x="52.976768"
+         y="95.244385"
+         id="tspan13661">Natural Selection</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.96162px;white-space:pre;inline-size:19.9326;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.102;stroke-dasharray:none;stroke-opacity:1"
+       x="52.976768"
+       y="95.244385"
+       id="text4688-70-3"
+       transform="matrix(0.58363281,0,0,0.58363281,8.6332544,51.50498)"><tspan
+         x="52.976768"
+         y="95.244385"
+         id="tspan13663">Energy Loss</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.96162px;white-space:pre;inline-size:28.4868;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.102;stroke-dasharray:none;stroke-opacity:1"
+       x="52.976768"
+       y="95.244385"
+       id="text4688-70-3-7"
+       transform="matrix(0.58363281,0,0,0.58363281,-23.532903,50.682205)"><tspan
+         x="52.976768"
+         y="95.244385"
+         id="tspan13665">Temperature Regulation</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.96162px;white-space:pre;inline-size:28.4868;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.102;stroke-dasharray:none;stroke-opacity:1"
+       x="52.976768"
+       y="95.244385"
+       id="text4688-70-3-7-5"
+       transform="matrix(0.58363281,0,0,0.58363281,-16.918838,61.096392)"><tspan
+         x="52.976768"
+         y="95.244385"
+         id="tspan13667">Physical Movement</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.96162px;text-align:center;text-anchor:middle;white-space:pre;inline-size:28.8915;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.102;stroke-dasharray:none;stroke-opacity:1"
+       x="62.671097"
+       y="95.244385"
+       id="text4688-70-3-6"
+       transform="matrix(0.58363281,0,0,0.58363281,-20.744851,39.794006)"><tspan
+         x="62.671097"
+         y="95.244385"
+         id="tspan13669">&quot;Brain&quot; maintainance cost</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="140.94342"
+       y="166.15117"
+       id="text4688-7-3"><tspan
+         sodipodi:role="line"
+         id="tspan4686-5-5"
+         style="stroke-width:0.0594967"
+         x="140.94342"
+         y="166.15117">Increase Energy Levell</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="191.70181"
+       y="165.40373"
+       id="text4688-7-3-7"><tspan
+         sodipodi:role="line"
+         id="tspan4686-5-5-3"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0594967"
+         x="191.70181"
+         y="165.40373">High-Effect Substances</tspan><tspan
+         sodipodi:role="line"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0594967"
+         x="191.70181"
+         y="166.83482"
+         id="tspan8161">(cause stronger- or lower-than-usual behaviour of  </tspan><tspan
+         sodipodi:role="line"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0594967"
+         x="191.70181"
+         y="168.26591"
+         id="tspan8163">specific cell-collections)</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="175.3596"
+       y="109.95367"
+       id="text4688-7-3-9"><tspan
+         sodipodi:role="line"
+         id="tspan4686-5-5-2"
+         style="stroke-width:0.0594967"
+         x="175.3596"
+         y="109.95367">Photoautotrophy</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.28998px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0670378;stroke-dasharray:none;stroke-opacity:1"
+       x="179.08057"
+       y="97.944527"
+       id="text4688-7-3-9-3"
+       transform="scale(0.88657174,1.1279403)"><tspan
+         sodipodi:role="line"
+         id="tspan4686-5-5-2-7"
+         style="stroke-width:0.0670378"
+         x="179.08057"
+         y="97.944527">Heterotrophy</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.28998px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0670378;stroke-dasharray:none;stroke-opacity:1"
+       x="163.67125"
+       y="114.28168"
+       id="text4688-7-3-9-3-6"
+       transform="scale(0.88657174,1.1279403)"><tspan
+         sodipodi:role="line"
+         id="tspan4686-5-5-2-7-0"
+         style="stroke-width:0.0670378"
+         x="163.67125"
+         y="114.28168">Hunting</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.28998px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0670378;stroke-dasharray:none;stroke-opacity:1"
+       x="163.54561"
+       y="118.39609"
+       id="text4688-7-3-9-3-62"
+       transform="scale(0.88657174,1.1279403)"><tspan
+         sodipodi:role="line"
+         id="tspan4686-5-5-2-7-6"
+         style="stroke-width:0.0670378"
+         x="163.54561"
+         y="118.39609">Grazing</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="194.84697"
+       y="109.38624"
+       id="text4688-7-3-9-0"><tspan
+         sodipodi:role="line"
+         id="tspan4686-5-5-2-2"
+         style="stroke-width:0.0594967"
+         x="194.84697"
+         y="109.38624">Chemoautotrophy</tspan><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0594967"
+         x="194.84697"
+         y="110.81733"
+         id="tspan6442" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="166.65591"
+       y="166.32523"
+       id="text4688-7-3-6"><tspan
+         sodipodi:role="line"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0594967"
+         x="166.65591"
+         y="166.32523"
+         id="tspan596">Building-Block-Molecule</tspan><tspan
+         sodipodi:role="line"
+         style="text-align:center;text-anchor:middle;stroke-width:0.0594967"
+         x="166.65591"
+         y="167.75632"
+         id="tspan600">Level</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:2.11667px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="107.38172"
+       y="104.14666"
+       id="text4692"><tspan
+         sodipodi:role="line"
+         id="tspan4690"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:2.11667px;font-family:sans-serif;-inkscape-font-specification:'sans-serif Bold';stroke-width:0.0594967"
+         x="107.38172"
+         y="104.14666">Behaviour</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="141.09813"
+       y="55.726364"
+       id="text4692-7"><tspan
+         sodipodi:role="line"
+         id="tspan4690-9"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-family:sans-serif;-inkscape-font-specification:'sans-serif Bold';stroke-width:0.0594967"
+         x="141.09813"
+         y="55.726364">Organism Recognition</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:2.11667px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="168.77405"
+       y="90.514305"
+       id="text4692-7-9"><tspan
+         sodipodi:role="line"
+         id="tspan4690-9-7"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:2.11667px;font-family:sans-serif;-inkscape-font-specification:'sans-serif Bold';stroke-width:0.0594967"
+         x="168.77405"
+         y="90.514305">Biochemistry</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:2.11667px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="57.873814"
+       y="159.22374"
+       id="text4692-2"><tspan
+         sodipodi:role="line"
+         id="tspan4690-7"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:2.11667px;font-family:sans-serif;-inkscape-font-specification:'sans-serif Bold';stroke-width:0.0594967"
+         x="57.873814"
+         y="159.22374">Form</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:2.11667px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="12.078082"
+       y="177.45667"
+       id="text4692-2-2"><tspan
+         sodipodi:role="line"
+         id="tspan4690-7-2"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:2.11667px;font-family:sans-serif;-inkscape-font-specification:'sans-serif Bold';stroke-width:0.0594967"
+         x="12.078082"
+         y="177.45667">Species</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:2.11667px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="52.718426"
+       y="127.53884"
+       id="text4692-2-9"><tspan
+         sodipodi:role="line"
+         id="tspan4690-7-3"
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:2.11667px;font-family:sans-serif;-inkscape-font-specification:'sans-serif Bold';stroke-width:0.0594967"
+         x="52.718426"
+         y="127.53884">Reproduction</tspan></text>
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.144154;stroke-dasharray:none;stroke-opacity:1"
+       d="m 90.036897,138.18946 4.676284,-4.7483"
+       id="path4864"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.164554;stroke-dasharray:none;stroke-opacity:1"
+       d="m 29.655761,121.79011 c -13.671387,0.37603 -14.037153,5.86019 -13.87133,8.48711 m -0.0308,6.31317 0.03709,6.94846 m -6.2846556,5.51643 3.4897756,4.46019 m 7.246316,-4.24966 -4.259484,4.45262 m -1.603131,3.52145 0.137398,3.36706 m 39.790313,-47.7449 -12.311164,7.28276 m 12.02511,-9.60148 -7.145988,-3.36595 M 38.245703,105.42379 23.943534,96.297608 M 38.167861,106.7967 22.160079,106.03856 m 16.234154,2.23838 c -3.089452,1.89162 -8.544522,4.64502 -12.694757,7.3231"
+       id="path4864-6"
+       sodipodi:nodetypes="cccccccccccccccccccc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.164554;stroke-dasharray:none;stroke-opacity:1"
+       d="m 60.036218,124.12078 -0.08331,-10.17771"
+       id="path4864-6-3"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.123467;stroke-dasharray:none;stroke-opacity:1"
+       d="m 60.056579,130.27157 0.08702,-1.70626"
+       id="path4864-6-3-1"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.123467;stroke-dasharray:none;stroke-opacity:1"
+       d="m 64.01058,136.46115 -2.274021,-2.84951"
+       id="path4864-6-3-6"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.123467;stroke-dasharray:none;stroke-opacity:1"
+       d="m 55.866502,137.01286 2.725429,-3.46026"
+       id="path4864-6-3-6-0"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.123467;stroke-dasharray:none;stroke-opacity:1"
+       d="m 55.654106,139.95961 3.031107,3.17922"
+       id="path4864-6-3-6-0-6"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.123372;stroke-dasharray:none;stroke-opacity:1"
+       d="m 63.916138,141.18918 -1.940148,2.1199 m 16.043601,-4.3765 -9.65667,1.15877"
+       id="path4864-6-3-6-0-6-2"
+       sodipodi:nodetypes="cccc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.164427;stroke-dasharray:none;stroke-opacity:1"
+       d="m 60.723117,148.49785 0.08049,7.28967"
+       id="path4864-6-3-6-0-6-2-9"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.122288;stroke-dasharray:none;stroke-opacity:1"
+       d="m 60.524965,164.24054 0.0059,1.65372"
+       id="path4864-6-3-6-0-6-2-9-3"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.122288;stroke-dasharray:none;stroke-opacity:1"
+       d="m 60.693807,170.13123 0.0059,1.65372"
+       id="path4864-6-3-6-0-6-2-9-3-3"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.164427;stroke-dasharray:none;stroke-opacity:1"
+       d="m 111.92365,171.50876 8.91352,-5.41743 m -20.4417,6.82498 -33.254609,1.70319 m -17.148437,-5.79889 -24.055525,0.15464 m -9.55248,5.43898 -0.911584,-9.06427"
+       id="path4864-6-3-6-0-6-2-9-3-3-1"
+       sodipodi:nodetypes="cccccccc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.123467;stroke-dasharray:none;stroke-opacity:1"
+       d="m 64.65279,138.23547 -0.01771,1.24249"
+       id="path4864-6-3-6-0-6-2-6"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.164554;stroke-dasharray:none;stroke-opacity:1"
+       d="m 59.685624,108.61929 -0.0874,-6.36024 m 0.176539,-2.91219 0.810093,-14.863572 m -0.155541,-8.347937 -0.0187,-4.614536 m -3.861505,27.824491 -9.043293,-7.392907"
+       id="path4864-6-7"
+       sodipodi:nodetypes="cccccccc" />
+    <rect
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.191448;stroke-dasharray:none;stroke-opacity:1"
+       id="rect5137-2"
+       width="31.24139"
+       height="15.216637"
+       x="132.07231"
+       y="48.223522" />
+    <rect
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.191448;stroke-dasharray:none;stroke-opacity:1"
+       id="rect5137-2-8"
+       width="46.576023"
+       height="66.371605"
+       x="94.714745"
+       y="74.535355" />
+    <rect
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.191448;stroke-dasharray:none;stroke-opacity:1"
+       id="rect5137-1"
+       width="21.447092"
+       height="21.429075"
+       x="49.951012"
+       y="155.79283" />
+    <rect
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.191448;stroke-dasharray:none;stroke-opacity:1"
+       id="rect5137-1-9"
+       width="21.217089"
+       height="35.435612"
+       x="4.7176638"
+       y="143.57762" />
+    <rect
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.191448;stroke-dasharray:none;stroke-opacity:1"
+       id="rect5137-1-0"
+       width="28.299059"
+       height="24.312382"
+       x="46.476463"
+       y="124.17381" />
+    <rect
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.191448;stroke-dasharray:none;stroke-opacity:1"
+       id="rect5137-3"
+       width="14.136351"
+       height="5.3629189"
+       x="117.62792"
+       y="75.931503" />
+    <text
+       xml:space="preserve"
+       style="font-size:1.14487px;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="98.168068"
+       y="79.167458"
+       id="text4062-6-2-5"><tspan
+         sodipodi:role="line"
+         id="tspan4060-1-9-6"
+         style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+         x="98.168068"
+         y="79.167458">Environment attributes</tspan></text>
+    <rect
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.191448;stroke-dasharray:none;stroke-opacity:1"
+       id="rect5137-3-2"
+       width="14.136351"
+       height="5.3629189"
+       x="97.263092"
+       y="75.966415" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.175963;stroke-dasharray:none;stroke-opacity:1"
+       d="m 124.2995,92.172297 -10.66395,9.133613"
+       id="path4864-5-3-2-0"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.175963;stroke-dasharray:none;stroke-opacity:1"
+       d="m 180.06409,109.48656 -0.27543,19.56569 m 16.54155,-15.56276 -14.27417,15.60219 m -29.90902,2.06869 9.86156,-18.46228 m -12.00823,16.81531 2.15406,1.66626 m -2.16951,1.60315 2.18208,-1.62079 m -10.8465,-2.77159 3.32058,-0.0142 m -3.27306,4.68583 3.32058,-0.0142"
+       id="path4864-5-3-2-0-36"
+       sodipodi:nodetypes="cccccccccccccc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.175963;stroke-dasharray:none;stroke-opacity:1"
+       d="m 104.40349,91.988146 7.63929,9.323264"
+       id="path4864-5-3-2-0-3"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.175963;stroke-dasharray:none;stroke-opacity:1"
+       d="m 124.48536,81.176482 -0.0533,8.031988"
+       id="path4864-5-3-2-0-8"
+       sodipodi:nodetypes="cc" />
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.175963;stroke-dasharray:none;stroke-opacity:1"
+       d="m 103.97663,81.444359 0.0416,7.769533"
+       id="path4864-5-3-2-0-8-9"
+       sodipodi:nodetypes="cc" />
+    <text
+       xml:space="preserve"
+       style="font-size:0.91122px;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0473548;stroke-dasharray:none;stroke-opacity:1"
+       x="83.37336"
+       y="114.3815"
+       id="text5277-2"
+       transform="scale(1.0172457,0.98304667)"><tspan
+         sodipodi:role="line"
+         style="fill:#000000;fill-opacity:1;stroke-width:0.0473548;stroke-dasharray:none"
+         x="83.37336"
+         y="114.3815"
+         id="tspan8888" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:0.91122px;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0473548;stroke-dasharray:none;stroke-opacity:1"
+       x="84.14077"
+       y="112.05582"
+       id="text5277-2-2"
+       transform="scale(1.0172457,0.98304667)"><tspan
+         sodipodi:role="line"
+         style="fill:#000000;fill-opacity:1;stroke-width:0.0473548;stroke-dasharray:none"
+         x="84.14077"
+         y="112.05582"
+         id="tspan8888-0" /></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:0.859014px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0446413;stroke-dasharray:none;stroke-opacity:1"
+       x="59.861664"
+       y="132.15317"
+       id="text6199-8"><tspan
+         sodipodi:role="line"
+         id="tspan6197-7"
+         style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-family:sans-serif;-inkscape-font-specification:sans-serif;fill:#000000;fill-opacity:1;stroke-width:0.0446413"
+         x="59.861664"
+         y="132.15317">Query DNA</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:0.859014px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0446413;stroke-dasharray:none;stroke-opacity:1"
+       x="64.71286"
+       y="137.70686"
+       id="text6225"><tspan
+         sodipodi:role="line"
+         id="tspan6223"
+         style="stroke-width:0.0446413"
+         x="64.71286"
+         y="137.70686">sexual?</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:0.859014px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0446413;stroke-dasharray:none;stroke-opacity:1"
+       x="54.866203"
+       y="139.12646"
+       id="text6229"><tspan
+         sodipodi:role="line"
+         id="tspan6227"
+         style="stroke-width:0.0446413"
+         x="54.866203"
+         y="139.12646">asexual?</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.96162px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;white-space:pre;inline-size:25.2323;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.101942;stroke-dasharray:none;stroke-opacity:1"
+       x="77.538719"
+       y="270.16879"
+       id="text6229-2"
+       transform="matrix(0.43406161,0,0,0.43406161,27.065577,50.460348)"><tspan
+         x="77.538719"
+         y="270.16879"
+         id="tspan13671">obtain OCG-Vector (in DNA)</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.96162px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;white-space:pre;inline-size:25.2323;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.101942;stroke-dasharray:none;stroke-opacity:1"
+       x="77.538719"
+       y="270.16879"
+       id="text6229-2-6"
+       transform="matrix(0.43406161,0,0,0.43406161,27.748533,56.439502)"><tspan
+         x="77.538719"
+         y="270.16879"
+         id="tspan13673">(Append Cells according to<tspan
+   y="270.16879"
+   id="tspan13675"> </tspan></tspan><tspan
+         x="77.538719"
+         y="272.62083"
+         id="tspan13677">OCG &amp; growth rate)</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.96162px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;white-space:pre;inline-size:25.2323;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.101942;stroke-dasharray:none;stroke-opacity:1"
+       x="77.538719"
+       y="270.16879"
+       id="text6229-2-6-6-0"
+       transform="matrix(0.58363281,0,0,0.58363281,-29.198838,5.0362661)"><tspan
+         x="77.538719"
+         y="270.16879"
+         id="tspan13679">Compare individual OCG to<tspan
+   y="270.16879"
+   id="tspan13681"> </tspan></tspan><tspan
+         x="77.538719"
+         y="272.62083"
+         id="tspan13683">existing Average OCGs</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.96162px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;white-space:pre;inline-size:25.2323;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.101942;stroke-dasharray:none;stroke-opacity:1"
+       x="77.538719"
+       y="270.16879"
+       id="text6229-2-6-6-0-6"
+       transform="matrix(0.58363281,0,0,0.58363281,-30.163221,-1.836197)"><tspan
+         x="77.538719"
+         y="270.16879"
+         id="tspan13685">Difference &gt; 1% ?</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.96162px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;white-space:pre;inline-size:25.2323;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.101942;stroke-dasharray:none;stroke-opacity:1"
+       x="77.538719"
+       y="270.16879"
+       id="text6229-2-6-6-0-6-2"
+       transform="matrix(0.58363281,0,0,0.58363281,-36.421445,-9.8713852)"><tspan
+         x="77.538719"
+         y="270.16879"
+         id="tspan13687">Yes</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.96162px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;white-space:pre;inline-size:25.2323;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.101942;stroke-dasharray:none;stroke-opacity:1"
+       x="77.538719"
+       y="270.16879"
+       id="text6229-2-6-6-0-6-2-1"
+       transform="matrix(0.58363281,0,0,0.58363281,-29.339046,-24.435673)"><tspan
+         x="77.538719"
+         y="270.16879"
+         id="tspan13689">Create new species
+</tspan><tspan
+         x="77.538719"
+         y="272.62083"
+         id="tspan13691">(new Average OCG)</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.96162px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;white-space:pre;inline-size:25.2323;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.101942;stroke-dasharray:none;stroke-opacity:1"
+       x="77.538719"
+       y="270.16879"
+       id="text6229-2-6-6-0-6-6"
+       transform="matrix(0.58363281,0,0,0.58363281,-24.315454,-9.7333562)"><tspan
+         x="77.538719"
+         y="270.16879"
+         id="tspan13693">No</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.96162px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;white-space:pre;inline-size:25.2323;display:inline;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.101942;stroke-dasharray:none;stroke-opacity:1"
+       x="77.538719"
+       y="270.16879"
+       id="text6229-2-6-9"
+       transform="matrix(0.58363281,0,0,0.58363281,114.79664,26.329849)"><tspan
+         x="77.538719"
+         y="270.16879"
+         id="tspan13695">Growth rate</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:0.859014px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0446413;stroke-dasharray:none;stroke-opacity:1"
+       x="64.923088"
+       y="140.52301"
+       id="text8485"><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0446413"
+         x="64.923088"
+         y="140.52301"
+         id="tspan8487">Fertilization</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.14487px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0594967;stroke-dasharray:none;stroke-opacity:1"
+       x="84.260704"
+       y="139.09064"
+       id="text8485-5"><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0594967"
+         x="84.260704"
+         y="139.09064"
+         id="tspan8487-9">in-vivo vs ex-vivo?</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:0.859014px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0446413;stroke-dasharray:none;stroke-opacity:1"
+       x="60.977074"
+       y="144.97543"
+       id="text8493"><tspan
+         sodipodi:role="line"
+         id="tspan8491"
+         style="stroke-width:0.0446413"
+         x="60.977074"
+         y="144.97543">Mutation </tspan><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0446413"
+         x="60.977074"
+         y="146.04919"
+         id="tspan7771">(koefficient-based, mutate both OCG- and behaviour vector )</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:0.851467px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0442491;stroke-dasharray:none;stroke-opacity:1"
+       x="60.396011"
+       y="162.11856"
+       id="text8497"><tspan
+         sodipodi:role="line"
+         id="tspan8495"
+         style="stroke-width:0.0442491"
+         x="60.396011"
+         y="162.11856">Define Cell Collections </tspan><tspan
+         sodipodi:role="line"
+         style="stroke-width:0.0442491"
+         x="60.396011"
+         y="163.18289"
+         id="tspan450">(Analogous to Segments in Biology)</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:0.645003px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.0207212;stroke-dasharray:none;stroke-opacity:1"
+       x="62.87175"
+       y="162.74754"
+       id="text9525"
+       transform="scale(0.96409089,1.0372466)"><tspan
+         sodipodi:role="line"
+         id="tspan9523"
+         style="fill:#000000;fill-opacity:1;stroke-width:0.0207212"
+         x="62.87175"
+         y="162.74754">(order of cell growth)</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:1.85303px;font-family:sans-serif;-inkscape-font-specification:sans-serif;text-align:center;text-anchor:middle;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.0595305;stroke-dasharray:none;stroke-opacity:1"
+       x="38.533653"
+       y="64.760559"
+       id="text10347"><tspan
+         sodipodi:role="line"
+         id="tspan10345"
+         style="stroke-width:0.0595305"
+         x="38.533653"
+         y="64.760559" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.85303px;fill:#000000;stroke-width:0.154419"
+       x="58.248154"
+       y="168.71115"
+       id="text476"><tspan
+         sodipodi:role="line"
+         id="tspan474"
+         style="stroke-width:0.154419"
+         x="58.248154"
+         y="168.71115" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.85303px;fill:#000000;stroke-width:0.154419"
+       x="89.810448"
+       y="120.07692"
+       id="text536"><tspan
+         sodipodi:role="line"
+         id="tspan534"
+         style="stroke-width:0.154419"
+         x="89.810448"
+         y="120.07692" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.85303px;fill:#000000;stroke-width:0.154419"
+       x="99.628426"
+       y="121.75436"
+       id="text567"><tspan
+         sodipodi:role="line"
+         id="tspan565"
+         style="stroke-width:0.154419"
+         x="99.628426"
+         y="121.75436" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.85303px;text-align:center;text-anchor:middle;fill:#000000;stroke-width:0.154419"
+       x="37.989891"
+       y="115.22279"
+       id="text819"><tspan
+         sodipodi:role="line"
+         id="tspan817"
+         style="stroke-width:0.154419"
+         x="37.989891"
+         y="115.22279" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.13241px;text-align:center;text-anchor:middle;fill:#000000;stroke-width:0.0595305;stroke-dasharray:none"
+       x="19.77689"
+       y="119.1003"
+       id="text4266"><tspan
+         sodipodi:role="line"
+         id="tspan4264"
+         style="fill:#000000;stroke-width:0.0595305"
+         x="19.77689"
+         y="119.1003" /></text>
+    <path
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.150432;stroke-dasharray:none;stroke-opacity:1"
+       d="m 29.090825,121.32702 0.649204,0.4349 -0.602844,0.49276"
+       id="path5219-6-3-7"
+       sodipodi:nodetypes="ccc"
+       inkscape:transform-center-x="0.28226405"
+       inkscape:transform-center-y="0.08492714" />
+    <text
+       xml:space="preserve"
+       style="font-size:1.94028px;text-align:center;text-anchor:middle;fill:#000000;stroke-width:0.102;stroke-dasharray:none"
+       x="76.664261"
+       y="140.33098"
+       id="text7199"><tspan
+         sodipodi:role="line"
+         id="tspan7197"
+         style="stroke-width:0.102"
+         x="76.664261"
+         y="140.33098" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.94028px;text-align:center;text-anchor:middle;fill:#000000;stroke-width:0.102"
+       x="55.530182"
+       y="99.363235"
+       id="text3201"><tspan
+         sodipodi:role="line"
+         id="tspan3199"
+         style="stroke-width:0.102"
+         x="55.530182"
+         y="99.363235" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.94028px;text-align:center;text-anchor:middle;fill:#000000;stroke-width:0.102"
+       x="30.130264"
+       y="84.981232"
+       id="text3521"><tspan
+         sodipodi:role="line"
+         id="tspan3519"
+         style="stroke-width:0.102"
+         x="30.130264"
+         y="84.981232" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.94028px;text-align:center;text-anchor:middle;fill:#000000;stroke-width:0.102"
+       x="43.648949"
+       y="84.583336"
+       id="text3552"><tspan
+         sodipodi:role="line"
+         id="tspan3550"
+         style="stroke-width:0.102"
+         x="43.648949"
+         y="84.583336" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:0.899136px;text-align:center;text-anchor:middle;fill:#000000;stroke-width:0.0472673"
+       x="59.733673"
+       y="82.149422"
+       id="text5022"><tspan
+         sodipodi:role="line"
+         id="tspan5020"
+         style="stroke-width:0.0472673"
+         x="59.733673"
+         y="82.149422">OCG = &quot;Order of cell growth&quot;</tspan></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.94028px;text-align:center;text-anchor:middle;fill:#000000;stroke-width:0.102"
+       x="2.0447626"
+       y="77.515106"
+       id="text7329"><tspan
+         sodipodi:role="line"
+         id="tspan7327"
+         style="stroke-width:0.102"
+         x="2.0447626"
+         y="77.515106" /></text>
+    <text
+       xml:space="preserve"
+       style="font-size:1.94028px;fill:#000000;stroke-width:0.102"
+       x="82.076424"
+       y="91.270233"
+       id="text3907"><tspan
+         sodipodi:role="line"
+         id="tspan3905"
+         style="stroke-width:0.102"
+         x="82.076424"
+         y="91.270233"></tspan></text>
+  </g>
+</svg>
