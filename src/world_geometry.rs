@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 const TERRAIN_SHADER_PATH: &str = "shaders/terrain.wgsl";
 
 const TILE_SIZE: u32 = 16;
-const ATLAS_COLS: u32 = 2;
-const ATLAS_ROWS: u32 = 4;
+const ATLAS_COLS: u32 = 16;
+const ATLAS_ROWS: u32 = 16;
 const BLOCK_TYPE_COUNT: u32 = ATLAS_COLS * ATLAS_ROWS;
 
 pub struct WorldPlugin {

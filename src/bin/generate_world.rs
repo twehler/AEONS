@@ -42,38 +42,120 @@ impl VoxelBuffer {
     }
 }
 
-const BLOCK_STONE:   u8 = 1;
-const BLOCK_DIRT:    u8 = 2;
-const BLOCK_GRASS:   u8 = 3;
-const BLOCK_UNKNOWN: u8 = 4;
-const BLOCK_RED: u8 = 5;
-const BLOCK_BLUE: u8 = 6;
+
+const BLOCK_CHALK_1: u8 = 0;
+const BLOCK_CHALK_2: u8 = 1;
+const BLOCK_CHALK_3: u8 = 2;
+const BLOCK_GREYSTONE_1: u8 = 3;
+const BLOCK_GREYSTONE_2: u8 = 4;
+const BLOCK_GREYSTONE_3: u8 = 5;
+const BLOCK_GREYSTONE_4: u8 = 6;
+const BLOCK_BROWNSTONE: u8 = 7;
+const BLOCK_SAND_1: u8 = 8;
+const BLOCK_SAND_2: u8 = 9;
+const BLOCK_RED_SAND_1: u8 = 10;
+const BLOCK_RED_SAND_2: u8 = 11;
+const BLOCK_AQUATIC_SAND_1: u8 = 12;
+const BLOCK_AQUATIC_SAND_2: u8 = 13;
+const BLOCK_AQUATIC_SAND_3: u8 = 14;
+const BLOCK_AQUATIC_SAND_4: u8 = 15;
+
+const BLOCK_CHALK_1_BIOLAYER_1: u8 = 32;
+const BLOCK_CHALK_2_BIOLAYER_1: u8 = 33;
+const BLOCK_CHALK_3_BIOLAYER_1: u8 = 34;
+const BLOCK_GREYSTONE_1_BIOLAYER_1: u8 = 35;
+const BLOCK_GREYSTONE_2_BIOLAYER_1: u8 = 36;
+const BLOCK_GREYSTONE_3_BIOLAYER_1: u8 = 37;
+const BLOCK_GREYSTONE_4_BIOLAYER_1: u8 = 38;
+const BLOCK_BROWNSTONE_BIOLAYER_1: u8 = 39;
+const BLOCK_SAND_1_BIOLAYER_1: u8 = 40;
+const BLOCK_SAND_2_BIOLAYER_1: u8 = 41;
+const BLOCK_RED_SAND_1_BIOLAYER_1: u8 = 42;
+const BLOCK_RED_SAND_2_BIOLAYER_1: u8 = 43;
+const BLOCK_AQUATIC_SAND_1_BIOLAYER_1: u8 = 44;
+const BLOCK_AQUATIC_SAND_2_BIOLAYER_1: u8 = 45;
+const BLOCK_AQUATIC_SAND_3_BIOLAYER_1: u8 = 46;
+const BLOCK_AQUATIC_SAND_4_BIOLAYER_1: u8 = 47;
+
+const BLOCK_CHALK_1_BIOLAYER_2: u8 = 64;
+const BLOCK_CHALK_2_BIOLAYER_2: u8 = 65;
+const BLOCK_CHALK_3_BIOLAYER_2: u8 = 66;
+const BLOCK_GREYSTONE_1_BIOLAYER_2: u8 = 67;
+const BLOCK_GREYSTONE_2_BIOLAYER_2: u8 = 68;
+const BLOCK_GREYSTONE_3_BIOLAYER_2: u8 = 69;
+const BLOCK_GREYSTONE_4_BIOLAYER_2: u8 = 70;
+const BLOCK_BROWNSTONE_BIOLAYER_2: u8 = 71;
+const BLOCK_SAND_1_BIOLAYER_2: u8 = 72;
+const BLOCK_SAND_2_BIOLAYER_2: u8 = 73;
+const BLOCK_RED_SAND_1_BIOLAYER_2: u8 = 74;
+const BLOCK_RED_SAND_2_BIOLAYER_2: u8 = 75;
+const BLOCK_AQUATIC_SAND_1_BIOLAYER_2: u8 = 76;
+const BLOCK_AQUATIC_SAND_2_BIOLAYER_2: u8 = 77;
+const BLOCK_AQUATIC_SAND_3_BIOLAYER_2: u8 = 78;
+const BLOCK_AQUATIC_SAND_4_BIOLAYER_2: u8 = 79;
+
+
+const BLOCK_UNKNOWN: u8 = 255;
+
+
 
 fn material_map_color_to_block(r: u8, g: u8, b: u8) -> u8 {
     match (r, g, b) {
-        (0xd2, 0xd2, 0xd2) => BLOCK_STONE,
-        (0x64, 0x44, 0x2b) => BLOCK_DIRT,
-        (0x0a, 0xa0, 0x00) => BLOCK_GRASS,
-        (0x9f, 0x01, 0x28) => BLOCK_RED,
-        (0x00, 0x2a, 0xff) => BLOCK_BLUE,
+        (0xff, 0xff, 0xff) => BLOCK_CHALK_1,
+        (0xf4, 0xe8, 0xe2) => BLOCK_CHALK_2,
+        (0xe9, 0xd2, 0xc6) => BLOCK_CHALK_3,
+        (0xc8, 0xc8, 0xc8) => BLOCK_GREYSTONE_1,
+        (0xaa, 0xaa, 0xaa) => BLOCK_GREYSTONE_2,
+        (0x99, 0x99, 0x99) => BLOCK_GREYSTONE_3,
+        (0x7e, 0x7e, 0x7e) => BLOCK_GREYSTONE_4,
+        (0xae, 0xa3, 0x9b) => BLOCK_BROWNSTONE,
+        (0xe0, 0xd3, 0xc6) => BLOCK_SAND_1,
+        (0xff, 0xe9, 0xc8) => BLOCK_SAND_2,
+        (0xff, 0xdd, 0xa9) => BLOCK_RED_SAND_1,
+        (0xf4, 0xca, 0x8b) => BLOCK_RED_SAND_2,
+        (0xb4, 0xc1, 0xbf) => BLOCK_AQUATIC_SAND_1,
+        (0x9a, 0xb1, 0xd1) => BLOCK_AQUATIC_SAND_2,
+        (0x8f, 0x95, 0xaf) => BLOCK_AQUATIC_SAND_3,
+        (0x74, 0x77, 0x85) => BLOCK_AQUATIC_SAND_4,
+
+        (0xff, 0xda, 0xc7) => BLOCK_CHALK_1_BIOLAYER_1,
+        (0xff, 0xcc, 0xb1) => BLOCK_CHALK_2_BIOLAYER_1,
+        (0xf4, 0xba, 0x9b) => BLOCK_CHALK_3_BIOLAYER_1,
+        (0xd6, 0x97, 0x76) => BLOCK_GREYSTONE_1_BIOLAYER_1,
+        (0xae, 0x7b, 0x61) => BLOCK_GREYSTONE_2_BIOLAYER_1,
+        (0x9c, 0x70, 0x5a) => BLOCK_GREYSTONE_3_BIOLAYER_1,
+        (0x7d, 0x59, 0x47) => BLOCK_GREYSTONE_4_BIOLAYER_1,
+        (0xb0, 0x8a, 0x6e) => BLOCK_BROWNSTONE_BIOLAYER_1,
+        (0xda, 0xac, 0x7e) => BLOCK_SAND_1_BIOLAYER_1,
+        (0xff, 0xb4, 0x68) => BLOCK_SAND_2_BIOLAYER_1,
+        (0xff, 0xa1, 0x42) => BLOCK_RED_SAND_1_BIOLAYER_1,
+        (0xff, 0x80, 0x00) => BLOCK_RED_SAND_2_BIOLAYER_1,
+        (0xca, 0xeb, 0xe3) => BLOCK_AQUATIC_SAND_1_BIOLAYER_1,
+        (0xad, 0xd7, 0xcd) => BLOCK_AQUATIC_SAND_2_BIOLAYER_1,
+        (0x6e, 0xa7, 0x9a) => BLOCK_AQUATIC_SAND_3_BIOLAYER_1,
+        (0x55, 0x8d, 0x80) => BLOCK_AQUATIC_SAND_4_BIOLAYER_1,
+
+        (0xcc, 0xd8, 0x9b) => BLOCK_CHALK_1_BIOLAYER_2,
+        (0x9d, 0xc4, 0x6c) => BLOCK_CHALK_2_BIOLAYER_2,
+        (0x7c, 0xb9, 0x4f) => BLOCK_CHALK_3_BIOLAYER_2,
+        (0x6d, 0xaf, 0x43) => BLOCK_GREYSTONE_1_BIOLAYER_2,
+        (0x71, 0xa0, 0x4e) => BLOCK_GREYSTONE_2_BIOLAYER_2,
+        (0x47, 0x7e, 0x22) => BLOCK_GREYSTONE_3_BIOLAYER_2,
+        (0x43, 0x7f, 0x1e) => BLOCK_GREYSTONE_4_BIOLAYER_2,
+        (0x64, 0x8a, 0x4e) => BLOCK_BROWNSTONE_BIOLAYER_2,
+        (0xa1, 0xa5, 0x77) => BLOCK_SAND_1_BIOLAYER_2,
+        (0xcc, 0xd3, 0x8e) => BLOCK_SAND_2_BIOLAYER_2,
+        (0xa9, 0xb9, 0x69) => BLOCK_RED_SAND_1_BIOLAYER_2,
+        (0xb0, 0xbd, 0x71) => BLOCK_RED_SAND_2_BIOLAYER_2,
+        (0x8a, 0x9b, 0x73) => BLOCK_AQUATIC_SAND_1_BIOLAYER_2,
+        (0x75, 0x92, 0x66) => BLOCK_AQUATIC_SAND_2_BIOLAYER_2,
+        (0x6e, 0x8c, 0x5e) => BLOCK_AQUATIC_SAND_3_BIOLAYER_2,
+        (0x38, 0x56, 0x35) => BLOCK_AQUATIC_SAND_4_BIOLAYER_2,
+
         _                  => BLOCK_UNKNOWN,
     }
 }
 
-
-fn block_type_to_layer(block_type: u8) -> u8 {
-    // Map block types to their tile position in reading order (left→right, top→bottom)
-    // Layer 0 = top-left tile, layer 1 = top-right, layer 2 = bottom-left, etc.
-    match block_type {
-        BLOCK_STONE   => 0,
-        BLOCK_RED     => 1,
-        BLOCK_DIRT    => 2,
-        BLOCK_BLUE    => 3,
-        BLOCK_GRASS   => 4,
-        BLOCK_UNKNOWN => 6,
-        _             => 6,
-    }
-}
 
 
 fn add_greedy_quad(
@@ -119,8 +201,7 @@ fn add_greedy_quad(
 
     // Pack block_type into the red channel of vertex color.
     // The shader reads it back as: i32(color.r * 255.0)
-    let layer   = block_type_to_layer(block_type);
-    let encoded = layer as f32 / 255.0;
+    let encoded = block_type as f32 / 255.0;
 
     buffer.colors.extend([[encoded, 0.0, 0.0, 1.0]; 4]);
 
@@ -183,11 +264,13 @@ fn main() {
             let px = mat_img.get_pixel(x, y);
             let surface_type = material_map_color_to_block(px[0], px[1], px[2]);
 
+            // Generate a surface 2 blocks deep
+            // All other blocks beneath will be generated as aquatic sand block 4
             for z in 0..col_height {
                 let block_type = if z >= col_height - 2 {
                     surface_type
                 } else {
-                    BLOCK_STONE
+                    BLOCK_AQUATIC_SAND_4
                 };
                 voxel_map.insert([x as i32, z, y as i32], block_type);
             }

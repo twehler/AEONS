@@ -46,7 +46,7 @@ fn main() {
             // std::path::Path doesn't have to_string() implemented because input could be anything
             // solution: use .to_string_lossy().into_owned() instead
             map_path: map_path_input.to_string_lossy().into_owned(),
-            texture_path: "test_texture_atlas2.png".to_string(),
+            texture_path: "texture_atlas.png".to_string(),
         })
         .add_plugins(bevy_flycam::PlayerPlugin)
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
