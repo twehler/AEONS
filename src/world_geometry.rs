@@ -2,14 +2,19 @@ use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
+use bevy::image::{ImageSampler, ImageSamplerDescriptor, ImageFilterMode};
 use std::fs::File;
 use serde::{Deserialize, Serialize};
 
-// Number of block types in your stacked texture PNG.
-// Stack them vertically: stone (layer 0), dirt (layer 1),
-// grass (layer 2), unknown (layer 3).
-const BLOCK_TYPE_COUNT: u32 = 4;
+
+
+
 const TERRAIN_SHADER_PATH: &str = "shaders/terrain.wgsl";
+
+const TILE_SIZE: u32 = 16;
+const ATLAS_COLS: u32 = 2;
+const ATLAS_ROWS: u32 = 4;
+const BLOCK_TYPE_COUNT: u32 = ATLAS_COLS * ATLAS_ROWS;
 
 pub struct WorldPlugin {
     pub map_path:     String,
@@ -71,6 +76,71 @@ struct PendingTexture {
 
 // --- Systems ---
 
+fn reorder_atlas_to_array(
+    image: &mut Image,
+    cols: u32,
+    rows: u32,
+    tile_size: u32,
+) {
+    use bevy::render::render_resource::{Extent3d, TextureFormat};
+
+    image.convert(TextureFormat::Rgba8UnormSrgb);
+
+    let expected_width  = cols * tile_size;
+    let expected_height = rows * tile_size;
+    let actual_width    = image.texture_descriptor.size.width;
+    let actual_height   = image.texture_descriptor.size.height;
+
+    assert_eq!(
+        actual_width, expected_width,
+        "Atlas width mismatch: image is {}px wide but ATLAS_COLS={} \
+         and TILE_SIZE={} expect {}px",
+        actual_width, cols, tile_size, expected_width
+    );
+    assert_eq!(
+        actual_height, expected_height,
+        "Atlas height mismatch: image is {}px tall but ATLAS_ROWS={} \
+         and TILE_SIZE={} expect {}px",
+        actual_height, rows, tile_size, expected_height
+    );
+
+    let bytes_per_pixel = 4usize;
+    let atlas_width     = expected_width as usize;
+    let total_tiles     = (cols * rows) as usize;
+    let tile_bytes      = tile_size as usize * tile_size as usize * bytes_per_pixel;
+
+    let src = image.data.as_ref()
+        .expect("Image has no data")
+        .clone();
+
+    let mut dst = vec![0u8; total_tiles * tile_bytes];
+
+    for tile_idx in 0..total_tiles {
+        let tile_col   = tile_idx % cols as usize;
+        let tile_row   = tile_idx / cols as usize;
+        let dst_offset = tile_idx * tile_bytes;
+
+        for py in 0..tile_size as usize {
+            for px in 0..tile_size as usize {
+                let src_x      = tile_col * tile_size as usize + px;
+                let src_y      = tile_row * tile_size as usize + py;
+                let src_offset = (src_y * atlas_width + src_x) * bytes_per_pixel;
+                let dst_pixel  = dst_offset + (py * tile_size as usize + px) * bytes_per_pixel;
+                dst[dst_pixel..dst_pixel + 4]
+                    .copy_from_slice(&src[src_offset..src_offset + 4]);
+            }
+        }
+    }
+
+    image.data = Some(dst);
+
+    image.texture_descriptor.size = Extent3d {
+        width:                 tile_size,
+        height:                tile_size * total_tiles as u32,
+        depth_or_array_layers: 1,
+    };
+}
+
 fn begin_load_scene(
     settings:    Res<WorldSettings>,
     mut commands: Commands,
@@ -112,6 +182,13 @@ fn finish_load_scene(
 
     // Reinterpret the stacked PNG as a texture array — one layer per block type
     let image = images.get_mut(&pending.handle).unwrap();
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        mag_filter:  ImageFilterMode::Nearest,
+        min_filter:  ImageFilterMode::Nearest,
+        mipmap_filter: ImageFilterMode::Nearest,
+        ..default()
+    });
+    reorder_atlas_to_array(image, ATLAS_COLS, ATLAS_ROWS, TILE_SIZE);
     image.reinterpret_stacked_2d_as_array(BLOCK_TYPE_COUNT);
 
     // Build the mesh from the cached data

@@ -46,15 +46,35 @@ const BLOCK_STONE:   u8 = 1;
 const BLOCK_DIRT:    u8 = 2;
 const BLOCK_GRASS:   u8 = 3;
 const BLOCK_UNKNOWN: u8 = 4;
+const BLOCK_RED: u8 = 5;
+const BLOCK_BLUE: u8 = 6;
 
 fn material_map_color_to_block(r: u8, g: u8, b: u8) -> u8 {
     match (r, g, b) {
         (0xd2, 0xd2, 0xd2) => BLOCK_STONE,
         (0x64, 0x44, 0x2b) => BLOCK_DIRT,
         (0x0a, 0xa0, 0x00) => BLOCK_GRASS,
+        (0x9f, 0x01, 0x28) => BLOCK_RED,
+        (0x00, 0x2a, 0xff) => BLOCK_BLUE,
         _                  => BLOCK_UNKNOWN,
     }
 }
+
+
+fn block_type_to_layer(block_type: u8) -> u8 {
+    // Map block types to their tile position in reading order (left→right, top→bottom)
+    // Layer 0 = top-left tile, layer 1 = top-right, layer 2 = bottom-left, etc.
+    match block_type {
+        BLOCK_STONE   => 0,
+        BLOCK_RED     => 1,
+        BLOCK_DIRT    => 2,
+        BLOCK_BLUE    => 3,
+        BLOCK_GRASS   => 4,
+        BLOCK_UNKNOWN => 6,
+        _             => 6,
+    }
+}
+
 
 fn add_greedy_quad(
     buffer: &mut VoxelBuffer,
@@ -99,7 +119,9 @@ fn add_greedy_quad(
 
     // Pack block_type into the red channel of vertex color.
     // The shader reads it back as: i32(color.r * 255.0)
-    let encoded = block_type as f32 / 255.0;
+    let layer   = block_type_to_layer(block_type);
+    let encoded = layer as f32 / 255.0;
+
     buffer.colors.extend([[encoded, 0.0, 0.0, 1.0]; 4]);
 
     if is_front {
