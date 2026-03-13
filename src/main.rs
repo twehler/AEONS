@@ -1,6 +1,7 @@
 mod world_geometry;
 mod bevy_flycam;
 mod viewport_settings;
+mod cell;
 
 use bevy::{
     prelude::*,
@@ -26,11 +27,11 @@ fn main() {
     // args[0] is always the program name
     // args[1] = input path
     if args.len() < 2 {
-        println!("Usage: cargo run --bin voxel_es <world.bin>");
+        println!("Usage: cargo run --bin AEONS <file.terrain>");
         return;
     }
 
-    let map_path_input = Path::new(&args[1]);
+    let terrain_path_input = Path::new(&args[1]);
 
     let mut app = App::new();
 
@@ -45,15 +46,16 @@ fn main() {
 
             // std::path::Path doesn't have to_string() implemented because input could be anything
             // solution: use .to_string_lossy().into_owned() instead
-            map_path: map_path_input.to_string_lossy().into_owned(),
-            texture_path: "texture_atlas.png".to_string(),
+            terrain_path: terrain_path_input.to_string_lossy().into_owned(),
+            texture_path: "texture_atlas_8x8.png".to_string(),
         })
         .add_plugins(bevy_flycam::PlayerPlugin)
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
 
         //.add_plugins(EguiPlugin::default())
         //.add_plugins(WorldInspectorPlugin::new())
-        .add_systems(Startup, setup);
+        .add_systems(Startup, setup)
+        .add_systems(Startup, cell::spawn_rhombic_dodecahedron);
 
     if show_wireframe {
         app.add_plugins(WireframePlugin::default());

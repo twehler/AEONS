@@ -1,3 +1,4 @@
+use log::warn;
 use bevy::prelude::*;
 use bevy::mesh::Indices;
 pub use bevy::render::render_resource::PrimitiveTopology;
@@ -16,6 +17,7 @@ use std::time::Instant;
 #[derive(Serialize, Deserialize)]
 pub struct WorldCache {
     pub positions:   Vec<[f32; 3]>,
+    pub block_metadata: Vec<u8>, // block-type
     pub normals:     Vec<[f32; 3]>,
     pub uvs:         Vec<[f32; 2]>,
     pub colors:      Vec<[f32; 4]>, // r = block_type / 255.0, gba unused
@@ -24,6 +26,7 @@ pub struct WorldCache {
 
 pub struct VoxelBuffer {
     pub positions: Vec<[f32; 3]>,
+    pub block_metadata: Vec<u8>, 
     pub normals:   Vec<[f32; 3]>,
     pub uvs:       Vec<[f32; 2]>,
     pub colors:    Vec<[f32; 4]>,
@@ -34,6 +37,7 @@ impl VoxelBuffer {
     pub fn new() -> Self {
         Self {
             positions: Vec::new(),
+            block_metadata: Vec::new(),
             normals:   Vec::new(),
             uvs:       Vec::new(),
             colors:    Vec::new(),
@@ -99,62 +103,6 @@ const BLOCK_UNKNOWN: u8 = 255;
 
 
 
-fn material_map_color_to_block(r: u8, g: u8, b: u8) -> u8 {
-    match (r, g, b) {
-        (0xff, 0xff, 0xff) => BLOCK_CHALK_1,
-        (0xf4, 0xe8, 0xe2) => BLOCK_CHALK_2,
-        (0xe9, 0xd2, 0xc6) => BLOCK_CHALK_3,
-        (0xc8, 0xc8, 0xc8) => BLOCK_GREYSTONE_1,
-        (0xaa, 0xaa, 0xaa) => BLOCK_GREYSTONE_2,
-        (0x99, 0x99, 0x99) => BLOCK_GREYSTONE_3,
-        (0x7e, 0x7e, 0x7e) => BLOCK_GREYSTONE_4,
-        (0xae, 0xa3, 0x9b) => BLOCK_BROWNSTONE,
-        (0xe0, 0xd3, 0xc6) => BLOCK_SAND_1,
-        (0xff, 0xe9, 0xc8) => BLOCK_SAND_2,
-        (0xff, 0xdd, 0xa9) => BLOCK_RED_SAND_1,
-        (0xf4, 0xca, 0x8b) => BLOCK_RED_SAND_2,
-        (0xb4, 0xc1, 0xbf) => BLOCK_AQUATIC_SAND_1,
-        (0x9a, 0xb1, 0xd1) => BLOCK_AQUATIC_SAND_2,
-        (0x8f, 0x95, 0xaf) => BLOCK_AQUATIC_SAND_3,
-        (0x74, 0x77, 0x85) => BLOCK_AQUATIC_SAND_4,
-
-        (0xff, 0xda, 0xc7) => BLOCK_CHALK_1_BIOLAYER_1,
-        (0xff, 0xcc, 0xb1) => BLOCK_CHALK_2_BIOLAYER_1,
-        (0xf4, 0xba, 0x9b) => BLOCK_CHALK_3_BIOLAYER_1,
-        (0xd6, 0x97, 0x76) => BLOCK_GREYSTONE_1_BIOLAYER_1,
-        (0xae, 0x7b, 0x61) => BLOCK_GREYSTONE_2_BIOLAYER_1,
-        (0x9c, 0x70, 0x5a) => BLOCK_GREYSTONE_3_BIOLAYER_1,
-        (0x7d, 0x59, 0x47) => BLOCK_GREYSTONE_4_BIOLAYER_1,
-        (0xb0, 0x8a, 0x6e) => BLOCK_BROWNSTONE_BIOLAYER_1,
-        (0xda, 0xac, 0x7e) => BLOCK_SAND_1_BIOLAYER_1,
-        (0xff, 0xb4, 0x68) => BLOCK_SAND_2_BIOLAYER_1,
-        (0xff, 0xa1, 0x42) => BLOCK_RED_SAND_1_BIOLAYER_1,
-        (0xff, 0x80, 0x00) => BLOCK_RED_SAND_2_BIOLAYER_1,
-        (0xca, 0xeb, 0xe3) => BLOCK_AQUATIC_SAND_1_BIOLAYER_1,
-        (0xad, 0xd7, 0xcd) => BLOCK_AQUATIC_SAND_2_BIOLAYER_1,
-        (0x6e, 0xa7, 0x9a) => BLOCK_AQUATIC_SAND_3_BIOLAYER_1,
-        (0x55, 0x8d, 0x80) => BLOCK_AQUATIC_SAND_4_BIOLAYER_1,
-
-        (0xcc, 0xd8, 0x9b) => BLOCK_CHALK_1_BIOLAYER_2,
-        (0x9d, 0xc4, 0x6c) => BLOCK_CHALK_2_BIOLAYER_2,
-        (0x7c, 0xb9, 0x4f) => BLOCK_CHALK_3_BIOLAYER_2,
-        (0x6d, 0xaf, 0x43) => BLOCK_GREYSTONE_1_BIOLAYER_2,
-        (0x71, 0xa0, 0x4e) => BLOCK_GREYSTONE_2_BIOLAYER_2,
-        (0x47, 0x7e, 0x22) => BLOCK_GREYSTONE_3_BIOLAYER_2,
-        (0x43, 0x7f, 0x1e) => BLOCK_GREYSTONE_4_BIOLAYER_2,
-        (0x64, 0x8a, 0x4e) => BLOCK_BROWNSTONE_BIOLAYER_2,
-        (0xa1, 0xa5, 0x77) => BLOCK_SAND_1_BIOLAYER_2,
-        (0xcc, 0xd3, 0x8e) => BLOCK_SAND_2_BIOLAYER_2,
-        (0xa9, 0xb9, 0x69) => BLOCK_RED_SAND_1_BIOLAYER_2,
-        (0xb0, 0xbd, 0x71) => BLOCK_RED_SAND_2_BIOLAYER_2,
-        (0x8a, 0x9b, 0x73) => BLOCK_AQUATIC_SAND_1_BIOLAYER_2,
-        (0x75, 0x92, 0x66) => BLOCK_AQUATIC_SAND_2_BIOLAYER_2,
-        (0x6e, 0x8c, 0x5e) => BLOCK_AQUATIC_SAND_3_BIOLAYER_2,
-        (0x38, 0x56, 0x35) => BLOCK_AQUATIC_SAND_4_BIOLAYER_2,
-
-        _                  => BLOCK_UNKNOWN,
-    }
-}
 
 
 
@@ -219,6 +167,73 @@ fn add_greedy_quad(
 }
 
 fn main() {
+
+    // count all blocks of unknown type (useful at the end of this code)
+    let mut unknown_blocks = 0;
+
+    // Closure-function to assign blocks based in their signature color inside the material map
+    let mut material_map_color_to_block = |r: u8, g: u8, b: u8| -> u8 {
+        match (r, g, b) {
+            (0xff, 0xff, 0xff) => BLOCK_CHALK_1,
+            (0xf4, 0xe8, 0xe2) => BLOCK_CHALK_2,
+            (0xe9, 0xd2, 0xc6) => BLOCK_CHALK_3,
+            (0xc8, 0xc8, 0xc8) => BLOCK_GREYSTONE_1,
+            (0xaa, 0xaa, 0xaa) => BLOCK_GREYSTONE_2,
+            (0x99, 0x99, 0x99) => BLOCK_GREYSTONE_3,
+            (0x7e, 0x7e, 0x7e) => BLOCK_GREYSTONE_4,
+            (0xae, 0xa3, 0x9b) => BLOCK_BROWNSTONE,
+            (0xe0, 0xd3, 0xc6) => BLOCK_SAND_1,
+            (0xff, 0xe9, 0xc8) => BLOCK_SAND_2,
+            (0xff, 0xdd, 0xa9) => BLOCK_RED_SAND_1,
+            (0xf4, 0xca, 0x8b) => BLOCK_RED_SAND_2,
+            (0xb4, 0xc1, 0xbf) => BLOCK_AQUATIC_SAND_1,
+            (0x9a, 0xb1, 0xd1) => BLOCK_AQUATIC_SAND_2,
+            (0x8f, 0x95, 0xaf) => BLOCK_AQUATIC_SAND_3,
+            (0x74, 0x77, 0x85) => BLOCK_AQUATIC_SAND_4,
+
+            (0xff, 0xda, 0xc7) => BLOCK_CHALK_1_BIOLAYER_1,
+            (0xff, 0xcc, 0xb1) => BLOCK_CHALK_2_BIOLAYER_1,
+            (0xf4, 0xba, 0x9b) => BLOCK_CHALK_3_BIOLAYER_1,
+            (0xd6, 0x97, 0x76) => BLOCK_GREYSTONE_1_BIOLAYER_1,
+            (0xae, 0x7b, 0x61) => BLOCK_GREYSTONE_2_BIOLAYER_1,
+            (0x9c, 0x70, 0x5a) => BLOCK_GREYSTONE_3_BIOLAYER_1,
+            (0x7d, 0x59, 0x47) => BLOCK_GREYSTONE_4_BIOLAYER_1,
+            (0xb0, 0x8a, 0x6e) => BLOCK_BROWNSTONE_BIOLAYER_1,
+            (0xda, 0xac, 0x7e) => BLOCK_SAND_1_BIOLAYER_1,
+            (0xff, 0xb4, 0x68) => BLOCK_SAND_2_BIOLAYER_1,
+            (0xff, 0xa1, 0x42) => BLOCK_RED_SAND_1_BIOLAYER_1,
+            (0xff, 0x80, 0x00) => BLOCK_RED_SAND_2_BIOLAYER_1,
+            (0xca, 0xeb, 0xe3) => BLOCK_AQUATIC_SAND_1_BIOLAYER_1,
+            (0xad, 0xd7, 0xcd) => BLOCK_AQUATIC_SAND_2_BIOLAYER_1,
+            (0x6e, 0xa7, 0x9a) => BLOCK_AQUATIC_SAND_3_BIOLAYER_1,
+            (0x55, 0x8d, 0x80) => BLOCK_AQUATIC_SAND_4_BIOLAYER_1,
+
+            (0xcc, 0xd8, 0x9b) => BLOCK_CHALK_1_BIOLAYER_2,
+            (0x9d, 0xc4, 0x6c) => BLOCK_CHALK_2_BIOLAYER_2,
+            (0x7c, 0xb9, 0x4f) => BLOCK_CHALK_3_BIOLAYER_2,
+            (0x6d, 0xaf, 0x43) => BLOCK_GREYSTONE_1_BIOLAYER_2,
+            (0x71, 0xa0, 0x4e) => BLOCK_GREYSTONE_2_BIOLAYER_2,
+            (0x47, 0x7e, 0x22) => BLOCK_GREYSTONE_3_BIOLAYER_2,
+            (0x43, 0x7f, 0x1e) => BLOCK_GREYSTONE_4_BIOLAYER_2,
+            (0x64, 0x8a, 0x4e) => BLOCK_BROWNSTONE_BIOLAYER_2,
+            (0xa1, 0xa5, 0x77) => BLOCK_SAND_1_BIOLAYER_2,
+            (0xcc, 0xd3, 0x8e) => BLOCK_SAND_2_BIOLAYER_2,
+            (0xa9, 0xb9, 0x69) => BLOCK_RED_SAND_1_BIOLAYER_2,
+            (0xb0, 0xbd, 0x71) => BLOCK_RED_SAND_2_BIOLAYER_2,
+            (0x8a, 0x9b, 0x73) => BLOCK_AQUATIC_SAND_1_BIOLAYER_2,
+            (0x75, 0x92, 0x66) => BLOCK_AQUATIC_SAND_2_BIOLAYER_2,
+            (0x6e, 0x8c, 0x5e) => BLOCK_AQUATIC_SAND_3_BIOLAYER_2,
+            (0x38, 0x56, 0x35) => BLOCK_AQUATIC_SAND_4_BIOLAYER_2,
+
+            _                  => {
+                unknown_blocks += 2; // increment by 2 because the terrain-surface is 2 blocks deep
+                BLOCK_UNKNOWN
+            }
+        }
+    };
+
+
+
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 5 {
@@ -252,9 +267,10 @@ fn main() {
         "Material map must match heightmap dimensions"
     );
 
-    println!("Building voxel map...");
+    println!("Collecting block positions & types...");
     let start = Instant::now();
     let mut voxel_map: HashMap<[i32; 3], u8> = HashMap::new();
+
 
     for y in 0..depth {
         for x in 0..width {
@@ -264,19 +280,12 @@ fn main() {
             let px = mat_img.get_pixel(x, y);
             let surface_type = material_map_color_to_block(px[0], px[1], px[2]);
 
-            // Generate a surface 2 blocks deep
-            // All other blocks beneath will be generated as aquatic sand block 4
             for z in 0..col_height {
-                let block_type = if z >= col_height - 2 {
-                    surface_type
-                } else {
-                    BLOCK_AQUATIC_SAND_4
-                };
-                voxel_map.insert([x as i32, z, y as i32], block_type);
-            }
+                voxel_map.insert([x as i32, z, y as i32], surface_type);
+        }
         }
     }
-    println!("Voxel map built in {:?}", start.elapsed());
+    println!("Completed in {:?}", start.elapsed());
 
     let mut min  = [i32::MAX; 3];
     let mut max_b = [i32::MIN; 3];
@@ -296,7 +305,7 @@ fn main() {
         }
     }
 
-    println!("Running greedy meshing...");
+    println!("Building terrain...");
     let start_gm = Instant::now();
 
     let partial_buffers: Vec<VoxelBuffer> = tasks.into_par_iter().map(|(d, i)| {
@@ -351,7 +360,7 @@ fn main() {
         local_buffer
     }).collect();
 
-    println!("Greedy meshing complete in {:?}", start_gm.elapsed());
+    println!("Building-process completed in {:?}", start_gm.elapsed());
 
     let mut buffer = VoxelBuffer::new();
     for mut pb in partial_buffers {
@@ -380,4 +389,8 @@ fn main() {
     enc.finish().expect("Failed to finish Zstd encoding");
 
     println!("Done! Vertices: {}", cache.positions.len());
+
+    if unknown_blocks != 0 {
+        println!("WARNING: Some colors in the Material-Map could not be matched to known block types! {} blocks with unknown type have been generated in total.", unknown_blocks);
+    }
 }

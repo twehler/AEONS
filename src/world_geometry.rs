@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 
 const TERRAIN_SHADER_PATH: &str = "shaders/terrain.wgsl";
 
-const TILE_SIZE: u32 = 16;
+const TILE_SIZE: u32 = 8;
 const ATLAS_COLS: u32 = 16;
 const ATLAS_ROWS: u32 = 16;
 const BLOCK_TYPE_COUNT: u32 = ATLAS_COLS * ATLAS_ROWS;
 
 pub struct WorldPlugin {
-    pub map_path:     String,
+    pub terrain_path:     String,
     pub texture_path: String, // path to the stacked block textures PNG
 }
 
@@ -25,7 +25,7 @@ impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<TerrainMaterial>::default());
         app.insert_resource(WorldSettings {
-            map_path:     self.map_path.clone(),
+            terrain_path:     self.terrain_path.clone(),
             texture_path: self.texture_path.clone(),
         });
         app.add_systems(Startup,  begin_load_scene);
@@ -63,7 +63,7 @@ pub struct WorldCache {
 
 #[derive(Resource)]
 struct WorldSettings {
-    map_path:     String,
+    terrain_path:     String,
     texture_path: String,
 }
 
@@ -147,7 +147,7 @@ fn begin_load_scene(
     asset_server: Res<AssetServer>,
 ) {
     // Deserialize the world cache from disk immediately
-    let file    = File::open(&settings.map_path).expect("Map file not found");
+    let file    = File::open(&settings.terrain_path).expect("Map file not found");
     let decoder = zstd::stream::read::Decoder::new(file)
         .expect("Failed to create Zstd decoder");
     let cache: WorldCache = bincode::deserialize_from(decoder)
