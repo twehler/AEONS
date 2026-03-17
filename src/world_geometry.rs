@@ -5,7 +5,7 @@ use bevy::shader::ShaderRef;
 use bevy::image::{ImageSampler, ImageSamplerDescriptor, ImageFilterMode};
 use std::fs::File;
 use serde::{Deserialize, Serialize};
-
+use std::collections::HashMap;
 
 
 
@@ -53,6 +53,7 @@ impl Material for TerrainMaterial {
 #[derive(Serialize, Deserialize)]
 pub struct WorldCache {
     pub positions: Vec<[f32; 3]>,
+    pub block_metadata: HashMap<[i32; 3], u8>,
     pub normals:   Vec<[f32; 3]>,
     pub uvs:       Vec<[f32; 2]>,
     pub colors:    Vec<[f32; 4]>,
@@ -73,6 +74,18 @@ struct PendingTexture {
     is_loaded: bool,
     cache:     WorldCache,
 }
+
+// --- Chunking system ---
+pub struct TerrainChunk {
+    pub chunk_xz:  [i32; 2],
+    pub dirty:     bool,
+}
+
+
+
+
+
+
 
 // --- Systems ---
 
@@ -141,17 +154,31 @@ fn reorder_atlas_to_array(
     };
 }
 
+
+
 fn begin_load_scene(
     settings:    Res<WorldSettings>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
 ) {
-    // Deserialize the world cache from disk immediately
-    let file    = File::open(&settings.terrain_path).expect("Map file not found");
-    let decoder = zstd::stream::read::Decoder::new(file)
+    // Deserialize the world cache from disk
+    let file       = File::open(&settings.terrain_path).expect("Map file not found");
+    let mut decoder = zstd::stream::read::Decoder::new(file)
         .expect("Failed to create Zstd decoder");
-    let cache: WorldCache = bincode::deserialize_from(decoder)
+
+    let cache: WorldCache =
+        bincode::serde::decode_from_std_read(&mut decoder, bincode::config::standard())
         .expect("Failed to deserialize world file");
+
+    let coord = [500i32, 0i32, 500i32];
+
+    if let Some(block_type) = cache.block_metadata.get(&coord) {
+        println!("Block type at (500, 500, 0): {}", block_type);
+    } else {
+        println!("No block at ({}, {}, {})", coord[0], coord[1], coord[2]);
+    }
+
+
 
     // Start async loading of the block texture atlas
     let handle: Handle<Image> = asset_server.load(&settings.texture_path);
@@ -161,7 +188,8 @@ fn begin_load_scene(
         is_loaded: false,
         cache,
     });
-}
+
+    }
 
 fn finish_load_scene(
     mut commands:    Commands,

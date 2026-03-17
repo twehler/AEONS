@@ -1,6 +1,7 @@
 mod world_geometry;
 mod bevy_flycam;
 mod viewport_settings;
+mod colony;
 mod cell;
 
 use bevy::{
@@ -51,11 +52,11 @@ fn main() {
         })
         .add_plugins(bevy_flycam::PlayerPlugin)
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
+        .add_plugins(colony::ColonyPlugin)
 
         //.add_plugins(EguiPlugin::default())
         //.add_plugins(WorldInspectorPlugin::new())
-        .add_systems(Startup, setup)
-        .add_systems(Startup, cell::spawn_rhombic_dodecahedron);
+        .add_systems(Startup, setup);
 
     if show_wireframe {
         app.add_plugins(WireframePlugin::default());

@@ -3,6 +3,38 @@ use bevy::mesh::Indices;
 pub use bevy::render::render_resource::PrimitiveTopology;
 use bevy::asset::RenderAssetUsages;
 
+
+
+#[derive(Component)]
+pub struct Cell {
+    pub cell_type: CellType,
+}
+
+
+
+
+pub enum CellType {
+    BlueCell,
+    RedCell,
+}
+
+impl CellType {
+    pub fn color(&self) -> Color {
+        match self {
+            Self::BlueCell => Color::from(Srgba::hex("00d0ff").unwrap()),
+            Self::RedCell  => Color::from(Srgba::hex("ff0000").unwrap()),
+        }
+    }
+
+    pub fn size(&self) -> f32 {
+        match self {
+            Self::BlueCell => 1.0,
+            Self::RedCell  => 1.4,
+        }
+    }
+}
+
+
 pub fn generate_rhombic_dodecahedron(pos: Vec3, total_width: f32) -> Mesh {
     let s = total_width / 4.0;
 
@@ -74,22 +106,21 @@ pub fn generate_rhombic_dodecahedron(pos: Vec3, total_width: f32) -> Mesh {
 }
 
 
-
 pub fn spawn_rhombic_dodecahedron(
-    mut commands:  Commands,
-    mut meshes:    ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    pos: Vec3,
+    cell_type:  &CellType,
+    commands:   &mut Commands,
+    meshes:     &mut ResMut<Assets<Mesh>>,
+    materials:  &mut ResMut<Assets<StandardMaterial>>,
 ) {
-    let mesh = generate_rhombic_dodecahedron(Vec3::new(100.0, 100.0, 80.0), 1.0);
+    let mesh = generate_rhombic_dodecahedron(Vec3::new(pos[0], pos[1], pos[2]), cell_type.size());
 
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.8, 0.7, 0.6),
+            base_color: cell_type.color(),
             ..default()
         })),
         Transform::IDENTITY,
     ));
 }
-
-
