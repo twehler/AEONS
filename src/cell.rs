@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use bevy::mesh::Indices;
 pub use bevy::render::render_resource::PrimitiveTopology;
 use bevy::asset::RenderAssetUsages;
-
+use avian3d::prelude::*;
 
 
 #[derive(Component)]
@@ -107,20 +107,27 @@ pub fn generate_rhombic_dodecahedron(pos: Vec3, total_width: f32) -> Mesh {
 
 
 pub fn spawn_rhombic_dodecahedron(
-    pos: Vec3,
-    cell_type:  &CellType,
-    commands:   &mut Commands,
-    meshes:     &mut ResMut<Assets<Mesh>>,
-    materials:  &mut ResMut<Assets<StandardMaterial>>,
+    pos:       Vec3,
+    cell_type: &CellType,
+    commands:  &mut Commands,
+    meshes:    &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
-    let mesh = generate_rhombic_dodecahedron(Vec3::new(pos[0], pos[1], pos[2]), cell_type.size());
+    let mesh = generate_rhombic_dodecahedron(pos, cell_type.size());
+    let mesh_handle = meshes.add(mesh.clone());
 
     commands.spawn((
-        Mesh3d(meshes.add(mesh)),
+        Mesh3d(mesh_handle),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: cell_type.color(),
             ..default()
         })),
-        Transform::IDENTITY,
+        Transform::from_translation(pos),
+        RigidBody::Dynamic,
+        Collider::convex_hull_from_mesh(&mesh)
+            .expect("Failed to build convex hull collider"),
+        LinearDamping(0.3),
+        AngularDamping(0.5),
+        Cell { cell_type: CellType::BlueCell }, // placeholder, pass properly
     ));
 }

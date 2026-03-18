@@ -15,7 +15,7 @@ use bevy_inspector_egui::quick::WorldInspectorPlugin;
 
 use std::env;
 use std::path::Path;
-
+use avian3d::prelude::*;
 
 
 
@@ -36,13 +36,13 @@ fn main() {
 
     let mut app = App::new();
 
-    app.add_plugins(DefaultPlugins.set(RenderPlugin {
+    app.add_plugins((DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {
             features: WgpuFeatures::POLYGON_MODE_LINE,
             ..default()
             }.into(),
             ..default()
-        }))
+        })), PhysicsPlugins::default())
         .add_plugins(world_geometry::WorldPlugin{
 
             // std::path::Path doesn't have to_string() implemented because input could be anything

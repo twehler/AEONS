@@ -1,6 +1,6 @@
 use crate::cell;
 use bevy::prelude::*;
-
+use avian3d::prelude::*;
 
 pub struct ColonyPlugin;
 

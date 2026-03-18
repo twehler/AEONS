@@ -4,6 +4,7 @@ use bevy::mesh::Indices;
 pub use bevy::render::render_resource::PrimitiveTopology;
 pub use bevy::asset::RenderAssetUsages;
 use serde::{Serialize, Deserialize};
+use bincode::{Encode, Decode};
 use image::GenericImageView;
 use std::collections::HashMap;
 use std::fs::File;
@@ -14,19 +15,28 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
 
-#[derive(Serialize, Deserialize)]
-pub struct WorldCache {
+
+
+#[derive(Encode, Decode)]
+pub struct ChunkCache {
+    pub chunk_coord: [i32; 2],   // chunk-space (not block-space)
     pub positions:   Vec<[f32; 3]>,
-    pub block_metadata: Vec<u8>, // block-type
     pub normals:     Vec<[f32; 3]>,
     pub uvs:         Vec<[f32; 2]>,
-    pub colors:      Vec<[f32; 4]>, // r = block_type / 255.0, gba unused
+    pub colors:      Vec<[f32; 4]>,
     pub indices:     Vec<u32>,
 }
 
+
+#[derive(Encode, Decode)]
+pub struct WorldCache {
+    pub block_metadata: HashMap<[i32; 3], u8>,
+    pub chunks: Vec<ChunkCache>,
+}
+
+// every chunk is a separate VoxelBuffer (mesh)
 pub struct VoxelBuffer {
     pub positions: Vec<[f32; 3]>,
-    pub block_metadata: Vec<u8>, 
     pub normals:   Vec<[f32; 3]>,
     pub uvs:       Vec<[f32; 2]>,
     pub colors:    Vec<[f32; 4]>,
@@ -37,7 +47,6 @@ impl VoxelBuffer {
     pub fn new() -> Self {
         Self {
             positions: Vec::new(),
-            block_metadata: Vec::new(),
             normals:   Vec::new(),
             uvs:       Vec::new(),
             colors:    Vec::new(),
@@ -45,6 +54,12 @@ impl VoxelBuffer {
         }
     }
 }
+
+
+
+
+
+
 
 
 const BLOCK_CHALK_1: u8 = 0;
@@ -168,6 +183,45 @@ fn add_greedy_quad(
 
 fn main() {
 
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 5 {
+        println!(
+            "Usage: cargo run --bin generate_world \
+             <heightmap.png> <max_height> <material_map.png> <output.bin>"
+        );
+        return;
+    }
+
+
+    let input_path    = Path::new(&args[1]);
+    let max_height    = args[2].parse::<f32>().expect("max_height must be a number");
+    let material_path = Path::new(&args[3]);
+    let output_path   = Path::new(&args[4]);
+
+    println!("--- Starting World Mesh Generation ---");
+
+    println!("Loading heightmap...");
+    let img = image::open(input_path)
+        .expect("Heightmap not found")
+        .to_luma8();
+    let (width, depth) = img.dimensions();
+
+    println!("Loading material map...");
+    let mat_img = image::open(material_path)
+        .expect("Material map not found")
+        .to_rgb8();
+
+    assert_eq!(
+        mat_img.dimensions(), (width, depth),
+        "Material map must match heightmap dimensions"
+    );
+
+    println!("Collecting block positions & types...");
+    let start = Instant::now();
+    let mut voxel_map: HashMap<[i32; 3], u8> = HashMap::new();
+
+
     // count all blocks of unknown type (useful at the end of this code)
     let mut unknown_blocks = 0;
 
@@ -226,51 +280,11 @@ fn main() {
             (0x38, 0x56, 0x35) => BLOCK_AQUATIC_SAND_4_BIOLAYER_2,
 
             _                  => {
-                unknown_blocks += 2; // increment by 2 because the terrain-surface is 2 blocks deep
+                unknown_blocks += 1;
                 BLOCK_UNKNOWN
             }
         }
     };
-
-
-
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() < 5 {
-        println!(
-            "Usage: cargo run --bin generate_world \
-             <heightmap.png> <max_height> <material_map.png> <output.bin>"
-        );
-        return;
-    }
-
-    let input_path    = Path::new(&args[1]);
-    let max_height    = args[2].parse::<f32>().expect("max_height must be a number");
-    let material_path = Path::new(&args[3]);
-    let output_path   = Path::new(&args[4]);
-
-    println!("--- Starting World Mesh Generation ---");
-
-    println!("Loading heightmap...");
-    let img = image::open(input_path)
-        .expect("Heightmap not found")
-        .to_luma8();
-    let (width, depth) = img.dimensions();
-
-    println!("Loading material map...");
-    let mat_img = image::open(material_path)
-        .expect("Material map not found")
-        .to_rgb8();
-
-    assert_eq!(
-        mat_img.dimensions(), (width, depth),
-        "Material map must match heightmap dimensions"
-    );
-
-    println!("Collecting block positions & types...");
-    let start = Instant::now();
-    let mut voxel_map: HashMap<[i32; 3], u8> = HashMap::new();
-
 
     for y in 0..depth {
         for x in 0..width {
@@ -278,119 +292,164 @@ fn main() {
             let col_height = ((pixel as f32 / 255.0) * max_height).round() as i32 + 1;
 
             let px = mat_img.get_pixel(x, y);
-            let surface_type = material_map_color_to_block(px[0], px[1], px[2]);
+            let block_type = material_map_color_to_block(px[0], px[1], px[2]);
 
             for z in 0..col_height {
-                voxel_map.insert([x as i32, z, y as i32], surface_type);
+                voxel_map.insert([x as i32, z, y as i32], block_type);
         }
         }
     }
     println!("Completed in {:?}", start.elapsed());
 
-    let mut min  = [i32::MAX; 3];
-    let mut max_b = [i32::MIN; 3];
-    for pos in voxel_map.keys() {
-        for i in 0..3 {
-            min[i]    = min[i].min(pos[i]);
-            max_b[i]  = max_b[i].max(pos[i]);
-        }
-    }
+
+// ---------------- Chunk Division ----------------
+
+    let chunk_size = 16i32;
+
+    // Validate map dimensions are divisible by chunk size
+    assert!(
+        width % chunk_size as u32 == 0 && depth % chunk_size as u32 == 0,
+        "Map dimensions ({}x{}) must be divisible by chunk size ({})",
+        width, depth, chunk_size
+    );
+
+    let chunks_x = (width  as i32) / chunk_size;
+    let chunks_z = (depth  as i32) / chunk_size;
+
+    // Find the global Y range (height is not chunked)
+    let min_y = voxel_map.keys().map(|k| k[1]).min().unwrap_or(0);
+    let max_y = voxel_map.keys().map(|k| k[1]).max().unwrap_or(0);
 
     let voxel_map = Arc::new(voxel_map);
 
-    let mut tasks = Vec::new();
-    for d in 0..3usize {
-        for i in (min[d] - 1)..=max_b[d] {
-            tasks.push((d, i));
-        }
-    }
+    // Build one task per chunk
+    let chunk_coords: Vec<(i32, i32)> = (0..chunks_z)
+        .flat_map(|cz| (0..chunks_x).map(move |cx| (cx, cz)))
+        .collect();
 
-    println!("Building terrain...");
+    println!("Building terrain in {} chunks...", chunk_coords.len());
     let start_gm = Instant::now();
 
-    let partial_buffers: Vec<VoxelBuffer> = tasks.into_par_iter().map(|(d, i)| {
-        let voxel_map = Arc::clone(&voxel_map);
-        let u = (d + 1) % 3;
-        let v = (d + 2) % 3;
-        let mut q = [0i32; 3]; q[d] = 1;
+    // ---------------- Per-Chunk Greedy Meshing ----------------
 
-        let mut local_buffer = VoxelBuffer::new();
-        let mut mask: HashMap<(i32, i32), (bool, u8)> = HashMap::new();
-        let mut x = [0i32; 3];
-        x[d] = i;
+    let chunk_buffers: Vec<((i32, i32), VoxelBuffer)> = chunk_coords
+        .into_par_iter()
+        .map(|(cx, cz)| {
+            let voxel_map = Arc::clone(&voxel_map);
 
-        for j in min[u]..=max_b[u] {
-            for k in min[v]..=max_b[v] {
-                x[u] = j; x[v] = k;
-                let current_type  = voxel_map.get(&x).copied();
-                let neighbor_type = voxel_map.get(
-                    &[x[0]+q[0], x[1]+q[1], x[2]+q[2]]
-                ).copied();
+            // World-space block range for this chunk
+            let x_min = cx * chunk_size;
+            let x_max = x_min + chunk_size - 1;
+            let z_min = cz * chunk_size;
+            let z_max = z_min + chunk_size - 1;
 
-                match (current_type, neighbor_type) {
-                    (Some(ct), None) => { mask.insert((j, k), (true,  ct)); }
-                    (None, Some(nt)) => { mask.insert((j, k), (false, nt)); }
-                    _ => {}
-                }
-            }
-        }
+            let min = [x_min, min_y, z_min];
+            let max_b = [x_max, max_y, z_max];
 
-        for j in min[u]..=max_b[u] {
-            for k in min[v]..=max_b[v] {
-                if let Some((front, btype)) = mask.remove(&(j, k)) {
-                    let mut w = 1i32;
-                    while mask.get(&(j + w, k)) == Some(&(front, btype)) {
-                        mask.remove(&(j + w, k));
-                        w += 1;
-                    }
-                    let mut h = 1i32;
-                    'h_loop: loop {
-                        for r in 0..w {
-                            if mask.get(&(j + r, k + h)) != Some(&(front, btype)) {
-                                break 'h_loop;
+            let mut buffer = VoxelBuffer::new();
+
+            // Run greedy meshing for all 3 axes within this chunk's bounds
+            for d in 0..3usize {
+                let u = (d + 1) % 3;
+                let v = (d + 2) % 3;
+                let mut q = [0i32; 3];
+                q[d] = 1;
+
+                for i in (min[d] - 1)..=max_b[d] {
+                    let mut mask: HashMap<(i32, i32), (bool, u8)> = HashMap::new();
+                    let mut x = [0i32; 3];
+                    x[d] = i;
+
+                    for j in min[u]..=max_b[u] {
+                        for k in min[v]..=max_b[v] {
+                            x[u] = j; x[v] = k;
+                            let current_type  = voxel_map.get(&x).copied();
+                            let neighbor_type = voxel_map.get(
+                                &[x[0]+q[0], x[1]+q[1], x[2]+q[2]]
+                            ).copied();
+
+                            match (current_type, neighbor_type) {
+                                (Some(ct), None) => { mask.insert((j, k), (true,  ct)); }
+                                (None, Some(nt)) => { mask.insert((j, k), (false, nt)); }
+                                _ => {}
                             }
                         }
-                        for r in 0..w { mask.remove(&(j + r, k + h)); }
-                        h += 1;
                     }
-                    add_greedy_quad(&mut local_buffer, d, front, j, k, i, w, h, btype);
+
+                    for j in min[u]..=max_b[u] {
+                        for k in min[v]..=max_b[v] {
+                            if let Some((front, btype)) = mask.remove(&(j, k)) {
+                                let mut w = 1i32;
+                                while mask.get(&(j + w, k)) == Some(&(front, btype)) {
+                                    mask.remove(&(j + w, k));
+                                    w += 1;
+                                }
+                                let mut h = 1i32;
+                                'h_loop: loop {
+                                    for r in 0..w {
+                                        if mask.get(&(j + r, k + h)) != Some(&(front, btype)) {
+                                            break 'h_loop;
+                                        }
+                                    }
+                                    for r in 0..w { mask.remove(&(j + r, k + h)); }
+                                    h += 1;
+                                }
+                                add_greedy_quad(&mut buffer, d, front, j, k, i, w, h, btype);
+                            }
+                        }
+                    }
                 }
             }
-        }
-        local_buffer
-    }).collect();
+
+            ((cx, cz), buffer)
+        })
+        .collect();
 
     println!("Building-process completed in {:?}", start_gm.elapsed());
 
-    let mut buffer = VoxelBuffer::new();
-    for mut pb in partial_buffers {
-        let offset = buffer.positions.len() as u32;
-        buffer.positions.append(&mut pb.positions);
-        buffer.normals.append(&mut pb.normals);
-        buffer.uvs.append(&mut pb.uvs);
-        buffer.colors.append(&mut pb.colors);
-        for idx in pb.indices { buffer.indices.push(idx + offset); }
-    }
+
+    // ---------------- Assemble WorldCache ----------------
+
+    let chunk_mesh_data: Vec<([i32; 2], VoxelBuffer)> = chunk_buffers
+        .into_iter()
+        .map(|((cx, cz), buf)| ([cx, cz], buf))
+        .collect();
 
     let cache = WorldCache {
-        positions: buffer.positions,
-        normals:   buffer.normals,
-        uvs:       buffer.uvs,
-        colors:    buffer.colors,
-        indices:   buffer.indices,
+        block_metadata: (*voxel_map).clone(),
+        chunks: chunk_mesh_data
+            .into_iter()
+            .map(|(coord, buf)| ChunkCache {
+                chunk_coord: coord,
+                positions:   buf.positions,
+                normals:     buf.normals,
+                uvs:         buf.uvs,
+                colors:      buf.colors,
+                indices:     buf.indices,
+            })
+            .collect(),
     };
 
+
+
     println!("Saving...");
-    let file    = File::create(output_path).expect("Failed to create output file");
-    let writer  = BufWriter::new(file);
+
+    let file   = File::create(output_path).expect("Failed to create output file");
+    let writer = BufWriter::new(file);
     let mut enc = zstd::stream::write::Encoder::new(writer, 3)
         .expect("Failed to create Zstd encoder");
-    bincode::serialize_into(&mut enc, &cache).expect("Failed to serialize");
+
+    bincode::encode_into_std_write(&cache, &mut enc, bincode::config::standard())
+        .expect("Failed to serialize");
+
     enc.finish().expect("Failed to finish Zstd encoding");
 
-    println!("Done! Vertices: {}", cache.positions.len());
+
+    let total_verts: usize = cache.chunks.iter().map(|c| c.positions.len()).sum();
+    println!("Done! {} chunks, {} total vertices", cache.chunks.len(), total_verts);
+
 
     if unknown_blocks != 0 {
-        println!("WARNING: Some colors in the Material-Map could not be matched to known block types! {} blocks with unknown type have been generated in total.", unknown_blocks);
+        println!("WARNING: Some colors in the Material-Map could not be matched to known block types! {} pixels with unknown color type have resulted in unknown blocks being generated.", unknown_blocks);
     }
 }
