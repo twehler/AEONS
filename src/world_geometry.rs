@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use avian3d::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
@@ -76,6 +77,24 @@ pub struct TerrainChunk {
 }
 
 // --- Resources ---
+
+// for collision
+#[derive(Resource)]
+pub struct HeightmapSampler {
+    pub heights: Vec<f32>,
+    pub width:   u32,
+    pub depth:   u32,
+    pub max_height: f32,
+}
+
+impl HeightmapSampler {
+    pub fn height_at(&self, x: f32, z: f32) -> f32 {
+        let xi = (x as u32).clamp(0, self.width - 1);
+        let zi = (z as u32).clamp(0, self.depth - 1);
+        self.heights[(zi * self.width + xi) as usize]
+    }
+}
+
 
 #[derive(Resource)]
 struct WorldSettings {

@@ -2,34 +2,44 @@ use bevy::prelude::*;
 use bevy::mesh::Indices;
 pub use bevy::render::render_resource::PrimitiveTopology;
 use bevy::asset::RenderAssetUsages;
-use avian3d::prelude::*;
 
-
-#[derive(Component)]
+#[derive(Component, Hash, Eq, PartialEq, Clone, Debug)]
 pub struct Cell {
     pub cell_type: CellType,
 }
 
-
-
-
+// Copy + Clone so CellType can live in both the HashMap key and the ocg vec
+// without ownership conflicts. Hash + Eq needed for HashMap keying.
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub enum CellType {
     BlueCell,
     RedCell,
+    GreenCell,
+    YellowCell,
+    OrangeCell,
+    LightBlueCell,
 }
 
 impl CellType {
     pub fn color(&self) -> Color {
         match self {
-            Self::BlueCell => Color::from(Srgba::hex("00d0ff").unwrap()),
-            Self::RedCell  => Color::from(Srgba::hex("ff0000").unwrap()),
+            Self::BlueCell      => Color::from(Srgba::hex("00d0ff").unwrap()),
+            Self::RedCell       => Color::from(Srgba::hex("ff0000").unwrap()),
+            Self::GreenCell     => Color::from(Srgba::hex("2bff00").unwrap()),
+            Self::YellowCell    => Color::from(Srgba::hex("ffff00").unwrap()),
+            Self::OrangeCell    => Color::from(Srgba::hex("ff8000").unwrap()),
+            Self::LightBlueCell => Color::from(Srgba::hex("00ffee").unwrap()),
         }
     }
 
     pub fn size(&self) -> f32 {
         match self {
-            Self::BlueCell => 1.0,
-            Self::RedCell  => 1.4,
+            Self::BlueCell      => 1.0,
+            Self::RedCell       => 1.4,
+            Self::GreenCell     => 1.0,
+            Self::YellowCell    => 1.0,
+            Self::OrangeCell    => 1.0,
+            Self::LightBlueCell => 1.0,
         }
     }
 }
@@ -38,7 +48,6 @@ impl CellType {
 pub fn generate_rhombic_dodecahedron(pos: Vec3, total_width: f32) -> Mesh {
     let s = total_width / 4.0;
 
-    // 14 vertices — same layout as the Python version
     let v = [
         // Cube corners (0-7)
         Vec3::new( s,  s,  s), Vec3::new( s,  s, -s),
@@ -58,42 +67,36 @@ pub fn generate_rhombic_dodecahedron(pos: Vec3, total_width: f32) -> Mesh {
     let mut normals:   Vec<[f32; 3]> = Vec::new();
     let mut indices:   Vec<u32>      = Vec::new();
 
-    // Mirrors add_face(p1, p2, p3, p4) from the Python version.
-    // p1 = center tip, p2/p4 = side cube corners, p3 = opposite tip.
     let mut add_face = |p1: usize, p2: usize, p3: usize, p4: usize| {
         let pts = [v[p1], v[p2], v[p3], v[p4]];
-
         let edge1 = pts[1] - pts[0];
         let edge2 = pts[2] - pts[0];
         let norm  = edge1.cross(edge2).normalize();
-
         let base = positions.len() as u32;
         for p in &pts {
             positions.push((*p + pos).into());
             normals.push(norm.into());
         }
-
-        // Two triangles per diamond face
         indices.extend([base, base+1, base+2, base, base+2, base+3]);
     };
 
-    // Top cap — connected to +Z tip (index 12)
-    add_face(12,  0, 10,  4); // Top-Front (+Y)
-    add_face(12,  4,  9,  6); // Top-Left  (-X)
-    add_face(12,  6, 11,  2); // Top-Back  (-Y)
-    add_face(12,  2,  8,  0); // Top-Right (+X)
+    // Top cap — +Z tip (12)
+    add_face(12,  0, 10,  4);
+    add_face(12,  4,  9,  6);
+    add_face(12,  6, 11,  2);
+    add_face(12,  2,  8,  0);
 
-    // Bottom cap — connected to -Z tip (index 13)
-    add_face( 5, 10,  1, 13); // Bottom-Front (+Y)
-    add_face( 7,  9,  5, 13); // Bottom-Left  (-X)
-    add_face( 3, 11,  7, 13); // Bottom-Back  (-Y)
-    add_face( 1,  8,  3, 13); // Bottom-Right (+X)
+    // Bottom cap — -Z tip (13)
+    add_face( 5, 10,  1, 13);
+    add_face( 7,  9,  5, 13);
+    add_face( 3, 11,  7, 13);
+    add_face( 1,  8,  3, 13);
 
     // Middle ring
-    add_face( 1, 10,  0,  8); // Side +X/+Y
-    add_face( 5,  9,  4, 10); // Side +Y/-X
-    add_face( 7, 11,  6,  9); // Side -X/-Y
-    add_face( 3,  8,  2, 11); // Side -Y/+X
+    add_face( 1, 10,  0,  8);
+    add_face( 5,  9,  4, 10);
+    add_face( 7, 11,  6,  9);
+    add_face( 3,  8,  2, 11);
 
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -114,7 +117,7 @@ pub fn spawn_rhombic_dodecahedron(
     materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
     let mesh = generate_rhombic_dodecahedron(pos, cell_type.size());
-    let mesh_handle = meshes.add(mesh.clone());
+    let mesh_handle = meshes.add(mesh);
 
     commands.spawn((
         Mesh3d(mesh_handle),
@@ -123,11 +126,6 @@ pub fn spawn_rhombic_dodecahedron(
             ..default()
         })),
         Transform::from_translation(pos),
-        RigidBody::Dynamic,
-        Collider::convex_hull_from_mesh(&mesh)
-            .expect("Failed to build convex hull collider"),
-        LinearDamping(0.3),
-        AngularDamping(0.5),
-        Cell { cell_type: CellType::BlueCell }, // placeholder, pass properly
+        Cell { cell_type: *cell_type },
     ));
 }

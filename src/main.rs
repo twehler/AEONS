@@ -42,7 +42,7 @@ fn main() {
             ..default()
             }.into(),
             ..default()
-        })), PhysicsPlugins::default())
+        }), PhysicsPlugins::default()))
         .add_plugins(world_geometry::WorldPlugin{
 
             // std::path::Path doesn't have to_string() implemented because input could be anything
