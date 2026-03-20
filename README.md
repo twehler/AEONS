@@ -1,4 +1,4 @@
-AEONS is a simulation-experiment to simulate the evolution of biological form and behaviour, focusing on multicellularity, 
+AEONS is a private scientific project to simulate the evolution of biological form and behaviour, focusing on multicellularity, 
 as well as its reactions to the outside environment over the generations. The simulation takes a purely Darwinistic approach, where natural selection is the only driving factor for everything that can be observed.
 
 The life forms consist of "cells", which are simple geometric forms and exist in a voxel-based world, similar to the pop-culture video game Minecraft. Nevertheless, this is a purely scientific project. 
