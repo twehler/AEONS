@@ -3,6 +3,7 @@ mod bevy_flycam;
 mod viewport_settings;
 mod colony;
 mod cell;
+mod terrain_collision;
 
 use bevy::{
     prelude::*,
@@ -15,7 +16,7 @@ use bevy_inspector_egui::quick::WorldInspectorPlugin;
 
 use std::env;
 use std::path::Path;
-use avian3d::prelude::*;
+
 
 
 
@@ -36,13 +37,13 @@ fn main() {
 
     let mut app = App::new();
 
-    app.add_plugins((DefaultPlugins.set(RenderPlugin {
+    app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {
             features: WgpuFeatures::POLYGON_MODE_LINE,
             ..default()
             }.into(),
             ..default()
-        }), PhysicsPlugins::default()))
+        }))
         .add_plugins(world_geometry::WorldPlugin{
 
             // std::path::Path doesn't have to_string() implemented because input could be anything
@@ -52,6 +53,7 @@ fn main() {
         })
         .add_plugins(bevy_flycam::PlayerPlugin)
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
+        .add_plugins(terrain_collision::TerrainCollisionPlugin)
         .add_plugins(colony::ColonyPlugin)
 
         //.add_plugins(EguiPlugin::default())

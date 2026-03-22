@@ -1,5 +1,4 @@
 use bevy::prelude::*;
-use avian3d::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
@@ -15,7 +14,8 @@ const ATLAS_COLS: u32 = 16;
 const ATLAS_ROWS: u32 = 16;
 const BLOCK_TYPE_COUNT: u32 = ATLAS_COLS * ATLAS_ROWS;
 
-// --- Plugin ---
+
+// ── Plugin ───────────────────────────────────────────────────────────────────
 
 pub struct WorldPlugin {
     pub terrain_path: String,
@@ -34,7 +34,8 @@ impl Plugin for WorldPlugin {
     }
 }
 
-// --- Custom terrain material ---
+
+// ── Custom terrain material ───────────────────────────────────────────────────
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 pub struct TerrainMaterial {
@@ -49,8 +50,8 @@ impl Material for TerrainMaterial {
     }
 }
 
-// --- Serialized world cache ---
-// Must exactly match the structs in generate_world.rs
+
+// ── Serialized world cache ────────────────────────────────────────────────────
 
 #[derive(Encode, Decode)]
 pub struct ChunkCache {
@@ -68,7 +69,8 @@ pub struct WorldCache {
     pub chunks:         Vec<ChunkCache>,
 }
 
-// --- Chunk component for later dirty-rebuild queries ---
+
+// ── Chunk component ───────────────────────────────────────────────────────────
 
 #[derive(Component)]
 pub struct TerrainChunk {
@@ -76,25 +78,55 @@ pub struct TerrainChunk {
     pub dirty:       bool,
 }
 
-// --- Resources ---
 
-// for collision
+// ── Collision resources ───────────────────────────────────────────────────────
+
+// Fast floor collision — one array lookup gives the surface height at any XZ.
+// Built from block_metadata at load time by taking the highest occupied Y
+// at each XZ column. height_at() is the primary terrain collision query —
+// it handles the vast majority of cases (open ground, slopes) at near-zero cost.
 #[derive(Resource)]
 pub struct HeightmapSampler {
-    pub heights: Vec<f32>,
-    pub width:   u32,
-    pub depth:   u32,
+    pub heights:    Vec<f32>,
+    pub width:      u32,
+    pub depth:      u32,
+    pub min_x:      i32, // world-space X of column 0
+    pub min_z:      i32, // world-space Z of column 0
     pub max_height: f32,
 }
 
 impl HeightmapSampler {
+    // Returns the Y of the top surface of the highest block at world (x, z).
+    // Clamps to the heightmap boundary for positions outside the world.
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
-        let xi = (x as u32).clamp(0, self.width - 1);
-        let zi = (z as u32).clamp(0, self.depth - 1);
+        let xi = ((x as i32 - self.min_x).max(0) as u32).min(self.width  - 1);
+        let zi = ((z as i32 - self.min_z).max(0) as u32).min(self.depth  - 1);
         self.heights[(zi * self.width + xi) as usize]
     }
 }
 
+// 3D block presence query — used for wall and ceiling collision.
+// Wraps block_metadata directly. is_solid() is O(1) HashMap lookup.
+// Only queried when an organism is near a potential wall — the heightmap
+// handles the common open-ground case without touching this resource.
+#[derive(Resource)]
+pub struct BlockWorld {
+    pub blocks: HashMap<[i32; 3], u8>,
+}
+
+impl BlockWorld {
+    pub fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
+        self.blocks.contains_key(&[x, y, z])
+    }
+
+    // Returns the block type at a position, if any.
+    pub fn block_type(&self, x: i32, y: i32, z: i32) -> Option<u8> {
+        self.blocks.get(&[x, y, z]).copied()
+    }
+}
+
+
+// ── Internal resources ────────────────────────────────────────────────────────
 
 #[derive(Resource)]
 struct WorldSettings {
@@ -109,7 +141,8 @@ struct PendingTexture {
     cache:     WorldCache,
 }
 
-// --- Systems ---
+
+// ── Systems ───────────────────────────────────────────────────────────────────
 
 fn begin_load_scene(
     settings:     Res<WorldSettings>,
@@ -129,6 +162,53 @@ fn begin_load_scene(
         cache.chunks.len(),
         cache.block_metadata.len()
     );
+
+    // ── Build HeightmapSampler ────────────────────────────────────────────────
+    // Determine world XZ bounds from block_metadata
+    let mut min_x = i32::MAX; let mut max_x = i32::MIN;
+    let mut min_z = i32::MAX; let mut max_z = i32::MIN;
+
+    for [x, _, z] in cache.block_metadata.keys() {
+        min_x = min_x.min(*x); max_x = max_x.max(*x);
+        min_z = min_z.min(*z); max_z = max_z.max(*z);
+    }
+
+    let width = (max_x - min_x + 1).max(1) as u32;
+    let depth = (max_z - min_z + 1).max(1) as u32;
+
+    // Initialise all heights to 0.0 (below any block)
+    let mut heights = vec![0.0f32; (width * depth) as usize];
+    let mut max_height = 0.0f32;
+
+    // For each block, update the height at its XZ column to the top of that block
+    for ([x, y, z], _) in &cache.block_metadata {
+        let xi = (x - min_x) as u32;
+        let zi = (z - min_z) as u32;
+        let top = *y as f32 + 1.0; // top surface of this block
+        let idx = (zi * width + xi) as usize;
+        if top > heights[idx] {
+            heights[idx] = top;
+        }
+        if top > max_height {
+            max_height = top;
+        }
+    }
+
+    commands.insert_resource(HeightmapSampler {
+        heights,
+        width,
+        depth,
+        min_x,
+        min_z,
+        max_height,
+    });
+
+    // ── Build BlockWorld ──────────────────────────────────────────────────────
+    // Clone block_metadata into a runtime-accessible resource.
+    // This is the authoritative 3D solid query used for wall collision.
+    commands.insert_resource(BlockWorld {
+        blocks: cache.block_metadata.clone(),
+    });
 
     let handle: Handle<Image> = asset_server.load(&settings.texture_path);
 
@@ -156,7 +236,6 @@ fn finish_load_scene(
 
     pending.is_loaded = true;
 
-    // Reinterpret the stacked PNG as a texture array
     let image = images.get_mut(&pending.handle).unwrap();
     image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         mag_filter:    ImageFilterMode::Nearest,
@@ -171,7 +250,6 @@ fn finish_load_scene(
         textures: pending.handle.clone(),
     });
 
-    // Spawn one mesh entity per chunk
     for chunk in &pending.cache.chunks {
         let mut mesh = Mesh::new(
             bevy::render::render_resource::PrimitiveTopology::TriangleList,
@@ -184,23 +262,21 @@ fn finish_load_scene(
         mesh.insert_indices(bevy::mesh::Indices::U32(chunk.indices.clone()));
 
         commands.spawn((
-            Mesh3d(meshes.add(mesh.clone())),
+            Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(material.clone()),
             Transform::IDENTITY,
-            RigidBody::Static,
-            Collider::trimesh_from_mesh(&mesh)
-                .expect("Failed to build terrain collider"),
             TerrainChunk {
                 chunk_coord: chunk.chunk_coord,
                 dirty:       false,
             },
-));
-        }
+        ));
+    }
 
     println!("Spawned {} chunk meshes", pending.cache.chunks.len());
 }
 
-// --- Atlas reordering (unchanged) ---
+
+// ── Atlas reordering ──────────────────────────────────────────────────────────
 
 fn reorder_atlas_to_array(
     image:     &mut Image,
