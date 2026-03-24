@@ -1,6 +1,8 @@
 use bevy::prelude::*;
 use crate::world_geometry::{HeightmapSampler, BlockWorld};
-use crate::colony::OrganismRoot;
+use crate::colony::*;
+use crate::cell::*;
+use std::collections::HashMap;
 
 // The radius used for wall collision queries, in world units.
 // Should be roughly the radius of the organism's body — adjust per simulation.
@@ -34,6 +36,8 @@ impl Plugin for TerrainCollisionPlugin {
 // Two phases per organism:
 //   1. Floor: heightmap lookup — O(1), handles open ground and slopes
 //   2. Walls: block query on horizontal neighbours — only runs near solid blocks
+
+/* OLD
 fn apply_terrain_collision(
     heightmap:  Res<HeightmapSampler>,
     blockworld: Res<BlockWorld>,
@@ -48,6 +52,12 @@ fn apply_terrain_collision(
         // If the organism has sunk below the surface, push it up instantly.
         // This handles walking on slopes and falling onto terrain correctly.
         let floor_y = heightmap.height_at(pos.x, pos.z);
+
+        info!("pos={:.1?} floor_y={:.1} min_x={} min_z={} width={} depth={}",
+            pos, floor_y, heightmap.min_x, heightmap.min_z,
+            heightmap.width, heightmap.depth);
+
+
         if pos.y < floor_y {
             transform.translation.y = floor_y;
         }
@@ -89,7 +99,208 @@ fn apply_terrain_collision(
         }
     }
 }
+*/
 
+pub fn apply_terrain_collision(
+    heightmap: Res<HeightmapSampler>,
+    blockworld: Res<BlockWorld>,
+    mut root_query: Query<(&mut Transform, &OrganismRoot)>,
+    mut joint_query: Query<&mut Transform, Without<OrganismRoot>>,
+    organisms: Query<&Organism>,
+) {
+    // Get all organism roots with their transforms
+    for (mut root_transform, root_entity) in root_query.iter_mut() {
+        // Find the Organism component associated with this root
+        let organism = match organisms.get(root_entity) {
+            Ok(org) => org,
+            Err(_) => continue,
+        };
+
+        let mut max_penetration = 0.0f32;
+        let mut wall_push = Vec3::ZERO;
+        
+        // Track which cells need correction
+        let mut cell_corrections: Vec<(Vec3, f32)> = Vec::new();
+
+        // Get the collection transforms relative to root
+        let mut collection_transforms: HashMap<CollectionId, Transform> = HashMap::new();
+        
+        // Build transforms for each collection by walking the hierarchy
+        for (&collection_id, collection) in &organism.collections {
+            let mut transform = Transform::from_translation(collection.starter_cell_position);
+            
+            // Apply parent transforms if any
+            let mut current_parent = collection.parent;
+            while let Some(parent_id) = current_parent {
+                if let Some(parent_collection) = organism.collections.get(&parent_id) {
+                    transform.translation += parent_collection.starter_cell_position;
+                    current_parent = parent_collection.parent;
+                } else {
+                    break;
+                }
+            }
+            
+            collection_transforms.insert(collection_id, transform);
+        }
+
+        // Iterate through every cell in the OCG
+        for entry in &organism.ocg {
+            // Get the collection transform for this cell
+            if let Some(collection_transform) = collection_transforms.get(&entry.collection_id) {
+                // Calculate cell's local position relative to organism root
+                let cell_local_pos = collection_transform.translation + Vec3::from(entry.offset);
+                
+                // Transform to world space using root transform
+                let cell_world_pos = root_transform.transform_point(cell_local_pos);
+                
+                // Check heightmap collision (floor/ceiling)
+                let floor_y = heightmap.height_at(cell_world_pos.x, cell_world_pos.z);
+                let cell_bottom = cell_world_pos.y;
+                let cell_top = cell_bottom + 1.0; // Assume cell height is 1 unit
+                
+                // Check if cell is penetrating terrain
+                if cell_bottom < floor_y {
+                    // Cell is underground - calculate how much to lift
+                    let penetration = floor_y - cell_bottom;
+                    if penetration > max_penetration {
+                        max_penetration = penetration;
+                    }
+                }
+                
+                // Check wall collision for this cell
+                let wall_correction = resolve_cell_wall_collision(cell_world_pos, 0.5, &blockworld);
+                if wall_correction != Vec3::ZERO {
+                    wall_push += wall_correction;
+                    cell_corrections.push((cell_world_pos, wall_correction.length()));
+                }
+            }
+        }
+
+        // Apply vertical correction (floor/ceiling)
+        if max_penetration > 0.0 {
+            root_transform.translation.y += max_penetration;
+            
+            // Re-check heightmap after vertical movement to ensure we're exactly on surface
+            let new_pos = root_transform.translation;
+            let floor_y = heightmap.height_at(new_pos.x, new_pos.z);
+            if root_transform.translation.y < floor_y {
+                root_transform.translation.y = floor_y;
+            }
+        }
+
+        // Apply horizontal correction (walls)
+        if wall_push != Vec3::ZERO {
+            // Average the wall pushes to get smooth movement
+            let avg_push = if !cell_corrections.is_empty() {
+                let total_weight: f32 = cell_corrections.iter().map(|(_, weight)| weight).sum();
+                let weighted_push = cell_corrections.iter()
+                    .fold(Vec3::ZERO, |acc, (pos, weight)| acc + *pos * *weight);
+                (weighted_push / total_weight).normalize() * wall_push.length()
+            } else {
+                wall_push
+            };
+            
+            // Apply horizontal movement
+            root_transform.translation.x += avg_push.x;
+            root_transform.translation.z += avg_push.z;
+            
+            // Re-check floor after horizontal movement
+            let new_pos = root_transform.translation;
+            let floor_y = heightmap.height_at(new_pos.x, new_pos.z);
+            if root_transform.translation.y < floor_y {
+                root_transform.translation.y = floor_y;
+            }
+        }
+    }
+}
+
+// Helper function to resolve wall collisions for individual cells
+fn resolve_cell_wall_collision(
+    cell_pos: Vec3,
+    radius: f32,
+    blockworld: &BlockWorld,
+) -> Vec3 {
+    let mut push = Vec3::ZERO;
+    
+    // Get the cell's footprint block coordinates
+    let block_x = (cell_pos.x - radius).floor() as i32;
+    let block_z = (cell_pos.z - radius).floor() as i32;
+    let block_x_max = (cell_pos.x + radius).floor() as i32;
+    let block_z_max = (cell_pos.z + radius).floor() as i32;
+    
+    // Check all blocks that the cell might intersect with
+    for bx in block_x..=block_x_max {
+        for bz in block_z..=block_z_max {
+            // Check at multiple Y levels (cell's Y and surrounding Y levels)
+            let cell_y_level = cell_pos.y.floor() as i32;
+            for dy in -1..=1 {
+                let check_y = cell_y_level + dy;
+                
+                if blockworld.is_solid(bx, check_y, bz) {
+                    // Calculate push from this block
+                    let block_min_x = bx as f32;
+                    let block_max_x = (bx + 1) as f32;
+                    let block_min_z = bz as f32;
+                    let block_max_z = (bz + 1) as f32;
+                    
+                    // Check X-axis penetration
+                    if cell_pos.x + radius > block_min_x && cell_pos.x - radius < block_max_x {
+                        let overlap_x = if cell_pos.x < block_min_x {
+                            // Cell is to the left of block
+                            (cell_pos.x + radius) - block_min_x
+                        } else if cell_pos.x > block_max_x {
+                            // Cell is to the right of block
+                            block_max_x - (cell_pos.x - radius)
+                        } else {
+                            // Cell center is inside block horizontally
+                            let left_overlap = (cell_pos.x + radius) - block_min_x;
+                            let right_overlap = block_max_x - (cell_pos.x - radius);
+                            if left_overlap < right_overlap {
+                                -left_overlap
+                            } else {
+                                right_overlap
+                            }
+                        };
+                        
+                        // Check Z-axis penetration
+                        let overlap_z = if cell_pos.z < block_min_z {
+                            (cell_pos.z + radius) - block_min_z
+                        } else if cell_pos.z > block_max_z {
+                            block_max_z - (cell_pos.z - radius)
+                        } else {
+                            let front_overlap = (cell_pos.z + radius) - block_min_z;
+                            let back_overlap = block_max_z - (cell_pos.z - radius);
+                            if front_overlap < back_overlap {
+                                -front_overlap
+                            } else {
+                                back_overlap
+                            }
+                        };
+                        
+                        // Apply push along the axis with greater penetration
+                        if overlap_x.abs() > overlap_z.abs() && overlap_x > 0.0 {
+                            let direction = if overlap_x > 0.0 {
+                                if cell_pos.x < block_min_x { -1.0 } else { 1.0 }
+                            } else {
+                                0.0
+                            };
+                            push.x += overlap_x * direction;
+                        } else if overlap_z > 0.0 {
+                            let direction = if overlap_z > 0.0 {
+                                if cell_pos.z < block_min_z { -1.0 } else { 1.0 }
+                            } else {
+                                0.0
+                            };
+                            push.z += overlap_z * direction;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    push
+}
 
 // ── Wall resolution ───────────────────────────────────────────────────────────
 

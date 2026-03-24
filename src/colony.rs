@@ -33,8 +33,9 @@ pub struct Colony {
     organisms: Vec<Organism>,
 }
 
+#[derive(Component)]
 pub struct Organism {
-    collections: HashMap<CollectionId, CellCollection>,
+    pub collections: HashMap<CollectionId, CellCollection>,
     pos:         Vec3,
     orientation: Quat,
     energy: f32,
@@ -47,7 +48,7 @@ pub struct Organism {
     // what type it is, and where it sits (absolute offset from that
     // collection's starter cell). Growth order = index order.
     // Mutation = inserting, removing, or modifying entries.
-    ocg: Vec<OcgEntry>,
+    pub ocg: Vec<OcgEntry>,
 }
 
 // Stable identifier for a CellCollection within an organism.
