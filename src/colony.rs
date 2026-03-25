@@ -33,22 +33,24 @@ pub struct Colony {
     organisms: Vec<Organism>,
 }
 
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub struct Organism {
     pub collections: HashMap<CollectionId, CellCollection>,
-    pos:         Vec3,
-    orientation: Quat,
-    energy: f32,
-    growth_speed: f32,
-    adult: bool,
+    pub pos:         Vec3,
+    pub orientation: Quat,
+    pub energy: f32,
+    pub growth_speed: f32,
+    pub adult: bool,
 
-
-    // The OCG is the organism's complete positional DNA.
-    // Each entry addresses one cell: which collection it belongs to,
+    // The OCG-vector is the organism's complete positional DNA.
+    // Each entry addresses one cell and which collection it belongs to,
     // what type it is, and where it sits (absolute offset from that
-    // collection's starter cell). Growth order = index order.
-    // Mutation = inserting, removing, or modifying entries.
+    // collection's starter cell).
+    // Growth order = index order.
+    // Mutation = inserting, removing, or modifying entries --> leads to change of physiology
     pub ocg: Vec<OcgEntry>,
+    pub joint_entities: HashMap<CollectionId, Entity>,
+    pub active_cells: Vec<(Vec3, CellType)>,
 }
 
 // Stable identifier for a CellCollection within an organism.
@@ -68,6 +70,7 @@ pub struct OcgEntry {
     pub offset: [f32; 3],
 }
 
+#[derive(Clone)]
 pub struct CellCollection {
     // Position of this collection's starter cell relative to the organism root.
     // Becomes the joint entity's Transform translation at rest.
@@ -118,6 +121,9 @@ fn spawn_colony(
         parent: Some(cc1),
     });
 
+    let cell_width = 0.5;
+    let half_cell_width = cell_width / 2.0;
+
     let ocg: Vec<OcgEntry> = vec![
         // starter cells
         OcgEntry { collection_id: cc1, cell_type: CellType::RedCell,       offset: [0.0,  0.0,  0.0] },
@@ -126,28 +132,30 @@ fn spawn_colony(
 
         // regular cells
 
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  1.0,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [0.0, -1.0,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0,  0.0,  1.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0,  0.0,  -1.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [1.0,  0.0,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-1.0,  0.0,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  cell_width,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [0.0, -cell_width,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0,  0.0,  cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0,  0.0,  -cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [cell_width,  0.0,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-cell_width,  0.0,  0.0] },
 
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  0.5,  0.5] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [0.5, 0.5,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.5,  0.0, 0.5] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0, -0.5, -0.5] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-0.5, -0.5,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-0.5, 0.0, -0.5] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  half_cell_width, half_cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [half_cell_width, half_cell_width,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [half_cell_width,  0.0, half_cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0, -half_cell_width, -half_cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_width, -half_cell_width,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_width, 0.0, -half_cell_width] },
 
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  -0.5,  0.5] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [0.5, -0.5,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-0.5,  0.0, 0.5] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0, 0.5, -0.5] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-0.5, 0.5,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.5, 0.0, -0.5] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  -half_cell_width, half_cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [half_cell_width, -half_cell_width,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_width, 0.0, half_cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0, half_cell_width, -half_cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_width, half_cell_width,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [half_cell_width, 0.0, -half_cell_width] },
 
         ];
+
+
 
     let o1 = Organism {
         collections,
@@ -157,11 +165,13 @@ fn spawn_colony(
         growth_speed: 1.0,
         adult: false,
         ocg,
+        joint_entities: HashMap::new(),
+        active_cells: Vec::new(),
     };
 
-    let colony = Colony { organisms: vec![o1] };
+    let mut colony = Colony { organisms: vec![o1] };
 
-    for organism in &colony.organisms {
+    for organism in &mut colony.organisms {
         spawn_organism(organism, &mut commands, &mut meshes, &mut materials, &mut inv_bindposes);
     }
 }
@@ -170,7 +180,7 @@ fn spawn_colony(
 // ── Organism spawn ───────────────────────────────────────────────────────────
 
 fn spawn_organism(
-    organism:      &Organism,
+    organism:      &mut Organism,
     commands:      &mut Commands,
     meshes:        &mut ResMut<Assets<Mesh>>,
     materials:     &mut ResMut<Assets<StandardMaterial>>,
@@ -223,6 +233,14 @@ fn spawn_organism(
         MeshCell { mesh_space_pos, cell_type: entry.cell_type, skinning }
     }).collect();
 
+
+    let active_cells: Vec<(Vec3, CellType)> = mesh_cells
+        .iter()
+        .map(|cell| (cell.mesh_space_pos, cell.cell_type))
+        .collect();
+
+    organism.active_cells = active_cells;
+
     // ── Step 3: Spawn joint entities ─────────────────────────────────────────
     // Each joint's Transform is its starter_cell_position relative to its parent.
     // For root joints (parent = None) this is relative to the organism root entity.
@@ -239,6 +257,10 @@ fn spawn_organism(
             (id, entity)
         })
         .collect();
+
+    // Store the joint entities in the Organism struct
+    organism.joint_entities = joint_entities.clone();  // Clone because we need it for hierarchy wiring
+
 
     // ── Step 4: Compute inverse bindposes ────────────────────────────────────
     // The inverse bindpose is the inverse of each bone's world-space rest transform.
@@ -260,12 +282,22 @@ fn spawn_organism(
         SkinnedMeshInverseBindposes::from(inverse_bindposes)
     );
 
+
+
+
     // ── Step 5: Spawn organism root ──────────────────────────────────────────
     let organism_root = commands.spawn((
         Transform::from_translation(organism.pos).with_rotation(organism.orientation),
         Visibility::Visible,
-        OrganismRoot, // ← add this
+        OrganismRoot,
+        organism.clone(), // adding Organism component
     )).id();
+
+
+
+
+
+
 
     // ── Step 6: Wire joint hierarchy ─────────────────────────────────────────
     for (&id, coll) in &organism.collections {

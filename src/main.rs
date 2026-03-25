@@ -3,7 +3,7 @@ mod bevy_flycam;
 mod viewport_settings;
 mod colony;
 mod cell;
-mod terrain_collision;
+mod movement;
 
 use bevy::{
     prelude::*,
@@ -53,7 +53,7 @@ fn main() {
         })
         .add_plugins(bevy_flycam::PlayerPlugin)
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
-        .add_plugins(terrain_collision::TerrainCollisionPlugin)
+        .add_plugins(movement::MovementPlugin)
         .add_plugins(colony::ColonyPlugin)
 
         //.add_plugins(EguiPlugin::default())

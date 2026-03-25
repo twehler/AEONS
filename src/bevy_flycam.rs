@@ -36,7 +36,7 @@ pub fn change_speed_on_scroll(
 impl Default for MovementSettings {
     fn default() -> Self {
         Self {
-            sensitivity: 0.00008,
+            sensitivity: 0.00007,
             speed: 12.0,
         }
     }
@@ -98,7 +98,7 @@ fn setup_player(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         FlyCam,
-        Transform::from_xyz(-2.0, 5.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(20.0, 100.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y),
         AmbientLight {
             color: Color::srgb(0.8, 0.8, 1.0),
             brightness: 500.0,

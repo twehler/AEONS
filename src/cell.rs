@@ -10,10 +10,7 @@ use std::collections::HashSet;
 
 // ── Components ───────────────────────────────────────────────────────────────
 
-#[derive(Component, Hash, Eq, PartialEq, Clone, Debug)]
-pub struct Cell {
-    pub cell_type: CellType,
-}
+
 
 #[derive(Component)]
 pub struct OrganismMesh;
@@ -45,12 +42,12 @@ impl CellType {
 
     pub fn size(&self) -> f32 {
         match self {
-            Self::BlueCell      => 1.0,
-            Self::RedCell       => 1.4,
-            Self::GreenCell     => 1.0,
-            Self::YellowCell    => 1.0,
-            Self::OrangeCell    => 1.0,
-            Self::LightBlueCell => 1.0,
+            Self::BlueCell      => 0.5,
+            Self::RedCell       => 0.5,
+            Self::GreenCell     => 0.5,
+            Self::YellowCell    => 0.5,
+            Self::OrangeCell    => 0.5,
+            Self::LightBlueCell => 0.5,
         }
     }
 }
