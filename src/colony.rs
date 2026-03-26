@@ -3,24 +3,13 @@ use crate::viewport_settings::*;
 use bevy::prelude::*;
 use std::collections::HashMap;
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+use rand::RngExt;
 
 pub struct ColonyPlugin;
 
 impl Plugin for ColonyPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_colony)
-        .add_systems(Update, apply_gravity);
-    }
-}
-
-const GRAVITY: f32 = 9.8;
-
-fn apply_gravity(
-    time:      Res<Time>,
-    mut query: Query<&mut Transform, With<OrganismRoot>>,
-) {
-    for mut transform in &mut query {
-        transform.translation.y -= GRAVITY * time.delta_secs();
+        app.add_systems(Startup, spawn_colony); 
     }
 }
 
@@ -51,6 +40,9 @@ pub struct Organism {
     pub ocg: Vec<OcgEntry>,
     pub joint_entities: HashMap<CollectionId, Entity>,
     pub active_cells: Vec<(Vec3, CellType)>,
+    pub is_climbing: bool,
+    pub movement_speed: f32,
+    pub movement_direction: Vec3,
 }
 
 // Stable identifier for a CellCollection within an organism.
@@ -88,6 +80,23 @@ pub struct OrganismRoot;
 
 
 
+#[derive(Component)]
+pub struct DirectionTimer {
+    pub timer: Timer,
+}
+
+impl DirectionTimer {
+    pub fn new(interval: f32) -> Self {
+        Self {
+            timer: Timer::from_seconds(interval, TimerMode::Repeating),
+        }
+    }
+}
+
+
+pub const RANDOM_DIRECTION_INTERVAL: f32 = 2.0; // Seconds between direction changes
+
+
 
 
 // ── Blend zone constant ──────────────────────────────────────────────────────
@@ -121,8 +130,8 @@ fn spawn_colony(
         parent: Some(cc1),
     });
 
-    let cell_width = 0.5;
-    let half_cell_width = cell_width / 2.0;
+    // GLOBAL_CELL_SIZE is a constant in cell.rs
+    let half_cell_size = GLOBAL_CELL_SIZE / 2.0;
 
     let ocg: Vec<OcgEntry> = vec![
         // starter cells
@@ -132,49 +141,83 @@ fn spawn_colony(
 
         // regular cells
 
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  cell_width,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [0.0, -cell_width,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0,  0.0,  cell_width] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0,  0.0,  -cell_width] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [cell_width,  0.0,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-cell_width,  0.0,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  GLOBAL_CELL_SIZE,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [0.0, -GLOBAL_CELL_SIZE,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0,  0.0,  GLOBAL_CELL_SIZE] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0,  0.0,  -GLOBAL_CELL_SIZE] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [GLOBAL_CELL_SIZE,  0.0,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-GLOBAL_CELL_SIZE,  0.0,  0.0] },
 
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  half_cell_width, half_cell_width] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [half_cell_width, half_cell_width,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [half_cell_width,  0.0, half_cell_width] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0, -half_cell_width, -half_cell_width] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_width, -half_cell_width,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_width, 0.0, -half_cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  half_cell_size, half_cell_size] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [half_cell_size, half_cell_size,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [half_cell_size,  0.0, half_cell_size] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0, -half_cell_size, -half_cell_size] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_size, -half_cell_size,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_size, 0.0, -half_cell_size] },
 
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  -half_cell_width, half_cell_width] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [half_cell_width, -half_cell_width,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_width, 0.0, half_cell_width] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0, half_cell_width, -half_cell_width] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_width, half_cell_width,  0.0] },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [half_cell_width, 0.0, -half_cell_width] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: [0.0,  -half_cell_size, half_cell_size] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: [half_cell_size, -half_cell_size,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_size, 0.0, half_cell_size] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [0.0, half_cell_size, -half_cell_size] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [-half_cell_size, half_cell_size,  0.0] },
+        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: [half_cell_size, 0.0, -half_cell_size] },
 
         ];
 
 
 
-    let o1 = Organism {
-        collections,
-        pos:         Vec3::new(100.0, 50.0, 100.0),
-        orientation: Quat::IDENTITY,
-        energy: 1.0,
-        growth_speed: 1.0,
-        adult: false,
-        ocg,
-        joint_entities: HashMap::new(),
-        active_cells: Vec::new(),
-    };
+    let mut orgs = vec![];
 
-    let mut colony = Colony { organisms: vec![o1] };
+    let mut rng = rand::rng();
+
+    for i in 0..10000 {
+        let org = create_organism(Vec3::new(rng.random_range(0.0..208.0),
+                                            81.0,
+                                            rng.random_range(0.0..208.0)), &collections, &ocg);
+        orgs.push(org);
+    }
+
+
+
+    let mut colony = Colony { organisms: orgs };
 
     for organism in &mut colony.organisms {
         spawn_organism(organism, &mut commands, &mut meshes, &mut materials, &mut inv_bindposes);
     }
 }
+
+
+
+
+fn create_organism(
+    pos: Vec3,
+    collections: &HashMap<CollectionId, CellCollection>,
+    ocg: &Vec<OcgEntry>,
+) -> Organism {
+    // Generate random initial direction and speed
+    let angle = rand::random::<f32>() * std::f32::consts::TAU;
+    let direction = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize();
+    let speed = rand::random::<f32>() * 20.0;
+    
+    Organism {
+        collections: collections.clone(),
+        pos,
+        orientation: Quat::IDENTITY,
+        energy: 1.0,
+        growth_speed: 1.0,
+        adult: false,
+        ocg: ocg.clone(),
+        joint_entities: HashMap::new(),
+        active_cells: Vec::new(),
+        is_climbing: false,
+        movement_speed: speed,
+        movement_direction: direction,
+    }
+}
+
+
+
+
 
 
 // ── Organism spawn ───────────────────────────────────────────────────────────
@@ -286,14 +329,22 @@ fn spawn_organism(
 
 
     // ── Step 5: Spawn organism root ──────────────────────────────────────────
+    /* OLD
     let organism_root = commands.spawn((
         Transform::from_translation(organism.pos).with_rotation(organism.orientation),
         Visibility::Visible,
         OrganismRoot,
         organism.clone(), // adding Organism component
     )).id();
+    */
 
-
+    let organism_root = commands.spawn((
+        Transform::from_translation(organism.pos).with_rotation(organism.orientation),
+        Visibility::Visible,
+        OrganismRoot,
+        organism.clone(),
+        DirectionTimer::new(RANDOM_DIRECTION_INTERVAL), // Add this
+    )).id();
 
 
 

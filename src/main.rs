@@ -37,6 +37,8 @@ fn main() {
 
     let mut app = App::new();
 
+    let movement_mode = movement::MovementMode::TwoD;
+
     app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {
             features: WgpuFeatures::POLYGON_MODE_LINE,
@@ -53,7 +55,7 @@ fn main() {
         })
         .add_plugins(bevy_flycam::PlayerPlugin)
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
-        .add_plugins(movement::MovementPlugin)
+        .add_plugins(movement::MovementPlugin::with_mode(movement_mode))
         .add_plugins(colony::ColonyPlugin)
 
         //.add_plugins(EguiPlugin::default())

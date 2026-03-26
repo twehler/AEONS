@@ -7,10 +7,7 @@ use bevy::mesh::VertexAttributeValues;
 use crate::viewport_settings::ShowGizmo;
 use std::collections::HashSet;
 
-
-// ── Components ───────────────────────────────────────────────────────────────
-
-
+pub const GLOBAL_CELL_SIZE: f32 = 0.5;
 
 #[derive(Component)]
 pub struct OrganismMesh;
@@ -42,12 +39,12 @@ impl CellType {
 
     pub fn size(&self) -> f32 {
         match self {
-            Self::BlueCell      => 0.5,
-            Self::RedCell       => 0.5,
-            Self::GreenCell     => 0.5,
-            Self::YellowCell    => 0.5,
-            Self::OrangeCell    => 0.5,
-            Self::LightBlueCell => 0.5,
+            Self::BlueCell      => GLOBAL_CELL_SIZE,
+            Self::RedCell       => GLOBAL_CELL_SIZE,
+            Self::GreenCell     => GLOBAL_CELL_SIZE,
+            Self::YellowCell    => GLOBAL_CELL_SIZE,
+            Self::OrangeCell    => GLOBAL_CELL_SIZE,
+            Self::LightBlueCell => GLOBAL_CELL_SIZE,
         }
     }
 }
