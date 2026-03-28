@@ -4,6 +4,7 @@ mod viewport_settings;
 mod colony;
 mod cell;
 mod movement;
+mod organism_collision;
 
 use bevy::{
     prelude::*,
