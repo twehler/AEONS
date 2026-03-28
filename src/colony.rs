@@ -170,9 +170,9 @@ fn spawn_colony(
 
     let mut rng = rand::rng();
 
-    for i in 0..10000 {
+    for i in 0..100 {
         let org = create_organism(Vec3::new(rng.random_range(0.0..208.0),
-                                            81.0,
+                                            80.0,
                                             rng.random_range(0.0..208.0)), &collections, &ocg);
         orgs.push(org);
     }

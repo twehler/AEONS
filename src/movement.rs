@@ -4,7 +4,7 @@ use crate::colony::*;
 use crate::cell::CellType;
 use std::collections::HashSet;
 use rand::prelude::*;
-
+use crate::organism_collision;
 
 pub struct MovementPlugin {
     pub mode: MovementMode,
@@ -17,46 +17,20 @@ impl MovementPlugin {
 }
 
 
-/* OLD
-impl Plugin for MovementPlugin {
-    fn build(&self, app: &mut App) {
-        // Insert resources (only the timer is still global)
-        app.insert_resource(RandomDirectionTimer::default());
-        app.insert_resource(self.mode);
-        
-        // Add common systems
-        app.add_systems(PostUpdate, (
-            apply_movement,
-            apply_floor_collision,
-            apply_world_bounds,
-        ).chain());
-        
-        // Add mode-specific systems based on the plugin's stored mode
-        match self.mode {
-            MovementMode::TwoD => {
-                app.add_systems(PostUpdate, random_2d_direction.before(apply_movement));
-                app.add_systems(PostUpdate, apply_gravity.after(apply_floor_collision));
-            }
-            MovementMode::ThreeD => {
-                app.add_systems(PostUpdate, random_3d_direction.before(apply_movement));
-                // No gravity system in 3D mode
-            }
-        }
-    }
-}
-*/
-
 impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
         // Remove: app.insert_resource(RandomDirectionTimer::default());
         app.insert_resource(self.mode);
-        
+        app.insert_resource(organism_collision::OrganismCollisionTimer::default());
+
         // Add common systems
         app.add_systems(PostUpdate, (
+            random_3d_direction,
+            organism_collision::apply_organism_collision,
             apply_movement,
             apply_floor_collision,
             apply_world_bounds,
-        ).chain());
+        ));
         
         // Add mode-specific systems based on the plugin's stored mode
         match self.mode {
@@ -91,34 +65,6 @@ impl Default for MovementMode {
     }
 }
 
-/* OLD
-// ── System: Random 2D direction (XZ plane only) ──────────────────────────
-
-fn random_2d_direction(
-    time: Res<Time>,
-    mut timer: ResMut<RandomDirectionTimer>,
-    mut query: Query<&mut Organism, With<OrganismRoot>>,
-) {
-    timer.timer.tick(time.delta());
-    
-    if timer.timer.just_finished() {
-        // Generate random angle between 0 and 2π
-        let angle = rand::random::<f32>() * std::f32::consts::TAU;
-        
-        // Set direction in XZ plane (Y = 0)
-        let direction = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize();
-        
-        // Generate random speed between 0 and 20
-        let speed = rand::random::<f32>() * 20.0;
-        
-        // Update all organisms
-        for mut organism in &mut query {
-            organism.movement_direction = direction;
-            organism.movement_speed = speed;
-        }
-    }
-}
-*/
 
 // ── System: Random 2D direction (XZ plane only) ──────────────────────────
 
@@ -146,36 +92,6 @@ fn random_2d_direction(
 
 
 
-// ── System: Random 3D direction (full XYZ, no gravity) ───────────────────
-/*
-fn random_3d_direction(
-    time: Res<Time>,
-    mut timer: ResMut<RandomDirectionTimer>,
-    mut query: Query<&mut Organism, With<OrganismRoot>>,
-) {
-    timer.timer.tick(time.delta());
-
-    if timer.timer.just_finished() {
-        // Generate random spherical coordinates
-        let theta = rand::random::<f32>() * std::f32::consts::TAU; // Azimuthal angle (0 to 2π)
-        let phi = rand::random::<f32>() * std::f32::consts::PI;    // Polar angle (0 to π)
-
-        // Convert spherical to Cartesian coordinates
-        let x = theta.cos() * phi.sin();
-        let y = phi.cos();
-        let z = theta.sin() * phi.sin();
-
-        let direction = Vec3::new(x, y, z).normalize();
-        let speed = rand::random::<f32>() * 20.0;
-
-        // Update all organisms
-        for mut organism in &mut query {
-            organism.movement_direction = direction;
-            organism.movement_speed = speed;
-        }
-    }
-}
-*/
 // ── System: Random 3D direction (full XYZ, no gravity) ───────────────────
 
 fn random_3d_direction(

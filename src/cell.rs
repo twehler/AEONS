@@ -7,7 +7,7 @@ use bevy::mesh::VertexAttributeValues;
 use crate::viewport_settings::ShowGizmo;
 use std::collections::HashSet;
 
-pub const GLOBAL_CELL_SIZE: f32 = 0.5;
+pub const GLOBAL_CELL_SIZE: f32 = 5.0;
 
 #[derive(Component)]
 pub struct OrganismMesh;
