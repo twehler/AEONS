@@ -1,10 +1,16 @@
 use bevy::prelude::*;
+
 use crate::world_geometry::{HeightmapSampler, BlockWorld};
 use crate::colony::*;
 use crate::cell::CellType;
 use std::collections::HashSet;
 use rand::prelude::*;
 use crate::organism_collision;
+
+// two constants which serve as an interval for a random number of seconds, after which an organism
+// chooses a new direction for travel
+const MIN_DIRECTION_INTERVAL: f32 = 1.0;
+const MAX_DIRECTION_INTERVAL: f32 = 10.0;
 
 pub struct MovementPlugin {
     pub mode: MovementMode,
@@ -26,7 +32,7 @@ impl Plugin for MovementPlugin {
         // Add common systems
         app.add_systems(PostUpdate, (
             random_3d_direction,
-            organism_collision::apply_organism_collision,
+            organism_collision::apply_organism_collision.after(TransformSystems::Propagate), // solving a visual bug
             apply_movement,
             apply_floor_collision,
             apply_world_bounds,
@@ -86,6 +92,10 @@ fn random_2d_direction(
             
             // Generate random speed between 0 and 20
             organism.movement_speed = rand::random::<f32>() * 20.0;
+
+            // Generate new random interval between 1 and 10 seconds for the next change
+            let new_interval = MIN_DIRECTION_INTERVAL + rand::random::<f32>() * (MAX_DIRECTION_INTERVAL - MIN_DIRECTION_INTERVAL);
+            timer.timer = Timer::from_seconds(new_interval, TimerMode::Repeating);
         }
     }
 }
@@ -115,6 +125,10 @@ fn random_3d_direction(
             
             organism.movement_direction = Vec3::new(x, y, z).normalize();
             organism.movement_speed = rand::random::<f32>() * 20.0;
+
+            // Generate new random interval between 1 and 10 seconds for the next change
+            let new_interval = MIN_DIRECTION_INTERVAL + rand::random::<f32>() * (MAX_DIRECTION_INTERVAL - MIN_DIRECTION_INTERVAL);
+            timer.timer = Timer::from_seconds(new_interval, TimerMode::Repeating);
         }
     }
 }
@@ -216,28 +230,39 @@ fn apply_gravity(
 }
 
 
-// ── Floor collision (ground only) ─────────────────────────────────────────
-
 fn apply_floor_collision(
     heightmap: Res<HeightmapSampler>,
+    // We need GlobalTransform for the joints, but Transform for the Root (to move it)
     mut query: Query<(&mut Transform, &Organism), With<OrganismRoot>>,
+    joint_query: Query<&GlobalTransform, Without<OrganismRoot>>,
 ) {
-    for (mut transform, organism) in &mut query {
+    for (mut root_transform, organism) in &mut query {
         let mut max_penetration = 0.0f32;
 
-        for (local_pos, cell_type) in &organism.active_cells {
-            let world_pos = transform.transform_point(*local_pos);
-            let cell_bottom = world_pos.y - cell_type.size() / 2.0;
-            let floor_y = heightmap.height_at(world_pos.x, world_pos.z);
+        // Iterate over the "living" subset of the OCG
+        for entry in &organism.grown_cells {
+            // 1. Get the world transform of the specific collection/joint this cell belongs to
+            if let Some(&joint_entity) = organism.joint_entities.get(&entry.collection_id) {
+                if let Ok(joint_global) = joint_query.get(joint_entity) {
+                    
+                    // 2. Calculate world position: Transform the local offset by the bone's world transform
+                    let world_pos = joint_global.transform_point(entry.offset);
+                    
+                    // 3. Calculate penetration based on cell size
+                    let cell_bottom = world_pos.y - entry.cell_type.size() / 2.0;
+                    let floor_y = heightmap.height_at(world_pos.x, world_pos.z);
 
-            let penetration = floor_y - cell_bottom;
-            if penetration > max_penetration {
-                max_penetration = penetration;
+                    let penetration = floor_y - cell_bottom;
+                    if penetration > max_penetration {
+                        max_penetration = penetration;
+                    }
+                }
             }
         }
 
+        // 4. Push the entire OrganismRoot up by the largest penetration found
         if max_penetration > 0.0 {
-            transform.translation.y += max_penetration;
+            root_transform.translation.y += max_penetration;
         }
     }
 }

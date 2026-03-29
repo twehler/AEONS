@@ -7,7 +7,7 @@ use bevy::mesh::VertexAttributeValues;
 use crate::viewport_settings::ShowGizmo;
 use std::collections::HashSet;
 
-pub const GLOBAL_CELL_SIZE: f32 = 5.0;
+pub const GLOBAL_CELL_SIZE: f32 = 1.0;
 
 #[derive(Component)]
 pub struct OrganismMesh;
@@ -96,20 +96,20 @@ impl CellSkinning {
 
 pub const FACE_NEIGHBOURS: [[i32; 3]; 12] = [
     // Top cap — tip +Z (v12)
-    [ 0,  1,  1],  // add_face(12,  0, 10,  4)
-    [-1,  0,  1],  // add_face(12,  4,  9,  6)
-    [ 0, -1,  1],  // add_face(12,  6, 11,  2)
-    [ 1,  0,  1],  // add_face(12,  2,  8,  0)
+    [ 0,  2,  2],  // add_face(12,  0, 10,  4)
+    [-2,  0,  2],  // add_face(12,  4,  9,  6)
+    [ 0, -2,  2],  // add_face(12,  6, 11,  2)
+    [ 2,  0,  2],  // add_face(12,  2,  8,  0)
     // Bottom cap — tip -Z (v13)
-    [ 0,  1, -1],  // add_face( 5, 10,  1, 13)
-    [-1,  0, -1],  // add_face( 7,  9,  5, 13)
-    [ 0, -1, -1],  // add_face( 3, 11,  7, 13)
-    [ 1,  0, -1],  // add_face( 1,  8,  3, 13)
+    [ 0,  2, -2],  // add_face( 5, 10,  1, 13)
+    [-2,  0, -2],  // add_face( 7,  9,  5, 13)
+    [ 0, -2, -2],  // add_face( 3, 11,  7, 13)
+    [ 2,  0, -2],  // add_face( 1,  8,  3, 13)
     // Middle ring
-    [ 1,  1,  0],  // add_face( 1, 10,  0,  8)
-    [-1,  1,  0],  // add_face( 5,  9,  4, 10)
-    [-1, -1,  0],  // add_face( 7, 11,  6,  9)
-    [ 1, -1,  0],  // add_face( 3,  8,  2, 11)
+    [ 2,  2,  0],  // add_face( 1, 10,  0,  8)
+    [-2,  2,  0],  // add_face( 5,  9,  4, 10)
+    [-2, -2,  0],  // add_face( 7, 11,  6,  9)
+    [ 2, -2,  0],  // add_face( 3,  8,  2, 11)
 ];
 
 
@@ -125,9 +125,9 @@ pub const ALL_NEIGHBOUR_OFFSETS: [[i32; 3]; 12] = FACE_NEIGHBOURS;
 // The grid step size is 1.0 (cells are placed at integer offsets in the OCG).
 fn quantise(pos: Vec3) -> [i32; 3] {
     [
-        pos.x.round() as i32,
-        pos.y.round() as i32,
-        pos.z.round() as i32,
+        (pos.x * 2.0).round() as i32,
+        (pos.y * 2.0).round() as i32,
+        (pos.z * 2.0).round() as i32,
     ]
 }
 
