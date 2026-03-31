@@ -59,7 +59,7 @@ impl VoxelBuffer {
 
 
 
-
+const WORLD_SCALE_FACTOR: f32 = 4.0;
 
 
 const BLOCK_CHALK_1: u8 = 0;
@@ -406,33 +406,60 @@ fn main() {
         .collect();
 
     println!("Building-process completed in {:?}", start_gm.elapsed());
+    println!("Saving...");
 
 
     // ---------------- Assemble WorldCache ----------------
 
+
+
     let chunk_mesh_data: Vec<([i32; 2], VoxelBuffer)> = chunk_buffers
-        .into_iter()
-        .map(|((cx, cz), buf)| ([cx, cz], buf))
-        .collect();
+    .into_iter()
+    .map(|((cx, cz), mut buf)| {  // Note: mut buf
+        // Scale positions in-place
+        for pos in &mut buf.positions {
+            pos[0] *= WORLD_SCALE_FACTOR;
+            pos[1] *= WORLD_SCALE_FACTOR;
+            pos[2] *= WORLD_SCALE_FACTOR;
+        }
+        
+        ([cx, cz], buf)
+    })
+    .collect();
+
+    let scaled_block_metadata: HashMap<[i32; 3], u8> = (*voxel_map)
+    .iter()
+    .map(|([x, y, z], &block_type)| {
+        ([
+            (*x as f32 * WORLD_SCALE_FACTOR) as i32,
+            (*y as f32 * WORLD_SCALE_FACTOR) as i32,
+            (*z as f32 * WORLD_SCALE_FACTOR) as i32,
+        ], block_type)
+    })
+    .collect();
+
+
 
     let cache = WorldCache {
-        block_metadata: (*voxel_map).clone(),
-        chunks: chunk_mesh_data
-            .into_iter()
-            .map(|(coord, buf)| ChunkCache {
-                chunk_coord: coord,
-                positions:   buf.positions,
-                normals:     buf.normals,
-                uvs:         buf.uvs,
-                colors:      buf.colors,
-                indices:     buf.indices,
-            })
-            .collect(),
+    block_metadata: scaled_block_metadata,
+    chunks: chunk_mesh_data
+        .into_iter()
+        .map(|(coord, buf)| ChunkCache {
+            chunk_coord: [
+                (coord[0] as f32 * WORLD_SCALE_FACTOR) as i32,
+                (coord[1] as f32 * WORLD_SCALE_FACTOR) as i32,
+            ],
+            positions:   buf.positions,
+            normals:     buf.normals,
+            uvs:         buf.uvs,
+            colors:      buf.colors,
+            indices:     buf.indices,
+        })
+        .collect(),
     };
 
 
-
-    println!("Saving...");
+    
 
     let file   = File::create(output_path).expect("Failed to create output file");
     let writer = BufWriter::new(file);

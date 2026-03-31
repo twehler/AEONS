@@ -14,10 +14,13 @@ const ORGANISM_BROAD_RADIUS: f32 = 10.0;
 const COLLECTION_MID_RADIUS: f32 = 5.0;
 
 // Narrow phase: two cells are in contact when their centres are closer than this.
-const CELL_CONTACT_RADIUS: f32 = GLOBAL_CELL_SIZE;
+const CELL_CONTACT_RADIUS: f32 = GLOBAL_CELL_SIZE * 1.1;
 
 // Fraction of movement speed converted into a deflection push on contact.
-const PUSH_STRENGTH: f32 = 0.5;
+const PUSH_STRENGTH: f32 = 1.0;
+
+const ORGANISM_COLLISION_TIMER: f32 = 0.1; // in milliseconds
+
 
 // ── Timer resource ────────────────────────────────────────────────────────────
 
@@ -32,7 +35,7 @@ pub struct OrganismCollisionTimer {
 impl Default for OrganismCollisionTimer {
     fn default() -> Self {
         Self {
-            timer: Timer::from_seconds(0.05, TimerMode::Repeating),
+            timer: Timer::from_seconds(ORGANISM_COLLISION_TIMER, TimerMode::Repeating),
         }
     }
 }
@@ -114,6 +117,8 @@ fn snapshot(
         collections,
     }
 }
+
+
 
 // ── Main system ───────────────────────────────────────────────────────────────
 
@@ -217,7 +222,7 @@ pub fn apply_organism_collision(
                                 let Some(a_cells) = cell_grid.get(&nk) else { continue };
 
                                 for &cell_pos_a in a_cells {
-                                    let dist = cell_pos_b.distance(cell_pos_a);
+                                    let dist = cell_pos_b.distance(cell_pos_a); // standard Euclidian distance function of Bevy
                                     if dist >= CELL_CONTACT_RADIUS || dist < 1e-6 {
                                         continue;
                                     }

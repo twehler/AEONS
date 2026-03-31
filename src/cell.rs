@@ -7,7 +7,7 @@ use bevy::mesh::VertexAttributeValues;
 use crate::viewport_settings::ShowGizmo;
 use std::collections::HashSet;
 
-pub const GLOBAL_CELL_SIZE: f32 = 1.0;
+pub const GLOBAL_CELL_SIZE: f32 = 3.5;
 
 #[derive(Component)]
 pub struct OrganismMesh;
@@ -96,20 +96,20 @@ impl CellSkinning {
 
 pub const FACE_NEIGHBOURS: [[i32; 3]; 12] = [
     // Top cap — tip +Z (v12)
-    [ 0,  2,  2],  // add_face(12,  0, 10,  4)
-    [-2,  0,  2],  // add_face(12,  4,  9,  6)
-    [ 0, -2,  2],  // add_face(12,  6, 11,  2)
-    [ 2,  0,  2],  // add_face(12,  2,  8,  0)
+    [ 0,  1,  1],  // add_face(12,  0, 10,  4)
+    [-1,  0,  1],  // add_face(12,  4,  9,  6)
+    [ 0, -1,  1],  // add_face(12,  6, 11,  2)
+    [ 1,  0,  1],  // add_face(12,  2,  8,  0)
     // Bottom cap — tip -Z (v13)
-    [ 0,  2, -2],  // add_face( 5, 10,  1, 13)
-    [-2,  0, -2],  // add_face( 7,  9,  5, 13)
-    [ 0, -2, -2],  // add_face( 3, 11,  7, 13)
-    [ 2,  0, -2],  // add_face( 1,  8,  3, 13)
+    [ 0,  1, -1],  // add_face( 5, 10,  1, 13)
+    [-1,  0, -1],  // add_face( 7,  9,  5, 13)
+    [ 0, -1, -1],  // add_face( 3, 11,  7, 13)
+    [ 1,  0, -1],  // add_face( 1,  8,  3, 13)
     // Middle ring
-    [ 2,  2,  0],  // add_face( 1, 10,  0,  8)
-    [-2,  2,  0],  // add_face( 5,  9,  4, 10)
-    [-2, -2,  0],  // add_face( 7, 11,  6,  9)
-    [ 2, -2,  0],  // add_face( 3,  8,  2, 11)
+    [ 1,  1,  0],  // add_face( 1, 10,  0,  8)
+    [-1,  1,  0],  // add_face( 5,  9,  4, 10)
+    [-1, -1,  0],  // add_face( 7, 11,  6,  9)
+    [ 1, -1,  0],  // add_face( 3,  8,  2, 11)
 ];
 
 
@@ -124,10 +124,12 @@ pub const ALL_NEIGHBOUR_OFFSETS: [[i32; 3]; 12] = FACE_NEIGHBOURS;
 // We round to the nearest integer, with a tolerance to handle float imprecision.
 // The grid step size is 1.0 (cells are placed at integer offsets in the OCG).
 fn quantise(pos: Vec3) -> [i32; 3] {
+
+    let epsilon = 1e-6;
     [
-        (pos.x * 2.0).round() as i32,
-        (pos.y * 2.0).round() as i32,
-        (pos.z * 2.0).round() as i32,
+        ((pos.x + epsilon)).floor() as i32,
+        ((pos.y + epsilon)).floor() as i32,
+        ((pos.z + epsilon)).floor() as i32,
     ]
 }
 
@@ -235,7 +237,6 @@ pub fn generate_rhombic_dodecahedron(pos: Vec3, total_width: f32) -> Mesh {
 pub struct MeshCell {
     pub mesh_space_pos: Vec3,
     pub cell_type:      CellType,
-    pub skinning:       CellSkinning,
 }
 
 pub fn merge_organism_mesh(cells: Vec<MeshCell>) -> Mesh {
@@ -250,8 +251,6 @@ pub fn merge_organism_mesh(cells: Vec<MeshCell>) -> Mesh {
     let mut positions:     Vec<[f32; 3]> = Vec::new();
     let mut normals:       Vec<[f32; 3]> = Vec::new();
     let mut colors:        Vec<[f32; 4]> = Vec::new();
-    let mut joint_indices: Vec<[u16; 4]> = Vec::new();
-    let mut joint_weights: Vec<[f32; 4]> = Vec::new();
     let mut indices:       Vec<u32>      = Vec::new();
 
     for cell in &cells {
@@ -273,38 +272,28 @@ pub fn merge_organism_mesh(cells: Vec<MeshCell>) -> Mesh {
         }
 
         // ── Generate visible faces only ───────────────────────────────────────
-        let base = positions.len() as u32;
+       let base = positions.len() as u32;
         let raw  = generate_rhombic_dodecahedron_raw(
             cell.mesh_space_pos,
             cell.cell_type.size(),
             &occupied,
         );
+        if raw.positions.is_empty() { continue; }
 
-        if raw.positions.is_empty() {
-            continue; // all faces culled (shouldn't happen if not fully_enclosed, but be safe)
-        }
-
-        let c          = cell.cell_type.color().to_linear();
-        let color      = [c.red, c.green, c.blue, 1.0];
+        let c     = cell.cell_type.color().to_linear();
+        let color = [c.red, c.green, c.blue, 1.0];
         let vert_count = raw.positions.len();
 
         colors.extend(std::iter::repeat_n(color, vert_count));
-        joint_indices.extend(std::iter::repeat_n(cell.skinning.joint_indices, vert_count));
-        joint_weights.extend(std::iter::repeat_n(cell.skinning.joint_weights, vert_count));
         positions.extend_from_slice(&raw.positions);
         normals.extend_from_slice(&raw.normals);
         indices.extend(raw.indices.iter().map(|i| i + base));
     }
 
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION,     positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL,       normals);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR,        colors);
-    mesh.insert_attribute(
-        Mesh::ATTRIBUTE_JOINT_INDEX,
-        VertexAttributeValues::Uint16x4(joint_indices),
-    );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, joint_weights);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL,   normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR,    colors);
     mesh.insert_indices(Indices::U32(indices));
     mesh
-}
+} 

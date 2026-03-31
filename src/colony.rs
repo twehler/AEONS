@@ -2,7 +2,6 @@ use crate::cell::*;
 use crate::viewport_settings::*;
 use bevy::prelude::*;
 use std::collections::HashMap;
-use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use rand::RngExt;
 
 pub struct ColonyPlugin;
@@ -97,10 +96,6 @@ impl DirectionTimer {
 
 
 
-// ── Blend zone constant ──────────────────────────────────────────────────────
-
-const BLEND_RADIUS: f32 = 2.0;
-
 
 // ── Plugin entry point ───────────────────────────────────────────────────────
 
@@ -108,7 +103,6 @@ fn spawn_colony(
     mut commands:      Commands,
     mut meshes:        ResMut<Assets<Mesh>>,
     mut materials:     ResMut<Assets<StandardMaterial>>,
-    mut inv_bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
 ) {
     let cc1 = CollectionId(1); // body core  — root, no parent
     let cc2 = CollectionId(2); // right limb — child of cc1
@@ -226,10 +220,10 @@ fn spawn_colony(
 
     let mut rng = rand::rng();
 
-    for i in 0..100 {
-        let org = create_organism(Vec3::new(rng.random_range(0.0..208.0),
-                                            2.0,
-                                            rng.random_range(0.0..208.0)), &collections, &ocg);
+    for i in 0..1000 {
+        let org = create_organism(Vec3::new(rng.random_range(0.0..1024.0),
+                                            80.0,
+                                            rng.random_range(0.0..1024.0)), &collections, &ocg);
         orgs.push(org);
     }
 
@@ -238,7 +232,7 @@ fn spawn_colony(
     let mut colony = Colony { organisms: orgs };
 
     for organism in &mut colony.organisms {
-        spawn_organism(organism, &mut commands, &mut meshes, &mut materials, &mut inv_bindposes);
+        spawn_organism(organism, &mut commands, &mut meshes, &mut materials);
     }
 }
 
@@ -284,7 +278,6 @@ fn spawn_organism(
     commands:      &mut Commands,
     meshes:        &mut ResMut<Assets<Mesh>>,
     materials:     &mut ResMut<Assets<StandardMaterial>>,
-    inv_bindposes: &mut ResMut<Assets<SkinnedMeshInverseBindposes>>,
 ) {
     // ── Step 1: Assign stable joint indices ──────────────────────────────────
     // Sort by CollectionId for deterministic ordering — HashMap iteration
@@ -293,45 +286,16 @@ fn spawn_organism(
     let mut sorted_ids: Vec<CollectionId> = organism.collections.keys().copied().collect();
     sorted_ids.sort_by_key(|id| id.0);
 
-    let joint_index_map: HashMap<CollectionId, u16> = sorted_ids
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, i as u16))
-        .collect();
-
     // ── Step 2: Build MeshCell list from OCG ─────────────────────────────────
     // mesh_space_pos = starter_cell_position + offset
     // This places each cell correctly in the mesh's rest pose coordinate space,
     // relative to the organism root. The skinning shader deforms from this rest
     // position using the joint transforms and inverse bindposes.
     let mesh_cells: Vec<MeshCell> = organism.ocg.iter().map(|entry| {
-        let own_collection  = &organism.collections[&entry.collection_id];
-        let own_joint       = joint_index_map[&entry.collection_id];
-        let mesh_space_pos  = own_collection.starter_cell_position + Vec3::from(entry.offset);
-
-        // Blend zone: find the nearest other collection's starter within BLEND_RADIUS
-        let nearest_neighbour = organism.collections
-            .iter()
-            .filter(|(id, _)| **id != entry.collection_id)
-            .map(|(id, coll)| {
-                let dist = mesh_space_pos.distance(coll.starter_cell_position);
-                (*id, dist)
-            })
-            .filter(|(_, dist)| *dist < BLEND_RADIUS)
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
-
-        let skinning = match nearest_neighbour {
-            None => CellSkinning::single(own_joint),
-            Some((neighbour_id, neighbour_dist)) => {
-                let own_dist       = Vec3::from(entry.offset).length().max(0.001);
-                let primary_weight = (neighbour_dist / (own_dist + neighbour_dist))
-                    .clamp(0.5, 1.0);
-                CellSkinning::blended(own_joint, joint_index_map[&neighbour_id], primary_weight)
-            }
-        };
-
-        MeshCell { mesh_space_pos, cell_type: entry.cell_type, skinning }
-    }).collect();
+    let own_collection = &organism.collections[&entry.collection_id];
+    let mesh_space_pos = own_collection.starter_cell_position + entry.offset;
+        MeshCell { mesh_space_pos, cell_type: entry.cell_type }
+    }).collect(); 
 
 
     let active_cells: Vec<(Vec3, CellType)> = mesh_cells
@@ -378,10 +342,6 @@ fn spawn_organism(
     })
     .collect();
 
-    let bindpose_handle = inv_bindposes.add(
-        SkinnedMeshInverseBindposes::from(inverse_bindposes)
-    );
-
     // random float between 1 and 10
     let random_interval = 1.0 + rand::random::<f32>() * 9.0;
 
@@ -406,34 +366,24 @@ fn spawn_organism(
         }
     }
 
-    // ── Step 7: Build ordered joints list for SkinnedMesh ────────────────────
-    // Must be in the same order as joint_index_map (sorted by CollectionId).
-    let joints_vec: Vec<Entity> = sorted_ids
-        .iter()
-        .map(|id| joint_entities[id])
-        .collect();
 
-    // ── Step 8: Spawn skinned mesh entity ────────────────────────────────────
+
+    // ── Step 8: Spawn mesh entity ────────────────────────────────────
     // Transform::IDENTITY — the mesh sits at the organism root's origin.
-    // The bones drive all deformation from the rest pose.
+
     let mesh   = merge_organism_mesh(mesh_cells);
     let handle = meshes.add(mesh);
 
     let mesh_entity = commands.spawn((
-        Mesh3d(handle),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            ..default()
-        })),
-        Transform::IDENTITY,
-        SkinnedMesh {
-            inverse_bindposes: bindpose_handle,
-            joints:            joints_vec,
-        },
-        OrganismMesh,
-        ShowGizmo,
-    )).id();
-
+    Mesh3d(handle),
+    MeshMaterial3d(materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        ..default()
+    })),
+    Transform::IDENTITY,
+    OrganismMesh,
+    ShowGizmo,
+)).id();
     commands.entity(organism_root).add_child(mesh_entity);
 }
 

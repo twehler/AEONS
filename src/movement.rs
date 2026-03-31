@@ -30,13 +30,13 @@ impl Plugin for MovementPlugin {
         app.insert_resource(organism_collision::OrganismCollisionTimer::default());
 
         // Add common systems
-        app.add_systems(PostUpdate, (
-            random_3d_direction,
-            organism_collision::apply_organism_collision.after(TransformSystems::Propagate), // solving a visual bug
+        app.add_systems(PostUpdate, ( 
             apply_movement,
             apply_floor_collision,
             apply_world_bounds,
-        ));
+        ).chain());
+
+        app.add_systems(Last, organism_collision::apply_organism_collision);
         
         // Add mode-specific systems based on the plugin's stored mode
         match self.mode {
