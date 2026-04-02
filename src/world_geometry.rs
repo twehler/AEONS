@@ -99,8 +99,8 @@ impl HeightmapSampler {
     // Returns the Y of the top surface of the highest block at world (x, z).
     // Clamps to the heightmap boundary for positions outside the world.
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
-        let xi = ((x as i32 - self.min_x).max(0) as u32).min(self.width  - 1);
-        let zi = ((z as i32 - self.min_z).max(0) as u32).min(self.depth  - 1);
+        let xi = ((x.floor() as i32 - self.min_x).max(0) as u32).min(self.width  - 1);
+        let zi = ((z.floor() as i32 - self.min_z).max(0) as u32).min(self.depth  - 1);
         self.heights[(zi * self.width + xi) as usize]
     }
 }
@@ -181,13 +181,20 @@ fn begin_load_scene(
     let mut max_height = 0.0f32;
 
     // For each block, update the height at its XZ column to the top of that block
+    let scale = 4u32; // WORLD_SCALE_FACTOR
     for ([x, y, z], _) in &cache.block_metadata {
-        let xi = (x - min_x) as u32;
-        let zi = (z - min_z) as u32;
-        let top = *y as f32 + 1.0; // top surface of this block
-        let idx = (zi * width + xi) as usize;
-        if top > heights[idx] {
-            heights[idx] = top;
+        let top = *y as f32 + scale as f32;
+        for dz in 0..scale {
+            for dx in 0..scale {
+                let xi = (x - min_x) as u32 + dx;
+                let zi = (z - min_z) as u32 + dz;
+                if xi < width && zi < depth {
+                    let idx = (zi * width + xi) as usize;
+                    if top > heights[idx] {
+                        heights[idx] = top;
+                    }
+                }
+            }
         }
         if top > max_height {
             max_height = top;
