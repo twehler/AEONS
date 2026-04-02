@@ -91,13 +91,16 @@ fn energy_tick(
 
         // ── Starvation → death ───────────────────────────────────────────
         if organism.energy <= 0.0 {
-            let corpse_energy = max_energy * CORPSE_ENERGY_FRACTION;
-            commands.entity(entity).remove::<Organism>();
-            commands.entity(entity).remove::<OrganismRoot>();
-            commands.entity(entity).insert(Corpse {
-                energy: corpse_energy,
-                decay_timer: Timer::from_seconds(CORPSE_DECAY_TIME, TimerMode::Once),
-            });
+            // Despawn the entire entity hierarchy and respawn as a simple corpse
+            commands.entity(entity).despawn();
+            // Spawn a standalone corpse marker at the same position
+            commands.spawn((
+                Transform::from_translation(transform.translation),
+                Corpse {
+                    energy: (organism.grown_cell_count as f32) * MAX_ENERGY_PER_CELL * CORPSE_ENERGY_FRACTION,
+                    decay_timer: Timer::from_seconds(CORPSE_DECAY_TIME, TimerMode::Once),
+                },
+            ));
         }
     }
 }

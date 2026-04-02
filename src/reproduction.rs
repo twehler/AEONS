@@ -154,11 +154,18 @@ fn reproduction_system(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut query: Query<(Entity, &mut Organism, &Transform), With<OrganismRoot>>,
+    pop_cap: Res<crate::colony::PopulationCap>,
 ) {
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() {
         return;
     }
+
+    let current_pop = query.iter().count();
+    if current_pop >= pop_cap.max {
+        return;
+    }
+    let spawn_budget = pop_cap.max - current_pop;
 
     let mut births: Vec<(Vec3, Vec<OcgEntry>, HashMap<CollectionId, CellCollection>, f32)> = Vec::new();
 
@@ -182,8 +189,13 @@ fn reproduction_system(
             let spawn_pos = transform.translation + perp * SPAWN_OFFSET;
 
             births.push((spawn_pos, child_ocg, child_collections, offspring_energy));
+            if births.len() >= spawn_budget {
+                break;
+            }
         }
     }
+
+    births.truncate(spawn_budget);
 
     // Spawn offspring outside the query borrow
     let shared_material = materials.add(StandardMaterial {

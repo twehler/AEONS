@@ -122,7 +122,10 @@ fn mesh_rebuild_system(
         return;
     }
 
+    let max_rebuilds_per_tick = 50;
+    let mut rebuild_count = 0;
     for (entity, organism) in &dirty_query {
+        if rebuild_count >= max_rebuilds_per_tick { break; }
         // Build new mesh from grown cells
         let mesh_cells: Vec<MeshCell> = organism.ocg[..organism.grown_cell_count]
             .iter()
@@ -153,5 +156,6 @@ fn mesh_rebuild_system(
 
         // Remove dirty marker
         commands.entity(entity).remove::<MeshDirty>();
+        rebuild_count += 1;
     }
 }

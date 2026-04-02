@@ -4,6 +4,7 @@ use crate::cell::CellType;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
+const MIN_SIZE_RATIO: f32 = 1.2;  // predator must be 20% larger than prey
 const PREDATION_CHECK_INTERVAL: f32 = 0.5;
 const PREDATION_RANGE: f32 = 15.0;      // organism centers must be this close
 const BITE_DAMAGE: f32 = 5.0;            // base damage per predation tick
@@ -62,10 +63,10 @@ fn predation_system(
     }
 
     // Snapshot positions and stats to avoid borrow conflicts
-    let snapshots: Vec<(Entity, Vec3, f32, f32, f32)> = query.iter()
+    let snapshots: Vec<(Entity, Vec3, f32, f32, f32, usize)> = query.iter()
         .map(|(entity, organism, transform)| {
             let (digestion, armor) = organism_stats(organism);
-            (entity, transform.translation, digestion, armor, organism.energy)
+            (entity, transform.translation, digestion, armor, organism.energy, organism.grown_cell_count)
         })
         .collect();
 
@@ -73,18 +74,18 @@ fn predation_system(
     let mut energy_changes: Vec<(Entity, f32)> = Vec::new();
 
     for i in 0..snapshots.len() {
-        let (entity_a, pos_a, dig_a, armor_a, energy_a) = snapshots[i];
+        let (entity_a, pos_a, dig_a, armor_a, energy_a, size_a) = snapshots[i];
 
         for j in (i + 1)..snapshots.len() {
-            let (entity_b, pos_b, dig_b, armor_b, energy_b) = snapshots[j];
+            let (entity_b, pos_b, dig_b, armor_b, energy_b, size_b) = snapshots[j];
 
             let dist = pos_a.distance(pos_b);
             if dist >= PREDATION_RANGE {
                 continue;
             }
 
-            // A attacks B (if A has digestion)
-            if dig_a > 0.0 && energy_b > 0.0 {
+            // A attacks B (if A has digestion AND is bigger)
+            if dig_a > 0.0 && energy_b > 0.0 && size_a as f32 >= size_b as f32 * MIN_SIZE_RATIO {
                 let effective_damage = (BITE_DAMAGE * dig_a * (1.0 - armor_b * 0.5)).max(0.0);
                 let actual_damage = effective_damage.min(energy_b);
                 let gained = actual_damage * ENERGY_TRANSFER_RATE;
@@ -92,8 +93,8 @@ fn predation_system(
                 energy_changes.push((entity_a, gained));
             }
 
-            // B attacks A (if B has digestion)
-            if dig_b > 0.0 && energy_a > 0.0 {
+            // B attacks A (if B has digestion AND is bigger)
+            if dig_b > 0.0 && energy_a > 0.0 && size_b as f32 >= size_a as f32 * MIN_SIZE_RATIO {
                 let effective_damage = (BITE_DAMAGE * dig_b * (1.0 - armor_a * 0.5)).max(0.0);
                 let actual_damage = effective_damage.min(energy_a);
                 let gained = actual_damage * ENERGY_TRANSFER_RATE;

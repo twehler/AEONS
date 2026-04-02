@@ -9,6 +9,7 @@ pub struct ColonyPlugin;
 
 impl Plugin for ColonyPlugin {
     fn build(&self, app: &mut App) {
+        app.insert_resource(PopulationCap::default());
         app.add_systems(Update, spawn_colony);
     }
 }
@@ -96,6 +97,17 @@ impl DirectionTimer {
     }
 }
 
+#[derive(Resource)]
+pub struct PopulationCap {
+    pub max: usize,
+}
+
+impl Default for PopulationCap {
+    fn default() -> Self {
+        Self { max: 1500 }
+    }
+}
+
 
 
 
@@ -111,148 +123,136 @@ fn spawn_colony(
 ) {
     if *spawned { return; }
     *spawned = true;
-    let cc1 = CollectionId(1); // body core  — root, no parent
-    let cc2 = CollectionId(2); // right limb — child of cc1
-    let cc3 = CollectionId(3); // left limb  — child of cc1
-    let cc4 = CollectionId(4);
-    let cc5 = CollectionId(5);
 
-    let mut collections = HashMap::new();
-    collections.insert(cc1, CellCollection {
-        starter_cell_position: Vec3::new(0.0, 0.0, 0.0),
-        parent: None,
-    });
-    collections.insert(cc2, CellCollection {
-        starter_cell_position: Vec3::new(2.0 * GLOBAL_CELL_SIZE, 0.0, 0.0),
-        parent: Some(cc1),
-    });
-    collections.insert(cc3, CellCollection {
-        starter_cell_position: Vec3::new(2.0 * -GLOBAL_CELL_SIZE, 0.0, 0.0),
-        parent: Some(cc1),
-    });
-    collections.insert(cc4, CellCollection {
-        starter_cell_position: Vec3::new(0.0, 0.0, 2.0 * GLOBAL_CELL_SIZE),
-        parent: Some(cc1),
-    });
-    collections.insert(cc5, CellCollection {
-        starter_cell_position: Vec3::new(0.0, 0.0, 2.0 * -GLOBAL_CELL_SIZE),
-        parent: Some(cc1),
-    });
-
-
-
-
-    // GLOBAL_CELL_SIZE is a constant in cell.rs
-    let half_cell_size = GLOBAL_CELL_SIZE / 2.0;
-
-
-    let ocg: Vec<OcgEntry> = vec![
-        // starter cells for cell-collections
-        OcgEntry { collection_id: cc1, cell_type: CellType::RedCell,       offset: Vec3::new(0.0,  0.0,  0.0) },
-        OcgEntry { collection_id: cc2, cell_type: CellType::RedCell,      offset: Vec3::new(0.0, 0.0, 0.0) },
-        OcgEntry { collection_id: cc3, cell_type: CellType::RedCell,     offset: Vec3::new(0.0, 0.0, 0.0) },
-        OcgEntry { collection_id: cc4, cell_type: CellType::RedCell,     offset: Vec3::new(0.0, 0.0, 0.0) },
-        OcgEntry { collection_id: cc5, cell_type: CellType::RedCell,     offset: Vec3::new(0.0, 0.0, 0.0) },
-
-
-
-        // regular cells
-
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: Vec3::new(0.0,  GLOBAL_CELL_SIZE, 0.0) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: Vec3::new(0.0, -GLOBAL_CELL_SIZE, 0.0) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(0.0,  0.0,  GLOBAL_CELL_SIZE) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(0.0,  0.0,  -GLOBAL_CELL_SIZE) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE,  0.0,  0.0) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(-GLOBAL_CELL_SIZE,  0.0,  0.0) },
-
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: Vec3::new(0.0,  half_cell_size, half_cell_size) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: Vec3::new(half_cell_size, half_cell_size,  0.0) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(half_cell_size,  0.0, half_cell_size) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(0.0, -half_cell_size, -half_cell_size) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(-half_cell_size, -half_cell_size, 0.0) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(-half_cell_size, 0.0, -half_cell_size) },
-
-        OcgEntry { collection_id: cc1, cell_type: CellType::OrangeCell,    offset: Vec3::new(0.0,  -half_cell_size, half_cell_size) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::LightBlueCell, offset: Vec3::new(half_cell_size, -half_cell_size,  0.0) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(-half_cell_size, 0.0, half_cell_size) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(0.0, half_cell_size, -half_cell_size) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(-half_cell_size, half_cell_size,  0.0) },
-        OcgEntry { collection_id: cc1, cell_type: CellType::YellowCell,    offset: Vec3::new(half_cell_size, 0.0, -half_cell_size) },
-
-
-
-        // creating cells for first limb
-        OcgEntry { collection_id: cc2, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 1.0, 0.0, 0.0) },
-        OcgEntry { collection_id: cc2, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 2.0, 0.0, 0.0) },
-        OcgEntry { collection_id: cc2, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 2.0, 0.0, GLOBAL_CELL_SIZE) },
-        OcgEntry { collection_id: cc2, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 2.0, 0.0, GLOBAL_CELL_SIZE * 2.0) },
-        OcgEntry { collection_id: cc2, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 2.0, 0.0, GLOBAL_CELL_SIZE * 3.0) },
-        OcgEntry { collection_id: cc2, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 2.0, 0.0, GLOBAL_CELL_SIZE * 4.0) },
-
-
-
-
-
-        // creating cells for second limb
-        OcgEntry { collection_id: cc3, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * -1.0, 0.0, 0.0) },
-        OcgEntry { collection_id: cc3, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * -2.0, 0.0, 0.0) },
-        OcgEntry { collection_id: cc3, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * -2.0, 0.0, GLOBAL_CELL_SIZE) },
-        OcgEntry { collection_id: cc3, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * -2.0, 0.0, GLOBAL_CELL_SIZE * 2.0) },
-        OcgEntry { collection_id: cc3, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * -2.0, 0.0, GLOBAL_CELL_SIZE * 3.0) },
-        OcgEntry { collection_id: cc3, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * -2.0, 0.0, GLOBAL_CELL_SIZE * 4.0) },
-
-
-
-
-        
-        // third limb
-        OcgEntry { collection_id: cc4, cell_type: CellType::YellowCell,    offset: Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE * 1.0) },
-        OcgEntry { collection_id: cc4, cell_type: CellType::YellowCell,    offset: Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE * 2.0) },
-        OcgEntry { collection_id: cc4, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 1.0, 0.0, GLOBAL_CELL_SIZE * 2.0) },
-        OcgEntry { collection_id: cc4, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 2.0, 0.0, GLOBAL_CELL_SIZE * 2.0) },
-        OcgEntry { collection_id: cc4, cell_type: CellType::YellowCell,    offset: Vec3::new(GLOBAL_CELL_SIZE * 3.0, 0.0, GLOBAL_CELL_SIZE * 2.0) },
-
-
-
-
-        // fourth limb
-        OcgEntry { collection_id: cc5, cell_type: CellType::YellowCell,    offset: Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE * -1.0) },
-        OcgEntry { collection_id: cc5, cell_type: CellType::YellowCell,    offset: Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE * -2.0) },
-
-        ];
-
-
-
-    let mut orgs = vec![];
-
-    let mut rng = rand::rng();
-
-    for _i in 0..1000 {
-        let x = rng.random_range(0.0..1024.0);
-        let z = rng.random_range(0.0..1024.0);
-        let y = heightmap.height_at(x, z) + 10.0; // spawn 10 units above terrain
-        let org = create_organism(Vec3::new(x, y, z), &collections, &ocg);
-        orgs.push(org);
-    }
-
-
-
-    // Build mesh once from the template OCG (same body plan for all organisms)
-    let template_mesh_cells: Vec<MeshCell> = ocg.iter().map(|entry| {
-        let own_collection = &collections[&entry.collection_id];
-        let mesh_space_pos = own_collection.starter_cell_position + entry.offset;
-        MeshCell { mesh_space_pos, cell_type: entry.cell_type }
-    }).collect();
-    let shared_mesh_handle = meshes.add(merge_organism_mesh(template_mesh_cells));
-    let shared_material_handle = materials.add(StandardMaterial {
+    let shared_material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         ..default()
     });
 
-    let mut colony = Colony { organisms: orgs };
+    let mut rng = rand::rng();
 
-    for organism in &mut colony.organisms {
-        spawn_organism(organism, &mut commands, shared_mesh_handle.clone(), shared_material_handle.clone());
+    // ── Template 1: Flat Raft (Producer) — 350 organisms ─────────────────
+    let raft_cc = CollectionId(1);
+    let mut raft_collections = HashMap::new();
+    raft_collections.insert(raft_cc, CellCollection {
+        starter_cell_position: Vec3::ZERO,
+        parent: None,
+    });
+    let raft_ocg = vec![
+        OcgEntry { collection_id: raft_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(0.0, 0.0, 0.0) },
+        OcgEntry { collection_id: raft_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: raft_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: raft_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: raft_cc, cell_type: CellType::RedCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 0.0, GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: raft_cc, cell_type: CellType::RedCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 0.0, GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: raft_cc, cell_type: CellType::RedCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 0.0, -GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: raft_cc, cell_type: CellType::RedCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 0.0, -GLOBAL_CELL_SIZE) },
+    ];
+
+    // ── Template 2: Drifter (Aquatic Producer) — 300 organisms ───────────
+    let drift_cc = CollectionId(1);
+    let mut drift_collections = HashMap::new();
+    drift_collections.insert(drift_cc, CellCollection {
+        starter_cell_position: Vec3::ZERO,
+        parent: None,
+    });
+    let drift_ocg = vec![
+        OcgEntry { collection_id: drift_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(0.0, 0.0, 0.0) },
+        OcgEntry { collection_id: drift_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: drift_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: drift_cc, cell_type: CellType::FinCell, offset: Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: drift_cc, cell_type: CellType::FinCell, offset: Vec3::new(0.0, 0.0, -GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: drift_cc, cell_type: CellType::YellowCell, offset: Vec3::new(0.0, -GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: drift_cc, cell_type: CellType::YellowCell, offset: Vec3::new(0.0, -2.0 * GLOBAL_CELL_SIZE, 0.0) },
+    ];
+
+    // ── Template 3: Photospine (Vertical Producer) — 150 organisms ───────
+    let spine_cc = CollectionId(1);
+    let mut spine_collections = HashMap::new();
+    spine_collections.insert(spine_cc, CellCollection {
+        starter_cell_position: Vec3::ZERO,
+        parent: None,
+    });
+    let spine_ocg = vec![
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(0.0, 2.0 * GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 2.0 * GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 2.0 * GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::YellowCell, offset: Vec3::new(0.0, GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::YellowCell, offset: Vec3::new(0.0, 0.0, 0.0) },
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::FinCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::FinCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::OrangeCell, offset: Vec3::new(0.0, -GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: spine_cc, cell_type: CellType::OrangeCell, offset: Vec3::new(0.0, -2.0 * GLOBAL_CELL_SIZE, 0.0) },
+    ];
+
+    // ── Template 4: Crawler (Pre-predator) — 100 organisms ───────────────
+    let crawl_cc = CollectionId(1);
+    let mut crawl_collections = HashMap::new();
+    crawl_collections.insert(crawl_cc, CellCollection {
+        starter_cell_position: Vec3::ZERO,
+        parent: None,
+    });
+    let crawl_ocg = vec![
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(0.0, GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(GLOBAL_CELL_SIZE, GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::GutCell, offset: Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::GutCell, offset: Vec3::new(0.0, 0.0, 2.0 * GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::FootCell, offset: Vec3::new(GLOBAL_CELL_SIZE, -GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::FootCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, -GLOBAL_CELL_SIZE, 0.0) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::LightBlueCell, offset: Vec3::new(0.0, 0.0, 0.0) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::LightBlueCell, offset: Vec3::new(0.0, 0.0, -GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: crawl_cc, cell_type: CellType::LightBlueCell, offset: Vec3::new(0.0, -GLOBAL_CELL_SIZE, 0.0) },
+    ];
+
+    // ── Template 5: Armored Blob (Defensive) — 100 organisms ─────────────
+    let armor_cc = CollectionId(1);
+    let mut armor_collections = HashMap::new();
+    armor_collections.insert(armor_cc, CellCollection {
+        starter_cell_position: Vec3::ZERO,
+        parent: None,
+    });
+    let armor_ocg = vec![
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(0.0, 0.0, 0.0) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::PhotoCell, offset: Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::HardCell, offset: Vec3::new(2.0 * GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::HardCell, offset: Vec3::new(-2.0 * GLOBAL_CELL_SIZE, 0.0, 0.0) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::HardCell, offset: Vec3::new(0.0, 0.0, 2.0 * GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::HardCell, offset: Vec3::new(0.0, 0.0, -2.0 * GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::OrangeCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 0.0, GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::OrangeCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 0.0, -GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::RedCell, offset: Vec3::new(GLOBAL_CELL_SIZE, 0.0, -GLOBAL_CELL_SIZE) },
+        OcgEntry { collection_id: armor_cc, cell_type: CellType::RedCell, offset: Vec3::new(-GLOBAL_CELL_SIZE, 0.0, GLOBAL_CELL_SIZE) },
+    ];
+
+    // ── Spawn all templates ──────────────────────────────────────────────
+    let templates: Vec<(u32, &HashMap<CollectionId, CellCollection>, &Vec<OcgEntry>, f32, f32)> = vec![
+        (350, &raft_collections, &raft_ocg, 38.0, 42.0),      // Flat Raft
+        (300, &drift_collections, &drift_ocg, 35.0, 45.0),     // Drifter
+        (150, &spine_collections, &spine_ocg, 38.0, 42.0),     // Photospine
+        (100, &crawl_collections, &crawl_ocg, 20.0, 30.0),     // Crawler
+        (100, &armor_collections, &armor_ocg, 38.0, 42.0),     // Armored Blob
+    ];
+
+    for (count, collections, ocg, min_y_offset, max_y_offset) in &templates {
+        // Build shared mesh for this template
+        let template_mesh_cells: Vec<MeshCell> = ocg.iter().map(|entry| {
+            let coll = &collections[&entry.collection_id];
+            MeshCell { mesh_space_pos: coll.starter_cell_position + entry.offset, cell_type: entry.cell_type }
+        }).collect();
+        let mesh_handle = meshes.add(merge_organism_mesh(template_mesh_cells));
+
+        for _ in 0..*count {
+            let x = rng.random_range(0.0..1024.0);
+            let z = rng.random_range(0.0..1024.0);
+            let terrain_y = heightmap.height_at(x, z);
+            let y_offset = min_y_offset + rng.random_range(0.0..(max_y_offset - min_y_offset));
+            let y = terrain_y + y_offset;
+            let mut org = create_organism(Vec3::new(x, y, z), collections, ocg);
+            spawn_organism(&mut org, &mut commands, mesh_handle.clone(), shared_material.clone());
+        }
     }
 }
 
