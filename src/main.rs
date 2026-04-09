@@ -5,6 +5,12 @@ mod colony;
 mod cell;
 mod movement;
 mod organism_collision;
+mod energy;
+mod reproduction;
+mod environment;
+mod water;
+mod predation;
+mod growth;
 
 use bevy::{
     prelude::*,
@@ -58,6 +64,11 @@ fn main() {
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
         .add_plugins(movement::MovementPlugin::with_mode(movement_mode))
         .add_plugins(colony::ColonyPlugin)
+        .add_plugins(energy::EnergyPlugin)
+        .add_plugins(reproduction::ReproductionPlugin)
+        .add_plugins(water::WaterPlugin)
+        .add_plugins(predation::PredationPlugin)
+        .add_plugins(growth::GrowthPlugin)
 
         //.add_plugins(EguiPlugin::default())
         //.add_plugins(WorldInspectorPlugin::new())
