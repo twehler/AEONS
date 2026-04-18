@@ -19,7 +19,7 @@ const CELL_CONTACT_RADIUS: f32 = GLOBAL_CELL_SIZE * 1.1;
 // Fraction of movement speed converted into a deflection push on contact.
 const PUSH_STRENGTH: f32 = 1.0;
 
-const ORGANISM_COLLISION_TIMER: f32 = 0.1; // in milliseconds
+const ORGANISM_COLLISION_TIMER: f32 = 0.1; // in seconds
 
 
 // ── Timer resource ────────────────────────────────────────────────────────────
@@ -79,8 +79,8 @@ struct OrganismSnapshot {
 }
 
 // Builds a snapshot for one organism by computing all cell world positions
-// from grown_cells (the OCG slice representing currently present cells).
-// Using grown_cells instead of active_cells means juvenile organisms with
+// from the grown OCG slice (ocg[..grown_cell_count]).
+// Using the grown subset instead of active_cells means juvenile organisms with
 // partially grown bodies are handled correctly — only existing cells collide.
 fn snapshot(
     entity:    Entity,
@@ -90,7 +90,7 @@ fn snapshot(
     // Build a map from CollectionId → list of cell world positions
     let mut coll_cells: HashMap<CollectionId, (Vec3, Vec<Vec3>)> = HashMap::new();
 
-    for entry in &organism.grown_cells {
+    for entry in &organism.ocg[..organism.grown_cell_count] {
         if let Some(collection) = organism.collections.get(&entry.collection_id) {
             // mesh_space_pos is the cell's local position relative to the organism root
             let mesh_space_pos = collection.starter_cell_position + Vec3::from(entry.offset);

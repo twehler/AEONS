@@ -7,7 +7,7 @@ use bevy::mesh::VertexAttributeValues;
 use crate::viewport_settings::ShowGizmo;
 use std::collections::HashSet;
 
-pub const GLOBAL_CELL_SIZE: f32 = 3.5;
+pub const GLOBAL_CELL_SIZE: f32 = 2.0;
 
 #[derive(Component)]
 pub struct OrganismMesh;
@@ -23,6 +23,11 @@ pub enum CellType {
     YellowCell,
     OrangeCell,
     LightBlueCell,
+    PhotoCell,
+    GutCell,
+    HardCell,
+    FootCell,
+    FinCell,
 }
 
 impl CellType {
@@ -34,6 +39,11 @@ impl CellType {
             Self::YellowCell    => Color::from(Srgba::hex("ffff00").unwrap()),
             Self::OrangeCell    => Color::from(Srgba::hex("ff8000").unwrap()),
             Self::LightBlueCell => Color::from(Srgba::hex("00ffee").unwrap()),
+            Self::PhotoCell     => Color::from(Srgba::hex("22cc22").unwrap()),
+            Self::GutCell       => Color::from(Srgba::hex("880022").unwrap()),
+            Self::HardCell      => Color::from(Srgba::hex("888888").unwrap()),
+            Self::FootCell      => Color::from(Srgba::hex("8B4513").unwrap()),
+            Self::FinCell       => Color::from(Srgba::hex("66ccff").unwrap()),
         }
     }
 
@@ -45,8 +55,83 @@ impl CellType {
             Self::YellowCell    => GLOBAL_CELL_SIZE,
             Self::OrangeCell    => GLOBAL_CELL_SIZE,
             Self::LightBlueCell => GLOBAL_CELL_SIZE,
+            Self::PhotoCell     => GLOBAL_CELL_SIZE,
+            Self::GutCell       => GLOBAL_CELL_SIZE,
+            Self::HardCell      => GLOBAL_CELL_SIZE,
+            Self::FootCell      => GLOBAL_CELL_SIZE,
+            Self::FinCell       => GLOBAL_CELL_SIZE,
         }
     }
+
+    pub fn properties(&self) -> CellProperties {
+        match self {
+            Self::BlueCell | Self::RedCell | Self::GreenCell |
+            Self::YellowCell | Self::OrangeCell | Self::LightBlueCell => CellProperties {
+                energy_cost: 0.05,
+                mass: 1.0,
+                armor: 0.0,
+                friction: 1.0,
+                thrust: 0.0,
+                photosynthesis: 0.0,
+                digestion: 0.0,
+            },
+            Self::PhotoCell => CellProperties {
+                energy_cost: 0.03,
+                mass: 0.8,
+                armor: 0.0,
+                friction: 0.5,
+                thrust: 0.0,
+                photosynthesis: 0.5,
+                digestion: 0.0,
+            },
+            Self::GutCell => CellProperties {
+                energy_cost: 0.08,
+                mass: 1.2,
+                armor: 0.0,
+                friction: 1.0,
+                thrust: 0.0,
+                photosynthesis: 0.0,
+                digestion: 2.0,
+            },
+            Self::HardCell => CellProperties {
+                energy_cost: 0.04,
+                mass: 2.0,
+                armor: 0.5,
+                friction: 1.0,
+                thrust: 0.0,
+                photosynthesis: 0.0,
+                digestion: 0.0,
+            },
+            Self::FootCell => CellProperties {
+                energy_cost: 0.06,
+                mass: 1.5,
+                armor: 0.1,
+                friction: 3.0,
+                thrust: 0.0,
+                photosynthesis: 0.0,
+                digestion: 0.0,
+            },
+            Self::FinCell => CellProperties {
+                energy_cost: 0.04,
+                mass: 0.6,
+                armor: 0.0,
+                friction: 0.3,
+                thrust: 2.5,
+                photosynthesis: 0.0,
+                digestion: 0.0,
+            },
+        }
+    }
+}
+
+pub struct CellProperties {
+    pub energy_cost: f32,
+    pub mass: f32,
+    pub armor: f32,
+    pub friction: f32,
+    pub thrust: f32,
+    pub photosynthesis: f32,
+    pub digestion: f32,
 }
 
 
@@ -123,13 +208,15 @@ pub const ALL_NEIGHBOUR_OFFSETS: [[i32; 3]; 12] = FACE_NEIGHBOURS;
 // Converts a continuous mesh-space position to a grid key for HashSet lookup.
 // We round to the nearest integer, with a tolerance to handle float imprecision.
 // The grid step size is 1.0 (cells are placed at integer offsets in the OCG).
-fn quantise(pos: Vec3) -> [i32; 3] {
 
-    let epsilon = 1e-6;
+
+
+fn quantise(pos: Vec3) -> [i32; 3] {
+    let half = GLOBAL_CELL_SIZE / 2.0;
     [
-        ((pos.x + epsilon)).floor() as i32,
-        ((pos.y + epsilon)).floor() as i32,
-        ((pos.z + epsilon)).floor() as i32,
+        (pos.x / half).round() as i32,
+        (pos.y / half).round() as i32,
+        (pos.z / half).round() as i32,
     ]
 }
 

@@ -1,8 +1,9 @@
 use bevy::prelude::*;
+use bevy::transform::TransformSystems;
 
 use crate::world_geometry::{HeightmapSampler, BlockWorld};
 use crate::colony::*;
-use crate::cell::CellType;
+use crate::cell::{CellType, GLOBAL_CELL_SIZE};
 use std::collections::HashSet;
 use rand::prelude::*;
 use crate::organism_collision;
@@ -25,28 +26,32 @@ impl MovementPlugin {
 
 impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
-        // Remove: app.insert_resource(RandomDirectionTimer::default());
         app.insert_resource(self.mode);
         app.insert_resource(organism_collision::OrganismCollisionTimer::default());
 
-        // Add common systems
-        app.add_systems(PostUpdate, ( 
-            apply_movement,
+        // Core physics chain:
+        //   movement runs before transform propagation,
+        //   floor collision + world bounds run after propagation (need correct GlobalTransform)
+        app.add_systems(PostUpdate,
+            apply_movement.before(TransformSystems::Propagate)
+        );
+        app.add_systems(PostUpdate, (
             apply_floor_collision,
             apply_world_bounds,
-        ).chain());
+        ).chain().after(TransformSystems::Propagate));
 
         app.add_systems(Last, organism_collision::apply_organism_collision);
-        
-        // Add mode-specific systems based on the plugin's stored mode
+
         match self.mode {
             MovementMode::TwoD => {
                 app.add_systems(PostUpdate, random_2d_direction.before(apply_movement));
-                app.add_systems(PostUpdate, apply_gravity.after(apply_floor_collision));
+                // Gravity runs before movement; floor collision (after propagation) has final say
+                app.add_systems(PostUpdate, apply_gravity
+                    .after(random_2d_direction)
+                    .before(apply_movement));
             }
             MovementMode::ThreeD => {
                 app.add_systems(PostUpdate, random_3d_direction.before(apply_movement));
-                // No gravity system in 3D mode
             }
         }
     }
@@ -142,18 +147,32 @@ fn random_3d_direction(
 const GRAVITY: f32 = 9.8;
 
 
+const MAX_CLIMB_HEIGHT: f32 = 4.0; // max ~1 block climb
+
 fn apply_movement(
     time: Res<Time>,
     blockworld: Res<BlockWorld>,
+    heightmap: Res<HeightmapSampler>,
     mut query: Query<(&mut Transform, &mut Organism), With<OrganismRoot>>,
 ) {
     let dt = time.delta_secs();
-    
+
     for (mut transform, mut organism) in &mut query {
         let move_vector = organism.movement_direction * organism.movement_speed * dt;
+
+        // Early exit: skip wall check if organism is well above terrain
+        let floor_y = heightmap.height_at(transform.translation.x, transform.translation.z);
+        if transform.translation.y - organism.bounding_radius > floor_y + 2.0 {
+            // Organism is floating above terrain, no walls possible
+            organism.is_climbing = false;
+            transform.translation.x += move_vector.x;
+            transform.translation.z += move_vector.z;
+            continue;
+        }
+
         let mut is_blocked = false;
         let mut climb_needed = 0.0f32;
-        
+
         // Check if there's a wall in the movement direction
         for (local_pos, cell_type) in &organism.active_cells {
             let world_pos = transform.transform_point(*local_pos);
@@ -189,10 +208,13 @@ fn apply_movement(
         // Update climbing flag based on wall detection
         organism.is_climbing = is_blocked;
         
-        if is_blocked && climb_needed > 0.0 {
-            // Wall in movement direction: climb at full speed (gravity will be disabled)
+        if is_blocked && climb_needed > 0.0 && climb_needed <= MAX_CLIMB_HEIGHT {
+            // Wall in movement direction, climbable: climb at full speed
             let climb_amount = (organism.movement_speed * dt).min(climb_needed);
             transform.translation.y += climb_amount;
+        } else if is_blocked {
+            // Wall too tall to climb, just stop
+            organism.is_climbing = false;
         } else {
             // No wall: move in the desired horizontal direction
             transform.translation.x += move_vector.x;
@@ -210,21 +232,19 @@ fn apply_movement(
 fn apply_gravity(
     mode: Res<MovementMode>,
     time: Res<Time>,
-    mut query: Query<(&mut Transform, &Organism), With<OrganismRoot>>,
+    mut query: Query<(&mut Transform, &mut Organism), With<OrganismRoot>>,
 ) {
     // If in 3D mode, never apply gravity
     if *mode == MovementMode::ThreeD {
         return;
     }
-    
-    // Otherwise (2D mode), apply gravity normally
+
     let dt = time.delta_secs();
-    let gravity_fall = GRAVITY * dt;
-    
-    for (mut transform, organism) in &mut query {
-        // Only apply gravity if not climbing
+
+    for (mut transform, mut organism) in &mut query {
         if !organism.is_climbing {
-            transform.translation.y -= gravity_fall;
+            organism.velocity.y -= GRAVITY * dt;
+            transform.translation.y += organism.velocity.y * dt;
         }
     }
 }
@@ -233,25 +253,19 @@ fn apply_gravity(
 fn apply_floor_collision(
     heightmap: Res<HeightmapSampler>,
     // We need GlobalTransform for the joints, but Transform for the Root (to move it)
-    mut query: Query<(&mut Transform, &Organism), With<OrganismRoot>>,
+    mut query: Query<(&mut Transform, &mut Organism), With<OrganismRoot>>,
     joint_query: Query<&GlobalTransform, Without<OrganismRoot>>,
 ) {
-    for (mut root_transform, organism) in &mut query {
+    for (mut root_transform, mut organism) in &mut query {
         let mut max_penetration = 0.0f32;
 
-        // Iterate over the "living" subset of the OCG
-        for entry in &organism.grown_cells {
-            // 1. Get the world transform of the specific collection/joint this cell belongs to
-            if let Some(&joint_entity) = organism.joint_entities.get(&entry.collection_id) {
+        // Iterate over precomputed floor cells (lowest Y per collection)
+        for (collection_id, offset) in &organism.floor_cells {
+            if let Some(&joint_entity) = organism.joint_entities.get(collection_id) {
                 if let Ok(joint_global) = joint_query.get(joint_entity) {
-                    
-                    // 2. Calculate world position: Transform the local offset by the bone's world transform
-                    let world_pos = joint_global.transform_point(entry.offset);
-                    
-                    // 3. Calculate penetration based on cell size
-                    let cell_bottom = world_pos.y - entry.cell_type.size() / 2.0;
+                    let world_pos = joint_global.transform_point(*offset);
+                    let cell_bottom = world_pos.y - GLOBAL_CELL_SIZE / 2.0;
                     let floor_y = heightmap.height_at(world_pos.x, world_pos.z);
-
                     let penetration = floor_y - cell_bottom;
                     if penetration > max_penetration {
                         max_penetration = penetration;
@@ -260,9 +274,13 @@ fn apply_floor_collision(
             }
         }
 
-        // 4. Push the entire OrganismRoot up by the largest penetration found
+        // Push the entire OrganismRoot up by the largest penetration found
         if max_penetration > 0.0 {
             root_transform.translation.y += max_penetration;
+            // Zero out downward velocity when on ground
+            if organism.velocity.y < 0.0 {
+                organism.velocity.y = 0.0;
+            }
         }
     }
 }
@@ -275,9 +293,9 @@ fn apply_world_bounds(
     mut query: Query<&mut Transform, With<OrganismRoot>>,
 ) {
     let min_x = heightmap.min_x as f32;
-    let max_x = (heightmap.min_x + heightmap.width as i32) as f32;
+    let max_x = (heightmap.min_x + heightmap.width as i32 - 1) as f32;
     let min_z = heightmap.min_z as f32;
-    let max_z = (heightmap.min_z + heightmap.depth as i32) as f32;
+    let max_z = (heightmap.min_z + heightmap.depth as i32 - 1) as f32;
 
     for mut transform in &mut query {
         transform.translation.x = transform.translation.x.clamp(min_x, max_x);
