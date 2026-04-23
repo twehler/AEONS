@@ -11,7 +11,7 @@ mod environment;
 mod water;
 mod predation;
 mod growth;
-mod tree;
+mod behaviour;
 
 use bevy::{
     prelude::*,
@@ -45,7 +45,7 @@ fn main() {
 
     let mut app = App::new();
 
-    let movement_mode = movement::MovementMode::TwoD;
+    let movement_mode = movement::MovementMode::ThreeD;
 
     app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {
@@ -66,11 +66,11 @@ fn main() {
         .add_plugins(movement::MovementPlugin::with_mode(movement_mode))
         .add_plugins(colony::ColonyPlugin)
         .add_plugins(energy::EnergyPlugin)
-        .add_plugins(reproduction::ReproductionPlugin)
+        //.add_plugins(reproduction::ReproductionPlugin)
         .add_plugins(water::WaterPlugin)
         .add_plugins(predation::PredationPlugin)
         .add_plugins(growth::GrowthPlugin)
-        .add_plugins(tree::TreePlugin)
+        .add_plugins(behaviour::BehaviourPlugin)
 
         //.add_plugins(EguiPlugin::default())
         //.add_plugins(WorldInspectorPlugin::new())

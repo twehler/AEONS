@@ -2,22 +2,18 @@ use bevy::prelude::*;
 use crate::colony::*;
 use crate::cell::{CellType, GLOBAL_CELL_SIZE, MeshCell, merge_organism_mesh, OrganismMesh};
 use crate::viewport_settings::ShowGizmo;
+use crate::movement::*;
 use std::collections::HashMap;
 use rand::prelude::*;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const REPRODUCTION_CHECK_INTERVAL: f32 = 2.0;
-const REPRODUCTION_ENERGY_FRACTION: f32 = 0.8;  // must have 80% of max energy
+const REPRODUCTION_ENERGY_FRACTION: f32 = 0.8; // must have 80% of max energy
 const OFFSPRING_ENERGY_FRACTION: f32 = 0.4;     // each offspring gets 40%
+const MUTATION_RATE: f32 = 1.0;                 // per cell per reproduction
 const MAX_ENERGY_PER_CELL: f32 = 10.0;
 const SPAWN_OFFSET: f32 = 5.0;                  // how far apart offspring spawn
-
-// ── Evolution Limits & Biases ────────────────────────────────────────────────
-const MUTATION_RATE: f32 = 0.85;                // 85% chance for a mutation event to occur per birth
-const GROWTH_BIAS: f32 = 0.65;                  // 65% chance to grow vs 35% chance to shrink/change
-const MAX_COLLECTIONS: usize = 64;              // Maximum 64 cell collections
-const MAX_CELLS_PER_COLLECTION: usize = 32;     // Maximum 32 cells per collection
 
 // ── Timer resource ───────────────────────────────────────────────────────────
 
@@ -56,86 +52,43 @@ const ALL_CELL_TYPES: [CellType; 11] = [
 
 fn mutate_ocg(ocg: &[OcgEntry], collections: &HashMap<CollectionId, CellCollection>) -> (Vec<OcgEntry>, HashMap<CollectionId, CellCollection>) {
     let mut rng = rand::rng();
-    let mut new_ocg = ocg.to_vec();
+    let mut new_ocg: Vec<OcgEntry> = Vec::with_capacity(ocg.len());
     let mut new_collections = collections.clone();
 
-    // 1. Check if a mutation event happens at all
-    if rng.random::<f32>() > MUTATION_RATE {
-        return (new_ocg, new_collections);
-    }
+    for entry in ocg {
+        let roll: f32 = rng.random();
 
-    // 2. Decide if the mutation adds to the organism (Growth) or modifies/removes (Shrinkage)
-    if rng.random::<f32>() < GROWTH_BIAS {
-        // --- GROWTH EVENT ---
-        
-        // Count how many cells are in each collection
-        let mut coll_counts = HashMap::new();
-        for entry in &new_ocg {
-            *coll_counts.entry(entry.collection_id).or_insert(0) += 1;
-        }
-
-        // Pick a random existing collection to branch off of
-        if let Some(&coll_id) = new_collections.keys().choose(&mut rng) {
-            let count = coll_counts.get(&coll_id).copied().unwrap_or(0);
-            
-            // If the collection has space, add a cell to it
-            if count < MAX_CELLS_PER_COLLECTION {
-                let parents: Vec<_> = new_ocg.iter().filter(|e| e.collection_id == coll_id).collect();
-                if let Some(parent) = parents.choose(&mut rng) {
-                    let directions = [
-                        Vec3::new(GLOBAL_CELL_SIZE, 0.0, 0.0),
-                        Vec3::new(-GLOBAL_CELL_SIZE, 0.0, 0.0),
-                        Vec3::new(0.0, GLOBAL_CELL_SIZE, 0.0),
-                        Vec3::new(0.0, -GLOBAL_CELL_SIZE, 0.0),
-                        Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE),
-                        Vec3::new(0.0, 0.0, -GLOBAL_CELL_SIZE),
-                    ];
-                    let dir = directions.choose(&mut rng).unwrap();
-                    let new_type = ALL_CELL_TYPES[rng.random_range(0..ALL_CELL_TYPES.len())];
-                    
-                    new_ocg.push(OcgEntry {
-                        collection_id: coll_id,
-                        cell_type: new_type,
-                        offset: parent.offset + *dir,
-                    });
-                }
-            } 
-            // If the collection is full, try to add a brand new collection instead
-            else if new_collections.len() < MAX_COLLECTIONS {
-                // Generate a safe new ID
-                let next_id_val = new_collections.keys().map(|id| id.0).max().unwrap_or(0) + 1;
-                let new_id = CollectionId(next_id_val);
-                
-                new_collections.insert(new_id, CellCollection {
-                    starter_cell_position: Vec3::new(
-                        rng.random_range(-2.0..2.0), 
-                        rng.random_range(-2.0..2.0), 
-                        rng.random_range(-2.0..2.0)
-                    ),
-                    parent: Some(coll_id),
-                });
-                
-                new_ocg.push(OcgEntry {
-                    collection_id: new_id,
-                    cell_type: ALL_CELL_TYPES[rng.random_range(0..ALL_CELL_TYPES.len())],
-                    offset: Vec3::ZERO,
-                });
-            }
-        }
-    } else {
-        // --- SHRINKAGE / MODIFICATION EVENT ---
-        if new_ocg.len() > 1 {
-            let idx = rng.random_range(0..new_ocg.len());
-            // 50% chance to delete the cell entirely, 50% chance to just change its type
-            if rng.random::<bool>() {
-                new_ocg.remove(idx);
-            } else {
-                new_ocg[idx].cell_type = ALL_CELL_TYPES[rng.random_range(0..ALL_CELL_TYPES.len())];
-            }
+        if roll < MUTATION_RATE * 0.3 {
+            continue;
+        } else if roll < MUTATION_RATE * 0.6 {
+            let new_type = ALL_CELL_TYPES[rng.random_range(0..ALL_CELL_TYPES.len())];
+            new_ocg.push(OcgEntry {
+                collection_id: entry.collection_id,
+                cell_type: new_type,
+                offset: entry.offset,
+            });
+        } else if roll < MUTATION_RATE {
+            new_ocg.push(entry.clone());
+            let directions = [
+                Vec3::new(GLOBAL_CELL_SIZE, 0.0, 0.0),
+                Vec3::new(-GLOBAL_CELL_SIZE, 0.0, 0.0),
+                Vec3::new(0.0, GLOBAL_CELL_SIZE, 0.0),
+                Vec3::new(0.0, -GLOBAL_CELL_SIZE, 0.0),
+                Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE),
+                Vec3::new(0.0, 0.0, -GLOBAL_CELL_SIZE),
+            ];
+            let dir = directions[rng.random_range(0..directions.len())];
+            let new_type = ALL_CELL_TYPES[rng.random_range(0..ALL_CELL_TYPES.len())];
+            new_ocg.push(OcgEntry {
+                collection_id: entry.collection_id,
+                cell_type: new_type,
+                offset: entry.offset + dir,
+            });
+        } else {
+            new_ocg.push(entry.clone());
         }
     }
 
-    // Safety fallback: Ensure at least 1 cell survives
     if new_ocg.is_empty() && !ocg.is_empty() {
         new_ocg.push(ocg[0].clone());
     }
@@ -219,14 +172,10 @@ fn reproduction_system(
         let threshold = max_energy * REPRODUCTION_ENERGY_FRACTION;
 
         if organism.energy >= threshold {
-            // Parent loses energy for reproduction
             let offspring_energy = max_energy * OFFSPRING_ENERGY_FRACTION;
-            organism.energy -= offspring_energy * 2.0; // energy for both offspring (one replaces parent conceptually)
+            organism.energy -= offspring_energy * 2.0;
 
-            // Mutate OCG for offspring
             let (child_ocg, child_collections) = mutate_ocg(&organism.ocg, &organism.collections);
-
-            // Spawn offset perpendicular to movement direction
             let perp = Vec3::new(-organism.movement_direction.z, 0.0, organism.movement_direction.x);
             let spawn_pos = transform.translation + perp * SPAWN_OFFSET;
 
@@ -239,7 +188,6 @@ fn reproduction_system(
 
     births.truncate(spawn_budget);
 
-    // Spawn offspring outside the query borrow
     let shared_material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         ..default()
@@ -250,6 +198,11 @@ fn reproduction_system(
         let angle = rng.random::<f32>() * std::f32::consts::TAU;
         let direction = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize();
         let speed = rng.random::<f32>() * 20.0;
+
+        // NEW: Random initial rotation and speed for offspring
+        let rot_angle = rng.random::<f32>() * std::f32::consts::TAU;
+        let target_rotation = Quat::from_rotation_y(rot_angle);
+        let rotation_speed = 1.0 + rng.random::<f32>() * 2.0;
 
         let floor_cells = compute_floor_cells(&ocg, &collections);
         let bounding_radius = compute_bounding_radius(&ocg, &collections);
@@ -263,7 +216,6 @@ fn reproduction_system(
         let grown_cell_count = ocg.len();
         let mesh_handle = build_mesh_for_ocg(&ocg, &collections, &mut meshes);
 
-        // Spawn joint entities
         let joint_entities: HashMap<CollectionId, Entity> = collections.iter()
             .map(|(&id, coll)| {
                 let entity = commands.spawn((
@@ -290,19 +242,24 @@ fn reproduction_system(
             velocity: Vec3::ZERO,
             floor_cells,
             bounding_radius,
+            // NEW: Assign rotation fields
+            target_rotation,
+            rotation_speed,
         };
 
-        let random_interval = 1.0 + rng.random::<f32>() * 9.0;
+        let random_interval_dir = 1.0 + rng.random::<f32>() * 9.0;
+        let random_interval_rot = 1.0 + rng.random::<f32>() * 9.0; 
 
         let organism_root = commands.spawn((
-            Transform::from_translation(pos),
+            // NEW: Spawn with initial rotation
+            Transform::from_translation(pos).with_rotation(target_rotation),
             Visibility::Visible,
             OrganismRoot,
             organism,
-            DirectionTimer::new(random_interval),
+            DirectionTimer::new(random_interval_dir),
+            RotationTimer::new(random_interval_rot), 
         )).id();
 
-        // Wire joint hierarchy
         for (&id, coll) in &collections {
             let joint_entity = joint_entities[&id];
             match coll.parent {
@@ -315,7 +272,6 @@ fn reproduction_system(
             }
         }
 
-        // Spawn mesh
         let mesh_entity = commands.spawn((
             Mesh3d(mesh_handle),
             MeshMaterial3d(shared_material.clone()),
