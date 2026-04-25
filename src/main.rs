@@ -45,7 +45,7 @@ fn main() {
 
     let mut app = App::new();
 
-    let movement_mode = movement::MovementMode::ThreeD;
+    let movement_mode = movement::MovementMode::TwoD;
 
     app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {

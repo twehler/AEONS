@@ -1,7 +1,17 @@
 use bevy::prelude::*;
 use crate::colony::*;
 use crate::cell::GLOBAL_CELL_SIZE;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+// ── Events ────────────────────────────────────────────────────────────────────
+
+// Fired whenever two organisms physically touch. 
+// Used by predation.rs and any future interaction logic.
+#[derive(Message, Clone, Copy)]
+pub struct OrganismContactEvent {
+    pub a: Entity,
+    pub b: Entity,
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -20,7 +30,6 @@ const CELL_CONTACT_RADIUS: f32 = GLOBAL_CELL_SIZE * 1.1;
 const PUSH_STRENGTH: f32 = 1.0;
 
 const ORGANISM_COLLISION_TIMER: f32 = 0.1; // in seconds
-
 
 // ── Timer resource ────────────────────────────────────────────────────────────
 
@@ -118,28 +127,12 @@ fn snapshot(
     }
 }
 
-
-
 // ── Main system ───────────────────────────────────────────────────────────────
 
-// Three-phase hierarchical collision:
-//
-//   Broad phase  — organism root vs organism root (O(n log n) with spatial hash)
-//                  Skips any pair whose roots are farther than ORGANISM_BROAD_RADIUS.
-//
-//   Mid phase    — collection starter vs collection starter (only for broad-passing pairs)
-//                  Skips any collection pair farther than COLLECTION_MID_RADIUS.
-//                  This is the key performance gate: organisms with many collections
-//                  only pay for per-cell work on the collections that are actually close.
-//
-//   Narrow phase — cell vs cell (only for mid-passing collection pairs)
-//                  Uses a spatial hash of one side's cells, probes with the other side.
-//                  Produces deflection pushes accumulated into movement_direction.
-//
-// Pushes are applied after all detection is complete to avoid order-dependent results.
 pub fn apply_organism_collision(
     time:       Res<Time>,
     mut timer:  ResMut<OrganismCollisionTimer>,
+    mut contact_events: MessageWriter<OrganismContactEvent>, // The event writer
     mut params: ParamSet<(
         Query<(&Organism, &Transform, Entity), With<OrganismRoot>>,
         Query<&mut Organism, With<OrganismRoot>>,
@@ -151,9 +144,6 @@ pub fn apply_organism_collision(
     }
 
     // ── Snapshot all organisms ────────────────────────────────────────────────
-    // Capture everything we need immutably before entering the collision loop.
-    // This avoids mid-loop re-borrows of the query and makes the borrow checker
-    // happy when we later switch to the mutable query for push application.
     let snapshots: Vec<OrganismSnapshot> = params.p0()
         .iter()
         .map(|(organism, transform, entity)| snapshot(entity, organism, transform))
@@ -170,6 +160,10 @@ pub fn apply_organism_collision(
 
     // Accumulate deflection pushes: entity → total push vector
     let mut pushes: HashMap<Entity, Vec3> = HashMap::new();
+    
+    // Track which pairs have already triggered an event this frame 
+    // to prevent spamming if multiple cells touch.
+    let mut emitted_events: HashSet<(Entity, Entity)> = HashSet::new();
 
     // ── Pair loop ─────────────────────────────────────────────────────────────
     for (idx_a, snap_a) in snapshots.iter().enumerate() {
@@ -194,8 +188,8 @@ pub fn apply_organism_collision(
                 }
 
                 // ── Mid phase: collection-pair loop ───────────────────────────
-                for (id_a, starter_a, cells_a) in &snap_a.collections {
-                    for (id_b, starter_b, cells_b) in &snap_b.collections {
+                for (_, starter_a, cells_a) in &snap_a.collections {
+                    for (_, starter_b, cells_b) in &snap_b.collections {
 
                         let collection_dist = starter_a.distance(*starter_b);
                         if collection_dist >= COLLECTION_MID_RADIUS {
@@ -203,9 +197,6 @@ pub fn apply_organism_collision(
                         }
 
                         // ── Narrow phase: cell-level spatial hash ─────────────
-                        // Hash side-A cells, probe with side-B cells.
-                        // Bucket size = CELL_CONTACT_RADIUS so a single
-                        // neighbour_keys probe covers all possible contacts.
                         let mut cell_grid: HashMap<[i32; 3], Vec<Vec3>> = HashMap::new();
                         for &cell_pos_a in cells_a {
                             cell_grid
@@ -222,11 +213,28 @@ pub fn apply_organism_collision(
                                 let Some(a_cells) = cell_grid.get(&nk) else { continue };
 
                                 for &cell_pos_a in a_cells {
-                                    let dist = cell_pos_b.distance(cell_pos_a); // standard Euclidian distance function of Bevy
+                                    let dist = cell_pos_b.distance(cell_pos_a);
                                     if dist >= CELL_CONTACT_RADIUS || dist < 1e-6 {
                                         continue;
                                     }
 
+                                    // ── FIRE COLLISION EVENT ──────────────────────
+                                    // Order entities deterministically so (A,B) and (B,A) hash identically
+                                    let pair = if snap_a.entity < snap_b.entity {
+                                        (snap_a.entity, snap_b.entity)
+                                    } else {
+                                        (snap_b.entity, snap_a.entity)
+                                    };
+
+                                    if !emitted_events.contains(&pair) {
+                                        emitted_events.insert(pair);
+                                        contact_events.write(OrganismContactEvent {
+                                            a: snap_a.entity,
+                                            b: snap_b.entity,
+                                        });
+                                    }
+
+                                    // ── PHYSICS PUSH ──────────────────────────────
                                     // Push direction: B away from A
                                     let push_dir = (cell_pos_b - cell_pos_a).normalize();
 
@@ -250,17 +258,12 @@ pub fn apply_organism_collision(
     }
 
     // ── Apply pushes ──────────────────────────────────────────────────────────
-    // p0 is fully released; p1 (mutable) is now safe to access.
-
-
     let mut write_query = params.p1();
     for (entity, push_vec) in &pushes {
-    let Ok(mut organism) = write_query.get_mut(*entity) else { continue };
-    let new_dir = organism.movement_direction + *push_vec;
-    if new_dir.length_squared() > 1e-6 {
-        organism.movement_direction = new_dir.normalize();
+        let Ok(mut organism) = write_query.get_mut(*entity) else { continue };
+        let new_dir = organism.movement_direction + *push_vec;
+        if new_dir.length_squared() > 1e-6 {
+            organism.movement_direction = new_dir.normalize();
+        }
     }
-}
-
-
 }

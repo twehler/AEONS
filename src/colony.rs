@@ -94,7 +94,7 @@ fn photoautotroph_template() -> TemplateData {
         OcgEntry { collection_id: cc, cell_type: CellType::PhotoCell, offset: Vec3::ZERO },
     ];
 
-    TemplateData { count: 200, collections, ocg, spawn_y: 2.0 }
+    TemplateData { count: 900, collections, ocg, spawn_y: 1.0 }
 }
 
 /// Heterotroph — Compact 18-cell predatory blob.
@@ -134,7 +134,7 @@ fn heterotroph_template() -> TemplateData {
         OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( -g, 0.0,  -g) },
     ];
 
-    TemplateData { count: 200, collections, ocg, spawn_y: 1.0 }
+    TemplateData { count: 20, collections, ocg, spawn_y: 1.0 }
 }
 
 // ── Spawning ──────────────────────────────────────────────────────────────────
