@@ -25,7 +25,7 @@ pub type MyBackend = Cuda;
 pub type MyAutodiffBackend = Autodiff<MyBackend>;
 use burn::backend::Autodiff;
 
-use crate::colony::{Organism, OrganismRoot, Heterotroph, Photoautotroph};
+use crate::colony::{Organism, OrganismRoot, Heterotroph, Photoautotroph, MAXIMUM_ORGANISMS};
 
 
 
@@ -33,6 +33,45 @@ use crate::colony::{Organism, OrganismRoot, Heterotroph, Photoautotroph};
 
 const SCAN_RADIUS: f32 = 30.0;
 const MAX_NEIGHBORS: usize = 16; // Fixed size for fast tensor batching
+
+
+// ── Warmup Logic ────────────────────────────────────────────────────────────
+
+fn warmup_gnn_cache(device: &CudaDevice) {
+    // Cast the u32 constant to usize, as Burn requires usize for tensor shapes.
+    let batch_size = MAXIMUM_ORGANISMS as usize;
+    
+    println!("🔥 Priming GNN training kernels for fixed batch size: {}...", batch_size);
+    
+    // 1. Initialize the dummy model and optimizer
+    let model = GnnPursuitModel::<MyAutodiffBackend>::new(device);
+    let mut optimizer: Box<dyn ModelOptimizer> = Box::new(AdamConfig::new().init());
+    
+    // 2. We no longer loop! We only generate EXACTLY the one shape the GNN will ever see.
+    let input_tensor = Tensor::<MyAutodiffBackend, 3>::zeros([batch_size, MAX_NEIGHBORS, 6], device);
+    let target_tensor = Tensor::<MyAutodiffBackend, 2>::zeros([batch_size, 5], device);
+    
+    // --- THE FULL TRAINING CYCLE (1 Iteration) ---
+    let output_tensor = model.forward(input_tensor);
+    
+    let loss = burn::nn::loss::MseLoss::new().forward(
+        output_tensor, 
+        target_tensor, 
+        burn::nn::loss::Reduction::Mean
+    );
+    
+    let gradients = loss.backward();
+    let grad_params = GradientsParams::from_grads(gradients, &model);
+    
+    // We bind the result to `_` to suppress Rust compiler warnings about unused variables
+    let _ = optimizer.step_model(1e-3, model, grad_params);
+    
+    println!("✅ GPU Warmup complete in O(1) time. Cache is permanently locked.");
+}
+
+
+
+
 
 #[derive(Component, Default)]
 pub struct LocalGraph {
@@ -98,8 +137,9 @@ impl<B: Backend> GnnPursuitModel<B> {
 
 pub trait ModelOptimizer {
     fn step_model(&mut self, lr: f64, model: GnnPursuitModel<MyAutodiffBackend>, grads: GradientsParams) -> GnnPursuitModel<MyAutodiffBackend>;
-}[patch.crates-io]
-cudarc = "=0.18.1"
+}
+
+
 
 impl<O> ModelOptimizer for O
 where
@@ -119,6 +159,8 @@ pub struct BrainResource {
 impl FromWorld for BrainResource {
     fn from_world(_world: &mut World) -> Self {
         let device = CudaDevice::default();
+        warmup_gnn_cache(&device);
+
         let model = GnnPursuitModel::new(&device);
         let optimizer = Box::new(AdamConfig::new().init()); 
         
@@ -210,6 +252,8 @@ fn scan_environment(
 }
 
 // The Core GNN Loop
+
+/* OLD
 fn batched_gnn_think_and_learn(
     time: Res<Time<Virtual>>,
     mut brain: NonSendMut<BrainResource>,
@@ -338,6 +382,150 @@ fn batched_gnn_think_and_learn(
             organism.movement_speed = ((speed_out + 1.0) / 2.0) * 20.0;
 
             let current_rotation = organism.target_rotation; // Fallback to current target
+            let target_rotation = Quat::from_rotation_y(yaw_out * std::f32::consts::PI);
+            
+            organism.target_rotation = current_rotation.slerp(target_rotation, 0.1);
+        }
+    }
+}
+
+*/
+
+fn batched_gnn_think_and_learn(
+    time: Res<Time<Virtual>>,
+    mut brain: NonSendMut<BrainResource>,
+    mut organisms: Query<&mut Organism>,
+    graphs: Query<(Entity, &Transform, &LocalGraph), With<Heterotroph>>,
+    transforms: Query<&Transform>, // Global lookup for any entity's position
+) {
+    if time.is_paused() {
+        return;
+    }
+
+    let max_orgs = MAXIMUM_ORGANISMS as usize;
+
+    // 1. Pre-allocate vectors with EXACT maximum capacity to prevent re-allocations
+    let mut batch_inputs = Vec::with_capacity(max_orgs * MAX_NEIGHBORS * 6);
+    let mut ideal_outputs = Vec::with_capacity(max_orgs * 5);
+    let mut active_entities = Vec::with_capacity(max_orgs);
+
+    for (h_entity, h_trans, graph) in graphs.iter() {
+        // Safety limit: Never exceed the fixed batch size
+        if active_entities.len() >= max_orgs {
+            break; 
+        }
+
+        let target_entity = match graph.target {
+            Some(e) => e,
+            None => continue, 
+        };
+
+        let target_pos = match transforms.get(target_entity) {
+            Ok(t) => t.translation,
+            Err(_) => continue,
+        };
+
+        // 2. STACK ALLOCATION: Zero-cost array instead of Vec::new()
+        let mut neighbors_data = [0.0; MAX_NEIGHBORS * 6];
+        let mut n_count = 0;
+
+        // Helper closure: writes directly to the pre-allocated stack array
+        let mut add_neighbor = |entity: Entity, edge_type: [f32; 3]| {
+            if n_count < MAX_NEIGHBORS {
+                if let Ok(t) = transforms.get(entity) {
+                    let rel = t.translation - h_trans.translation;
+                    let offset = n_count * 6;
+                    neighbors_data[offset..offset + 6]
+                        .copy_from_slice(&[rel.x, rel.y, rel.z, edge_type[0], edge_type[1], edge_type[2]]);
+                    n_count += 1;
+                }
+            }
+        };
+
+        // Add Edges
+        add_neighbor(target_entity, [1.0, 0.0, 0.0]);
+        for &prey_entity in graph.potential_prey.iter() {
+            add_neighbor(prey_entity, [0.0, 0.0, 1.0]);
+        }
+        for &competitor_entity in graph.non_prey.iter() {
+            add_neighbor(competitor_entity, [0.0, 1.0, 0.0]);
+        }
+
+        // Calculate proxy ideal behavior
+        let relative_pos = target_pos - h_trans.translation;
+        let ideal_dir = relative_pos.normalize_or_zero();
+        
+        let forward = Vec3::Z;
+        let dot = forward.dot(ideal_dir);
+        let cross = forward.cross(ideal_dir);
+        let ideal_yaw = f32::atan2(cross.y, dot).clamp(-1.0, 1.0);
+
+        // Push data to the main vectors
+        batch_inputs.extend_from_slice(&neighbors_data);
+        ideal_outputs.extend_from_slice(&[ideal_dir.x, ideal_dir.y, ideal_dir.z, 1.0, ideal_yaw]);
+        active_entities.push(h_entity);
+    }
+
+    let active_count = active_entities.len();
+    
+    // If no one is active, skip GPU work to save power
+    if active_count == 0 { return; }
+
+    // 3. INSTANT PADDING: Resize fills the rest of the Vec with 0.0 automatically.
+    // This creates "ghost" organisms to perfectly satisfy the MAXIMUM_ORGANISMS batch size.
+    batch_inputs.resize(max_orgs * MAX_NEIGHBORS * 6, 0.0);
+    ideal_outputs.resize(max_orgs * 5, 0.0);
+
+    // 4. FIXED TENSOR CREATION: The GPU now only ever sees `max_orgs`
+    let input_tensor = Tensor::<MyAutodiffBackend, 3>::from_data(
+        TensorData::new(batch_inputs, [max_orgs, MAX_NEIGHBORS, 6]),
+        &brain.device,
+    );
+    
+    let target_tensor = Tensor::<MyAutodiffBackend, 2>::from_data(
+        TensorData::new(ideal_outputs, [max_orgs, 5]),
+        &brain.device,
+    );
+
+    // Forward, Loss, and Backprop
+    let output_tensor = brain.model.forward(input_tensor);
+    let loss = burn::nn::loss::MseLoss::new().forward(
+        output_tensor.clone(), 
+        target_tensor, 
+        burn::nn::loss::Reduction::Mean
+    );
+    
+    let gradients = loss.backward();
+    
+    let cloned_model = brain.model.clone();
+    let grad_params = GradientsParams::from_grads(gradients, &brain.model);
+    
+    let new_model = brain.optimizer.step_model(1e-3, cloned_model, grad_params);
+    brain.model = new_model;
+
+    // Apply Decisions
+    let output_data = output_tensor.into_data().into_vec::<f32>().expect("Failed to convert tensor");
+
+    // 5. SELECTIVE APPLICATION: We only iterate up to `active_entities`, 
+    // completely ignoring the math results of the zero-padded ghosts!
+    for (i, entity) in active_entities.into_iter().enumerate() {
+        if let Ok(mut organism) = organisms.get_mut(entity) {
+            let offset = i * 5;
+            
+            let dir_x = output_data[offset + 0];
+            // output_data[offset + 1] is Y, ignored for 2D movement
+            let dir_z = output_data[offset + 2];
+            let speed_out = output_data[offset + 3];
+            let yaw_out = output_data[offset + 4];
+
+            let new_dir = Vec3::new(dir_x, 0.0, dir_z);
+            if new_dir.length_squared() > 0.01 {
+                organism.movement_direction = new_dir.normalize();
+            }
+
+            organism.movement_speed = ((speed_out + 1.0) / 2.0) * 20.0;
+
+            let current_rotation = organism.target_rotation; 
             let target_rotation = Quat::from_rotation_y(yaw_out * std::f32::consts::PI);
             
             organism.target_rotation = current_rotation.slerp(target_rotation, 0.1);

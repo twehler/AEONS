@@ -43,6 +43,19 @@ fn main() {
 
     let terrain_path_input = Path::new(&args[1]);
 
+
+    if let Ok(mut cache_path) = std::env::current_dir() {
+        cache_path.push("caches");
+        cache_path.push("cubecl");
+        
+        // Ensure the folders actually exist on the hard drive
+        std::fs::create_dir_all(&cache_path).ok();
+
+        unsafe {
+            std::env::set_var("CUBECL_CACHE_DIR", cache_path.to_string_lossy().as_ref());
+        }
+    }
+
     let mut app = App::new();
 
     let movement_mode = movement::MovementMode::TwoD;

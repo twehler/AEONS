@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use rand::RngExt;
 use rand::prelude::*;
 
+pub const MAXIMUM_ORGANISMS: u32 = 1100;
+
 pub struct ColonyPlugin;
 
 impl Plugin for ColonyPlugin {
@@ -134,7 +136,7 @@ fn heterotroph_template() -> TemplateData {
         OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( -g, 0.0,  -g) },
     ];
 
-    TemplateData { count: 20, collections, ocg, spawn_y: 1.0 }
+    TemplateData { count: 200, collections, ocg, spawn_y: 1.0 }
 }
 
 // ── Spawning ──────────────────────────────────────────────────────────────────

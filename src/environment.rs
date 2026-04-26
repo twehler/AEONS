@@ -17,7 +17,7 @@ pub struct EnvironmentSample {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-pub const WATER_LEVEL: f32 = 10.9; // world Y of water surface
+pub const WATER_LEVEL: f32 = 4.9; // world Y of water surface
 
 // Temperature gradient: warmer at lower altitudes, cooler at peaks.
 const TEMP_BASE: f32 = 0.7;
