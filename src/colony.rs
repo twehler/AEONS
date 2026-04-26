@@ -2,12 +2,13 @@ use crate::cell::*;
 use crate::viewport_settings::*;
 use crate::world_geometry::HeightmapSampler;
 use crate::movement::*;
+use crate::environment::*;
 use bevy::prelude::*;
 use std::collections::HashMap;
 use rand::RngExt;
 use rand::prelude::*;
 
-pub const MAXIMUM_ORGANISMS: u32 = 1100;
+pub const MAXIMUM_ORGANISMS: usize = 1100;
 
 pub struct ColonyPlugin;
 
@@ -31,6 +32,7 @@ pub struct Organism {
     pub joint_entities:     HashMap<CollectionId, Entity>,
     pub active_cells:       Vec<(Vec3, CellType)>,
     pub grown_cell_count:   usize,
+    pub weight:             f32,
     pub is_climbing:        bool,
     pub movement_speed:     f32,
     pub movement_direction: Vec3,
@@ -74,7 +76,7 @@ pub struct PopulationCap {
     pub max: usize,
 }
 impl Default for PopulationCap {
-    fn default() -> Self { Self { max: 1500 } }
+    fn default() -> Self { Self { max: MAXIMUM_ORGANISMS } }
 }
 
 // ── Organism templates ────────────────────────────────────────────────────────
@@ -99,41 +101,16 @@ fn photoautotroph_template() -> TemplateData {
     TemplateData { count: 900, collections, ocg, spawn_y: 1.0 }
 }
 
-/// Heterotroph — Compact 18-cell predatory blob.
+
 fn heterotroph_template() -> TemplateData {
     let cc = CollectionId(1);
     let mut collections = HashMap::new();
     collections.insert(cc, CellCollection { starter_cell_position: Vec3::ZERO, parent: None });
 
-    let g = GLOBAL_CELL_SIZE;
+
     let ocg = vec![
-        // Core digestion (2 cells)
-        OcgEntry { collection_id: cc, cell_type: CellType::GutCell,  offset: Vec3::new( 0.0,  0.0,  0.0) },
-        OcgEntry { collection_id: cc, cell_type: CellType::GutCell,  offset: Vec3::new( 0.0,   g,   0.0) },
-        
-        // Horizontal Fins for movement (4 cells)
-        OcgEntry { collection_id: cc, cell_type: CellType::FinCell,  offset: Vec3::new(  g,  0.0,  0.0) },
-        OcgEntry { collection_id: cc, cell_type: CellType::FinCell,  offset: Vec3::new( -g,  0.0,  0.0) },
-        OcgEntry { collection_id: cc, cell_type: CellType::FinCell,  offset: Vec3::new( 0.0, 0.0,   g) },
-        OcgEntry { collection_id: cc, cell_type: CellType::FinCell,  offset: Vec3::new( 0.0, 0.0,  -g) },
-        
-        // Red Body Mass - Top layer (4 cells)
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new(  g,   g,  0.0) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( -g,   g,  0.0) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( 0.0,  g,   g) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( 0.0,  g,  -g) },
-        
-        // Red Body Mass - Bottom layer (4 cells)
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new(  g,  -g,  0.0) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( -g,  -g,  0.0) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( 0.0, -g,   g) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( 0.0, -g,  -g) },
-        
-        // Red Body Mass - Middle horizontal corners (4 cells)
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new(  g, 0.0,   g) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( -g, 0.0,   g) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new(  g, 0.0,  -g) },
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( -g, 0.0,  -g) },
+
+        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( 0.0,  0.0,  0.0) },
     ];
 
     TemplateData { count: 200, collections, ocg, spawn_y: 1.0 }
@@ -183,8 +160,8 @@ fn spawn_colony(
 
     // ── Spawn photoautotrophs ─────────────────────────────────────────────────
     for _ in 0..photo_template.count {
-        let x = rng.random_range(0.0_f32..1024.0);
-        let z = rng.random_range(0.0_f32..1024.0);
+        let x = rng.random_range(0.0_f32..MAP_MAX_X);
+        let z = rng.random_range(0.0_f32..MAP_MAX_Z);
         let y = heightmap.height_at(x, z) + photo_template.spawn_y;
 
         let mut org = create_organism(
@@ -205,8 +182,8 @@ fn spawn_colony(
 
     // ── Spawn heterotrophs ────────────────────────────────────────────────────
     for _ in 0..hetero_template.count {
-        let x = rng.random_range(0.0_f32..1024.0);
-        let z = rng.random_range(0.0_f32..1024.0);
+        let x = rng.random_range(0.0_f32..MAP_MAX_X);
+        let z = rng.random_range(0.0_f32..MAP_MAX_Z);
         let y = heightmap.height_at(x, z) + hetero_template.spawn_y;
 
         let mut org = create_organism(
@@ -286,6 +263,7 @@ fn create_organism(
         joint_entities:     HashMap::new(),
         active_cells:       Vec::new(),
         grown_cell_count:   ocg.len(),
+        weight:             ocg.len() as f32,
         is_climbing:        false,
         movement_speed,
         movement_direction: direction,

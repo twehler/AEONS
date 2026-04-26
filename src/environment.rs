@@ -22,6 +22,8 @@ pub const WATER_LEVEL: f32 = 4.9; // world Y of water surface
 // Temperature gradient: warmer at lower altitudes, cooler at peaks.
 const TEMP_BASE: f32 = 0.7;
 const TEMP_HEIGHT_SCALE: f32 = 0.005; // per unit of height
+pub const MAP_MAX_X: f32 = 1024.0;
+pub const MAP_MAX_Z: f32 = 1024.0;
 
 // Simple noise-like variation using sin/cos of world position
 // (deterministic, no extra crate needed)

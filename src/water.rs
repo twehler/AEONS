@@ -6,28 +6,26 @@ use crate::world_geometry::HeightmapSampler;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const WATER_COLOR: Color = Color::srgba(0.1, 0.3, 0.8, 0.35);
-const BUOYANCY_STRENGTH: f32 = 12.0;  // upward force when submerged
-const WATER_DRAG: f32 = 0.92;          // velocity damping per frame underwater
+const BUOYANCY_STRENGTH: f32 = 12.0;  
 
-// ── Components ───────────────────────────────────────────────────────────────
+// NEW: True aerodynamic/hydrodynamic drag coefficient
+const TRUE_WATER_DRAG_COEF: f32 = 0.05; 
 
+// ── Components & Plugin (Keep your existing WaterPlane and Plugin) ───────────
 #[derive(Component)]
 pub struct WaterPlane;
 
-// ── Plugin ───────────────────────────────────────────────────────────────────
-
 pub struct WaterPlugin;
-
 impl Plugin for WaterPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (
-            spawn_water_plane,
-            apply_buoyancy,
-        ));
+        app.add_systems(Update, (spawn_water_plane, apply_buoyancy));
     }
 }
 
 // ── Systems ──────────────────────────────────────────────────────────────────
+
+// (Keep your existing spawn_water_plane system here!)
+// fn spawn_water_plane(...) { ... }
 
 fn spawn_water_plane(
     mut commands: Commands,
@@ -63,6 +61,8 @@ fn spawn_water_plane(
     ));
 }
 
+
+
 fn apply_buoyancy(
     time: Res<Time>,
     mut query: Query<(&mut Transform, &mut Organism), With<OrganismRoot>>,
@@ -74,25 +74,46 @@ fn apply_buoyancy(
             continue;
         }
 
-        // Submersion depth: how far below water surface
         let depth = WATER_LEVEL - transform.translation.y;
-        let submersion = (depth / (organism.bounding_radius.max(1.0))).clamp(0.0, 1.0);
+        let submersion = (depth / organism.bounding_radius.max(1.0)).clamp(0.0, 1.0);
 
         // Buoyancy: upward force proportional to submersion
         organism.velocity.y += BUOYANCY_STRENGTH * submersion * dt;
 
-        // Water drag: slow down all movement
-        organism.velocity *= WATER_DRAG;
-        organism.movement_speed *= WATER_DRAG;
+        // ──────────────────────────────────────────────────────────────────
+        // NEW: Physically Accurate Fluid Drag (F = C_d * Area * V^2)
+        // ──────────────────────────────────────────────────────────────────
+        let weight = organism.weight.max(1.0);
+        let area = weight.powf(2.0 / 3.0); // Square-Cube law for frontal area
+
+        // 1. Apply drag to physical gravity/push velocity
+        let vel_sq = organism.velocity.length_squared();
+        if vel_sq > 0.001 {
+            let drag_force = TRUE_WATER_DRAG_COEF * area * vel_sq * submersion;
+            let drag_accel = drag_force / weight; // Newton's Second Law: a = F/m
+            
+            let current_speed = organism.velocity.length();
+            let new_speed = (current_speed - drag_accel * dt).max(0.0);
+            organism.velocity = organism.velocity.normalize() * new_speed;
+        }
+
+        // 2. Apply drag to biological movement speed 
+        let mov_sq = organism.movement_speed.powi(2);
+        if mov_sq > 0.001 {
+            let drag_force = TRUE_WATER_DRAG_COEF * area * mov_sq * submersion;
+            let drag_accel = drag_force / weight; 
+            
+            organism.movement_speed = (organism.movement_speed - drag_accel * dt).max(0.0);
+        }
 
         // FinCell bonus: organisms with fins move faster underwater
         let mut fin_thrust = 0.0f32;
-        for entry in &organism.ocg[..organism.grown_cell_count] {
+        // Using iter().take() to safely read only the grown cells
+        for entry in organism.ocg.iter().take(organism.grown_cell_count) {
             fin_thrust += entry.cell_type.properties().thrust;
         }
-        if fin_thrust > 0.0 {
-            let thrust_bonus = fin_thrust * 0.1 * dt;
-            transform.translation += organism.movement_direction * thrust_bonus;
-        }
+        
+        // Add fin thrust back into the movement speed
+        organism.movement_speed += fin_thrust * submersion * dt;
     }
 }

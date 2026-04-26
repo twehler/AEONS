@@ -41,7 +41,7 @@ fn warmup_gnn_cache(device: &CudaDevice) {
     // Cast the u32 constant to usize, as Burn requires usize for tensor shapes.
     let batch_size = MAXIMUM_ORGANISMS as usize;
     
-    println!("🔥 Priming GNN training kernels for fixed batch size: {}...", batch_size);
+    println!("Priming GNN training kernels for fixed batch size: {}...", batch_size);
     
     // 1. Initialize the dummy model and optimizer
     let model = GnnPursuitModel::<MyAutodiffBackend>::new(device);
@@ -66,7 +66,7 @@ fn warmup_gnn_cache(device: &CudaDevice) {
     // We bind the result to `_` to suppress Rust compiler warnings about unused variables
     let _ = optimizer.step_model(1e-3, model, grad_params);
     
-    println!("✅ GPU Warmup complete in O(1) time. Cache is permanently locked.");
+    println!("GPU Warmup complete. CubeCL-cache is now permanently locked.");
 }
 
 
@@ -252,144 +252,6 @@ fn scan_environment(
 }
 
 // The Core GNN Loop
-
-/* OLD
-fn batched_gnn_think_and_learn(
-    time: Res<Time<Virtual>>,
-    mut brain: NonSendMut<BrainResource>,
-    mut organisms: Query<&mut Organism>,
-    graphs: Query<(Entity, &Transform, &LocalGraph), With<Heterotroph>>,
-    transforms: Query<&Transform>, // Global lookup for any entity's position
-) {
-    if time.is_paused() {
-        return;
-    }
-
-    let mut batch_inputs = Vec::new();
-    let mut ideal_outputs_raw = Vec::new();
-    let mut active_entities = Vec::new();
-
-    for (h_entity, h_trans, graph) in graphs.iter() {
-        // If there is no target, we skip training to simulate "wandering/idle"
-        let target_entity = match graph.target {
-            Some(e) => e,
-            None => continue, 
-        };
-
-        // Ensure the target still exists in the world
-        let target_pos = match transforms.get(target_entity) {
-            Ok(t) => t.translation,
-            Err(_) => continue,
-        };
-
-        let mut neighbors_raw = Vec::new();
-        let mut neighbor_count = 0;
-
-        // Helper closure to build edge features [Rel X, Rel Y, Rel Z, Target, NonPrey, PotPrey]
-        let mut add_neighbor = |entity: Entity, edge_type: [f32; 3]| {
-            if neighbor_count >= MAX_NEIGHBORS { return; }
-            if let Ok(t) = transforms.get(entity) {
-                let rel = t.translation - h_trans.translation;
-                neighbors_raw.extend_from_slice(&[rel.x, rel.y, rel.z, edge_type[0], edge_type[1], edge_type[2]]);
-                neighbor_count += 1;
-            }
-        };
-
-        // Add Target Edge (One-Hot: [1, 0, 0])
-        add_neighbor(target_entity, [1.0, 0.0, 0.0]);
-
-        // Add Potential Prey Edges (One-Hot: [0, 0, 1])
-        for &prey_entity in graph.potential_prey.iter() {
-            add_neighbor(prey_entity, [0.0, 0.0, 1.0]);
-        }
-
-        // Add Non-Prey Edges (One-Hot: [0, 1, 0])
-        for &competitor_entity in graph.non_prey.iter() {
-            add_neighbor(competitor_entity, [0.0, 1.0, 0.0]);
-        }
-
-        // Pad the remaining slots with zeros to maintain tensor shape
-        for _ in neighbor_count..MAX_NEIGHBORS {
-            neighbors_raw.extend_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        }
-
-        // Calculate proxy ideal behavior for Reward/Punishment 
-        // (MSE loss towards this ideal vector enforces distance minimization)
-        let relative_pos = target_pos - h_trans.translation;
-        let ideal_dir = relative_pos.normalize_or_zero();
-        
-        ideal_outputs_raw.push(ideal_dir.x);
-        ideal_outputs_raw.push(ideal_dir.y);
-        ideal_outputs_raw.push(ideal_dir.z);
-        ideal_outputs_raw.push(1.0); // Ideal speed (max)
-        
-        let forward = Vec3::Z;
-        let dot = forward.dot(ideal_dir);
-        let cross = forward.cross(ideal_dir);
-        let ideal_yaw = f32::atan2(cross.y, dot);
-        ideal_outputs_raw.push(ideal_yaw.clamp(-1.0, 1.0));
-
-        batch_inputs.extend(neighbors_raw);
-        active_entities.push(h_entity);
-    }
-
-    let batch_size = active_entities.len();
-    if batch_size == 0 { return; }
-
-    // Convert data to Tensors
-    // Input is 3D: [Batch Size, Number of Neighbors, 6 Features per Neighbor]
-    let input_tensor = Tensor::<MyAutodiffBackend, 3>::from_data(
-        TensorData::new(batch_inputs, [batch_size, MAX_NEIGHBORS, 6]),
-        &brain.device,
-    );
-    
-    let target_tensor = Tensor::<MyAutodiffBackend, 2>::from_data(
-        TensorData::new(ideal_outputs_raw, [batch_size, 5]),
-        &brain.device,
-    );
-
-    // Forward, Loss, and Backprop
-    let output_tensor = brain.model.forward(input_tensor);
-    let loss = burn::nn::loss::MseLoss::new().forward(output_tensor.clone(), target_tensor, burn::nn::loss::Reduction::Mean);
-    
-    let gradients = loss.backward();
-    
-    // Decouple borrows safely
-    let cloned_model = brain.model.clone();
-    let grad_params = GradientsParams::from_grads(gradients, &brain.model);
-    
-    let new_model = brain.optimizer.step_model(1e-3, cloned_model, grad_params);
-    brain.model = new_model;
-
-    // Apply Decisions
-    let output_data = output_tensor.into_data().into_vec::<f32>().expect("Failed to convert tensor to Vec<f32>");
-
-    for (i, entity) in active_entities.into_iter().enumerate() {
-        if let Ok(mut organism) = organisms.get_mut(entity) {
-            let offset = i * 5;
-            
-            let dir_x = output_data[offset + 0];
-            let dir_y = output_data[offset + 1];
-            let dir_z = output_data[offset + 2];
-            let speed_out = output_data[offset + 3];
-            let yaw_out = output_data[offset + 4];
-
-            let new_dir = Vec3::new(dir_x, 0.0, dir_z);
-            if new_dir.length_squared() > 0.01 {
-                organism.movement_direction = new_dir.normalize();
-            }
-
-            organism.movement_speed = ((speed_out + 1.0) / 2.0) * 20.0;
-
-            let current_rotation = organism.target_rotation; // Fallback to current target
-            let target_rotation = Quat::from_rotation_y(yaw_out * std::f32::consts::PI);
-            
-            organism.target_rotation = current_rotation.slerp(target_rotation, 0.1);
-        }
-    }
-}
-
-*/
 
 fn batched_gnn_think_and_learn(
     time: Res<Time<Virtual>>,

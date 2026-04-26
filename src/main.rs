@@ -79,7 +79,7 @@ fn main() {
         .add_plugins(movement::MovementPlugin::with_mode(movement_mode))
         .add_plugins(colony::ColonyPlugin)
         .add_plugins(energy::EnergyPlugin)
-        //.add_plugins(reproduction::ReproductionPlugin)
+        .add_plugins(reproduction::ReproductionPlugin)
         .add_plugins(water::WaterPlugin)
         .add_plugins(predation::PredationPlugin)
         .add_plugins(growth::GrowthPlugin)
