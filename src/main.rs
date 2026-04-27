@@ -1,5 +1,5 @@
 mod world_geometry;
-mod bevy_flycam;
+mod player_plugin;
 mod viewport_settings;
 mod colony;
 mod cell;
@@ -12,6 +12,8 @@ mod water;
 mod predation;
 mod growth;
 mod behaviour;
+mod intelligence_level_1;
+mod intelligence_level_3;
 
 use bevy::{
     prelude::*,
@@ -74,7 +76,7 @@ fn main() {
             terrain_path: terrain_path_input.to_string_lossy().into_owned(),
             texture_path: "texture_atlas_8x8.png".to_string(),
         })
-        .add_plugins(bevy_flycam::PlayerPlugin)
+        .add_plugins(player_plugin::PlayerPlugin)
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
         .add_plugins(movement::MovementPlugin::with_mode(movement_mode))
         .add_plugins(colony::ColonyPlugin)

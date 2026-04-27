@@ -9,12 +9,12 @@ const ENERGY_TICK_INTERVAL: f32 = 0.5;
 pub const MAX_ENERGY_PER_CELL: f32 = 10.0;
 
 const PHOTO_PRODUCTION_PER_CELL: f32 = 0.2;    
-const NON_PHOTO_CONSUMPTION_PER_CELL: f32 = 0.4; 
+const NON_PHOTO_CONSUMPTION_PER_CELL: f32 = 0.01; 
 
 // NEW: Biomechanical movement cost constants
 // These are tuned so that max speed (20) doesn't instantly kill them, 
 // but still heavily punishes sprinting, especially for heavy creatures.
-const K_GROUND_FRICTION: f32 = 0.05;  
+const K_GROUND_FRICTION: f32 = 0.01;  
 const K_FLUID_DRAG: f32 = 0.0005;     
 
 // ── Helper Functions ──────────────────────────────────────────────────────────

@@ -153,56 +153,6 @@ fn reproduction_system(
     mut query: Query<(Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>), With<OrganismRoot>>,
     
 ) {
-    /* OLD
-    timer.timer.tick(time.delta());
-    if !timer.timer.just_finished() {
-        return;
-    }
-
-    let current_pop = query.iter().count();
-    if current_pop >= MAXIMUM_ORGANISMS {
-        return;
-    }
-    let spawn_budget = pop_cap.max - current_pop;
-
-    // The births queue now stores the boolean markers for biological classification
-    let mut births: Vec<(Vec3, Vec<OcgEntry>, HashMap<CollectionId, CellCollection>, f32, bool, bool)> = Vec::new();
-
-    for (_entity, mut organism, transform, is_photo, is_hetero) in &mut query {
-        let max_energy = get_max_energy(&organism);
-
-        // MITIGATION 1: Do not divide by zero or allow dead shells to reproduce
-        if max_energy <= 0.0 { continue; }
-
-        // Asexual Reproduction condition: Hit 100% Energy (using 0.01 for float safety)
-        if organism.energy >= max_energy - 0.01 {
-            
-            // Mitosis style split: Offspring and Parent each get 50%
-            let offspring_energy = max_energy * OFFSPRING_ENERGY_FRACTION;
-            organism.energy -= offspring_energy;
-
-            let (child_ocg, child_collections) = mutate_ocg(&organism.ocg, &organism.collections);
-            
-            // Random Map Generation
-            let mut rng = rand::rng();
-            let spawn_x = rng.random_range(0.0..MAP_MAX_X);
-            let spawn_z = rng.random_range(0.0..MAP_MAX_Z);
-            
-            // MITIGATION 2: Preserve the parent's Y coordinate so it doesn't clip below floor
-            let spawn_pos = Vec3::new(spawn_x, transform.translation.y, spawn_z);
-
-            // Respect the strict GNN limit
-            if births.len() >= spawn_budget {
-                break;
-            }
-
-            births.push((spawn_pos, child_ocg, child_collections, offspring_energy, is_photo, is_hetero));
-            if births.len() >= spawn_budget {
-                break;
-            }
-        }
-    }
-    */
 
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() {
@@ -261,7 +211,8 @@ fn reproduction_system(
         let speed = rng.random::<f32>() * 20.0;
 
         let rot_angle = rng.random::<f32>() * std::f32::consts::TAU;
-        let target_rotation = Quat::from_rotation_y(rot_angle);
+
+
         let rotation_speed = 1.0 + rng.random::<f32>() * 2.0;
 
         let floor_cells = compute_floor_cells(&ocg, &collections);
@@ -299,26 +250,50 @@ fn reproduction_system(
             weight: ocg.len() as f32,
             is_climbing: false,
             movement_speed: speed,
+            last_movement_speed: 0.0,
             movement_direction: direction,
+            last_movement_direction: Vec3::ZERO,
             velocity: Vec3::ZERO,
             floor_cells,
             bounding_radius,
-            target_rotation,
+            rotation: Vec3::new(0.0, rot_angle, 0.0),
+            last_rotation: Vec3::ZERO,
+            target_rotation: Vec3::ZERO,
             rotation_speed,
+            last_rotation_speed: 0.0,
         };
 
         let random_interval_dir = 1.0 + rng.random::<f32>() * 9.0;
-        let random_interval_rot = 1.0 + rng.random::<f32>() * 9.0; 
+        let random_interval_rot = 1.0 + rng.random::<f32>() * 9.0;
+
+        // Convert the ML-friendly Vec3 back into a Quaternion for Bevy's Transform
+        let spawn_rotation = Quat::from_euler(
+            EulerRot::YXZ,
+            organism.rotation.y,
+            organism.rotation.x,
+            organism.rotation.z,
+        );
 
         // 1. Spawn the root entity dynamically so we can add conditional components
         let mut root_entity = commands.spawn((
-            Transform::from_translation(pos).with_rotation(target_rotation),
+            Transform::from_translation(organism.pos).with_rotation(spawn_rotation),
+            Visibility::Visible,
+            OrganismRoot,
+            organism, // Pass the organism struct directly; it safely retains the Vec3 internally
+            DirectionTimer::new(random_interval_dir),
+            RotationTimer::new(random_interval_rot), 
+        ));
+
+        /* OLD 
+        let mut root_entity = commands.spawn((
+            Transform::from_translation(organism.pos).with_rotation(organism.rotation),
             Visibility::Visible,
             OrganismRoot,
             organism,
             DirectionTimer::new(random_interval_dir),
             RotationTimer::new(random_interval_rot), 
         ));
+        */
 
         // 2. Safely pass down the genetic marker components!
         if is_photo {

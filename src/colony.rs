@@ -35,12 +35,17 @@ pub struct Organism {
     pub weight:             f32,
     pub is_climbing:        bool,
     pub movement_speed:     f32,
+    pub last_movement_speed: f32,
     pub movement_direction: Vec3,
+    pub last_movement_direction: Vec3,
     pub velocity:           Vec3,
     pub floor_cells:        Vec<(CollectionId, Vec3)>,
     pub bounding_radius:    f32,
-    pub target_rotation:    Quat,
+    pub rotation:           Vec3,
+    pub last_rotation:      Vec3,
+    pub target_rotation:    Vec3,
     pub rotation_speed:     f32,
+    pub last_rotation_speed:f32,
 }
 
 /// Marks an organism as a photoautotroph (energy from photosynthesis).
@@ -226,7 +231,8 @@ fn create_organism(
         OrganismKind::Heterotroph    => 15.0 + rng.random::<f32>() * 10.0,
     };
 
-    let target_rotation = Quat::from_rotation_y(angle);
+
+    let target_rotation = Vec3::new(0.0, angle, 0.0);
 
     let rotation_speed = match kind {
         OrganismKind::Photoautotroph => 0.0,
@@ -266,12 +272,17 @@ fn create_organism(
         weight:             ocg.len() as f32,
         is_climbing:        false,
         movement_speed,
+        last_movement_speed: 0.0,
         movement_direction: direction,
+        last_movement_direction: Vec3::new(1.0, 1.0, 1.0),
         velocity:           Vec3::ZERO,
         floor_cells,
         bounding_radius,
+        rotation: Vec3::ZERO,
+        last_rotation: Vec3::new(1.0, 1.0, 1.0),
         target_rotation,
         rotation_speed,
+        last_rotation_speed: 0.0,
     }
 }
 
@@ -303,26 +314,33 @@ fn spawn_organism(
     let random_interval_dir = 1.0 + rng.random::<f32>() * 9.0;
     let random_interval_rot = 1.0 + rng.random::<f32>() * 9.0; 
 
+
+    // Convert the ML-friendly Vec3 (Euler angles) back into a Quaternion for Bevy's Transform
+    let spawn_rotation = Quat::from_euler(
+        EulerRot::YXZ, // YXZ is standard for Y-up systems (Yaw, Pitch, Roll)
+        organism.target_rotation.y,
+        organism.target_rotation.x,
+        organism.target_rotation.z,
+    );
+
     let root = match kind {
         OrganismKind::Photoautotroph => commands.spawn((
-            Transform::from_translation(organism.pos).with_rotation(organism.target_rotation),
+            Transform::from_translation(organism.pos).with_rotation(spawn_rotation),
             Visibility::Visible,
             OrganismRoot,
             Photoautotroph,
             organism.clone(),
             DirectionTimer::new(random_interval_dir),
             RotationTimer::new(random_interval_rot), 
-
         )).id(),
         OrganismKind::Heterotroph => commands.spawn((
-            Transform::from_translation(organism.pos).with_rotation(organism.target_rotation),
+            Transform::from_translation(organism.pos).with_rotation(spawn_rotation),
             Visibility::Visible,
             OrganismRoot,
             Heterotroph,
             organism.clone(),
             DirectionTimer::new(random_interval_dir),
             RotationTimer::new(random_interval_rot), 
-
         )).id(),
     };
 
