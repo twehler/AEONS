@@ -1,20 +1,36 @@
-use bevy::prelude::*;
-use crate::colony::*;
-use crate::cell::{CellType, GLOBAL_CELL_SIZE, MeshCell, merge_organism_mesh, OrganismMesh};
-use crate::viewport_settings::ShowGizmo;
-use crate::movement::*;
-// NEW: Import the max energy calculator and map bounds
-use crate::energy::get_max_energy;
-use crate::environment::{MAP_MAX_X, MAP_MAX_Z}; 
+// Reproduction.
+//
+// Offspring are exact copies of their parent's body plan — same body parts,
+// same cell types, no mutation. Each newborn is a rhombic-dodecahedron
+// organism (one cell per body part), just like every parent.
+//
+// The `reproduced` boolean on `Organism` enforces a species-specific
+// reproduction cap: heterotrophs reproduce at most once, photoautotrophs at
+// most twice.
 
-use std::collections::HashMap;
+use bevy::prelude::*;
 use rand::prelude::*;
+
+use crate::cell::*;
+use crate::colony::*;
+use crate::energy::MAX_ENERGY_PER_CELL;
+use crate::world_geometry::{MAP_MAX_X, MAP_MAX_Z};
+
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const REPRODUCTION_CHECK_INTERVAL: f32 = 2.0;
-const OFFSPRING_ENERGY_FRACTION: f32 = 0.5; // Changed to 50% (Parent and Child split the max energy)
-const MUTATION_RATE: f32 = 1.0;                 
+
+/// Energy split between parent and offspring at reproduction (50/50).
+const OFFSPRING_ENERGY_FRACTION: f32 = 0.5;
+
+/// Threshold (fraction of `max_energy`) above which an organism becomes a
+/// reproduction candidate.
+const REPRODUCTION_ENERGY_THRESHOLD: f32 = 0.8;
+
+const HETEROTROPH_REPRODUCTION_CAP:    u8 = 1;
+const PHOTOAUTOTROPH_REPRODUCTION_CAP: u8 = 2;
+
 
 // ── Timer resource ───────────────────────────────────────────────────────────
 
@@ -25,11 +41,10 @@ pub struct ReproductionTimer {
 
 impl Default for ReproductionTimer {
     fn default() -> Self {
-        Self {
-            timer: Timer::from_seconds(REPRODUCTION_CHECK_INTERVAL, TimerMode::Repeating),
-        }
+        Self { timer: Timer::from_seconds(REPRODUCTION_CHECK_INTERVAL, TimerMode::Repeating) }
     }
 }
+
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
@@ -42,288 +57,103 @@ impl Plugin for ReproductionPlugin {
     }
 }
 
-// ── Mutation ─────────────────────────────────────────────────────────────────
 
-const ALL_CELL_TYPES: [CellType; 11] = [
-    CellType::BlueCell, CellType::RedCell, CellType::GreenCell,
-    CellType::YellowCell, CellType::OrangeCell, CellType::LightBlueCell,
-    CellType::PhotoCell, CellType::GutCell, CellType::HardCell,
-    CellType::FootCell, CellType::FinCell,
-];
+// ── Inheritance ──────────────────────────────────────────────────────────────
 
-fn mutate_ocg(ocg: &[OcgEntry], collections: &HashMap<CollectionId, CellCollection>) -> (Vec<OcgEntry>, HashMap<CollectionId, CellCollection>) {
-    let mut rng = rand::rng();
-    let mut new_ocg: Vec<OcgEntry> = Vec::with_capacity(ocg.len());
-    let mut new_collections = collections.clone();
-
-    for entry in ocg {
-        let roll: f32 = rng.random();
-
-        if roll < MUTATION_RATE * 0.3 {
-            continue;
-        } else if roll < MUTATION_RATE * 0.6 {
-            let new_type = ALL_CELL_TYPES[rng.random_range(0..ALL_CELL_TYPES.len())];
-            new_ocg.push(OcgEntry {
-                collection_id: entry.collection_id,
-                cell_type: new_type,
-                offset: entry.offset,
-            });
-        } else if roll < MUTATION_RATE {
-            new_ocg.push(entry.clone());
-            let directions = [
-                Vec3::new(GLOBAL_CELL_SIZE, 0.0, 0.0),
-                Vec3::new(-GLOBAL_CELL_SIZE, 0.0, 0.0),
-                Vec3::new(0.0, GLOBAL_CELL_SIZE, 0.0),
-                Vec3::new(0.0, -GLOBAL_CELL_SIZE, 0.0),
-                Vec3::new(0.0, 0.0, GLOBAL_CELL_SIZE),
-                Vec3::new(0.0, 0.0, -GLOBAL_CELL_SIZE),
-            ];
-            let dir = directions[rng.random_range(0..directions.len())];
-            let new_type = ALL_CELL_TYPES[rng.random_range(0..ALL_CELL_TYPES.len())];
-            new_ocg.push(OcgEntry {
-                collection_id: entry.collection_id,
-                cell_type: new_type,
-                offset: entry.offset + dir,
-            });
-        } else {
-            new_ocg.push(entry.clone());
-        }
-    }
-
-    if new_ocg.is_empty() && !ocg.is_empty() {
-        new_ocg.push(ocg[0].clone());
-    }
-
-    (new_ocg, new_collections)
+/// Build a child genome by cloning each alive parent body part verbatim.
+fn inherit_body_parts(parent: &[BodyPart]) -> Vec<BodyPart> {
+    parent.iter()
+        .filter(|b| b.is_alive())
+        .cloned()
+        .collect()
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn compute_floor_cells(ocg: &[OcgEntry], collections: &HashMap<CollectionId, CellCollection>) -> Vec<(CollectionId, Vec3)> {
-    let mut min_y_per_collection: HashMap<CollectionId, (Vec3, f32)> = HashMap::new();
-    for entry in ocg {
-        if let Some(coll) = collections.get(&entry.collection_id) {
-            let world_y = coll.starter_cell_position.y + entry.offset.y;
-            match min_y_per_collection.entry(entry.collection_id) {
-                std::collections::hash_map::Entry::Vacant(e) => { e.insert((entry.offset, world_y)); }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if world_y < e.get().1 { e.insert((entry.offset, world_y)); }
-                }
-            }
-        }
-    }
-    min_y_per_collection.into_iter().map(|(id, (offset, _))| (id, offset)).collect()
-}
-
-fn compute_bounding_radius(ocg: &[OcgEntry], collections: &HashMap<CollectionId, CellCollection>) -> f32 {
-    ocg.iter().map(|entry| {
-        if let Some(coll) = collections.get(&entry.collection_id) {
-            (coll.starter_cell_position + entry.offset).length()
-        } else {
-            0.0
-        }
-    }).fold(0.0f32, f32::max) + GLOBAL_CELL_SIZE
-}
-
-fn build_mesh_for_ocg(
-    ocg: &[OcgEntry],
-    collections: &HashMap<CollectionId, CellCollection>,
-    meshes: &mut ResMut<Assets<Mesh>>,
-) -> Handle<Mesh> {
-    let mesh_cells: Vec<MeshCell> = ocg.iter().filter_map(|entry| {
-        collections.get(&entry.collection_id).map(|coll| {
-            MeshCell {
-                mesh_space_pos: coll.starter_cell_position + entry.offset,
-                cell_type: entry.cell_type,
-            }
-        })
-    }).collect();
-    meshes.add(merge_organism_mesh(mesh_cells))
-}
-
-// ── System ───────────────────────────────────────────────────────────────────
+// ── Reproduction system ──────────────────────────────────────────────────────
 
 fn reproduction_system(
-    time: Res<Time>,
-    mut timer: ResMut<ReproductionTimer>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    // We check if the parent has the Photoautotroph or Heterotroph components
-    mut query: Query<(Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>), With<OrganismRoot>>,
-    
+    time:           Res<Time>,
+    mut timer:      ResMut<ReproductionTimer>,
+    mut commands:   Commands,
+    mut meshes:     ResMut<Assets<Mesh>>,
+    mut materials:  ResMut<Assets<StandardMaterial>>,
+    mut query:      Query<
+        (Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>),
+        With<OrganismRoot>,
+    >,
 ) {
-
     timer.timer.tick(time.delta());
-    if !timer.timer.just_finished() {
-        return;
-    }
+    if !timer.timer.just_finished() { return; }
 
     let current_pop = query.iter().count();
-    let max_pop = MAXIMUM_ORGANISMS as usize; // Cast the strict constant to usize
-    
-    // Check against the strict constant
-    if current_pop >= max_pop {
-        return;
-    }
-    
-    // Calculate the remaining slots for the GNN tensor
-    let spawn_budget = max_pop - current_pop;
+    if current_pop >= MAXIMUM_ORGANISMS { return; }
+    let spawn_budget = MAXIMUM_ORGANISMS - current_pop;
 
-    let mut births: Vec<(Vec3, Vec<OcgEntry>, HashMap<CollectionId, CellCollection>, f32, bool, bool)> = Vec::new();
+    let mut pending_births: Vec<PendingBirth> = Vec::new();
+    let mut rng = rand::rng();
 
     for (_entity, mut organism, transform, is_photo, is_hetero) in &mut query {
-        let max_energy = get_max_energy(&organism);
+        if pending_births.len() >= spawn_budget { break; }
 
+        if organism.reproduced { continue; }
+
+        let max_energy = (organism.grown_cell_count() as f32) * MAX_ENERGY_PER_CELL;
         if max_energy <= 0.0 { continue; }
+        if organism.energy < max_energy * REPRODUCTION_ENERGY_THRESHOLD { continue; }
 
-        if organism.energy >= max_energy * 0.8 {
-            let offspring_energy = max_energy * OFFSPRING_ENERGY_FRACTION;
-            organism.energy -= offspring_energy;
+        let offspring_energy = max_energy * OFFSPRING_ENERGY_FRACTION;
+        organism.energy      -= offspring_energy;
+        organism.reproductions = organism.reproductions.saturating_add(1);
 
-            let (child_ocg, child_collections) = mutate_ocg(&organism.ocg, &organism.collections);
-            
-            let mut rng = rand::rng();
-            let spawn_x = rng.random_range(0.0..MAP_MAX_X);
-            let spawn_z = rng.random_range(0.0..MAP_MAX_Z);
-            let spawn_pos = Vec3::new(spawn_x, transform.translation.y, spawn_z);
+        let cap = if is_photo { PHOTOAUTOTROPH_REPRODUCTION_CAP } else { HETEROTROPH_REPRODUCTION_CAP };
+        if organism.reproductions >= cap { organism.reproduced = true; }
 
-            births.push((spawn_pos, child_ocg, child_collections, offspring_energy, is_photo, is_hetero));
-            
-            // Respect the strict GNN limit
-            if births.len() >= spawn_budget {
-                break;
-            }
-        }
+        let kind = if is_photo {
+            OrganismKind::Photoautotroph
+        } else if is_hetero {
+            OrganismKind::Heterotroph
+        } else {
+            continue;
+        };
+
+        let child_parts = inherit_body_parts(&organism.body_parts);
+        if child_parts.is_empty() { continue; }
+
+        let spawn_x = rng.random_range(0.0..MAP_MAX_X);
+        let spawn_z = rng.random_range(0.0..MAP_MAX_Z);
+        let spawn_pos = Vec3::new(spawn_x, transform.translation.y, spawn_z);
+
+        pending_births.push(PendingBirth {
+            pos:    spawn_pos,
+            parts:  child_parts,
+            energy: offspring_energy,
+            kind,
+        });
     }
-
-    births.truncate(spawn_budget);
 
     let shared_material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         ..default()
     });
 
-    for (pos, ocg, collections, energy, is_photo, is_hetero) in births {
-        let mut rng = rand::rng();
-        let angle = rng.random::<f32>() * std::f32::consts::TAU;
-        let direction = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize();
-        let speed = rng.random::<f32>() * 20.0;
-
-        let rot_angle = rng.random::<f32>() * std::f32::consts::TAU;
-
-
-        let rotation_speed = 1.0 + rng.random::<f32>() * 2.0;
-
-        let floor_cells = compute_floor_cells(&ocg, &collections);
-        let bounding_radius = compute_bounding_radius(&ocg, &collections);
-
-        let active_cells: Vec<(Vec3, CellType)> = ocg.iter().filter_map(|entry| {
-            collections.get(&entry.collection_id).map(|coll| {
-                (coll.starter_cell_position + entry.offset, entry.cell_type)
-            })
-        }).collect();
-
-        let grown_cell_count = ocg.len();
-        let mesh_handle = build_mesh_for_ocg(&ocg, &collections, &mut meshes);
-
-        let joint_entities: HashMap<CollectionId, Entity> = collections.iter()
-            .map(|(&id, coll)| {
-                let entity = commands.spawn((
-                    Transform::from_translation(coll.starter_cell_position),
-                    Visibility::Visible,
-                )).id();
-                (id, entity)
-            })
-            .collect();
-
-        let organism = Organism {
-            collections: collections.clone(),
-            pos,
-            energy,
-            growth_speed: 1.0,
-            adult: false,
-            ocg: ocg.clone(),
-            joint_entities: joint_entities.clone(),
-            active_cells,
-            grown_cell_count,
-            weight: ocg.len() as f32,
-            is_climbing: false,
-            movement_speed: speed,
-            last_movement_speed: 0.0,
-            movement_direction: direction,
-            last_movement_direction: Vec3::ZERO,
-            velocity: Vec3::ZERO,
-            floor_cells,
-            bounding_radius,
-            rotation: Vec3::new(0.0, rot_angle, 0.0),
-            last_rotation: Vec3::ZERO,
-            target_rotation: Vec3::ZERO,
-            rotation_speed,
-            last_rotation_speed: 0.0,
-        };
-
-        let random_interval_dir = 1.0 + rng.random::<f32>() * 9.0;
-        let random_interval_rot = 1.0 + rng.random::<f32>() * 9.0;
-
-        // Convert the ML-friendly Vec3 back into a Quaternion for Bevy's Transform
-        let spawn_rotation = Quat::from_euler(
-            EulerRot::YXZ,
-            organism.rotation.y,
-            organism.rotation.x,
-            organism.rotation.z,
+    for birth in pending_births {
+        spawn_organism(
+            birth.pos,
+            birth.parts,
+            birth.kind,
+            birth.energy,
+            &mut commands,
+            &mut meshes,
+            &shared_material,
+            &mut rng,
         );
-
-        // 1. Spawn the root entity dynamically so we can add conditional components
-        let mut root_entity = commands.spawn((
-            Transform::from_translation(organism.pos).with_rotation(spawn_rotation),
-            Visibility::Visible,
-            OrganismRoot,
-            organism, // Pass the organism struct directly; it safely retains the Vec3 internally
-            DirectionTimer::new(random_interval_dir),
-            RotationTimer::new(random_interval_rot), 
-        ));
-
-        /* OLD 
-        let mut root_entity = commands.spawn((
-            Transform::from_translation(organism.pos).with_rotation(organism.rotation),
-            Visibility::Visible,
-            OrganismRoot,
-            organism,
-            DirectionTimer::new(random_interval_dir),
-            RotationTimer::new(random_interval_rot), 
-        ));
-        */
-
-        // 2. Safely pass down the genetic marker components!
-        if is_photo {
-            root_entity.insert(Photoautotroph);
-        }
-        if is_hetero {
-            root_entity.insert(Heterotroph);
-        }
-
-        let organism_root = root_entity.id();
-
-        for (&id, coll) in &collections {
-            let joint_entity = joint_entities[&id];
-            match coll.parent {
-                None => { commands.entity(organism_root).add_child(joint_entity); }
-                Some(parent_id) => {
-                    if let Some(&parent_entity) = joint_entities.get(&parent_id) {
-                        commands.entity(parent_entity).add_child(joint_entity);
-                    }
-                }
-            }
-        }
-
-        let mesh_entity = commands.spawn((
-            Mesh3d(mesh_handle),
-            MeshMaterial3d(shared_material.clone()),
-            Transform::IDENTITY,
-            OrganismMesh,
-            ShowGizmo,
-        )).id();
-        commands.entity(organism_root).add_child(mesh_entity);
     }
+}
+
+
+struct PendingBirth {
+    pos:    Vec3,
+    parts:  Vec<BodyPart>,
+    energy: f32,
+    kind:   OrganismKind,
 }

@@ -1,409 +1,258 @@
 use bevy::prelude::*;
-use burn::{
-    module::Module,
-    nn::{Linear, LinearConfig},
-    tensor::{
-        backend::{AutodiffBackend, Backend},
-        Tensor, TensorData,
-    },
-    optim::{AdamConfig, GradientsParams, Optimizer},
-};
-
-/* CPU-Logic
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
-
-// ── Backend Configuration ───────────────────────────────────────────────────
-pub type MyBackend = NdArray;
-
-*/
-use burn_cuda::{Cuda, CudaDevice};
-
-
-// Set the backend to LibTorch (f32 precision)
-pub type MyBackend = Cuda;
-pub type MyAutodiffBackend = Autodiff<MyBackend>;
 use burn::backend::Autodiff;
+use burn::module::{Initializer, Module, Param};
+use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::tensor::{Tensor, TensorData, backend::Backend};
+use burn_cuda::{Cuda, CudaDevice};
+use std::collections::HashMap;
 
-use crate::colony::{Organism, OrganismRoot, Heterotroph, Photoautotroph, MAXIMUM_ORGANISMS};
+use crate::colony::{Organism, Heterotroph, Photoautotroph, MAXIMUM_ORGANISMS};
 
+pub type MyBackend = Autodiff<Cuda>;
 
-
-// ── Bevy Components & Resources ─────────────────────────────────────────────
-
-const SCAN_RADIUS: f32 = 60.0;
-const MAX_NEIGHBORS: usize = 16; // Fixed size for fast tensor batching
-const INPUTS: usize = 17;
-
-// ── Warmup Logic ────────────────────────────────────────────────────────────
-
-pub fn warmup_level_3_cache(device: &CudaDevice) {
-    // Cast the u32 constant to usize, as Burn requires usize for tensor shapes.
-    let batch_size = MAXIMUM_ORGANISMS as usize;
-        
-    println!("#############################################################");
-    println!("###### Priming GNN training kernels for batch size: {} ######", batch_size);
-    println!("#############################################################");
+const N:         usize = MAXIMUM_ORGANISMS as usize;
+const IN:        usize = 3;
+const HIDDEN:    usize = 16;
+const OUT:       usize = 4;
+const RADIUS:    f32   = 30.0;
+const MAX_SPEED: f32   = 20.0;
+const LR:        f64   = 1e-3;
 
 
-    // Initialize the dummy model and optimizer
-    let model = GnnPursuitModel::<MyAutodiffBackend>::new(device);
-    let mut optimizer: Box<dyn ModelOptimizer> = Box::new(AdamConfig::new().init());
-    
-
-    let input_tensor = Tensor::<MyAutodiffBackend, 3>::zeros([batch_size, MAX_NEIGHBORS, INPUTS], device);
-    let target_tensor = Tensor::<MyAutodiffBackend, 2>::zeros([batch_size, 5], device);
-    
-    // --- THE FULL TRAINING CYCLE (1 Iteration) ---
-    let output_tensor = model.forward(input_tensor);
-    
-    let loss = burn::nn::loss::MseLoss::new().forward(
-        output_tensor, 
-        target_tensor, 
-        burn::nn::loss::Reduction::Mean
-    );
-    
-    let gradients = loss.backward();
-    let grad_params = GradientsParams::from_grads(gradients, &model);
-    
-    // We bind the result to `_` to suppress Rust compiler warnings about unused variables
-    let _ = optimizer.step_model(1e-3, model, grad_params);
-    
-    println!("################################################################");
-    println!("######### Tuning for Intelligence Level 3 complete. ############");
-    println!("################################################################");
-}
+#[derive(Component, Clone, Copy)]
+pub struct BrainSlot(pub u32);
 
 
-
-
-
-#[derive(Component, Default)]
-pub struct LocalGraph {
-    pub target: Option<Entity>,
-    pub non_prey: Vec<Entity>,
-    pub potential_prey: Vec<Entity>,
-}
-
-#[derive(Resource)]
-pub struct ScannerTimer {
-    pub timer: Timer,
-}
-
-impl Default for ScannerTimer {
-    fn default() -> Self {
-        Self {
-            timer: Timer::from_seconds(1.0, TimerMode::Repeating),
-        }
-    }
-}
-
-
-// ── Neural Network Architecture (GNN) ───────────────────────────────────────
-// Advanced Model
+// Per-organism private weights. The leading `N` dimension means every slot
+// owns its own MLP — there is no weight sharing across organisms. The
+// batched matmul (`unsqueeze → matmul → squeeze`) evaluates all N MLPs in
+// a single GPU op, so isolation costs no throughput.
 #[derive(Module, Debug)]
-pub struct GnnPursuitModel<B: Backend> {
-    // Message Layer: Processes the [Rel X, Rel Y, Rel Z, IsTarget, IsNonPrey, IsPotPrey]
-    msg_layer: Linear<B>,
-    // Update Layers: Processes the aggregated mean of all neighbor messages
-    fc1: Linear<B>,
-    fc2: Linear<B>,
+pub struct PoolMlp<B: Backend> {
+    w1: Param<Tensor<B, 3>>,    // [N, IN, HIDDEN]
+    b1: Param<Tensor<B, 2>>,    // [N, HIDDEN]
+    w2: Param<Tensor<B, 3>>,    // [N, HIDDEN, OUT]
+    b2: Param<Tensor<B, 2>>,    // [N, OUT]
 }
 
-impl<B: Backend> GnnPursuitModel<B> {
-    pub fn new(device: &B::Device) -> Self {
+impl<B: Backend> PoolMlp<B> {
+    fn new(device: &B::Device) -> Self {
+        let w = Initializer::Uniform { min: -0.5, max: 0.5 };
+        let z = Initializer::Zeros;
         Self {
-
-            msg_layer: LinearConfig::new(INPUTS, 32).init(device),
-
-            fc1: LinearConfig::new(32, 32).init(device),
-            // Output: 5 (Dir X, Dir Y, Dir Z, Speed, Rotation Yaw)
-            fc2: LinearConfig::new(32, 5).init(device),
+            w1: w.init([N, IN, HIDDEN], device),
+            b1: z.init([N, HIDDEN], device),
+            w2: w.init([N, HIDDEN, OUT], device),
+            b2: z.init([N, OUT], device),
         }
     }
 
-    pub fn forward(&self, neighbors: Tensor<B, 3>) -> Tensor<B, 2> {
-        // 1. Message Phase: evaluate each neighbor
-        let x = self.msg_layer.forward(neighbors);
+    // x: [N, IN] → [N, OUT]. Each row uses its own [IN, HIDDEN] / [HIDDEN, OUT]
+    // weight matrices via batched matmul.
+    fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let x = x.unsqueeze_dim::<3>(1).matmul(self.w1.val()).squeeze::<2>() + self.b1.val();
         let x = burn::tensor::activation::relu(x);
-        
-        // 2. Aggregate Phase: collapse the neighbor dimension (Dim 1)
-        // This is what makes it a true egocentric Graph Neural Network!
-        let x = x.mean_dim(1).squeeze_dim(1); 
-        
-        // 3. Update Phase: make a decision based on the aggregated context
-        let x = self.fc1.forward(x);
-        let x = burn::tensor::activation::relu(x);
-        let x = self.fc2.forward(x);
-        burn::tensor::activation::tanh(x) 
+        let x = x.unsqueeze_dim::<3>(1).matmul(self.w2.val()).squeeze::<2>() + self.b2.val();
+        burn::tensor::activation::tanh(x)
     }
 }
 
 
-
-pub trait ModelOptimizer {
-    fn step_model(&mut self, lr: f64, model: GnnPursuitModel<MyAutodiffBackend>, grads: GradientsParams) -> GnnPursuitModel<MyAutodiffBackend>;
+pub trait BrainOpt {
+    fn step(&mut self, lr: f64, m: PoolMlp<MyBackend>, g: GradientsParams) -> PoolMlp<MyBackend>;
 }
 
-impl<O> ModelOptimizer for O
-where
-    O: Optimizer<GnnPursuitModel<MyAutodiffBackend>, MyAutodiffBackend>,
-{
-    fn step_model(&mut self, lr: f64, model: GnnPursuitModel<MyAutodiffBackend>, grads: GradientsParams) -> GnnPursuitModel<MyAutodiffBackend> {
-        self.step(lr, model, grads)
+impl<O: Optimizer<PoolMlp<MyBackend>, MyBackend>> BrainOpt for O {
+    fn step(&mut self, lr: f64, m: PoolMlp<MyBackend>, g: GradientsParams) -> PoolMlp<MyBackend> {
+        Optimizer::step(self, lr, m, g)
     }
 }
 
-pub struct BrainResourceLevel3 {
-    pub model: GnnPursuitModel<MyAutodiffBackend>,
-    pub optimizer: Box<dyn ModelOptimizer>,
-    pub device: <MyAutodiffBackend as Backend>::Device,
+
+pub struct BrainPool {
+    model:       PoolMlp<MyBackend>,
+    opt:         Box<dyn BrainOpt>,
+    free:        Vec<u32>,
+    map:         HashMap<Entity, u32>,
+    pub device:  CudaDevice,
 }
 
-impl FromWorld for BrainResourceLevel3 {
-    fn from_world(_world: &mut World) -> Self {
-        let device = CudaDevice::default();
-        warmup_level_3_cache(&device);
-
-        let model = GnnPursuitModel::new(&device);
-        let optimizer = Box::new(AdamConfig::new().init()); 
-        
+impl BrainPool {
+    fn new(device: CudaDevice) -> Self {
         Self {
-            model,
-            optimizer,
+            model: PoolMlp::<MyBackend>::new(&device),
+            opt:   Box::new(AdamConfig::new().init()),
+            free:  (0..N as u32).rev().collect(),
+            map:   HashMap::with_capacity(N),
             device,
         }
     }
 }
 
-// ── Systems ─────────────────────────────────────────────────────────────────
+impl FromWorld for BrainPool {
+    fn from_world(_: &mut World) -> Self {
+        let device = CudaDevice::default();
+        warmup(&device);
+        Self::new(device)
+    }
+}
 
-// Ensures newly reproduced heterotrophs get a graph
-pub fn initialize_local_graphs(
+
+// One full forward → MSE → backward → step at the maximum batch shape so
+// CUDA caches the kernels. Subsequent ticks reuse the same shape and avoid
+// recompilation.
+fn warmup(device: &CudaDevice) {
+    let m = PoolMlp::<MyBackend>::new(device);
+    let mut o: Box<dyn BrainOpt> = Box::new(AdamConfig::new().init());
+    let i      = Tensor::<MyBackend, 2>::zeros([N, IN],  device);
+    let target = Tensor::<MyBackend, 2>::zeros([N, OUT], device);
+    let mask   = Tensor::<MyBackend, 2>::zeros([N, 1],   device);
+    let out    = m.forward(i);
+    let sq     = (out - target).powf_scalar(2.0).sum_dim(1);   // [N, 1]
+    let loss   = (sq * mask).sum().div_scalar(1.0_f32);
+    let g      = GradientsParams::from_grads(loss.backward(), &m);
+    let _      = o.step(LR, m, g);
+}
+
+
+pub fn assign_brains(
+    mut pool: NonSendMut<BrainPool>,
+    new: Query<Entity, (With<Heterotroph>, Without<BrainSlot>)>,
     mut commands: Commands,
-    query: Query<Entity, (With<Heterotroph>, Without<LocalGraph>)>,
 ) {
-    for entity in query.iter() {
-        commands.entity(entity).insert(LocalGraph::default());
+    for e in new.iter() {
+        let Some(slot) = pool.free.pop() else { continue };
+        // NOTE: The slot's weights are intentionally NOT reset on reuse.
+        // A new organism inheriting the previous occupant's trained MLP is
+        // analogous to inherited instinct — and a freshly-spawned predator
+        // converges to correct pursuit within a few ticks of MSE training
+        // anyway, so any residual bias is quickly overwritten.
+        pool.map.insert(e, slot);
+        // try_insert silently no-ops on dead entities — see the matching
+        // comment in `intelligence_level_1.rs::assign_brains_l1`. Same race
+        // applies here: a heterotroph can starve in Update between this
+        // PreUpdate query and the apply_deferred flush. RemovedComponents
+        // self-heals the slot bookkeeping in the next tick.
+        commands.entity(e).try_insert(BrainSlot(slot));
     }
 }
 
-// The Scanner Function: Rebuilds the graph edges every 1 second
-pub fn scan_environment(
-    time: Res<Time>,
-    mut timer: ResMut<ScannerTimer>,
-    mut heterotrophs: Query<(Entity, &Transform, &mut LocalGraph), With<Heterotroph>>,
-    phototrophs: Query<(Entity, &Transform), With<Photoautotroph>>,
-    all_heteros: Query<(Entity, &Transform), With<Heterotroph>>,
+pub fn free_brains(
+    mut pool: NonSendMut<BrainPool>,
+    mut removed: RemovedComponents<Heterotroph>,
 ) {
-    timer.timer.tick(time.delta());
-    if !timer.timer.just_finished() {
-        return;
-    }
-
-    for (h_entity, h_trans, mut graph) in heterotrophs.iter_mut() {
-        graph.target = None;
-        graph.non_prey.clear();
-        graph.potential_prey.clear();
-
-        let mut min_dist = f32::MAX;
-        let mut closest_photo = None;
-
-        // 1. Scan for Phototrophs (Prey)
-        for (p_entity, p_trans) in phototrophs.iter() {
-            let dist = h_trans.translation.distance(p_trans.translation);
-            if dist <= SCAN_RADIUS {
-                if dist < min_dist {
-                    // Push the previous closest into potential prey
-                    if let Some(prev_closest) = closest_photo {
-                        graph.potential_prey.push(prev_closest);
-                    }
-                    min_dist = dist;
-                    closest_photo = Some(p_entity);
-                } else {
-                    graph.potential_prey.push(p_entity);
-                }
-            }
-        }
-        graph.target = closest_photo;
-
-        // 2. Scan for Heterotrophs (Non-Prey / Competitors)
-        for (other_h, o_trans) in all_heteros.iter() {
-            if other_h != h_entity {
-                let dist = h_trans.translation.distance(o_trans.translation);
-                if dist <= SCAN_RADIUS {
-                    graph.non_prey.push(other_h);
-                }
-            }
-        }
+    for e in removed.read() {
+        if let Some(slot) = pool.map.remove(&e) { pool.free.push(slot); }
     }
 }
 
-// The Core GNN Loop
 
+// MSE supervision against an analytically-computed ideal action.
+//
+// For every active heterotroph with prey within RADIUS, the oracle is:
+//   ideal_speed = +1.0  (tanh-space; remaps to MAX_SPEED on application)
+//   ideal_dir   = unit vector from predator to nearest prey
+//
+// The batch is fixed at shape [N, IN]/[N, OUT] so CUDA kernel caches stay
+// hot. Inactive slots (no prey in range, or unassigned) get zero input,
+// zero target, and zero mask — their per-row squared error is multiplied
+// by 0 before reduction, so they contribute exactly zero gradient.
+//
+// Predators with no prey in range are not just zero-loss but also skipped
+// at apply time: their movement_direction / movement_speed are left
+// untouched, so they keep cruising on their last command instead of being
+// jerked toward (0, 0, 0).
 pub fn apply_intelligence_level_3(
     time: Res<Time<Virtual>>,
-    mut brain: NonSendMut<BrainResourceLevel3>,
-    mut organisms: Query<&mut Organism>,
-    graphs: Query<(Entity, &Transform, &LocalGraph), With<Heterotroph>>,
-    transforms: Query<&Transform>, // Global lookup for any entity's position
+    mut pool: NonSendMut<BrainPool>,
+    mut heteros: Query<(Entity, &mut Organism, &Transform, &BrainSlot), With<Heterotroph>>,
+    photos: Query<&Transform, With<Photoautotroph>>,
 ) {
-    if time.is_paused() {
-        return;
-    }
+    if time.is_paused() { return; }
 
-    let max_orgs = MAXIMUM_ORGANISMS as usize;
+    // Flat row-major scratch buffers for the fixed [N, _] tensors.
+    let mut input  = vec![0.0_f32; N * IN];
+    let mut target = vec![0.0_f32; N * OUT];
+    let mut mask   = vec![0.0_f32; N];
 
-    // Pre-allocate vectors with exact maximum capacity to prevent re-allocations
-    let mut batch_inputs = Vec::with_capacity(max_orgs * MAX_NEIGHBORS * INPUTS);
-    let mut ideal_outputs = Vec::with_capacity(max_orgs * 5);
-    let mut active_entities = Vec::with_capacity(max_orgs);
+    // (entity, slot) for every predator that gets its action applied this tick.
+    let mut active: Vec<(Entity, u32)> = Vec::with_capacity(N);
+    let mut count  = 0.0_f32;
 
+    for (entity, _organism, transform, slot) in heteros.iter() {
+        let s = slot.0 as usize;
+        if s >= N { continue; }
+        let pos = transform.translation;
 
-    for (h_entity, h_trans, graph) in graphs.iter() {
-        if active_entities.len() >= max_orgs { break; }
-
-        // 1. Check for target
-        let target_entity = match graph.target {
-            Some(e) => e,
-            None => continue, 
-        };
-
-        // 2. Get target position
-        let target_pos = match transforms.get(target_entity) {
-            Ok(t) => t.translation,
-            Err(_) => continue,
-        };
-
-        // 3. Fetch the organism to read its internal self-state
-        let organism = match organisms.get(h_entity) {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-
-        // package the 11 new self-state features 
-
-        let self_features = [
-            organism.last_movement_speed,
-            organism.last_movement_direction.x,
-            organism.last_movement_direction.y,
-            organism.last_movement_direction.z,
-            organism.rotation.x,          // Directly accessing Vec3
-            organism.rotation.y,          // Directly accessing Vec3
-            organism.rotation.z,          // Directly accessing Vec3
-            organism.last_rotation.x,     // Directly accessing Vec3
-            organism.last_rotation.y,     // Directly accessing Vec3
-            organism.last_rotation.z,     // Directly accessing Vec3
-            organism.last_rotation_speed,
-        ];
-
-        let mut neighbors_data = [0.0; MAX_NEIGHBORS * INPUTS]; // INPUTS features
-        let mut n_count = 0;
-
-        // 5. Build neighbor features
-        let mut add_neighbor = |entity: Entity, edge_type: [f32; 3]| {
-            if n_count < MAX_NEIGHBORS {
-                if let Ok(t) = transforms.get(entity) {
-                    let rel = t.translation - h_trans.translation;
-                    let offset = n_count * INPUTS;
-                    
-                    // Write Relative Position (3)
-                    neighbors_data[offset..offset + 3].copy_from_slice(&[rel.x, rel.y, rel.z]);
-                    // Write Edge Type (3)
-                    neighbors_data[offset + 3..offset + 6].copy_from_slice(&edge_type);
-                    // Write Self State (11)
-                    neighbors_data[offset + 6..offset + INPUTS].copy_from_slice(&self_features);
-                    
-                    n_count += 1;
-                }
+        // Find nearest prey within RADIUS.
+        let mut best_d = f32::INFINITY;
+        let mut best_p = pos;
+        let mut found  = false;
+        for pt in photos.iter() {
+            let d = pos.distance(pt.translation);
+            if d <= RADIUS && d < best_d {
+                best_d = d;
+                best_p = pt.translation;
+                found  = true;
             }
-        };
-
-        // Add Edges
-        add_neighbor(target_entity, [1.0, 0.0, 0.0]);
-        for &prey_entity in graph.potential_prey.iter() { add_neighbor(prey_entity, [0.0, 0.0, 1.0]); }
-        for &competitor_entity in graph.non_prey.iter() { add_neighbor(competitor_entity, [0.0, 1.0, 0.0]); }
-
-        // Calculate proxy ideal behavior
-        let relative_pos = target_pos - h_trans.translation;
-        let ideal_dir = relative_pos.normalize_or_zero();
-        
-        let dot = Vec3::Z.dot(ideal_dir);
-        let cross = Vec3::Z.cross(ideal_dir);
-        let ideal_yaw = f32::atan2(cross.y, dot).clamp(-1.0, 1.0);
-
-        // Append to batch
-        batch_inputs.extend_from_slice(&neighbors_data);
-        ideal_outputs.extend_from_slice(&[ideal_dir.x, ideal_dir.y, ideal_dir.z, 1.0, ideal_yaw]);
-        active_entities.push(h_entity);
-    }
-
-
-    let active_count = active_entities.len();
-    
-    // If no one is active, skip GPU work to save power
-    if active_count == 0 { return; }
-
-    // 3. INSTANT PADDING: Resize fills the rest of the Vec with 0.0 automatically.
-    // This creates "ghost" organisms to perfectly satisfy the MAXIMUM_ORGANISMS batch size.
-    batch_inputs.resize(max_orgs * MAX_NEIGHBORS * INPUTS, 0.0);
-    ideal_outputs.resize(max_orgs * 5, 0.0);
-
-    // 4. FIXED TENSOR CREATION: The GPU now only ever sees `max_orgs`
-    let input_tensor = Tensor::<MyAutodiffBackend, 3>::from_data(
-        TensorData::new(batch_inputs, [max_orgs, MAX_NEIGHBORS, INPUTS]),
-        &brain.device,
-    );
-    
-    let target_tensor = Tensor::<MyAutodiffBackend, 2>::from_data(
-        TensorData::new(ideal_outputs, [max_orgs, 5]),
-        &brain.device,
-    );
-
-    // Forward, Loss, and Backprop
-    let output_tensor = brain.model.forward(input_tensor);
-    let loss = burn::nn::loss::MseLoss::new().forward(
-        output_tensor.clone(), 
-        target_tensor, 
-        burn::nn::loss::Reduction::Mean
-    );
-    
-    let gradients = loss.backward();
-    
-    let cloned_model = brain.model.clone();
-    let grad_params = GradientsParams::from_grads(gradients, &brain.model);
-    
-    let new_model = brain.optimizer.step_model(1e-3, cloned_model, grad_params);
-    brain.model = new_model;
-
-    // Apply Decisions
-    let output_data = output_tensor.into_data().into_vec::<f32>().expect("Failed to convert tensor");
-
-    // 5. SELECTIVE APPLICATION: We only iterate up to `active_entities`, 
-    // completely ignoring the math results of the zero-padded ghosts!
-    for (i, entity) in active_entities.into_iter().enumerate() {
-        if let Ok(mut organism) = organisms.get_mut(entity) {
-            let offset = i * 5;
-
-            let dir_x = output_data[offset + 0];
-            // output_data[offset + 1] is Y, ignored for 2D movement
-            let dir_z = output_data[offset + 2];
-            let speed_out = output_data[offset + 3];
-            let yaw_out = output_data[offset + 4];
-
-            let new_dir = Vec3::new(dir_x, 0.0, dir_z);
-            if new_dir.length_squared() > 0.01 {
-                organism.movement_direction = new_dir.normalize();
-            }
-
-            organism.movement_speed = ((speed_out + 1.0) / 2.0) * 20.0;
-
-            let current_rotation = organism.target_rotation; 
-
-
-            let target_rotation = Vec3::new(0.0, yaw_out * std::f32::consts::PI, 0.0);
-
-            organism.target_rotation = current_rotation.slerp(target_rotation, 0.1);
         }
+
+        // Always fill the input row (zeros if no prey, normalized rel pos otherwise).
+        // Whether this row's gradient counts is controlled by `mask`, not by
+        // skipping the input — keeping the tensor shape fixed at [N, IN] is
+        // what makes the GPU kernel cache stay hot.
+        let rel = if found { (best_p - pos) / RADIUS } else { Vec3::ZERO };
+        let i_off = s * IN;
+        input[i_off    ] = rel.x;
+        input[i_off + 1] = rel.y;
+        input[i_off + 2] = rel.z;
+
+        if found {
+            // Oracle: head straight at the prey at full speed.
+            let ideal_dir = (best_p - pos).normalize_or_zero();
+            let t_off = s * OUT;
+            target[t_off    ] = 1.0;            // ideal speed (tanh-space)
+            target[t_off + 1] = ideal_dir.x;
+            target[t_off + 2] = ideal_dir.y;
+            target[t_off + 3] = ideal_dir.z;
+            mask[s] = 1.0;
+            count  += 1.0;
+            active.push((entity, slot.0));
+        }
+        // If no prey found: mask stays 0, target stays 0, and we do NOT
+        // push to `active`, so this organism's movement is not overwritten
+        // and it keeps cruising on its previous command.
+    }
+
+    // No predators have prey in range → nothing to train, nothing to apply.
+    // We still skip the GPU work entirely (a [N, IN] forward pass on all
+    // zeros would just waste cycles).
+    if count == 0.0 { return; }
+
+    // Build tensors and train.
+    let i_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(input,  [N, IN]),  &pool.device);
+    let t_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(target, [N, OUT]), &pool.device);
+    let m_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(mask,   [N, 1]),   &pool.device);
+
+    let out = pool.model.forward(i_t);
+    // Per-row squared error → mask out inactive slots → mean over active count.
+    let sq   = (out.clone() - t_t).powf_scalar(2.0).sum_dim(1);   // [N, 1]
+    let loss = (sq * m_t).sum().div_scalar(count);
+
+    let cm = pool.model.clone();
+    let gp = GradientsParams::from_grads(loss.backward(), &pool.model);
+    pool.model = pool.opt.step(LR, cm, gp);
+
+    // Read outputs back and apply only to active predators.
+    let out_data = out.into_data().into_vec::<f32>().expect("brain output");
+
+    for (entity, slot) in active {
+        let off = slot as usize * OUT;
+        let speed = out_data[off];
+        let dir   = Vec3::new(out_data[off + 1], out_data[off + 2], out_data[off + 3]);
+
+        let Ok((_, mut org, _, _)) = heteros.get_mut(entity) else { continue };
+        if dir.length_squared() > 0.01 { org.movement_direction = dir.normalize(); }
+        org.movement_speed = ((speed + 1.0) * 0.5).clamp(0.0, 1.0) * MAX_SPEED;
     }
 }

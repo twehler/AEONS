@@ -4,10 +4,6 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 // Major credit goes to: https://github.com/sburris0/bevy_flycam
 
-pub mod prelude {
-    pub use crate::*;
-}
-
 // Mouse sensitivity and movement speed
 #[derive(Resource)]
 pub struct MovementSettings {
@@ -212,25 +208,14 @@ fn initial_grab_on_flycam_spawn(
 pub struct PlayerPlugin;
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
-        common_build(app);
-        app.add_systems(Startup, setup_player);
+        app.init_resource::<MovementSettings>()
+            .init_resource::<KeyBindings>()
+            .add_systems(Startup, setup_player)
+            .add_systems(Startup, initial_grab_cursor)
+            .add_systems(Startup, initial_grab_on_flycam_spawn)
+            .add_systems(Update, player_move)
+            .add_systems(Update, player_look)
+            .add_systems(Update, toggle_pause)
+            .add_systems(Update, change_speed_on_scroll);
     }
-}
-
-pub struct NoCameraPlayerPlugin;
-impl Plugin for NoCameraPlayerPlugin {
-    fn build(&self, app: &mut App) {
-        common_build(app);
-    }
-}
-
-fn common_build(app: &mut App) {
-    app.init_resource::<MovementSettings>()
-        .init_resource::<KeyBindings>()
-        .add_systems(Startup, initial_grab_cursor)
-        .add_systems(Startup, initial_grab_on_flycam_spawn)
-        .add_systems(Update, player_move)
-        .add_systems(Update, player_look)
-        .add_systems(Update, toggle_pause) // Replaced cursor_grab
-        .add_systems(Update, change_speed_on_scroll);
 }

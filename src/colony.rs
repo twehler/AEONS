@@ -1,52 +1,118 @@
 use crate::cell::*;
-use crate::viewport_settings::*;
-use crate::world_geometry::HeightmapSampler;
-use crate::movement::*;
-use crate::environment::*;
+use crate::viewport_settings::ShowGizmo;
+use crate::world_geometry::{HeightmapSampler, MAP_MAX_X, MAP_MAX_Z};
+use crate::movement::DirectionTimer;
 use bevy::prelude::*;
-use std::collections::HashMap;
-use rand::RngExt;
 use rand::prelude::*;
 
+/// Hard cap on simulation population. Both brain pools size their tensors to
+/// this constant — exceeding it would silently miss organisms in the batched
+/// MLP forward pass.
 pub const MAXIMUM_ORGANISMS: usize = 1100;
+
+/// Initial population of each trophic strategy. Photoautotrophs dominate so
+/// the food web has plenty of prey for the smaller heterotroph predator pool.
+const INITIAL_PHOTOAUTOTROPHS: u32 = 400;
+const INITIAL_HETEROTROPHS:    u32 = 200;
+
+/// Initial Krishi cohort size. `pub` so `krishi.rs` reads it directly —
+/// keeps every "how many of X spawn at startup" knob in one place.
+pub const INITIAL_KRISHI: u32 = 1;
+
 
 pub struct ColonyPlugin;
 
 impl Plugin for ColonyPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(PopulationCap::default());
         app.add_systems(Update, spawn_colony.run_if(resource_exists::<HeightmapSampler>));
     }
 }
 
-// ── Core data structures ──────────────────────────────────────────────────────
+
+// ── Organism ─────────────────────────────────────────────────────────────────
+//
+// New architecture: an organism is an ordered list of body parts. Each body
+// part is a separate child entity rendering its own procedural mesh. Cell
+// data lives inside `BodyPart::cells` (typed vertex-cells).
+//
+// Aggregate quantities (weight, bounding radius, photo/non-photo tally) are
+// computed on demand from `body_parts` rather than stored as redundant
+// fields — they're only read by ~10 Hz systems and the iteration cost is
+// negligible at our scale.
 
 #[derive(Component, Clone)]
 pub struct Organism {
-    pub collections:        HashMap<CollectionId, CellCollection>,
-    pub pos:                Vec3,
-    pub energy:             f32,
-    pub growth_speed:       f32,
-    pub adult:              bool,
-    pub ocg:                Vec<OcgEntry>,
-    pub joint_entities:     HashMap<CollectionId, Entity>,
-    pub active_cells:       Vec<(Vec3, CellType)>,
-    pub grown_cell_count:   usize,
-    pub weight:             f32,
-    pub is_climbing:        bool,
-    pub movement_speed:     f32,
-    pub last_movement_speed: f32,
+    pub body_parts: Vec<BodyPart>,
+    pub energy: f32,
+    /// True when the organism's position has an unobstructed line to the sun.
+    /// Maintained by `photosynthesis.rs` and consumed by Level 1 brains.
+    pub in_sunlight: bool,
+    /// Hard gate consulted by `reproduction.rs`: once `true`, this organism
+    /// will never spawn another offspring for the rest of its life.
+    pub reproduced: bool,
+    /// Running count of successful reproductions, used by `reproduction.rs`
+    /// to decide when to flip `reproduced` (heterotrophs flip after the
+    /// first, photoautotrophs after the second).
+    pub reproductions: u8,
+    pub movement_speed: f32,
     pub movement_direction: Vec3,
-    pub last_movement_direction: Vec3,
-    pub velocity:           Vec3,
-    pub floor_cells:        Vec<(CollectionId, Vec3)>,
-    pub bounding_radius:    f32,
-    pub rotation:           Vec3,
-    pub last_rotation:      Vec3,
-    pub target_rotation:    Vec3,
-    pub rotation_speed:     f32,
-    pub last_rotation_speed:f32,
+    pub velocity: Vec3,
+    pub is_climbing: bool,
+    /// Vertical metres climbed since the last energy tick, awaiting payment
+    /// at `ELEVATION_ENERGY_PER_UNIT` per unit. Reset to 0 each tick. Krishi
+    /// is excluded from the energy system entirely so its debt never drains.
+    pub climb_energy_debt: f32,
 }
+
+impl Organism {
+    /// Total currently-grown cells across alive body parts. Predation-
+    /// consumed body parts are skipped — they no longer contribute to
+    /// energy, weight or photosynthesis bookkeeping.
+    #[inline]
+    pub fn grown_cell_count(&self) -> usize {
+        self.body_parts.iter().filter(|b| b.is_alive())
+            .map(|b| b.cells.len()).sum()
+    }
+
+    /// (photo_count, non_photo_count) over grown cells of alive body parts.
+    pub fn cell_counts(&self) -> (u32, u32) {
+        let mut p = 0u32;
+        let mut np = 0u32;
+        for bp in self.body_parts.iter().filter(|b| b.is_alive()) {
+            let (a, b) = bp.cell_counts();
+            p  += a;
+            np += b;
+        }
+        (p, np)
+    }
+
+    /// Effective biological mass — proportional to grown cell count of
+    /// alive body parts. Floored at 1.0 so single-cell juveniles don't
+    /// divide by zero in energy / drag calculations.
+    #[inline]
+    pub fn weight(&self) -> f32 {
+        (self.grown_cell_count() as f32).max(1.0)
+    }
+
+    /// Maximum world-space distance from the organism root that any grown
+    /// cell on an alive body part can reach. Used by water buoyancy
+    /// submersion and movement broad phase.
+    pub fn bounding_radius(&self) -> f32 {
+        let mut max_r = 2.0 * RD_HALF_SIZE; // single-cell starter floor
+        for bp in self.body_parts.iter().filter(|b| b.is_alive()) {
+            let r = bp.local_offset.length() + bp.local_bounding_radius();
+            if r > max_r { max_r = r; }
+        }
+        max_r
+    }
+
+    /// Number of body parts that still have cells and haven't been eaten.
+    #[inline]
+    pub fn alive_body_part_count(&self) -> usize {
+        self.body_parts.iter().filter(|b| b.is_alive()).count()
+    }
+}
+
 
 /// Marks an organism as a photoautotroph (energy from photosynthesis).
 #[derive(Component, Clone, Copy)]
@@ -56,72 +122,48 @@ pub struct Photoautotroph;
 #[derive(Component, Clone, Copy)]
 pub struct Heterotroph;
 
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
-pub struct CollectionId(pub u32);
-
-#[derive(Clone, Debug)]
-pub struct OcgEntry {
-    pub collection_id: CollectionId,
-    pub cell_type:     CellType,
-    pub offset:        Vec3,
-}
-
-#[derive(Clone)]
-pub struct CellCollection {
-    pub starter_cell_position: Vec3,
-    pub parent:                Option<CollectionId>,
-}
-
 #[derive(Component)]
 pub struct OrganismRoot;
 
 
-#[derive(Resource)]
-pub struct PopulationCap {
-    pub max: usize,
-}
-impl Default for PopulationCap {
-    fn default() -> Self { Self { max: MAXIMUM_ORGANISMS } }
-}
-
-// ── Organism templates ────────────────────────────────────────────────────────
-
-struct TemplateData {
-    count:       u32,
-    collections: HashMap<CollectionId, CellCollection>,
-    ocg:         Vec<OcgEntry>,
-    spawn_y:     f32,
+/// Trophic strategy chosen at spawn time. Decides which marker component is
+/// inserted on the root entity and which colour the starter cell takes.
+#[derive(Clone, Copy, Debug)]
+pub enum OrganismKind {
+    Photoautotroph,
+    Heterotroph,
 }
 
-/// Photoautotroph — Single-cell photosynthetic organism.
-fn photoautotroph_template() -> TemplateData {
-    let cc = CollectionId(1);
-    let mut collections = HashMap::new();
-    collections.insert(cc, CellCollection { starter_cell_position: Vec3::ZERO, parent: None });
-
-    let ocg = vec![
-        OcgEntry { collection_id: cc, cell_type: CellType::PhotoCell, offset: Vec3::ZERO },
-    ];
-
-    TemplateData { count: 900, collections, ocg, spawn_y: 1.0 }
+impl OrganismKind {
+    /// Cell type of the organism's first cell. Photoautotrophs start green,
+    /// heterotrophs start red — the recognisable initial state before any
+    /// mutation kicks in.
+    #[inline]
+    pub fn starter_cell(self) -> CellType {
+        match self {
+            OrganismKind::Photoautotroph => CellType::Photo,
+            OrganismKind::Heterotroph    => CellType::NonPhoto,
+        }
+    }
 }
 
 
-fn heterotroph_template() -> TemplateData {
-    let cc = CollectionId(1);
-    let mut collections = HashMap::new();
-    collections.insert(cc, CellCollection { starter_cell_position: Vec3::ZERO, parent: None });
+// ── Starter body part ────────────────────────────────────────────────────────
 
-
-    let ocg = vec![
-
-        OcgEntry { collection_id: cc, cell_type: CellType::RedCell,  offset: Vec3::new( 0.0,  0.0,  0.0) },
-    ];
-
-    TemplateData { count: 200, collections, ocg, spawn_y: 1.0 }
+/// Construct the canonical 1-cell starter body part. The mesh generator
+/// renders this as a rhombic dodecahedron — the "first instance" appearance
+/// the spec calls for.
+pub fn make_starter_body_part(cell_type: CellType) -> BodyPart {
+    BodyPart {
+        kind: BodyPartKind::Body,
+        local_offset: Vec3::ZERO,
+        cells: vec![ Cell { local_pos: Vec3::ZERO, cell_type } ],
+        consumed: false,
+    }
 }
 
-// ── Spawning ──────────────────────────────────────────────────────────────────
+
+// ── Spawning ─────────────────────────────────────────────────────────────────
 
 fn spawn_colony(
     mut commands:  Commands,
@@ -133,6 +175,10 @@ fn spawn_colony(
     if *spawned { return; }
     *spawned = true;
 
+    // One shared white material across every organism. StandardMaterial
+    // multiplies base_color by ATTRIBUTE_COLOR, so a white base lets the
+    // per-vertex cell colour shine through unchanged. Also: 1100 organisms
+    // sharing one material handle keeps GPU bind-group churn minimal.
     let shared_material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         ..default()
@@ -140,224 +186,117 @@ fn spawn_colony(
 
     let mut rng = rand::rng();
 
-    let photo_template = photoautotroph_template();
-    let hetero_template = heterotroph_template();
-
-    let photo_mesh = {
-        let cells: Vec<MeshCell> = photo_template.ocg.iter().map(|e| {
-            MeshCell {
-                mesh_space_pos: photo_template.collections[&e.collection_id].starter_cell_position + e.offset,
-                cell_type: e.cell_type,
-            }
-        }).collect();
-        meshes.add(merge_organism_mesh(cells))
-    };
-
-    let hetero_mesh = {
-        let cells: Vec<MeshCell> = hetero_template.ocg.iter().map(|e| {
-            MeshCell {
-                mesh_space_pos: hetero_template.collections[&e.collection_id].starter_cell_position + e.offset,
-                cell_type: e.cell_type,
-            }
-        }).collect();
-        meshes.add(merge_organism_mesh(cells))
-    };
-
-    // ── Spawn photoautotrophs ─────────────────────────────────────────────────
-    for _ in 0..photo_template.count {
+    for _ in 0..INITIAL_PHOTOAUTOTROPHS {
         let x = rng.random_range(0.0_f32..MAP_MAX_X);
         let z = rng.random_range(0.0_f32..MAP_MAX_Z);
-        let y = heightmap.height_at(x, z) + photo_template.spawn_y;
-
-        let mut org = create_organism(
-            Vec3::new(x, y, z),
-            &photo_template.collections,
-            &photo_template.ocg,
-            OrganismKind::Photoautotroph,
-            &mut rng,
-        );
+        let y = heightmap.height_at(x, z) + 1.0;
+        let parts = vec![ make_starter_body_part(CellType::Photo) ];
+        let max_e = (parts.iter().map(|b| b.cells.len()).sum::<usize>() as f32)
+                    * crate::energy::MAX_ENERGY_PER_CELL;
         spawn_organism(
-            &mut org,
-            &mut commands,
-            photo_mesh.clone(),
-            shared_material.clone(),
+            Vec3::new(x, y, z),
+            parts,
             OrganismKind::Photoautotroph,
+            max_e * 0.5,
+            &mut commands,
+            &mut meshes,
+            &shared_material,
+            &mut rng,
         );
     }
 
-    // ── Spawn heterotrophs ────────────────────────────────────────────────────
-    for _ in 0..hetero_template.count {
+    for _ in 0..INITIAL_HETEROTROPHS {
         let x = rng.random_range(0.0_f32..MAP_MAX_X);
         let z = rng.random_range(0.0_f32..MAP_MAX_Z);
-        let y = heightmap.height_at(x, z) + hetero_template.spawn_y;
-
-        let mut org = create_organism(
-            Vec3::new(x, y, z),
-            &hetero_template.collections,
-            &hetero_template.ocg,
-            OrganismKind::Heterotroph,
-            &mut rng,
-        );
+        let y = heightmap.height_at(x, z) + 1.0;
+        let parts = vec![ make_starter_body_part(CellType::NonPhoto) ];
+        let max_e = (parts.iter().map(|b| b.cells.len()).sum::<usize>() as f32)
+                    * crate::energy::MAX_ENERGY_PER_CELL;
         spawn_organism(
-            &mut org,
-            &mut commands,
-            hetero_mesh.clone(),
-            shared_material.clone(),
+            Vec3::new(x, y, z),
+            parts,
             OrganismKind::Heterotroph,
+            max_e * 0.5,
+            &mut commands,
+            &mut meshes,
+            &shared_material,
+            &mut rng,
         );
     }
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
-enum OrganismKind {
-    Photoautotroph,
-    Heterotroph,
-}
-
-fn create_organism(
-    pos:        Vec3,
-    collections: &HashMap<CollectionId, CellCollection>,
-    ocg:        &Vec<OcgEntry>,
-    kind:       OrganismKind,
-    rng:        &mut impl rand::Rng,
-) -> Organism {
+/// Construct + register an organism with the supplied body-part genome at
+/// world position `pos`. Used by both initial colony spawn and reproduction.
+///
+/// Hierarchy produced:
+///   OrganismRoot (transform = pos, has Organism + Photoautotroph/Heterotroph)
+///   ├── BodyPart child 0 (transform = body_parts[0].local_offset, Mesh3d)
+///   ├── BodyPart child 1 (transform = body_parts[1].local_offset, Mesh3d)
+///   └── ...
+pub fn spawn_organism(
+    pos:            Vec3,
+    body_parts:     Vec<BodyPart>,
+    kind:           OrganismKind,
+    initial_energy: f32,
+    commands:       &mut Commands,
+    meshes:         &mut ResMut<Assets<Mesh>>,
+    material:       &Handle<StandardMaterial>,
+    rng:            &mut impl rand::Rng,
+) -> Entity {
     let angle     = rng.random::<f32>() * std::f32::consts::TAU;
-    let direction = Vec3::new(angle.cos(), 0.0, angle.sin()).normalize();
-
-    let movement_speed = match kind {
+    let direction = Vec3::new(angle.cos(), 0.0, angle.sin());
+    let speed     = match kind {
         OrganismKind::Photoautotroph => 0.0,
         OrganismKind::Heterotroph    => 15.0 + rng.random::<f32>() * 10.0,
     };
 
-
-    let target_rotation = Vec3::new(0.0, angle, 0.0);
-
-    let rotation_speed = match kind {
-        OrganismKind::Photoautotroph => 0.0,
-        OrganismKind::Heterotroph    => 1.0 + rng.random::<f32>() * 2.0,
-    };
-
-    let mut min_y_per_coll: HashMap<CollectionId, (Vec3, f32)> = HashMap::new();
-    for entry in ocg {
-        let coll    = &collections[&entry.collection_id];
-        let world_y = coll.starter_cell_position.y + entry.offset.y;
-        min_y_per_coll
-            .entry(entry.collection_id)
-            .and_modify(|e| { if world_y < e.1 { *e = (entry.offset, world_y); } })
-            .or_insert((entry.offset, world_y));
-    }
-    let floor_cells: Vec<(CollectionId, Vec3)> = min_y_per_coll
-        .into_iter()
-        .map(|(id, (off, _))| (id, off))
-        .collect();
-
-    let bounding_radius = ocg.iter()
-        .map(|e| (collections[&e.collection_id].starter_cell_position + e.offset).length())
-        .fold(0.0_f32, f32::max) + GLOBAL_CELL_SIZE;
-
-    let max_energy = (ocg.len() as f32) * 10.0;
-
-    Organism {
-        collections:        collections.clone(),
-        pos,
-        energy:             max_energy * 0.5,
-        growth_speed:       1.0,
-        adult:              false,
-        ocg:                ocg.clone(),
-        joint_entities:     HashMap::new(),
-        active_cells:       Vec::new(),
-        grown_cell_count:   ocg.len(),
-        weight:             ocg.len() as f32,
-        is_climbing:        false,
-        movement_speed,
-        last_movement_speed: 0.0,
+    let organism = Organism {
+        body_parts: body_parts.clone(),
+        energy: initial_energy.max(0.0),
+        in_sunlight: false,
+        reproduced: false,
+        reproductions: 0,
+        movement_speed: speed,
         movement_direction: direction,
-        last_movement_direction: Vec3::new(1.0, 1.0, 1.0),
-        velocity:           Vec3::ZERO,
-        floor_cells,
-        bounding_radius,
-        rotation: Vec3::ZERO,
-        last_rotation: Vec3::new(1.0, 1.0, 1.0),
-        target_rotation,
-        rotation_speed,
-        last_rotation_speed: 0.0,
-    }
-}
-
-fn spawn_organism(
-    organism:        &mut Organism,
-    commands:        &mut Commands,
-    mesh_handle:     Handle<Mesh>,
-    material_handle: Handle<StandardMaterial>,
-    kind:            OrganismKind,
-) {
-    organism.active_cells = organism.ocg.iter().map(|e| {
-        (
-            organism.collections[&e.collection_id].starter_cell_position + e.offset,
-            e.cell_type,
-        )
-    }).collect();
-
-    let joint_entities: HashMap<CollectionId, Entity> = organism.collections.iter().map(|(&id, coll)| {
-        let e = commands.spawn((
-            Transform::from_translation(coll.starter_cell_position),
-            Visibility::Visible,
-        )).id();
-        (id, e)
-    }).collect();
-    organism.joint_entities = joint_entities.clone();
-
-    let mut rng = rand::rng();
-
-    let random_interval_dir = 1.0 + rng.random::<f32>() * 9.0;
-    let random_interval_rot = 1.0 + rng.random::<f32>() * 9.0; 
-
-
-    // Convert the ML-friendly Vec3 (Euler angles) back into a Quaternion for Bevy's Transform
-    let spawn_rotation = Quat::from_euler(
-        EulerRot::YXZ, // YXZ is standard for Y-up systems (Yaw, Pitch, Roll)
-        organism.target_rotation.y,
-        organism.target_rotation.x,
-        organism.target_rotation.z,
-    );
-
-    let root = match kind {
-        OrganismKind::Photoautotroph => commands.spawn((
-            Transform::from_translation(organism.pos).with_rotation(spawn_rotation),
-            Visibility::Visible,
-            OrganismRoot,
-            Photoautotroph,
-            organism.clone(),
-            DirectionTimer::new(random_interval_dir),
-            RotationTimer::new(random_interval_rot), 
-        )).id(),
-        OrganismKind::Heterotroph => commands.spawn((
-            Transform::from_translation(organism.pos).with_rotation(spawn_rotation),
-            Visibility::Visible,
-            OrganismRoot,
-            Heterotroph,
-            organism.clone(),
-            DirectionTimer::new(random_interval_dir),
-            RotationTimer::new(random_interval_rot), 
-        )).id(),
+        velocity: Vec3::ZERO,
+        is_climbing: false,
+        climb_energy_debt: 0.0,
     };
 
-    for (&id, coll) in &organism.collections {
-        let joint = joint_entities[&id];
-        match coll.parent {
-            None         => { commands.entity(root).add_child(joint); }
-            Some(par_id) => { commands.entity(joint_entities[&par_id]).add_child(joint); }
-        }
+    let direction_interval = 1.0 + rng.random::<f32>() * 9.0;
+    let spawn_rotation     = Quat::from_rotation_y(angle);
+
+    let mut root_cmd = commands.spawn((
+        Transform::from_translation(pos).with_rotation(spawn_rotation),
+        Visibility::Visible,
+        OrganismRoot,
+        organism,
+        DirectionTimer::new(direction_interval),
+    ));
+    match kind {
+        OrganismKind::Photoautotroph => { root_cmd.insert(Photoautotroph); }
+        OrganismKind::Heterotroph    => { root_cmd.insert(Heterotroph); }
+    }
+    let root = root_cmd.id();
+
+    // One child entity per body part. Each child carries its own mesh,
+    // its local offset relative to the root, and a `BodyPartIndex` so
+    // systems that walk the hierarchy (mesh rebuild, gizmo overlays) can
+    // map back to the slot in `Organism::body_parts` in O(1).
+    for (i, bp) in body_parts.iter().enumerate() {
+        let mesh_handle = meshes.add(generate_body_part_mesh(bp));
+        let child = commands.spawn((
+            Mesh3d(mesh_handle),
+            MeshMaterial3d(material.clone()),
+            Transform::from_translation(bp.local_offset),
+            Visibility::Visible,
+            OrganismMesh,
+            BodyPartIndex(i),
+            ShowGizmo,
+        )).id();
+        commands.entity(root).add_child(child);
     }
 
-    let mesh_entity = commands.spawn((
-        Mesh3d(mesh_handle),
-        MeshMaterial3d(material_handle),
-        Transform::IDENTITY,
-        OrganismMesh,
-        ShowGizmo,
-    )).id();
-    commands.entity(root).add_child(mesh_entity);
+    root
 }

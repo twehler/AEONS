@@ -10,10 +10,11 @@ mod reproduction;
 mod environment;
 mod water;
 mod predation;
-mod growth;
+mod photosynthesis;
 mod behaviour;
 mod intelligence_level_1;
 mod intelligence_level_3;
+mod krishi;
 
 use bevy::{
     prelude::*,
@@ -37,13 +38,13 @@ fn main() {
     let show_wireframe = args.iter().any(|arg| arg == "--wireframe");
 
     // args[0] is always the program name
-    // args[1] = input path
+    // args[1] = input path (.glb under assets/)
     if args.len() < 2 {
-        println!("Usage: cargo run --bin AEONS <file.terrain>");
+        println!("Usage: cargo run --bin AEONS <world.glb>");
         return;
     }
 
-    let terrain_path_input = Path::new(&args[1]);
+    let world_path_input = Path::new(&args[1]);
 
 
     if let Ok(mut cache_path) = std::env::current_dir() {
@@ -70,11 +71,11 @@ fn main() {
             ..default()
         }))
         .add_plugins(world_geometry::WorldPlugin{
-
             // std::path::Path doesn't have to_string() implemented because input could be anything
-            // solution: use .to_string_lossy().into_owned() instead
-            terrain_path: terrain_path_input.to_string_lossy().into_owned(),
-            texture_path: "texture_atlas_8x8.png".to_string(),
+            // solution: use .to_string_lossy().into_owned() instead.
+            // The glb is resolved relative to Bevy's asset root (`assets/`);
+            // a leading `assets/` segment is stripped by the plugin.
+            world_path: world_path_input.to_string_lossy().into_owned(),
         })
         .add_plugins(player_plugin::PlayerPlugin)
         .add_plugins(viewport_settings::ViewportSettingsPlugin)
@@ -84,8 +85,8 @@ fn main() {
         .add_plugins(reproduction::ReproductionPlugin)
         .add_plugins(water::WaterPlugin)
         .add_plugins(predation::PredationPlugin)
-        .add_plugins(growth::GrowthPlugin)
         .add_plugins(behaviour::BehaviourPlugin)
+        .add_plugins(krishi::KrishiPlugin)
 
         //.add_plugins(EguiPlugin::default())
         //.add_plugins(WorldInspectorPlugin::new())
