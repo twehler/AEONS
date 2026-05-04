@@ -58,15 +58,6 @@ impl Plugin for ReproductionPlugin {
 }
 
 
-// ── Inheritance ──────────────────────────────────────────────────────────────
-
-/// Build a child genome by cloning each alive parent body part verbatim.
-fn inherit_body_parts(parent: &[BodyPart]) -> Vec<BodyPart> {
-    parent.iter()
-        .filter(|b| b.is_alive())
-        .cloned()
-        .collect()
-}
 
 
 // ── Reproduction system ──────────────────────────────────────────────────────
@@ -116,8 +107,8 @@ fn reproduction_system(
             continue;
         };
 
-        let child_parts = inherit_body_parts(&organism.body_parts);
-        if child_parts.is_empty() { continue; }
+        let child_ocg = crate::mutation::mutate_ocg(&organism.ocg, &mut rng);
+        if child_ocg.is_empty() { continue; }
 
         let spawn_x = rng.random_range(0.0..MAP_MAX_X);
         let spawn_z = rng.random_range(0.0..MAP_MAX_Z);
@@ -125,7 +116,7 @@ fn reproduction_system(
 
         pending_births.push(PendingBirth {
             pos:    spawn_pos,
-            parts:  child_parts,
+            ocg:    child_ocg,
             energy: offspring_energy,
             kind,
         });
@@ -139,7 +130,7 @@ fn reproduction_system(
     for birth in pending_births {
         spawn_organism(
             birth.pos,
-            birth.parts,
+            birth.ocg,
             birth.kind,
             birth.energy,
             &mut commands,
@@ -153,7 +144,7 @@ fn reproduction_system(
 
 struct PendingBirth {
     pos:    Vec3,
-    parts:  Vec<BodyPart>,
+    ocg:    Vec<(usize, Vec3, CellType)>,
     energy: f32,
     kind:   OrganismKind,
 }

@@ -111,28 +111,31 @@ fn snapshot(
     organism:  &Organism,
     transform: &Transform,
 ) -> OrganismSnapshot {
-    let body_parts: Vec<BodyPartSnapshot> = organism.body_parts.iter()
-        .enumerate()
-        .filter(|(_, bp)| !bp.cells.is_empty())
-        .map(|(i, bp)| {
-            // Cell positions in world space, computed once per tick.
-            let cells_world: Vec<Vec3> = bp.cells.iter()
-                .map(|c| transform.transform_point(bp.local_offset + c.local_pos))
-                .collect();
-
-            // Centroid + radius for the mid-phase sphere test.
-            let centroid = cells_world.iter().fold(Vec3::ZERO, |a, b| a + *b)
-                            / cells_world.len() as f32;
-            let bound = bp.local_bounding_radius();
-
-            BodyPartSnapshot {
-                index: i,
-                world_centroid: centroid,
-                bound_radius: bound,
-                cells_world,
-            }
-        })
+    // Derive collision cell positions from the OCG instead of BodyPart::cells.
+    // OCG positions are relative to the organism root, so one transform_point
+    // converts each to world space. All cells form a single BodyPartSnapshot
+    // (index 0) — multi-body-part organisms collapse to one collision volume,
+    // which matches the current single-body-part invariant.
+    let cells_world: Vec<Vec3> = organism.ocg.iter()
+        .map(|(_, pos, _)| transform.transform_point(*pos))
         .collect();
+
+    let body_parts = if cells_world.is_empty() {
+        vec![]
+    } else {
+        let centroid = cells_world.iter().copied().fold(Vec3::ZERO, |a, b| a + b)
+                       / cells_world.len() as f32;
+        let bound_radius = cells_world.iter()
+            .map(|&p| (p - centroid).length())
+            .fold(0.0_f32, f32::max)
+            + CELL_COLLISION_RADIUS;
+        vec![BodyPartSnapshot {
+            index: 0,
+            world_centroid: centroid,
+            bound_radius,
+            cells_world,
+        }]
+    };
 
     OrganismSnapshot {
         entity,

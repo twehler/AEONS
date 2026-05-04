@@ -1,5 +1,6 @@
 use crate::cell::*;
 use crate::viewport_settings::ShowGizmo;
+use crate::volumetric_growth::build_mesh_from_ocg;
 use crate::world_geometry::{HeightmapSampler, MAP_MAX_X, MAP_MAX_Z};
 use crate::movement::DirectionTimer;
 use bevy::prelude::*;
@@ -43,6 +44,11 @@ impl Plugin for ColonyPlugin {
 #[derive(Component, Clone)]
 pub struct Organism {
     pub body_parts: Vec<BodyPart>,
+    /// Order-of-cell-growth ledger: each entry is (index, position relative
+    /// to organism root). Populated from body-part cells at spawn time, then
+    /// extended by volumetric_growth as the organism grows. Collision geometry
+    /// is derived from this vector instead of body_parts[].cells.
+    pub ocg: Vec<(usize, Vec3, CellType)>,
     pub energy: f32,
     /// True when the organism's position has an unobstructed line to the sun.
     /// Maintained by `photosynthesis.rs` and consumed by Level 1 brains.
@@ -70,18 +76,18 @@ impl Organism {
     /// energy, weight or photosynthesis bookkeeping.
     #[inline]
     pub fn grown_cell_count(&self) -> usize {
-        self.body_parts.iter().filter(|b| b.is_alive())
-            .map(|b| b.cells.len()).sum()
+        self.ocg.len()
     }
 
     /// (photo_count, non_photo_count) over grown cells of alive body parts.
     pub fn cell_counts(&self) -> (u32, u32) {
         let mut p = 0u32;
         let mut np = 0u32;
-        for bp in self.body_parts.iter().filter(|b| b.is_alive()) {
-            let (a, b) = bp.cell_counts();
-            p  += a;
-            np += b;
+        for (_, _, ct) in &self.ocg {
+            match ct {
+                CellType::Photo    => p  += 1,
+                CellType::NonPhoto => np += 1,
+            }
         }
         (p, np)
     }
@@ -99,8 +105,8 @@ impl Organism {
     /// submersion and movement broad phase.
     pub fn bounding_radius(&self) -> f32 {
         let mut max_r = 2.0 * RD_HALF_SIZE; // single-cell starter floor
-        for bp in self.body_parts.iter().filter(|b| b.is_alive()) {
-            let r = bp.local_offset.length() + bp.local_bounding_radius();
+        for (_, pos, _) in &self.ocg {
+            let r = pos.length() + MESH_PADDING.max(2.0 * RD_HALF_SIZE);
             if r > max_r { max_r = r; }
         }
         max_r
@@ -135,30 +141,12 @@ pub enum OrganismKind {
 }
 
 impl OrganismKind {
-    /// Cell type of the organism's first cell. Photoautotrophs start green,
-    /// heterotrophs start red — the recognisable initial state before any
-    /// mutation kicks in.
     #[inline]
-    pub fn starter_cell(self) -> CellType {
+    pub fn starter_cell_type(self) -> CellType {
         match self {
             OrganismKind::Photoautotroph => CellType::Photo,
             OrganismKind::Heterotroph    => CellType::NonPhoto,
         }
-    }
-}
-
-
-// ── Starter body part ────────────────────────────────────────────────────────
-
-/// Construct the canonical 1-cell starter body part. The mesh generator
-/// renders this as a rhombic dodecahedron — the "first instance" appearance
-/// the spec calls for.
-pub fn make_starter_body_part(cell_type: CellType) -> BodyPart {
-    BodyPart {
-        kind: BodyPartKind::Body,
-        local_offset: Vec3::ZERO,
-        cells: vec![ Cell { local_pos: Vec3::ZERO, cell_type } ],
-        consumed: false,
     }
 }
 
@@ -190,12 +178,11 @@ fn spawn_colony(
         let x = rng.random_range(0.0_f32..MAP_MAX_X);
         let z = rng.random_range(0.0_f32..MAP_MAX_Z);
         let y = heightmap.height_at(x, z) + 1.0;
-        let parts = vec![ make_starter_body_part(CellType::Photo) ];
-        let max_e = (parts.iter().map(|b| b.cells.len()).sum::<usize>() as f32)
-                    * crate::energy::MAX_ENERGY_PER_CELL;
+        let ocg = vec![(0usize, Vec3::ZERO, CellType::Photo)];
+        let max_e = (ocg.len() as f32) * crate::energy::MAX_ENERGY_PER_CELL;
         spawn_organism(
             Vec3::new(x, y, z),
-            parts,
+            ocg,
             OrganismKind::Photoautotroph,
             max_e * 0.5,
             &mut commands,
@@ -209,12 +196,11 @@ fn spawn_colony(
         let x = rng.random_range(0.0_f32..MAP_MAX_X);
         let z = rng.random_range(0.0_f32..MAP_MAX_Z);
         let y = heightmap.height_at(x, z) + 1.0;
-        let parts = vec![ make_starter_body_part(CellType::NonPhoto) ];
-        let max_e = (parts.iter().map(|b| b.cells.len()).sum::<usize>() as f32)
-                    * crate::energy::MAX_ENERGY_PER_CELL;
+        let ocg = vec![(0usize, Vec3::ZERO, CellType::NonPhoto)];
+        let max_e = (ocg.len() as f32) * crate::energy::MAX_ENERGY_PER_CELL;
         spawn_organism(
             Vec3::new(x, y, z),
-            parts,
+            ocg,
             OrganismKind::Heterotroph,
             max_e * 0.5,
             &mut commands,
@@ -226,17 +212,17 @@ fn spawn_colony(
 }
 
 
-/// Construct + register an organism with the supplied body-part genome at
-/// world position `pos`. Used by both initial colony spawn and reproduction.
+/// Construct + register an organism from its OCG genome at world position
+/// `pos`. The OCG is the organism's DNA — body shape is fully determined by
+/// replaying it through `build_mesh_from_ocg`. Used by both initial colony
+/// spawn and reproduction (children are adult clones of their parent's OCG).
 ///
 /// Hierarchy produced:
 ///   OrganismRoot (transform = pos, has Organism + Photoautotroph/Heterotroph)
-///   ├── BodyPart child 0 (transform = body_parts[0].local_offset, Mesh3d)
-///   ├── BodyPart child 1 (transform = body_parts[1].local_offset, Mesh3d)
-///   └── ...
+///   └── single body-part child (Mesh3d built from OCG replay)
 pub fn spawn_organism(
     pos:            Vec3,
-    body_parts:     Vec<BodyPart>,
+    ocg:            Vec<(usize, Vec3, CellType)>,
     kind:           OrganismKind,
     initial_energy: f32,
     commands:       &mut Commands,
@@ -251,8 +237,18 @@ pub fn spawn_organism(
         OrganismKind::Heterotroph    => 15.0 + rng.random::<f32>() * 10.0,
     };
 
+    // Single sentinel body part for predation soft-delete bookkeeping.
+    let first_ct = ocg.first().map(|(_, _, ct)| *ct).unwrap_or(CellType::NonPhoto);
+    let sentinel = BodyPart {
+        kind:         BodyPartKind::Body,
+        local_offset: Vec3::ZERO,
+        cells:        vec![Cell { local_pos: Vec3::ZERO, cell_type: first_ct }],
+        consumed:     false,
+    };
+
     let organism = Organism {
-        body_parts: body_parts.clone(),
+        body_parts: vec![sentinel],
+        ocg: ocg.clone(),
         energy: initial_energy.max(0.0),
         in_sunlight: false,
         reproduced: false,
@@ -280,23 +276,18 @@ pub fn spawn_organism(
     }
     let root = root_cmd.id();
 
-    // One child entity per body part. Each child carries its own mesh,
-    // its local offset relative to the root, and a `BodyPartIndex` so
-    // systems that walk the hierarchy (mesh rebuild, gizmo overlays) can
-    // map back to the slot in `Organism::body_parts` in O(1).
-    for (i, bp) in body_parts.iter().enumerate() {
-        let mesh_handle = meshes.add(generate_body_part_mesh(bp));
-        let child = commands.spawn((
-            Mesh3d(mesh_handle),
-            MeshMaterial3d(material.clone()),
-            Transform::from_translation(bp.local_offset),
-            Visibility::Visible,
-            OrganismMesh,
-            BodyPartIndex(i),
-            ShowGizmo,
-        )).id();
-        commands.entity(root).add_child(child);
-    }
+    // One mesh child representing the full body, built by replaying the OCG.
+    let mesh_handle = meshes.add(build_mesh_from_ocg(&ocg));
+    let child = commands.spawn((
+        Mesh3d(mesh_handle),
+        MeshMaterial3d(material.clone()),
+        Transform::from_translation(Vec3::ZERO),
+        Visibility::Visible,
+        OrganismMesh,
+        BodyPartIndex(0),
+        ShowGizmo,
+    )).id();
+    commands.entity(root).add_child(child);
 
     root
 }

@@ -1,4 +1,6 @@
 mod world_geometry;
+mod volumetric_growth;
+mod mutation;
 mod player_plugin;
 mod viewport_settings;
 mod colony;
