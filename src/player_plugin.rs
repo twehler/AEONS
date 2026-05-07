@@ -81,6 +81,15 @@ fn initial_grab_cursor(primary_cursor_options: Single<&mut CursorOptions, With<P
 fn setup_player(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
+        // Tight far plane bounds both the visible mesh set and the directional
+        // light's cascade-shadow ortho fit. Bevy 0.18's default is 1000 units;
+        // at large maps that pulls a huge swath of terrain into every
+        // shadow-pass draw and inflates extract-phase work over many entities.
+        Projection::Perspective(PerspectiveProjection {
+            far: 300.0,
+            near: 0.1,
+            ..default()
+        }),
         FlyCam,
         Transform::from_xyz(20.0, 100.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y),
         AmbientLight {

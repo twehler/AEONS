@@ -1,22 +1,27 @@
-mod world_geometry;
-mod volumetric_growth;
-mod mutation;
+#[path = "world/world_geometry.rs"]    mod world_geometry;
+#[path = "world/environment.rs"]       mod environment;
+#[path = "world/water.rs"]             mod water;
+
+#[path = "colony/colony.rs"]           mod colony;
+#[path = "colony/cell.rs"]             mod cell;
+#[path = "colony/energy.rs"]           mod energy;
+#[path = "colony/reproduction.rs"]     mod reproduction;
+#[path = "colony/krishi.rs"]           mod krishi;
+
+#[path = "growth/volumetric_growth/mod.rs"] mod volumetric_growth;
+#[path = "growth/mutation.rs"]          mod mutation;
+
+#[path = "behaviour/behaviour.rs"]            mod behaviour;
+#[path = "behaviour/intelligence_level_1.rs"] mod intelligence_level_1;
+#[path = "behaviour/intelligence_level_3.rs"] mod intelligence_level_3;
+#[path = "behaviour/predation.rs"]            mod predation;
+#[path = "behaviour/photosynthesis.rs"]       mod photosynthesis;
+
+#[path = "movement_physics/movement.rs"]           mod movement;
+#[path = "movement_physics/organism_collision.rs"] mod organism_collision;
+
 mod player_plugin;
 mod viewport_settings;
-mod colony;
-mod cell;
-mod movement;
-mod organism_collision;
-mod energy;
-mod reproduction;
-mod environment;
-mod water;
-mod predation;
-mod photosynthesis;
-mod behaviour;
-mod intelligence_level_1;
-mod intelligence_level_3;
-mod krishi;
 
 use bevy::{
     prelude::*,

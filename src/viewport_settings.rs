@@ -6,7 +6,7 @@ use bevy::camera::RenderTarget;
 use bevy::render::render_resource::{Extent3d, TextureFormat};
 use bevy::window::PrimaryWindow;
 
-use crate::colony::{Photoautotroph, Heterotroph};
+use crate::colony::{Photoautotroph, Heterotroph, Organism, OrganismRoot};
 
 
 // Initial statistics-pane height as a fraction of the window's logical height.
@@ -46,6 +46,7 @@ impl Plugin for ViewportSettingsPlugin {
                 resize_render_target,
                 toggle_advanced_viewport,
                 update_fps_text,
+                update_cell_count_text,
                 track_organism_births,
                 track_organism_deaths,
                 update_counter_texts,
@@ -128,6 +129,11 @@ struct PanelDivider;
 
 #[derive(Component)]
 struct FpsText {
+    timer: Timer,
+}
+
+#[derive(Component)]
+struct CellCountText {
     timer: Timer,
 }
 
@@ -261,12 +267,26 @@ fn setup_panes(
                 BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
             ))
             .with_children(|panel| {
-                panel.spawn((
-                    Text::new("FPS: 0.0"),
-                    TextFont { font_size: 20.0, ..default() },
-                    TextColor(Color::WHITE),
-                    FpsText { timer: Timer::from_seconds(0.05, TimerMode::Repeating) },
-                ));
+                panel
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::FlexStart,
+                        ..default()
+                    })
+                    .with_children(|left| {
+                        left.spawn((
+                            Text::new("FPS: 0.0"),
+                            TextFont { font_size: 20.0, ..default() },
+                            TextColor(Color::WHITE),
+                            FpsText { timer: Timer::from_seconds(0.05, TimerMode::Repeating) },
+                        ));
+                        left.spawn((
+                            Text::new("Cells: 0"),
+                            TextFont { font_size: 20.0, ..default() },
+                            TextColor(Color::WHITE),
+                            CellCountText { timer: Timer::from_seconds(0.2, TimerMode::Repeating) },
+                        ));
+                    });
 
                 // Graph: absolutely positioned so it sits at exactly 25vw
                 // from the window edge and fills the panel height. Taking it
@@ -396,6 +416,24 @@ fn update_fps_text(
                     text.0 = format!("FPS: {:.1}", fps_value);
                 }
             }
+        }
+    }
+}
+
+
+fn update_cell_count_text(
+    time: Res<Time>,
+    organisms: Query<&Organism, With<OrganismRoot>>,
+    mut query: Query<(&mut Text, &mut CellCountText)>,
+) {
+    for (mut text, mut marker) in &mut query {
+        marker.timer.tick(time.delta());
+        if marker.timer.just_finished() {
+            let total: usize = organisms
+                .iter()
+                .map(|o| o.grown_cell_count())
+                .sum();
+            text.0 = format!("Cells: {}", total);
         }
     }
 }
