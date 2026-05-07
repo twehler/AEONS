@@ -27,7 +27,7 @@ use crate::world_geometry::HeightmapSampler;
 /// light source — is the unit vector below.
 pub const SUN_DIRECTION: Vec3 = Vec3::new(0.5, std::f32::consts::FRAC_1_SQRT_2, 0.5);
 
-const SHADOW_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+const SHADOW_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Step length of the shadow raymarch in world units. Chosen to match the
 /// heightmap cell size (1.0) so each step samples a fresh terrain cell.

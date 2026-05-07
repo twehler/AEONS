@@ -208,12 +208,27 @@ pub fn apply_intelligence_level_3(
         input[i_off + 2] = rel.z;
 
         if found {
-            // Oracle: head straight at the prey at full speed.
-            let ideal_dir = (best_p - pos).normalize_or_zero();
+            // Oracle: head straight at the prey at full speed. The
+            // ideal direction is PROJECTED ONTO THE XZ PLANE before
+            // becoming the training target — translation in
+            // `apply_movement` is XZ-only and the body's yaw rotation
+            // reads dir.x / dir.z. If we trained on a 3D unit vector,
+            // a vertically-offset prey (prey on a hill, predator below
+            // on a slope) would produce a target like
+            // (0.04, 0.998, 0.03): the model learns to saturate Y near
+            // 1 while X and Z hover near zero with training noise.
+            // That noise is enough to flip the sign of dir.x / dir.z
+            // between ticks, sending yaw across `atan2`'s
+            // discontinuities — visually a spinning heterotroph. With
+            // the XZ-projected target the model learns meaningful X
+            // and Z outputs that tell the body which way to face.
+            let to_prey  = best_p - pos;
+            let to_prey_xz = Vec3::new(to_prey.x, 0.0, to_prey.z);
+            let ideal_dir  = to_prey_xz.normalize_or_zero();
             let t_off = s * OUT;
             target[t_off    ] = 1.0;            // ideal speed (tanh-space)
             target[t_off + 1] = ideal_dir.x;
-            target[t_off + 2] = ideal_dir.y;
+            target[t_off + 2] = 0.0;            // no Y motion ever
             target[t_off + 3] = ideal_dir.z;
             mask[s] = 1.0;
             count  += 1.0;
@@ -249,7 +264,11 @@ pub fn apply_intelligence_level_3(
     for (entity, slot) in active {
         let off = slot as usize * OUT;
         let speed = out_data[off];
-        let dir   = Vec3::new(out_data[off + 1], out_data[off + 2], out_data[off + 3]);
+        // Discard the Y output (defence-in-depth — a freshly-recycled
+        // slot whose previous tenant hadn't fully retrained could
+        // otherwise leak Y noise into the yaw calculation in
+        // apply_movement).
+        let dir   = Vec3::new(out_data[off + 1], 0.0, out_data[off + 3]);
 
         let Ok((_, mut org, _, _)) = heteros.get_mut(entity) else { continue };
         if dir.length_squared() > 0.01 { org.movement_direction = dir.normalize(); }

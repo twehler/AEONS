@@ -101,12 +101,29 @@ fn predation_system(
             let share = prey_org.energy / alive as f32;
             prey_org.energy = (prey_org.energy - share).max(0.0);
 
+            // Decrement the cached cell counts BEFORE clearing the part,
+            // since the cell types are read from `bp.cells`. The
+            // `Organism::{photo,non_photo}_cell_count` fields are updated
+            // only at composition-change events; predation is one of them.
+            let bp_counts = prey_org.body_parts[prey_bp_idx].cell_counts();
+            prey_org.photo_cell_count     -= bp_counts.0 as i32;
+            prey_org.non_photo_cell_count -= bp_counts.1 as i32;
+
             let bp = &mut prey_org.body_parts[prey_bp_idx];
             bp.consumed = true;
             bp.cells.clear();
+            // Each body part now owns its OCG too; clear it so cell-count
+            // accessors and is_alive() agree the part is gone.
+            bp.ocg.clear();
 
             let new_alive = prey_org.alive_body_part_count();
-            (share, new_alive == 0)
+            // Bilateral organisms cannot survive losing a half — once one
+            // body part is consumed, the whole organism dies. This avoids
+            // visually-bisected zombies that would otherwise wander on
+            // half a body. Asymmetric (NoSymmetry) organisms degrade
+            // gradually as before.
+            let bilateral_collapse = matches!(prey_org.symmetry, Symmetry::Bilateral);
+            (share, new_alive == 0 || bilateral_collapse)
         };
 
         // ── Credit predator ──────────────────────────────────────────────

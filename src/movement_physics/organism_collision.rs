@@ -111,31 +111,40 @@ fn snapshot(
     organism:  &Organism,
     transform: &Transform,
 ) -> OrganismSnapshot {
-    // Derive collision cell positions from the OCG instead of BodyPart::cells.
-    // OCG positions are relative to the organism root, so one transform_point
-    // converts each to world space. All cells form a single BodyPartSnapshot
-    // (index 0) — multi-body-part organisms collapse to one collision volume,
-    // which matches the current single-body-part invariant.
-    let cells_world: Vec<Vec3> = organism.ocg.iter()
-        .map(|(_, pos, _)| transform.transform_point(*pos))
-        .collect();
-
-    let body_parts = if cells_world.is_empty() {
-        vec![]
-    } else {
+    // One snapshot per alive body part. Each body part's OCG lives in its
+    // own local frame; for branches that frame is offset from the root by
+    // the attachment origin (parent_idx = 0 in the current single-level
+    // hierarchy). We approximate the world position by adding the attachment
+    // origin in the parent's frame, then transforming by the root.
+    //
+    // This ignores the branch's own `attachment.rotation` for now — once
+    // body-part rotation is animated, branch cell positions should be
+    // computed via `parent_world * Translate(origin) * Rotate * cell_local`.
+    // Until then, attachment.rotation is Quat::IDENTITY and the simpler
+    // composition is exact.
+    let mut body_parts: Vec<BodyPartSnapshot> = Vec::new();
+    for (idx, bp) in organism.body_parts.iter().enumerate() {
+        if !bp.is_alive() { continue; }
+        let part_origin_local = bp.attachment.as_ref()
+            .map(|a| a.origin_local)
+            .unwrap_or(Vec3::ZERO);
+        let cells_world: Vec<Vec3> = bp.ocg.iter()
+            .map(|(_, p, _)| transform.transform_point(part_origin_local + *p))
+            .collect();
+        if cells_world.is_empty() { continue; }
         let centroid = cells_world.iter().copied().fold(Vec3::ZERO, |a, b| a + b)
                        / cells_world.len() as f32;
         let bound_radius = cells_world.iter()
             .map(|&p| (p - centroid).length())
             .fold(0.0_f32, f32::max)
             + CELL_COLLISION_RADIUS;
-        vec![BodyPartSnapshot {
-            index: 0,
+        body_parts.push(BodyPartSnapshot {
+            index: idx,
             world_centroid: centroid,
             bound_radius,
             cells_world,
-        }]
-    };
+        });
+    }
 
     OrganismSnapshot {
         entity,

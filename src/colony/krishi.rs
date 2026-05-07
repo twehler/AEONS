@@ -129,23 +129,32 @@ fn load_krishi_assets(mut commands: Commands, asset_server: Res<AssetServer>) {
 /// cell alone already covers a sphere of radius `CELL_COLLISION_RADIUS`
 /// which is adequate for that range.
 fn make_krishi_body(scale: f32) -> BodyPart {
-    let mut cells = vec![Cell {
-        local_pos: Vec3::ZERO,
-        cell_type: CellType::NonPhoto,
-    }];
+    let mut cells = vec![Cell::new(Vec3::ZERO, CellType::NonPhoto)];
 
     if scale > 1.2 {
         let r = scale * 0.5;
         for dir in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
-            cells.push(Cell { local_pos: dir * r, cell_type: CellType::NonPhoto });
+            cells.push(Cell::new(dir * r, CellType::NonPhoto));
         }
     }
+
+    // Mirror cells into the per-part OCG so collision / energy code sees the
+    // same cell catalogue everything else uses.
+    let ocg: Vec<(usize, Vec3, CellType)> = cells.iter().enumerate()
+        .map(|(i, c)| (i, c.local_pos, c.cell_type))
+        .collect();
 
     BodyPart {
         kind:          BodyPartKind::Body,
         local_offset:  Vec3::ZERO,
         cells,
+        ocg,
+        attachment:    None,
         consumed:      false,
+        debug_blue:    false,
+        // Krishi has a hand-built footprint; mutation must never touch it
+        // and the visual is the glb scene, not a generated mesh.
+        regrowable:    false,
     }
 }
 
@@ -202,15 +211,25 @@ fn spawn_krishi(
     let max_energy = (body_parts.iter().map(|b| b.cells.len()).sum::<usize>() as f32)
                      * crate::energy::MAX_ENERGY_PER_CELL;
 
-    let ocg: Vec<(usize, Vec3, CellType)> = body_parts.iter()
-        .flat_map(|bp| bp.cells.iter().map(|c| (bp.local_offset + c.local_pos, c.cell_type)))
-        .enumerate()
-        .map(|(i, (pos, ct))| (i, pos, ct))
-        .collect();
+    // Populate per-cell physiology caches even though the body is hand-built
+    // and never regrows — `Organism::recompute_cell_counts` reads them, and
+    // future physiology rules will too. Krishi's Photo cells (currently
+    // none — its layout is all NonPhoto) would still produce energy through
+    // the standard photosynthesis path if any were present.
+    let mut body_parts = body_parts;
+    crate::physiology::recompute_body_parts(&mut body_parts);
 
-    let organism = Organism {
+    let mut organism = Organism {
         body_parts: body_parts.clone(),
-        ocg,
+        // Krishi never reproduces (`reproduced: true` below) so the symmetry
+        // value is structurally irrelevant — set to NoSymmetry for type
+        // consistency with the rest of the population.
+        symmetry:             Symmetry::NoSymmetry,
+        // Krishi roams freely (mobile predator); no plant-like form.
+        is_sessile:           false,
+        has_variable_form:    false,
+        photo_cell_count:     0,
+        non_photo_cell_count: 0,
         energy:             max_energy * 0.5,
         in_sunlight:        false,
         // `reproduced = true` permanently gates `reproduction_system` off.
@@ -225,6 +244,7 @@ fn spawn_krishi(
         is_climbing:        false,
         climb_energy_debt:  0.0,
     };
+    organism.recompute_cell_counts();
 
     let direction_interval = 1.0 + rng.random::<f32>() * 9.0;
     let spawn_rotation     = Quat::from_rotation_y(angle);

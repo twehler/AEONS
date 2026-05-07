@@ -11,10 +11,11 @@
 use bevy::prelude::*;
 use rand::prelude::*;
 
+use crate::body_part::{self, Attachment};
 use crate::cell::*;
 use crate::colony::*;
 use crate::energy::MAX_ENERGY_PER_CELL;
-use crate::world_geometry::{MAP_MAX_X, MAP_MAX_Z};
+use crate::world_geometry::{HeightmapSampler, MAP_MAX_X, MAP_MAX_Z};
 
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -68,6 +69,7 @@ fn reproduction_system(
     mut commands:   Commands,
     mut meshes:     ResMut<Assets<Mesh>>,
     mut materials:  ResMut<Assets<StandardMaterial>>,
+    heightmap:      Option<Res<HeightmapSampler>>,
     mut query:      Query<
         (Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>),
         With<OrganismRoot>,
@@ -107,43 +109,120 @@ fn reproduction_system(
             continue;
         };
 
-        let child_ocg = crate::mutation::mutate_ocg(&organism.ocg, &mut rng);
-        if child_ocg.is_empty() { continue; }
+        // Build the child's body parts from the parent's plan, using the
+        // growth pipeline appropriate to the parent's symmetry. Offspring
+        // inherit the parent's symmetry verbatim.
+        let child_body_parts = match organism.symmetry {
+            Symmetry::NoSymmetry => {
+                // Legacy path. 20% chance: spawn a new branch body part.
+                // 80%: extend the root part's OCG by one cell.
+                if body_part::should_branch(&mut rng) {
+                    let mut parts = organism.body_parts.clone();
+                    let parent_ocg = &parts[0].ocg;
+                    if parent_ocg.is_empty() { continue; }
+                    let (origin_local, outward) =
+                        body_part::pick_attachment(parent_ocg, &mut rng);
+                    let seed_ct = parent_ocg[0].2;
+                    let attachment = Attachment {
+                        parent_idx:   0,
+                        origin_local,
+                        rotation:     Quat::IDENTITY,
+                    };
+                    let new_part = body_part::create_branch_body_part(
+                        seed_ct, attachment, outward,
+                    );
+                    // Grow the new part from 1 cell to 2.
+                    let grown_ocg = crate::mutation::mutate_ocg(
+                        &new_part.ocg, &mut rng,
+                    );
+                    if grown_ocg.is_empty() { continue; }
+                    let mut grown_part = new_part;
+                    grown_part.cells = grown_ocg.iter()
+                        .map(|(_, p, ct)| Cell::new(*p, *ct))
+                        .collect();
+                    grown_part.ocg = grown_ocg;
+                    parts.push(grown_part);
+                    parts
+                } else {
+                    let mut parts = organism.body_parts.clone();
+                    let grown_ocg = crate::mutation::mutate_ocg(
+                        &parts[0].ocg, &mut rng,
+                    );
+                    if grown_ocg.is_empty() { continue; }
+                    parts[0].cells = grown_ocg.iter()
+                        .map(|(_, p, ct)| Cell::new(*p, *ct))
+                        .collect();
+                    parts[0].ocg = grown_ocg;
+                    parts
+                }
+            }
+            Symmetry::Bilateral => {
+                // Grow the right half by one cell (constrained to x ≥
+                // MIN_X_BILATERAL), then re-mirror to update the left half.
+                // No branching for bilateral organisms — that would
+                // require pairing every branch with a mirror branch, which
+                // is deferred to a later iteration.
+                let mut parts = organism.body_parts.clone();
+                if parts.len() < 2 { continue; } // safety net
+                let Some(grown_right) =
+                    crate::mutation::mutate_bilateral(&parts[0].ocg, &mut rng)
+                    else { continue; };
+                let grown_left = body_part::mirror_ocg_x(&grown_right);
+                parts[0].cells = grown_right.iter()
+                    .map(|(_, p, ct)| Cell::new(*p, *ct))
+                    .collect();
+                parts[0].ocg = grown_right;
+                parts[1].cells = grown_left.iter()
+                    .map(|(_, p, ct)| Cell::new(*p, *ct))
+                    .collect();
+                parts[1].ocg = grown_left;
+                parts
+            }
+        };
 
         let spawn_x = rng.random_range(0.0..MAP_MAX_X);
         let spawn_z = rng.random_range(0.0..MAP_MAX_Z);
-        let spawn_pos = Vec3::new(spawn_x, transform.translation.y, spawn_z);
+        // Spawn on the ground at the chosen XZ, with a 1.0-unit clearance
+        // mirroring the initial colony spawn (`spawn_colony`). Falling back
+        // to the parent's Y if the heightmap resource hasn't been inserted
+        // yet keeps reproduction usable in the (rare) early-tick window
+        // before the world finishes loading.
+        let spawn_y = match heightmap.as_ref() {
+            Some(hm) => hm.height_at(spawn_x, spawn_z) + 1.0,
+            None     => transform.translation.y,
+        };
+        let spawn_pos = Vec3::new(spawn_x, spawn_y, spawn_z);
 
         pending_births.push(PendingBirth {
-            pos:    spawn_pos,
-            ocg:    child_ocg,
-            energy: offspring_energy,
+            pos:        spawn_pos,
+            body_parts: child_body_parts,
+            energy:     offspring_energy,
             kind,
+            // Offspring inherit the parent's symmetry, sessility, and
+            // variable-form trait verbatim. Per design: a variable-form
+            // parent always produces a variable-form (sessile) child;
+            // a bilateral mobile parent always produces a bilateral
+            // mobile child.
+            symmetry:          organism.symmetry,
+            has_variable_form: organism.has_variable_form,
+            is_sessile:        organism.is_sessile,
         });
     }
 
-    let photo_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.2, 0.8, 0.2),
-        ..default()
-    });
-    let hetero_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.8, 0.2, 0.2),
-        ..default()
-    });
+    let organism_materials = OrganismMaterials::new(&mut materials);
 
     for birth in pending_births {
-        let material = match birth.kind {
-            OrganismKind::Photoautotroph => &photo_material,
-            OrganismKind::Heterotroph    => &hetero_material,
-        };
         spawn_organism(
             birth.pos,
-            birth.ocg,
+            birth.body_parts,
             birth.kind,
+            birth.symmetry,
+            birth.has_variable_form,
+            birth.is_sessile,
             birth.energy,
             &mut commands,
             &mut meshes,
-            material,
+            &organism_materials,
             &mut rng,
         );
     }
@@ -151,8 +230,11 @@ fn reproduction_system(
 
 
 struct PendingBirth {
-    pos:    Vec3,
-    ocg:    Vec<(usize, Vec3, CellType)>,
-    energy: f32,
-    kind:   OrganismKind,
+    pos:               Vec3,
+    body_parts:        Vec<BodyPart>,
+    energy:            f32,
+    kind:              OrganismKind,
+    symmetry:          Symmetry,
+    has_variable_form: bool,
+    is_sessile:        bool,
 }

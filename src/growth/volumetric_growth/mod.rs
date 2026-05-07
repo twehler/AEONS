@@ -219,6 +219,48 @@ pub fn grow_ocg_one_step(
     new_ocg
 }
 
+/// As `grow_ocg_one_step`, but only candidate cells with `x >= min_x` are
+/// considered. Returns the parent OCG unchanged when no candidate satisfies
+/// the constraint. Used by the bilateral pipeline to keep the right half
+/// strictly on the +X side of the YZ mirror plane.
+///
+/// `min_x` is checked against the candidate's centre with a tiny float-drift
+/// slack (`-1e-3`) — see body_part::MIN_X_BILATERAL for rationale.
+pub fn grow_ocg_one_step_constrained(
+    ocg:   &[(usize, Vec3, CellType)],
+    rng:   &mut impl rand::Rng,
+    min_x: f32,
+) -> Vec<(usize, Vec3, CellType)> {
+    if ocg.is_empty() {
+        return Vec::new();
+    }
+    let mut state = VolumetricState::empty();
+    for (_, center, _) in ocg.iter() {
+        state.centers.push(*center);
+        update_lattice_bookkeeping(&mut state, *center);
+    }
+    let (v, t) = rebuild_mesh(&state.centers);
+    state.vertices = v;
+    state.triangles = t;
+
+    let threshold = min_x - 1e-3;
+    let candidates: Vec<_> = collect_candidates(&state)
+        .into_iter()
+        .filter(|c| c.center.x >= threshold)
+        .collect();
+    if candidates.is_empty() {
+        return ocg.to_vec();
+    }
+    let pick = rng.random_range(0..candidates.len());
+    let center = candidates[pick].center;
+
+    let cell_type = ocg[0].2;
+    let new_idx = ocg.len();
+    let mut new_ocg = ocg.to_vec();
+    new_ocg.push((new_idx, center, cell_type));
+    new_ocg
+}
+
 // ── Plugin (sandbox) ──────────────────────────────────────────────────────────
 
 pub struct VolumetricGrowthPlugin;
@@ -409,8 +451,14 @@ fn spawn_volumetric_mesh(
         })),
         VolumetricMesh,
         Organism {
-            body_parts: vec![],
-            ocg: vec![(0, Vec3::ZERO, CellType::Photo)],
+            body_parts: vec![crate::colony::root_body_part_from_ocg(
+                &[(0, Vec3::ZERO, CellType::Photo)],
+            )],
+            symmetry:             crate::organism::Symmetry::NoSymmetry,
+            is_sessile:           false,
+            has_variable_form:    false,
+            photo_cell_count:     1,
+            non_photo_cell_count: 0,
             energy: 0.0,
             in_sunlight: false,
             reproduced: false,
@@ -460,12 +508,14 @@ fn grow_one_step(
 
     if let Ok(mut organism) = organism_query.single_mut() {
         let relative_pos = center - state.centers[0];
-        let ocg_idx = organism.ocg.len();
-        organism.ocg.push((ocg_idx, relative_pos, CellType::Photo));
-        info!(
-            "organism.ocg[{}] = ({:.3}, {:.3}, {:.3})",
-            ocg_idx, relative_pos.x, relative_pos.y, relative_pos.z
-        );
+        if let Some(root) = organism.body_parts.first_mut() {
+            let ocg_idx = root.ocg.len();
+            root.ocg.push((ocg_idx, relative_pos, CellType::Photo));
+            info!(
+                "organism.body_parts[0].ocg[{}] = ({:.3}, {:.3}, {:.3})",
+                ocg_idx, relative_pos.x, relative_pos.y, relative_pos.z
+            );
+        }
     }
 
     let cells_placed = state.centers.len() - 1;

@@ -6,7 +6,11 @@ use crate::krishi::Krishi;
 const ENERGY_TICK_INTERVAL: f32 = 0.5;
 pub const MAX_ENERGY_PER_CELL: f32 = 10.0;
 
-const PHOTO_PRODUCTION_PER_CELL:      f32 = 4.0;
+/// Per-tick energy a fully-surrounded (18 RD neighbours) photo cell
+/// produces. Read by `physiology.rs::PhotosyntheticCell::new` to derive
+/// the per-cell `energy_production` cache; the photosynthesis tick itself
+/// runs in `physiology.rs`, not here.
+pub const PHOTO_PRODUCTION_PER_CELL:  f32 = 4.0;
 const NON_PHOTO_CONSUMPTION_PER_CELL: f32 = 0.01;
 
 // Movement-cost coefficients tuned so a max-speed (20) sprint is heavily
@@ -57,18 +61,19 @@ fn manage_energy(
     // unmodified for the procedural organisms; the only cost is one extra
     // archetype filter at query construction time.
     mut organisms: Query<
-        (Entity, &mut Organism, &Transform, Has<Photoautotroph>),
+        (Entity, &mut Organism, &Transform),
         (With<OrganismRoot>, Without<Krishi>),
     >,
 ) {
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
-    for (entity, mut organism, transform, is_photoautotroph) in organisms.iter_mut() {
+    for (entity, mut organism, transform) in organisms.iter_mut() {
         let max_energy = get_max_energy(&organism);
 
-        // Tally cell types from grown cells across all alive body parts.
-        let (photo_count, non_photo_count) = organism.cell_counts();
+        // Cached cell counts — kept in sync by physiology / predation, no
+        // per-tick iteration needed here.
+        let non_photo_count = organism.non_photo_cell_count.max(0) as f32;
 
         // Submersion ∈ [0, 1]: 0 = entirely above water, 1 = fully submerged.
         let bounding = organism.bounding_radius().max(1.0);
@@ -89,24 +94,16 @@ fn manage_energy(
             * (K_FLUID_DRAG * weight.powf(2.0 / 3.0) * speed.powi(3))
             * ENERGY_TICK_INTERVAL;
 
-        // Only photoautotroph-tagged organisms photosynthesise. A heterotroph
-        // that mutated to carry Photo cells does not get to free-ride on the
-        // sun — without prey it must starve. The cell-level tally still
-        // matters as a proxy for "biological investment in photosynthesis":
-        // a photoautotroph that mutates *away* from Photo cells loses
-        // production proportionally and can starve too.
-        let production = if is_photoautotroph {
-            photo_count as f32 * PHOTO_PRODUCTION_PER_CELL
-        } else {
-            0.0
-        };
+        // Photosynthesis is owned by `physiology.rs` now (per-cell,
+        // neighbour-count-weighted). Only consumption + clamp + starvation
+        // despawn happen here.
         let elevation_cost = organism.climb_energy_debt * ELEVATION_ENERGY_PER_UNIT;
         organism.climb_energy_debt = 0.0;
 
-        let consumption = non_photo_count as f32 * NON_PHOTO_CONSUMPTION_PER_CELL
+        let consumption = non_photo_count * NON_PHOTO_CONSUMPTION_PER_CELL
                           + friction_cost + fluid_cost + elevation_cost;
 
-        organism.energy = (organism.energy + production - consumption).clamp(0.0, max_energy);
+        organism.energy = (organism.energy - consumption).clamp(0.0, max_energy);
 
         if organism.energy <= 0.0 {
             commands.entity(entity).despawn();

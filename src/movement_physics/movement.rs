@@ -170,6 +170,33 @@ fn apply_movement(
     let half_size = RD_HALF_SIZE;
 
     for (mut transform, mut organism) in &mut query {
+        // Sessile organisms never move (plant-like body plan). Brain
+        // systems may still write `movement_speed` / `movement_direction`
+        // — those writes are simply ignored here. Floor-collision and
+        // world-bounds clamping run in their own systems and continue to
+        // apply, so a sessile cell still settles onto the heightmap.
+        if organism.is_sessile { continue; }
+
+        // Yaw the organism so its local +Z axis (defined as "front" by
+        // the body-plan convention) points along the XZ projection of
+        // its movement direction. Body never pitches or rolls — Y-axis
+        // rotation only — which keeps mesh-vs-world AABB tests in the
+        // axis-aligned regime they were tuned for. Snap (no slerp) is
+        // intentional: brains can change heading at any tick rate, and
+        // a smoothing layer would just lag the visual behind the
+        // collision geometry that already follows the new heading.
+        if organism.movement_speed > 0.0 {
+            let dir = organism.movement_direction;
+            let dir_xz_len_sq = dir.x * dir.x + dir.z * dir.z;
+            if dir_xz_len_sq > 1e-6 {
+                // For a Y-axis yaw θ: local +Z maps to world
+                // (sin θ, 0, cos θ). Solving for θ that aligns this
+                // with (dir.x, 0, dir.z) gives θ = atan2(dir.x, dir.z).
+                let yaw = dir.x.atan2(dir.z);
+                transform.rotation = Quat::from_rotation_y(yaw);
+            }
+        }
+
         let move_vector = organism.movement_direction * organism.movement_speed * dt;
 
         // Airborne early-out: well above the heightmap → no triangles to hit.
