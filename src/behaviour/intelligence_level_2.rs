@@ -1,17 +1,11 @@
-// Intelligence Level 3 — Heterotroph REINFORCE pool, largest hidden width.
+// Intelligence Level 2 — Heterotroph REINFORCE pool, medium hidden width.
 //
-// Same architecture as `intelligence_level_1_hetero.rs` /
-// `intelligence_level_2.rs` but with `HIDDEN = 64`. Inputs / outputs /
-// training loop are identical — see the L1 hetero file for the full
-// REINFORCE derivation and per-tick narration.
-//
-// This is the same pool that previously held the MSE-against-oracle
-// "head straight at nearest prey" predator brain. The supervised
-// pursuit code is gone; the hetero-only filter and the world-model
-// input were added so this pool now learns prey-seeking from the
-// energy-delta reward signal alone, exactly like Level 1 and 2.
-// Krishi (the fixed-mesh predator type from `krishi.rs`) has its
-// `intelligence_level` set to Level 3 at spawn so it lands here too.
+// Same architecture as `intelligence_level_1_hetero.rs` but with
+// `HIDDEN = 32` (vs L1's 16). Inputs / outputs / training loop are
+// identical — see the L1 hetero file for the full REINFORCE derivation
+// and per-tick narration. The only thing the level number selects in
+// the new RL world is the network's hidden width: more capacity at the
+// cost of more GPU compute per tick.
 //
 // Inputs (17): energy_norm + 16-dim world model.
 // Outputs (4): tanh-squashed (speed, dir.x, dir.y, dir.z).
@@ -31,7 +25,7 @@ use crate::world_model::{WorldModelGrid, WORLD_MODEL_DIMS, fill_world_model};
 
 const N:         usize = MAXIMUM_ORGANISMS;
 const IN:        usize = 1 + WORLD_MODEL_DIMS;
-const HIDDEN:    usize = 64;
+const HIDDEN:    usize = 32;
 const OUT:       usize = 4;
 const MAX_SPEED: f32   = 20.0;
 const LR:        f64   = 1e-3;
@@ -42,18 +36,18 @@ const REWARD_CLAMP:   f32 = 1.0;
 
 
 #[derive(Component, Clone, Copy)]
-pub struct BrainSlotL3(pub u32);
+pub struct BrainSlotL2(pub u32);
 
 
 #[derive(Module, Debug)]
-pub struct PoolMlpL3<B: Backend> {
+pub struct PoolMlpL2<B: Backend> {
     w1: Param<Tensor<B, 3>>,
     b1: Param<Tensor<B, 2>>,
     w2: Param<Tensor<B, 3>>,
     b2: Param<Tensor<B, 2>>,
 }
 
-impl<B: Backend> PoolMlpL3<B> {
+impl<B: Backend> PoolMlpL2<B> {
     fn new(device: &B::Device) -> Self {
         let w = Initializer::Uniform { min: -0.5, max: 0.5 };
         let z = Initializer::Zeros;
@@ -74,20 +68,20 @@ impl<B: Backend> PoolMlpL3<B> {
 }
 
 
-trait BrainOptL3 {
-    fn step(&mut self, lr: f64, m: PoolMlpL3<MyBackend>, g: GradientsParams) -> PoolMlpL3<MyBackend>;
+trait BrainOptL2 {
+    fn step(&mut self, lr: f64, m: PoolMlpL2<MyBackend>, g: GradientsParams) -> PoolMlpL2<MyBackend>;
 }
 
-impl<O: Optimizer<PoolMlpL3<MyBackend>, MyBackend>> BrainOptL3 for O {
-    fn step(&mut self, lr: f64, m: PoolMlpL3<MyBackend>, g: GradientsParams) -> PoolMlpL3<MyBackend> {
+impl<O: Optimizer<PoolMlpL2<MyBackend>, MyBackend>> BrainOptL2 for O {
+    fn step(&mut self, lr: f64, m: PoolMlpL2<MyBackend>, g: GradientsParams) -> PoolMlpL2<MyBackend> {
         Optimizer::step(self, lr, m, g)
     }
 }
 
 
-pub struct BrainPoolL3 {
-    model:        PoolMlpL3<MyBackend>,
-    opt:          Box<dyn BrainOptL3>,
+pub struct BrainPoolL2 {
+    model:        PoolMlpL2<MyBackend>,
+    opt:          Box<dyn BrainOptL2>,
     free:         Vec<u32>,
     map:          HashMap<Entity, u32>,
     prev_state:   Vec<f32>,
@@ -98,10 +92,10 @@ pub struct BrainPoolL3 {
     pub device:   CudaDevice,
 }
 
-impl BrainPoolL3 {
+impl BrainPoolL2 {
     fn new(device: CudaDevice) -> Self {
         Self {
-            model:       PoolMlpL3::<MyBackend>::new(&device),
+            model:       PoolMlpL2::<MyBackend>::new(&device),
             opt:         Box::new(AdamConfig::new().init()),
             free:        (0..N as u32).rev().collect(),
             map:         HashMap::with_capacity(N),
@@ -194,7 +188,7 @@ impl BrainPoolL3 {
     }
 }
 
-impl FromWorld for BrainPoolL3 {
+impl FromWorld for BrainPoolL2 {
     fn from_world(_: &mut World) -> Self {
         let device = CudaDevice::default();
         warmup(&device);
@@ -204,8 +198,8 @@ impl FromWorld for BrainPoolL3 {
 
 
 fn warmup(device: &CudaDevice) {
-    let m = PoolMlpL3::<MyBackend>::new(device);
-    let mut o: Box<dyn BrainOptL3> = Box::new(AdamConfig::new().init());
+    let m = PoolMlpL2::<MyBackend>::new(device);
+    let mut o: Box<dyn BrainOptL2> = Box::new(AdamConfig::new().init());
     let i      = Tensor::<MyBackend, 2>::zeros([N, IN],  device);
     let action = Tensor::<MyBackend, 2>::zeros([N, OUT], device);
     let mask   = Tensor::<MyBackend, 2>::zeros([N, 1],   device);
@@ -220,16 +214,16 @@ fn warmup(device: &CudaDevice) {
 }
 
 
-pub fn assign_brains_l3(
-    mut pool:     NonSendMut<BrainPoolL3>,
+pub fn assign_brains_l2(
+    mut pool:     NonSendMut<BrainPoolL2>,
     new:          Query<(Entity, &Organism, Option<&BrainInheritance>, Option<&BrainRestore>), (
         With<Heterotroph>,
-        Without<BrainSlotL3>,
+        Without<BrainSlotL2>,
     )>,
     mut commands: Commands,
 ) {
     for (e, organism, inheritance, restore) in new.iter() {
-        if !matches!(organism.intelligence_level, IntelligenceLevel::Level3) { continue; }
+        if !matches!(organism.intelligence_level, IntelligenceLevel::Level2) { continue; }
 
         let Some(slot) = pool.free.pop() else { continue };
         let s = slot as usize;
@@ -238,7 +232,7 @@ pub fn assign_brains_l3(
         if let Some(r) = restore {
             match pool.restore_slot(s, r) {
                 Ok(())   => { restored = true; }
-                Err(err) => error!("L3 brain restore failed for {e:?}: {err} — using fresh slot"),
+                Err(err) => error!("L2 brain restore failed for {e:?}: {err} — using fresh slot"),
             }
         } else if let Some(BrainInheritance(parent)) = inheritance {
             if let Some(&parent_slot) = pool.map.get(parent) {
@@ -253,14 +247,14 @@ pub fn assign_brains_l3(
         }
 
         pool.map.insert(e, slot);
-        commands.entity(e).try_insert(BrainSlotL3(slot));
+        commands.entity(e).try_insert(BrainSlotL2(slot));
         commands.entity(e).try_remove::<BrainInheritance>();
         commands.entity(e).try_remove::<BrainRestore>();
     }
 }
 
-pub fn free_brains_l3(
-    mut pool:    NonSendMut<BrainPoolL3>,
+pub fn free_brains_l2(
+    mut pool:    NonSendMut<BrainPoolL2>,
     mut removed: RemovedComponents<Heterotroph>,
 ) {
     for e in removed.read() {
@@ -273,11 +267,11 @@ pub fn free_brains_l3(
 }
 
 
-pub fn apply_intelligence_level_3(
+pub fn apply_intelligence_level_2(
     time:           Res<Time<Virtual>>,
     world_grid:     Res<WorldModelGrid>,
-    mut pool:       NonSendMut<BrainPoolL3>,
-    mut heteros:    Query<(Entity, &mut Organism, &Transform, &BrainSlotL3), With<Heterotroph>>,
+    mut pool:       NonSendMut<BrainPoolL2>,
+    mut heteros:    Query<(Entity, &mut Organism, &Transform, &BrainSlotL2), With<Heterotroph>>,
     mut input_buf:  Local<Vec<f32>>,
     mut adv_buf:    Local<Vec<f32>>,
     mut mask_buf:   Local<Vec<f32>>,

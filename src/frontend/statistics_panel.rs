@@ -9,6 +9,7 @@
 // dragging the divider above this panel shrinks/grows it.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 
 use bevy::prelude::*;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
@@ -340,7 +341,10 @@ pub fn update_fps_text(
         if fps_marker.timer.just_finished() {
             if let Some(fps_diag) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) {
                 if let Some(fps_value) = fps_diag.smoothed() {
-                    text.0 = format!("FPS: {:.1}", fps_value);
+                    // `text.0.clear() + write!` reuses the existing String
+                    // buffer instead of allocating a new one each tick.
+                    text.0.clear();
+                    let _ = write!(text.0, "FPS: {:.1}", fps_value);
                 }
             }
         }
@@ -356,8 +360,15 @@ pub fn update_cell_count_text(
     for (mut text, mut marker) in &mut query {
         marker.timer.tick(time.delta());
         if marker.timer.just_finished() {
-            let total: usize = organisms.iter().map(|o| o.grown_cell_count()).sum();
-            text.0 = format!("Cells: {}", total);
+            // Sum the cached counts directly — `grown_cell_count`
+            // walks `body_parts.iter().filter(...).map(|bp| bp.ocg.len())`
+            // every call. With photo+non_photo cached on Organism we
+            // avoid the body-part walk entirely.
+            let total: i64 = organisms.iter()
+                .map(|o| (o.photo_cell_count + o.non_photo_cell_count) as i64)
+                .sum();
+            text.0.clear();
+            let _ = write!(text.0, "Cells: {}", total);
         }
     }
 }
@@ -391,8 +402,14 @@ pub fn update_counter_texts(
     mut hetero_q: Query<&mut Text, (With<HeteroCountText>, Without<PhotoCountText>)>,
 ) {
     if !counts.is_changed() { return; }
-    for mut text in &mut photo_q  { text.0 = format!("Phototrophic: {}",  counts.photo);  }
-    for mut text in &mut hetero_q { text.0 = format!("Heterotrophic: {}", counts.hetero); }
+    for mut text in &mut photo_q  {
+        text.0.clear();
+        let _ = write!(text.0, "Phototrophic: {}",  counts.photo);
+    }
+    for mut text in &mut hetero_q {
+        text.0.clear();
+        let _ = write!(text.0, "Heterotrophic: {}", counts.hetero);
+    }
 }
 
 

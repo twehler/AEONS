@@ -225,9 +225,18 @@ fn spawn_krishi(
         // value is structurally irrelevant — set to NoSymmetry for type
         // consistency with the rest of the population.
         symmetry:             Symmetry::NoSymmetry,
+        // Mobile heterotroph → Level 3 brain (large RL pool).
+        // Spelled out here because the krishi spawn path doesn't
+        // go through `spawn_organism`'s rolling logic.
+        intelligence_level:   IntelligenceLevel::Level3,
         // Krishi roams freely (mobile predator); no plant-like form.
         is_sessile:           false,
         has_variable_form:    false,
+        // Krishi has a hand-built footprint and never grows — adult
+        // from spawn. (No mesh smoothing is run because Krishi's body
+        // part is `regrowable: false`, so spawn_organism skips mesh
+        // creation entirely; its visual is the glb scene.)
+        adult:                true,
         photo_cell_count:     0,
         non_photo_cell_count: 0,
         energy:             max_energy * 0.5,
@@ -243,6 +252,7 @@ fn spawn_krishi(
         velocity:           Vec3::ZERO,
         is_climbing:        false,
         climb_energy_debt:  0.0,
+        cached_bounding_radius: 0.0,
     };
     organism.recompute_cell_counts();
 

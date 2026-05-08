@@ -1,6 +1,6 @@
 use crate::cell::*;
 use crate::frontend::ShowGizmo;
-use crate::volumetric_growth::build_mesh_from_ocg;
+use crate::volumetric_growth::{build_mesh_from_ocg, build_smoothed_mesh_from_ocg};
 use crate::world_geometry::{HeightmapSampler, MAP_MAX_X, MAP_MAX_Z};
 use crate::movement::DirectionTimer;
 use bevy::prelude::*;
@@ -109,7 +109,24 @@ pub struct ColonyLoadPath(pub Option<String>);
 // just calls `physiology::recompute_body_parts` after rehydrating.
 
 const SAVE_PATH:  &str    = "src/test.colony";
-const SAVE_MAGIC: &[u8;8] = b"AEONS001";
+/// Current save format magic.
+///
+/// Version history:
+///   * v003 — appends a per-organism brain section (weights + REINFORCE
+///     prev_* state) so loaded colonies resume in *exactly* the
+///     state they were saved in, neural-network state included.
+///   * v002 — added the 1-byte `intelligence_level` field after
+///     `has_variable_form`. No brain weights.
+///   * v001 — original. No `intelligence_level`, no brain weights.
+///
+/// All older versions are still loadable. The loader synthesises any
+/// missing fields from the deterministic spawn-time rules; missing
+/// brain sections leave each organism's slot at the recycled / default
+/// initial weights, so behaviour starts un-trained but the colony
+/// composition (positions, body parts, energy) is restored correctly.
+const SAVE_MAGIC:             &[u8;8] = b"AEONS003";
+const SAVE_MAGIC_LEGACY_V002: &[u8;8] = b"AEONS002";
+const SAVE_MAGIC_LEGACY_V001: &[u8;8] = b"AEONS001";
 
 /// One-shot resource: when set to `true`, `save_colony_system` writes the
 /// current world to `SAVE_PATH` on the next Update tick and resets the
@@ -123,23 +140,39 @@ pub struct SaveRequested(pub bool);
 fn save_colony_system(
     mut save_requested: ResMut<SaveRequested>,
     organisms: Query<
-        (&Transform, &Organism, Has<Photoautotroph>, Has<Heterotroph>),
+        (Entity, &Transform, &Organism, Has<Photoautotroph>, Has<Heterotroph>),
         With<OrganismRoot>,
     >,
+    // NonSend access to all four brain pools so we can read every
+    // assigned slot's GPU weights into CPU vectors once each
+    // (`pool.snapshot()` does the four GPU→CPU transfers); after
+    // that the per-organism brain extraction is pure CPU work.
+    pool_l1p: NonSend<crate::intelligence_level_1_photo::BrainPoolL1Photo>,
+    pool_l1h: NonSend<crate::intelligence_level_1_hetero::BrainPoolL1Hetero>,
+    pool_l2:  NonSend<crate::intelligence_level_2::BrainPoolL2>,
+    pool_l3:  NonSend<crate::intelligence_level_3::BrainPoolL3>,
 ) {
     if !save_requested.0 { return; }
     save_requested.0 = false;
+
+    // ── Pool snapshots — one set of GPU→CPU transfers per pool. ──
+    // Doing this up front (vs per-organism) drops the cost from
+    // O(organisms × 4) GPU syncs to O(pools × 4) = 16 total.
+    let snap_l1p = pool_l1p.snapshot();
+    let snap_l1h = pool_l1h.snapshot();
+    let snap_l2  = pool_l2 .snapshot();
+    let snap_l3  = pool_l3 .snapshot();
 
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     buf.extend_from_slice(SAVE_MAGIC);
 
     // Two-pass to write the count up front. iter() over Query is cheap.
     let count = organisms.iter()
-        .filter(|(_, _, is_photo, is_hetero)| *is_photo || *is_hetero)
+        .filter(|(_, _, _, is_photo, is_hetero)| *is_photo || *is_hetero)
         .count() as u32;
     put_u32(&mut buf, count);
 
-    for (transform, org, is_photo, is_hetero) in organisms.iter() {
+    for (entity, transform, org, is_photo, is_hetero) in organisms.iter() {
         let kind: u8 = if is_photo { 0 } else if is_hetero { 1 } else { continue };
 
         put_u8(&mut buf, kind);
@@ -162,6 +195,14 @@ fn save_colony_system(
         });
         put_u8(&mut buf, org.is_sessile as u8);
         put_u8(&mut buf, org.has_variable_form as u8);
+        // v002 addition — saved so loaded organisms keep their
+        // assigned intelligence level instead of being re-rolled.
+        put_u8(&mut buf, match org.intelligence_level {
+            IntelligenceLevel::Level0 => 0,
+            IntelligenceLevel::Level1 => 1,
+            IntelligenceLevel::Level2 => 2,
+            IntelligenceLevel::Level3 => 3,
+        });
 
         put_u32(&mut buf, org.body_parts.len() as u32);
         for bp in &org.body_parts {
@@ -206,6 +247,43 @@ fn save_colony_system(
                 });
             }
         }
+
+        // ── v003 brain section ───────────────────────────────────
+        // Look up this organism in the pool that matches its
+        // intelligence level. If the slot exists (it usually does
+        // — slot assignment runs in PreUpdate), serialise the
+        // weights + REINFORCE state. Otherwise emit `brain_present
+        // = 0` and the loader will recreate the slot with the
+        // pool's default / recycled weights.
+        let brain_data = match (org.intelligence_level, is_photo, is_hetero) {
+            (IntelligenceLevel::Level0, _, _) => None,
+            (IntelligenceLevel::Level1, true,  _   ) => snap_l1p.extract(entity),
+            (IntelligenceLevel::Level1, false, true) => snap_l1h.extract(entity),
+            (IntelligenceLevel::Level2, false, true) => snap_l2 .extract(entity),
+            (IntelligenceLevel::Level3, false, true) => snap_l3 .extract(entity),
+            _ => None,  // shouldn't happen — defensive
+        };
+        match brain_data {
+            None => put_u8(&mut buf, 0),
+            Some(b) => {
+                put_u8(&mut buf, 1);
+                put_u32(&mut buf, b.w1.len() as u32);
+                for &x in &b.w1 { put_f32(&mut buf, x); }
+                put_u32(&mut buf, b.b1.len() as u32);
+                for &x in &b.b1 { put_f32(&mut buf, x); }
+                put_u32(&mut buf, b.w2.len() as u32);
+                for &x in &b.w2 { put_f32(&mut buf, x); }
+                put_u32(&mut buf, b.b2.len() as u32);
+                for &x in &b.b2 { put_f32(&mut buf, x); }
+                put_u32(&mut buf, b.prev_state.len() as u32);
+                for &x in &b.prev_state { put_f32(&mut buf, x); }
+                put_u32(&mut buf, b.prev_action.len() as u32);
+                for &x in &b.prev_action { put_f32(&mut buf, x); }
+                put_f32(&mut buf, b.prev_energy);
+                put_f32(&mut buf, b.baseline);
+                put_u8 (&mut buf, b.has_prev as u8);
+            }
+        }
     }
 
     match std::fs::write(SAVE_PATH, &buf) {
@@ -226,6 +304,13 @@ struct LoadedRecord {
     rotation:  Quat,
     kind:      OrganismKind,
     organism:  Organism,
+    /// Saved brain weights + REINFORCE state. `None` for Level 0
+    /// organisms (no pool to restore into) and for v001/v002 saves
+    /// (which predate brain serialisation). When `Some`,
+    /// `spawn_loaded_organism` attaches a `BrainRestore` component
+    /// and the pool's `assign_brains_*` will install the weights
+    /// next PreUpdate.
+    brain:     Option<crate::rl_helpers::BrainRestore>,
 }
 
 
@@ -233,14 +318,25 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
     let bytes = std::fs::read(path)?;
     let mut c = 0usize;
 
-    // Magic header check.
-    if bytes.len() < SAVE_MAGIC.len()
-        || &bytes[..SAVE_MAGIC.len()] != SAVE_MAGIC
-    {
+    // Magic header check. We accept v003 (current — adds brain
+    // weights + REINFORCE prev_*), v002 (adds intelligence_level
+    // byte), and v001 (oldest — none of those). For v001/v002 the
+    // loader synthesises any missing fields from the deterministic
+    // spawn-time rules.
+    if bytes.len() < SAVE_MAGIC.len() {
+        return Err(std::io::Error::other("file too short — missing magic"));
+    }
+    let magic = &bytes[..SAVE_MAGIC.len()];
+    let format_v003 = magic == SAVE_MAGIC;
+    let format_v002 = magic == SAVE_MAGIC_LEGACY_V002;
+    let format_v001 = magic == SAVE_MAGIC_LEGACY_V001;
+    if !format_v003 && !format_v002 && !format_v001 {
         return Err(std::io::Error::other(
-            "magic mismatch — not an AEONS colony save (or wrong version)",
+            "magic mismatch — not an AEONS colony save (or unsupported version)",
         ));
     }
+    // v002+ all share the intelligence_level byte after has_variable_form.
+    let has_intelligence_byte = format_v003 || format_v002;
     c += SAVE_MAGIC.len();
 
     let count = read_u32(&bytes, &mut c)?;
@@ -277,6 +373,28 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         };
         let is_sessile        = read_u8(&bytes, &mut c)? != 0;
         let has_variable_form = read_u8(&bytes, &mut c)? != 0;
+
+        // v002+ saves the intelligence level explicitly; v001 didn't,
+        // so we synthesise it via the same deterministic rule that
+        // was in force when those saves were written.
+        let intelligence_level = if has_intelligence_byte {
+            match read_u8(&bytes, &mut c)? {
+                0 => IntelligenceLevel::Level0,
+                1 => IntelligenceLevel::Level1,
+                2 => IntelligenceLevel::Level2,
+                3 => IntelligenceLevel::Level3,
+                other => return Err(std::io::Error::other(
+                    format!("unknown intelligence-level tag: {other}"),
+                )),
+            }
+        } else if is_sessile {
+            IntelligenceLevel::Level0
+        } else {
+            match kind {
+                OrganismKind::Photoautotroph => IntelligenceLevel::Level1,
+                OrganismKind::Heterotroph    => IntelligenceLevel::Level3,
+            }
+        };
 
         let bp_count = read_u32(&bytes, &mut c)?;
         let mut body_parts: Vec<BodyPart> = Vec::with_capacity(bp_count as usize);
@@ -345,11 +463,60 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
             });
         }
 
-        let organism = Organism {
+        // ── v003 brain section (only if format_v003). ────────────
+        // Parsed BEFORE building the Organism so any read errors
+        // surface here rather than propagating into the spawn
+        // pipeline.
+        let brain: Option<crate::rl_helpers::BrainRestore> = if format_v003 {
+            let brain_present = read_u8(&bytes, &mut c)?;
+            if brain_present == 1 {
+                let n_w1 = read_u32(&bytes, &mut c)? as usize;
+                let mut w1 = Vec::with_capacity(n_w1);
+                for _ in 0..n_w1 { w1.push(read_f32(&bytes, &mut c)?); }
+                let n_b1 = read_u32(&bytes, &mut c)? as usize;
+                let mut b1 = Vec::with_capacity(n_b1);
+                for _ in 0..n_b1 { b1.push(read_f32(&bytes, &mut c)?); }
+                let n_w2 = read_u32(&bytes, &mut c)? as usize;
+                let mut w2 = Vec::with_capacity(n_w2);
+                for _ in 0..n_w2 { w2.push(read_f32(&bytes, &mut c)?); }
+                let n_b2 = read_u32(&bytes, &mut c)? as usize;
+                let mut b2 = Vec::with_capacity(n_b2);
+                for _ in 0..n_b2 { b2.push(read_f32(&bytes, &mut c)?); }
+                let n_ps = read_u32(&bytes, &mut c)? as usize;
+                let mut prev_state = Vec::with_capacity(n_ps);
+                for _ in 0..n_ps { prev_state.push(read_f32(&bytes, &mut c)?); }
+                let n_pa = read_u32(&bytes, &mut c)? as usize;
+                let mut prev_action = Vec::with_capacity(n_pa);
+                for _ in 0..n_pa { prev_action.push(read_f32(&bytes, &mut c)?); }
+                let prev_energy = read_f32(&bytes, &mut c)?;
+                let baseline    = read_f32(&bytes, &mut c)?;
+                let has_prev    = read_u8 (&bytes, &mut c)? != 0;
+                Some(crate::rl_helpers::BrainRestore {
+                    w1, b1, w2, b2, prev_state, prev_action,
+                    prev_energy, baseline, has_prev,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // `adult` is not in the save format; it's derivable from
+        // (`has_variable_form`, total grown cell count): non-variable
+        // form organisms are always adult, variable-form become adult
+        // when they reach `MAX_CELLS`.
+        let total_cells = (photo_cell_count + non_photo_cell_count).max(0) as usize;
+        let adult = !has_variable_form
+            || total_cells >= crate::volumetric_growth::MAX_CELLS;
+
+        let mut organism = Organism {
             body_parts,
             symmetry,
+            intelligence_level,
             is_sessile,
             has_variable_form,
+            adult,
             photo_cell_count,
             non_photo_cell_count,
             energy,
@@ -361,9 +528,13 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
             velocity,
             is_climbing,
             climb_energy_debt,
+            // Will be derived from the loaded body_parts on the next
+            // line — saving the value would have been redundant.
+            cached_bounding_radius: 0.0,
         };
+        organism.recompute_bounding_radius();
 
-        out.push(LoadedRecord { pos, rotation, kind, organism });
+        out.push(LoadedRecord { pos, rotation, kind, organism, brain });
     }
 
     Ok(out)
@@ -379,12 +550,13 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
 /// photo cache was reconstructed during decoding).
 fn spawn_loaded_organism(
     record:    LoadedRecord,
+    smoothing: bool,
     commands:  &mut Commands,
     meshes:    &mut ResMut<Assets<Mesh>>,
     materials: &OrganismMaterials,
     rng:       &mut impl rand::Rng,
 ) -> Entity {
-    let LoadedRecord { pos, rotation, kind, organism } = record;
+    let LoadedRecord { pos, rotation, kind, organism, brain } = record;
     if organism.body_parts.is_empty() {
         // Defensive — skip organisms with no body parts (should never
         // happen on a valid save).
@@ -392,6 +564,10 @@ fn spawn_loaded_organism(
     }
 
     let body_parts_snapshot = organism.body_parts.clone();
+    // Capture intelligence level + adult flag before `organism` is
+    // moved into the spawn bundle.
+    let intelligence_level = organism.intelligence_level;
+    let adult              = organism.adult;
     let direction_interval = 1.0 + rng.random::<f32>() * 9.0;
 
     let mut root_cmd = commands.spawn((
@@ -405,12 +581,37 @@ fn spawn_loaded_organism(
         OrganismKind::Photoautotroph => { root_cmd.insert(Photoautotroph); }
         OrganismKind::Heterotroph    => { root_cmd.insert(Heterotroph); }
     }
+    match intelligence_level {
+        IntelligenceLevel::Level0 => {
+            root_cmd.insert(crate::intelligence_level_0::BrainLevel0);
+        }
+        IntelligenceLevel::Level1
+        | IntelligenceLevel::Level2
+        | IntelligenceLevel::Level3 => {}
+    }
+    // Attach the saved brain weights (if any) so the matching pool's
+    // `assign_brains_*` writes them into the slot it picks. Skipped
+    // for Level 0 (no pool) and for v001/v002 saves (no brain bytes).
+    if let Some(b) = brain {
+        if !matches!(intelligence_level, IntelligenceLevel::Level0) {
+            root_cmd.insert(b);
+        }
+    }
     let root = root_cmd.id();
 
     let mut bp_entities: Vec<Entity> = Vec::with_capacity(body_parts_snapshot.len());
     for (idx, bp) in body_parts_snapshot.iter().enumerate() {
+        // Adult-at-load → use the smoothed mesh, but only when
+        // `smoothing` is on; otherwise the faceted build that
+        // `continuous_growth` will eventually re-smooth (or leave
+        // faceted, depending on the flag at that future tick).
         let mesh_handle = if bp.regrowable && !bp.ocg.is_empty() {
-            Some(meshes.add(build_mesh_from_ocg(&bp.ocg)))
+            let mesh = if adult && smoothing {
+                build_smoothed_mesh_from_ocg(&bp.ocg)
+            } else {
+                build_mesh_from_ocg(&bp.ocg)
+            };
+            Some(meshes.add(mesh))
         } else {
             None
         };
@@ -436,6 +637,12 @@ fn spawn_loaded_organism(
                 Mesh3d(mh),
                 MeshMaterial3d(mat),
                 OrganismMesh,
+                // Per-organism meshes don't cast shadows: the shadow
+                // pass would otherwise re-extract every body-part
+                // entity per cascade per frame, dominating render cost.
+                // Terrain still casts shadows; organism shadows are
+                // negligible at our cell scale.
+                bevy::light::NotShadowCaster,
             ));
         }
         let child = child_cmd.id();
@@ -529,6 +736,7 @@ fn spawn_colony(
     mut materials:   ResMut<Assets<StandardMaterial>>,
     heightmap:       Res<HeightmapSampler>,
     load_path:       Res<ColonyLoadPath>,
+    smoothing:       Res<crate::simulation_settings::Smoothing>,
     mut spawned:     Local<bool>,
 ) {
     if *spawned { return; }
@@ -546,7 +754,7 @@ fn spawn_colony(
             Ok(records) => {
                 let n = records.len();
                 for record in records {
-                    spawn_loaded_organism(record, &mut commands, &mut meshes, &materials, &mut rng);
+                    spawn_loaded_organism(record, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
                 }
                 info!("loaded colony from {} — {} organisms restored", path, n);
                 return;
@@ -575,18 +783,31 @@ fn spawn_colony(
         } else {
             // Bilateral seed: cells at (±MIN_X_BILATERAL, 0, 0) — exact
             // +X axis-aligned RD neighbours sharing a rhombic face on
-            // the YZ-plane.
+            // the YZ-plane. Both go into a SINGLE body part whose OCG
+            // contains both halves; `build_mesh_from_ocg`'s weld+dedup
+            // fuses them at the seam (see `bilateral_body_part_from_right_ocg`).
             let right_seed = vec![(
                 0usize,
                 Vec3::new(crate::body_part::MIN_X_BILATERAL, 0.0, 0.0),
                 CellType::Photo,
             )];
-            let parts = crate::body_part::bilateral_pair_from_right_ocg(&right_seed)
-                .to_vec();
+            let parts = vec![
+                crate::body_part::bilateral_body_part_from_right_ocg(&right_seed)
+            ];
             let max_e = 2.0 * crate::energy::MAX_ENERGY_PER_CELL;
             (Symmetry::Bilateral, parts, max_e)
         };
 
+        // Initial cohort intelligence level — rolled once per organism.
+        // For photoautotrophs the 80%-Level0 target falls out of the
+        // sessile branch (sessile == has_variable_form for photos), so
+        // mobile photos always go to Level1. Inherited verbatim by
+        // offspring after this point.
+        let intel = IntelligenceLevel::for_initial_spawn(
+            OrganismKind::Photoautotroph,
+            has_variable_form,
+            &mut rng,
+        );
         spawn_organism(
             Vec3::new(x, y, z),
             body_parts,
@@ -597,6 +818,8 @@ fn spawn_colony(
             // has_variable_form is true; we pass false here to keep the
             // signal explicit.
             false,
+            intel,
+            smoothing.0,
             max_e * 0.5,
             &mut commands,
             &mut meshes,
@@ -609,17 +832,24 @@ fn spawn_colony(
         let x = rng.random_range(0.0_f32..MAP_MAX_X);
         let z = rng.random_range(0.0_f32..MAP_MAX_Z);
         let y = heightmap.height_at(x, z) + 1.0;
-        // Bilateral seed: cells at (±MIN_X_BILATERAL, 0, 0) — exact +X
-        // axis-aligned RD neighbours sharing a rhombic face on the
-        // YZ-plane.
+        // Single bilateral body part — see comment for the
+        // photoautotroph cohort above.
         let right_seed = vec![(
             0usize,
             Vec3::new(crate::body_part::MIN_X_BILATERAL, 0.0, 0.0),
             CellType::NonPhoto,
         )];
-        let body_parts = crate::body_part::bilateral_pair_from_right_ocg(&right_seed)
-            .to_vec();
+        let body_parts = vec![
+            crate::body_part::bilateral_body_part_from_right_ocg(&right_seed)
+        ];
         let max_e = 2.0 * crate::energy::MAX_ENERGY_PER_CELL;
+        // Heterotroph intelligence: 50/40/10 across L1/L2/L3 — see
+        // `IntelligenceLevel::for_initial_spawn`.
+        let intel = IntelligenceLevel::for_initial_spawn(
+            OrganismKind::Heterotroph,
+            false,
+            &mut rng,
+        );
         spawn_organism(
             Vec3::new(x, y, z),
             body_parts,
@@ -627,6 +857,8 @@ fn spawn_colony(
             Symmetry::Bilateral,
             false,  // has_variable_form — heterotrophs are always mobile
             false,  // is_sessile
+            intel,
+            smoothing.0,
             max_e * 0.5,
             &mut commands,
             &mut meshes,
@@ -711,17 +943,19 @@ impl OrganismMaterials {
 ///   │                          attachment.origin_local in part-0's frame)
 ///   └── ...
 pub fn spawn_organism(
-    pos:               Vec3,
-    mut body_parts:    Vec<BodyPart>,
-    kind:              OrganismKind,
-    symmetry:          Symmetry,
-    has_variable_form: bool,
-    is_sessile:        bool,
-    initial_energy:    f32,
-    commands:          &mut Commands,
-    meshes:            &mut ResMut<Assets<Mesh>>,
-    materials:         &OrganismMaterials,
-    rng:               &mut impl rand::Rng,
+    pos:                Vec3,
+    mut body_parts:     Vec<BodyPart>,
+    kind:               OrganismKind,
+    symmetry:           Symmetry,
+    has_variable_form:  bool,
+    is_sessile:         bool,
+    intelligence_level: IntelligenceLevel,
+    smoothing:          bool,
+    initial_energy:     f32,
+    commands:           &mut Commands,
+    meshes:             &mut ResMut<Assets<Mesh>>,
+    materials:          &OrganismMaterials,
+    rng:                &mut impl rand::Rng,
 ) -> Entity {
     // Enforce the invariant: variable-form organisms are always sessile and
     // always NoSymmetry. Caller bugs that violate this are silently fixed
@@ -748,11 +982,21 @@ pub fn spawn_organism(
         OrganismKind::Heterotroph    => 15.0 + rng.random::<f32>() * 10.0,
     };
 
+    // Adult at spawn for any organism that won't grow during its own
+    // lifetime. Variable-form organisms grow via `continuous_growth`
+    // and only become adult once they reach `MAX_CELLS`; everything
+    // else is born "fully grown" (its body plan is whatever it was
+    // born with — reproduction grows the OFFSPRING by one cell, not
+    // the parent).
+    let adult = !has_variable_form;
+
     let mut organism = Organism {
         body_parts: body_parts.clone(),
         symmetry,
+        intelligence_level,
         is_sessile,
         has_variable_form,
+        adult,
         photo_cell_count:     0,
         non_photo_cell_count: 0,
         energy: initial_energy.max(0.0),
@@ -764,6 +1008,8 @@ pub fn spawn_organism(
         velocity: Vec3::ZERO,
         is_climbing: false,
         climb_energy_debt: 0.0,
+        // Populated by recompute_cell_counts below.
+        cached_bounding_radius: 0.0,
     };
     organism.recompute_cell_counts();
 
@@ -781,6 +1027,19 @@ pub fn spawn_organism(
         OrganismKind::Photoautotroph => { root_cmd.insert(Photoautotroph); }
         OrganismKind::Heterotroph    => { root_cmd.insert(Heterotroph); }
     }
+    // Wire intelligence-pool markers off the stored `intelligence_level`
+    // field. Level 0 → `BrainLevel0` keeps the entity out of the L1/L3
+    // assign queries. Levels 1 and 3 don't need a marker at spawn —
+    // their `assign_*` systems pick the entity up via the trophic
+    // marker (`Photoautotroph` / `Heterotroph`) and assign a slot.
+    match intelligence_level {
+        IntelligenceLevel::Level0 => {
+            root_cmd.insert(crate::intelligence_level_0::BrainLevel0);
+        }
+        IntelligenceLevel::Level1
+        | IntelligenceLevel::Level2
+        | IntelligenceLevel::Level3 => {}
+    }
     let root = root_cmd.id();
 
     // Spawn one mesh child per body part. Branches are parented to their
@@ -791,8 +1050,18 @@ pub fn spawn_organism(
     let mut bp_entities: Vec<Entity> = Vec::with_capacity(body_parts.len());
     for (idx, bp) in body_parts.iter().enumerate() {
         // Skip mesh creation for non-regrowable / empty parts (e.g. Krishi).
+        // Adult organisms get the smoothed mesh straight away (when
+        // `smoothing` is on); growing (variable-form) organisms get the
+        // faceted mesh that `continuous_growth` will replace once they
+        // reach MAX_CELLS. With `smoothing` off the faceted mesh is
+        // used unconditionally.
         let mesh_handle = if bp.regrowable && !bp.ocg.is_empty() {
-            Some(meshes.add(build_mesh_from_ocg(&bp.ocg)))
+            let mesh = if adult && smoothing {
+                build_smoothed_mesh_from_ocg(&bp.ocg)
+            } else {
+                build_mesh_from_ocg(&bp.ocg)
+            };
+            Some(meshes.add(mesh))
         } else {
             None
         };
@@ -820,6 +1089,7 @@ pub fn spawn_organism(
                 Mesh3d(mh),
                 MeshMaterial3d(mat),
                 OrganismMesh,
+                bevy::light::NotShadowCaster,
             ));
         }
         let child = child_cmd.id();

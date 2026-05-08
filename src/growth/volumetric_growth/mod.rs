@@ -63,7 +63,7 @@ pub mod geometry;
 pub mod growth_controls;
 pub mod tetrahedron;
 //pub mod fill_holes;
-mod smooth_vertices;
+pub mod smooth_vertices;
 
 use geometry::build_flat_mesh;
 use growth_controls::{CandidateInfo, GrowthController};
@@ -175,14 +175,45 @@ fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>) {
 
 // ── OCG pathway ───────────────────────────────────────────────────────────────
 
-/// Produce the adult mesh by treating each OCG entry's position as a cell
-/// centre and running the same translate → weld → dedup pipeline.
+/// Smoothing parameters used when an organism becomes `adult`. `lambda`
+/// is the per-iteration blend toward the one-ring centroid (0 = identity,
+/// 1 = collapse to centroid); `iterations` controls how many passes the
+/// Jacobi smoother runs. The values here give a soft "rounded" silhouette
+/// over a 30-cell rhombic-dodecahedron blob without erasing the lobes
+/// produced by branch attachments.
+pub const ADULT_SMOOTH_LAMBDA:     f32   = 0.3;
+pub const ADULT_SMOOTH_ITERATIONS: usize = 3;
+
+/// Produce the (un-smoothed) flat mesh by treating each OCG entry's
+/// position as a cell centre and running the translate → weld → dedup
+/// pipeline. Used during growth, when each new cell adds a faceted
+/// rhombic-dodecahedron lobe.
 pub fn build_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
     if ocg.is_empty() {
         return build_flat_mesh(&[], &[]);
     }
     let centers: Vec<Vec3> = ocg.iter().map(|(_, p, _)| *p).collect();
     let (verts, tris) = rebuild_mesh(&centers);
+    build_flat_mesh(&verts, &tris)
+}
+
+/// Same as `build_mesh_from_ocg` but additionally runs the Jacobi
+/// vertex smoother (`smooth_vertices`) before constructing the Bevy
+/// mesh. Called once per organism — at spawn for non-variable-form
+/// organisms (they don't grow during their lifetime) and on the
+/// continuous-growth tick that crosses `MAX_CELLS` for variable-form
+/// organisms. After that the mesh stays smoothed for the rest of the
+/// organism's life; no per-frame smoothing cost.
+pub fn build_smoothed_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
+    if ocg.is_empty() {
+        return build_flat_mesh(&[], &[]);
+    }
+    let centers: Vec<Vec3> = ocg.iter().map(|(_, p, _)| *p).collect();
+    let (mut verts, tris) = rebuild_mesh(&centers);
+    smooth_vertices::smooth_vertices(
+        &mut verts, &tris,
+        ADULT_SMOOTH_LAMBDA, ADULT_SMOOTH_ITERATIONS,
+    );
     build_flat_mesh(&verts, &tris)
 }
 
@@ -201,9 +232,16 @@ pub fn grow_ocg_one_step(
         state.centers.push(*center);
         update_lattice_bookkeeping(&mut state, *center);
     }
-    let (v, t) = rebuild_mesh(&state.centers);
-    state.vertices = v;
-    state.triangles = t;
+    // Dodecahedron candidate generation reads only `frontier_pos` and
+    // `occupied` (both populated by `update_lattice_bookkeeping`), so the
+    // full mesh rebuild is wasted work. Tetrahedron mode (currently
+    // unused) still needs the cached `triangles` slab — keep the rebuild
+    // there.
+    if matches!(GROWTH_MODE, GrowthMode::Tetrahedron) {
+        let (v, t) = rebuild_mesh(&state.centers);
+        state.vertices = v;
+        state.triangles = t;
+    }
 
     let candidates = collect_candidates(&state);
     if candidates.is_empty() {
@@ -239,9 +277,12 @@ pub fn grow_ocg_one_step_constrained(
         state.centers.push(*center);
         update_lattice_bookkeeping(&mut state, *center);
     }
-    let (v, t) = rebuild_mesh(&state.centers);
-    state.vertices = v;
-    state.triangles = t;
+    // Same Dodec-mode rebuild_mesh skip as in grow_ocg_one_step.
+    if matches!(GROWTH_MODE, GrowthMode::Tetrahedron) {
+        let (v, t) = rebuild_mesh(&state.centers);
+        state.vertices = v;
+        state.triangles = t;
+    }
 
     let threshold = min_x - 1e-3;
     let candidates: Vec<_> = collect_candidates(&state)
@@ -455,8 +496,10 @@ fn spawn_volumetric_mesh(
                 &[(0, Vec3::ZERO, CellType::Photo)],
             )],
             symmetry:             crate::organism::Symmetry::NoSymmetry,
+            intelligence_level:   crate::organism::IntelligenceLevel::Level1,
             is_sessile:           false,
             has_variable_form:    false,
+            adult:                false,
             photo_cell_count:     1,
             non_photo_cell_count: 0,
             energy: 0.0,
@@ -468,6 +511,7 @@ fn spawn_volumetric_mesh(
             velocity: Vec3::ZERO,
             is_climbing: false,
             climb_energy_debt: 0.0,
+            cached_bounding_radius: 0.0,
         },
     ));
 }

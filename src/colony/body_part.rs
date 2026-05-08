@@ -161,44 +161,64 @@ pub fn mirror_ocg_x(
         .collect()
 }
 
-/// Build `[right_half, left_half]` body parts from a right-half OCG.
-/// Both halves are root-level (`attachment: None`), `BodyPartKind::Body`,
-/// `regrowable: true`. Convention: index 0 = right, index 1 = left.
-/// Caller invokes `physiology::recompute_body_parts` afterwards (already
-/// done inside `spawn_organism`).
-pub fn bilateral_pair_from_right_ocg(
+/// Build the single bilateral body part from a right-half OCG.
+///
+/// Returns ONE `BodyPart` whose OCG contains both halves: the input
+/// right-side cells followed by their mirror images across the YZ
+/// plane (`mirror_ocg_x`). `volumetric_growth::build_mesh_from_ocg`
+/// then runs its translate → weld → drop-interior-faces pipeline over
+/// the combined cell list, which automatically:
+///
+///   * **Connects the halves at the seam.** The right seed at
+///     `(+MIN_X_BILATERAL, 0, 0)` and its mirror at
+///     `(-MIN_X_BILATERAL, 0, 0)` are exact +X axis-aligned RD
+///     neighbours, sharing four vertices on their common rhombic face
+///     on the YZ plane. The weld step (HashMap on quantised positions
+///     with `WELD_EPS = 1e-4`) merges those four vertices, fusing the
+///     halves into a single connected mesh. Same applies to every
+///     other right cell whose mirror lands at lattice-adjacency.
+///   * **Drops the now-hidden seam face.** Each shared rhombic face
+///     appears with sorted-vertex multiplicity 2 (one copy from each
+///     cell). The dedup step removes both copies. The outward-facing
+///     triangles from each cell survive with their natural winding.
+///   * **Generates no extra geometry.** The bridge between the halves
+///     is the merged-vertex topology itself — no manual zipper
+///     stitching, no `fill_holes`. Surviving triangles point outward
+///     by construction (each is the outward copy from its unique
+///     source cell).
+///
+/// Replaces the previous `bilateral_pair_from_right_ocg` which
+/// returned two separate body parts and produced two coplanar
+/// opposite-winding faces at the seam. With a single body part those
+/// faces cancel during dedup and the mesh is genuinely seamless.
+pub fn bilateral_body_part_from_right_ocg(
     right_ocg: &[(usize, Vec3, CellType)],
-) -> [BodyPart; 2] {
+) -> BodyPart {
     let left_ocg = mirror_ocg_x(right_ocg);
 
-    let right_cells: Vec<Cell> = right_ocg.iter()
-        .map(|(_, p, ct)| Cell::new(*p, *ct))
+    // Combined OCG: right cells first, then left mirrors. Indices are
+    // re-numbered sequentially so the body part's OCG is a contiguous
+    // [0..N) ledger as every other body part is.
+    let combined_ocg: Vec<(usize, Vec3, CellType)> = right_ocg.iter()
+        .chain(left_ocg.iter())
+        .enumerate()
+        .map(|(i, (_, p, ct))| (i, *p, *ct))
         .collect();
-    let left_cells: Vec<Cell> = left_ocg.iter()
+
+    let cells: Vec<Cell> = combined_ocg.iter()
         .map(|(_, p, ct)| Cell::new(*p, *ct))
         .collect();
 
-    let right = BodyPart {
+    BodyPart {
         kind:         BodyPartKind::Body,
         local_offset: Vec3::ZERO,
-        cells:        right_cells,
-        ocg:          right_ocg.to_vec(),
+        cells,
+        ocg:          combined_ocg,
         attachment:   None,
         consumed:     false,
         debug_blue:   false,
         regrowable:   true,
-    };
-    let left = BodyPart {
-        kind:         BodyPartKind::Body,
-        local_offset: Vec3::ZERO,
-        cells:        left_cells,
-        ocg:          left_ocg,
-        attachment:   None,
-        consumed:     false,
-        debug_blue:   false,
-        regrowable:   true,
-    };
-    [right, left]
+    }
 }
 
 

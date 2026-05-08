@@ -38,19 +38,24 @@ impl Plugin for PredationPlugin {
 
 
 fn predation_system(
-    mut commands:        Commands,
-    mut contact_events:  MessageReader<OrganismContactEvent>,
-    mut heterotrophs:    Query<&mut Organism, (With<Heterotroph>, Without<Photoautotroph>)>,
-    mut phototrophs:     Query<&mut Organism, (With<Photoautotroph>, Without<Heterotroph>)>,
-    children_query:      Query<&Children>,
-    body_part_idx_query: Query<&BodyPartIndex>,
+    mut commands:           Commands,
+    mut contact_events:     MessageReader<OrganismContactEvent>,
+    mut heterotrophs:       Query<&mut Organism, (With<Heterotroph>, Without<Photoautotroph>)>,
+    mut phototrophs:        Query<&mut Organism, (With<Photoautotroph>, Without<Heterotroph>)>,
+    children_query:         Query<&Children>,
+    body_part_idx_query:    Query<&BodyPartIndex>,
+    mut already_eaten:      Local<HashSet<(Entity, usize)>>,
+    mut already_despawned:  Local<HashSet<Entity>>,
 ) {
     // Per-frame dedup: a single body part can be the subject of more than
     // one contact event in the same tick (multiple cell-pair contacts feed
     // distinct events). Eating it more than once would double-credit the
     // predator and let multiple predators "share" the same body part.
-    let mut already_eaten:    HashSet<(Entity, usize)> = HashSet::new();
-    let mut already_despawned: HashSet<Entity>          = HashSet::new();
+    // `Local<HashSet>` reuses allocations across ticks instead of
+    // freshly allocating them at the top of every Update — they're just
+    // cleared.
+    already_eaten.clear();
+    already_despawned.clear();
 
     for event in contact_events.read() {
         // Identify predator + prey + which body-part index belongs to prey.
@@ -115,6 +120,11 @@ fn predation_system(
             // Each body part now owns its OCG too; clear it so cell-count
             // accessors and is_alive() agree the part is gone.
             bp.ocg.clear();
+
+            // Composition changed — refresh the cached bounding radius
+            // so movement / floor / collision queries don't keep using
+            // the pre-consumption envelope.
+            prey_org.recompute_bounding_radius();
 
             let new_alive = prey_org.alive_body_part_count();
             // Bilateral organisms cannot survive losing a half — once one

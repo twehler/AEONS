@@ -40,3 +40,25 @@ impl Default for SimulationRunning {
 /// player camera idle.
 #[derive(Resource, Default)]
 pub struct PlayerControlsActive(pub bool);
+
+
+/// When `true`, adult organisms get their body-part meshes smoothed via
+/// the Jacobi vertex smoother in `volumetric_growth::smooth_vertices`.
+/// Smoothing happens at most once per organism — at spawn for
+/// non-variable-form organisms, on the continuous-growth tick that
+/// crosses `MAX_CELLS` for variable-form organisms.
+///
+/// When `false`, the faceted rhombic-dodecahedron mesh is used
+/// throughout the organism's life. Toggling at runtime is non-retroactive:
+/// already-smoothed meshes stay smoothed, already-faceted ones stay
+/// faceted; only future spawn / adult-transition events read the
+/// current value.
+///
+/// Initial value: `true` — preserves the most recently-implemented
+/// visual default.
+#[derive(Resource)]
+pub struct Smoothing(pub bool);
+
+impl Default for Smoothing {
+    fn default() -> Self { Self(true) }
+}

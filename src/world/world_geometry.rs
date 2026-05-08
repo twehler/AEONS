@@ -42,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 /// terrain-following precision for memory + cache locality. At 4.0 a 2048²
 /// world produces a 512² grid (~1 MB) that fits comfortably in L3, vs the
 /// 16 MB array a 1.0 cell size would require.
-pub const HEIGHTMAP_CELL_SIZE: f32 = 1.0;
+pub const HEIGHTMAP_CELL_SIZE: f32 = 4.0;
 
 /// Bucket edge length (world units) of the XZ spatial grid used to accelerate
 /// triangle queries. Smaller = fewer triangles per query but more memory.
@@ -131,6 +131,16 @@ impl WorldMesh {
         out.clear();
         let (kx0, kz0) = Self::key(min.x, min.z, self.bucket);
         let (kx1, kz1) = Self::key(max.x, max.z, self.bucket);
+        // Single-bucket fast path: the AABB fits entirely in one grid cell,
+        // so no duplicate triangle indices are possible — sort/dedup are
+        // wasted work. Most cell-vs-world tests at our scales hit this
+        // path because cells are ~1 unit wide and buckets are 4 units.
+        if kx0 == kx1 && kz0 == kz1 {
+            if let Some(idxs) = self.grid.get(&(kx0, kz0)) {
+                out.extend_from_slice(idxs);
+            }
+            return;
+        }
         for kx in kx0..=kx1 {
             for kz in kz0..=kz1 {
                 if let Some(idxs) = self.grid.get(&(kx, kz)) {
@@ -144,11 +154,12 @@ impl WorldMesh {
 
     /// True if any triangle of the world intersects the axis-aligned box
     /// `[min, max]`. Uses the spatial grid as a broad phase, then a full
-    /// triangle-vs-AABB SAT test (Akenine-Möller).
-    pub fn aabb_intersects(&self, min: Vec3, max: Vec3) -> bool {
-        let mut nearby = Vec::new();
-        self.collect_nearby(min, max, &mut nearby);
-        for ti in nearby {
+    /// triangle-vs-AABB SAT test (Akenine-Möller). Caller passes a scratch
+    /// `Vec<u32>` (typically a `Local<Vec<u32>>` in a Bevy system) so the
+    /// hot wall-collision path doesn't allocate per call.
+    pub fn aabb_intersects_with(&self, min: Vec3, max: Vec3, scratch: &mut Vec<u32>) -> bool {
+        self.collect_nearby(min, max, scratch);
+        for &ti in scratch.iter() {
             if tri_aabb_overlap(self.triangles[ti as usize], min, max) {
                 return true;
             }
@@ -156,14 +167,18 @@ impl WorldMesh {
         false
     }
 
-    /// Highest Y of any vertex of any triangle whose XZ AABB intersects the
-    /// XZ region of `[min, max]`. Returns `None` when there is no candidate.
-    /// Used to compute climb height when a movement step is wall-blocked.
-    pub fn max_y_in_xz(&self, min: Vec3, max: Vec3) -> Option<f32> {
+    /// Allocating wrapper, kept for callers outside the per-frame hot path.
+    pub fn aabb_intersects(&self, min: Vec3, max: Vec3) -> bool {
         let mut nearby = Vec::new();
-        self.collect_nearby(min, max, &mut nearby);
+        self.aabb_intersects_with(min, max, &mut nearby)
+    }
+
+    /// Same as `max_y_in_xz` but takes a scratch buffer to skip the per-call
+    /// allocation. Used by `apply_movement` via a `Local<Vec<u32>>`.
+    pub fn max_y_in_xz_with(&self, min: Vec3, max: Vec3, scratch: &mut Vec<u32>) -> Option<f32> {
+        self.collect_nearby(min, max, scratch);
         let mut best: Option<f32> = None;
-        for ti in nearby {
+        for &ti in scratch.iter() {
             let tri = self.triangles[ti as usize];
             let txmin = tri[0].x.min(tri[1].x).min(tri[2].x);
             let txmax = tri[0].x.max(tri[1].x).max(tri[2].x);
@@ -174,6 +189,12 @@ impl WorldMesh {
             best = Some(best.map_or(tymax, |b| b.max(tymax)));
         }
         best
+    }
+
+    /// Allocating wrapper.
+    pub fn max_y_in_xz(&self, min: Vec3, max: Vec3) -> Option<f32> {
+        let mut nearby = Vec::new();
+        self.max_y_in_xz_with(min, max, &mut nearby)
     }
 }
 

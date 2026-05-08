@@ -161,10 +161,11 @@ fn random_3d_direction(
 /// inset, a single settled cell triggers a permanent
 /// climb-vs-gravity oscillation (visible terrain jitter).
 fn apply_movement(
-    time:        Res<Time>,
-    world_mesh:  Res<WorldMesh>,
-    heightmap:   Res<HeightmapSampler>,
-    mut query:   Query<(&mut Transform, &mut Organism), With<OrganismRoot>>,
+    time:            Res<Time>,
+    world_mesh:      Res<WorldMesh>,
+    heightmap:       Res<HeightmapSampler>,
+    mut query:       Query<(&mut Transform, &mut Organism), With<OrganismRoot>>,
+    mut tri_scratch: Local<Vec<u32>>,
 ) {
     let dt = time.delta_secs();
     let half_size = RD_HALF_SIZE;
@@ -232,10 +233,10 @@ fn apply_movement(
                     );
                     let cell_max = next_pos + Vec3::splat(half_size);
 
-                    if world_mesh.aabb_intersects(cell_min, cell_max) {
+                    if world_mesh.aabb_intersects_with(cell_min, cell_max, &mut tri_scratch) {
                         is_blocked = true;
                         let top = world_mesh
-                            .max_y_in_xz(cell_min, cell_max)
+                            .max_y_in_xz_with(cell_min, cell_max, &mut tri_scratch)
                             .unwrap_or_else(|| heightmap.height_at(next_pos.x, next_pos.z));
                         let needed = top - (world_pos.y - half_size);
                         if needed > climb_needed { climb_needed = needed; }

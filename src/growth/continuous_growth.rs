@@ -29,10 +29,26 @@ use crate::physiology;
 use crate::volumetric_growth::{build_mesh_from_ocg, MAX_CELLS};
 
 
-/// How often the continuous-growth tick runs. 1.0 s gives a noticeable
-/// "growing" silhouette over ~30 seconds for a fresh seed reaching the
-/// 30-cell cap. Tune higher for slower growth, lower for faster.
+/// Effective growth cadence per organism. Each variable-form organism
+/// receives one growth tick every `CONTINUOUS_GROWTH_INTERVAL` seconds.
+/// 1.0 s gives a noticeable "growing" silhouette over ~30 seconds for
+/// a fresh seed reaching the 30-cell cap.
 const CONTINUOUS_GROWTH_INTERVAL: f32 = 1.0;
+
+/// Number of phase slices the per-second growth workload is sliced into.
+/// At 30, the system fires every `1/30` s ≈ 33 ms and each tick
+/// processes only the organisms whose entity-index modulo 30 matches
+/// the rotating phase counter — roughly 1/30th of the variable-form
+/// population per tick. Total work per second is unchanged; the
+/// per-tick allocator + Bevy command-buffer spike that was visible
+/// every second goes away. Aligned with the 30 Hz brain tick so both
+/// throttled subsystems share the same timing rhythm.
+const GROWTH_PHASE_PERIOD: u32 = 30;
+
+/// Wall-clock interval between phase steps. `CONTINUOUS_GROWTH_INTERVAL
+/// / GROWTH_PHASE_PERIOD` so the per-organism cadence is preserved.
+const GROWTH_PHASE_STEP_SECS: f32 =
+    CONTINUOUS_GROWTH_INTERVAL / GROWTH_PHASE_PERIOD as f32;
 
 
 // ── Resources ────────────────────────────────────────────────────────────────
@@ -42,9 +58,18 @@ pub struct ContinuousGrowthTimer(pub Timer);
 
 impl Default for ContinuousGrowthTimer {
     fn default() -> Self {
-        Self(Timer::from_seconds(CONTINUOUS_GROWTH_INTERVAL, TimerMode::Repeating))
+        Self(Timer::from_seconds(GROWTH_PHASE_STEP_SECS, TimerMode::Repeating))
     }
 }
+
+/// Rotating phase counter (mod `GROWTH_PHASE_PERIOD`). Incremented by
+/// the system on every fired tick. An organism is processed this tick
+/// iff `entity.index() % GROWTH_PHASE_PERIOD == counter`. Using the
+/// entity index as the phase saves one byte per organism vs. storing a
+/// `growth_phase` field; the modulo of sequentially-allocated indices
+/// distributes evenly across phases at our scales.
+#[derive(Resource, Default)]
+pub struct GrowthPhaseCounter(pub u32);
 
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
@@ -54,6 +79,7 @@ pub struct ContinuousGrowthPlugin;
 impl Plugin for ContinuousGrowthPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ContinuousGrowthTimer>()
+            .init_resource::<GrowthPhaseCounter>()
             .add_systems(Update, grow_variable_form_organisms);
     }
 }
@@ -65,6 +91,8 @@ impl Plugin for ContinuousGrowthPlugin {
 fn grow_variable_form_organisms(
     time:                Res<Time<Virtual>>,
     mut timer:           ResMut<ContinuousGrowthTimer>,
+    mut phase_counter:   ResMut<GrowthPhaseCounter>,
+    smoothing:           Res<crate::simulation_settings::Smoothing>,
     mut commands:        Commands,
     mut meshes:          ResMut<Assets<Mesh>>,
     mut materials:       ResMut<Assets<StandardMaterial>>,
@@ -79,12 +107,29 @@ fn grow_variable_form_organisms(
     timer.0.tick(time.delta());
     if !timer.0.just_finished() { return; }
 
+    // Read the current phase, then advance the counter for the next
+    // tick. Every organism whose entity-index mod period equals
+    // `current_phase` will be processed this tick; all others wait
+    // for their slot in the rotation.
+    let current_phase = phase_counter.0;
+    phase_counter.0 = (phase_counter.0 + 1) % GROWTH_PHASE_PERIOD;
+
     let mut rng = rand::rng();
-    // Built once per tick, not per organism — `materials.add()` is cheap
-    // but still a heap allocation per call, and per-tick is plenty.
-    let materials_helper = OrganismMaterials::new(&mut materials);
+    // Lazy-initialised — materials are only needed by the branch path.
+    // 80% of growth ticks hit the extend path which doesn't need them,
+    // and many ticks find nothing to grow at all. Building 3 fresh
+    // StandardMaterial assets every second when most ticks don't spawn
+    // a branch is wasteful.
+    let mut materials_helper: Option<OrganismMaterials> = None;
 
     for (root_entity, mut organism, is_photo, is_hetero) in &mut organisms {
+        // Phase gate: only ~1/`GROWTH_PHASE_PERIOD` of variable-form
+        // organisms run their growth step this tick. Per-organism
+        // effective rate stays at 1 / `CONTINUOUS_GROWTH_INTERVAL`
+        // because the phase counter rotates through every value over
+        // exactly that interval.
+        if root_entity.index().index() % GROWTH_PHASE_PERIOD != current_phase { continue; }
+
         if !organism.has_variable_form { continue; }
         if organism.grown_cell_count() >= MAX_CELLS { continue; }
         if organism.body_parts.is_empty() { continue; }
@@ -98,10 +143,12 @@ fn grow_variable_form_organisms(
         };
 
         if body_part::should_branch(&mut rng) {
+            let mh = materials_helper
+                .get_or_insert_with(|| OrganismMaterials::new(&mut materials));
             grow_new_branch(
                 &mut organism, root_entity, kind,
                 &mut rng, &mut commands, &mut meshes,
-                &materials_helper, &children_q, &body_part_idx_q,
+                mh, &children_q, &body_part_idx_q,
             );
         } else {
             extend_root_part(
@@ -109,6 +156,52 @@ fn grow_variable_form_organisms(
                 &mut rng, &mut meshes,
                 &children_q, &body_part_idx_q, &mesh3d_q,
             );
+        }
+
+        // Adult-transition check. Runs on whichever tick first pushes
+        // the organism over `MAX_CELLS`. Once `adult` flips, this
+        // branch never fires for that organism again — the
+        // `grown_cell_count() >= MAX_CELLS` guard above also skips it
+        // from the growth loop entirely. So the smoothing pass is
+        // strictly one-time per organism over its entire lifetime.
+        // The smoothing operation itself is gated on `Smoothing` —
+        // when the resource is `false` the `adult` flag still flips
+        // (so future smoothing-on toggles don't re-fire), but the
+        // mesh stays faceted.
+        if !organism.adult && organism.grown_cell_count() >= MAX_CELLS {
+            organism.adult = true;
+            if smoothing.0 {
+                smooth_all_body_part_meshes(
+                    &organism, root_entity, &mut meshes,
+                    &children_q, &body_part_idx_q, &mesh3d_q,
+                );
+            }
+        }
+    }
+}
+
+
+/// Replace every alive, regrowable body-part mesh on `organism` with
+/// the smoothed version of its OCG. Called exactly once per organism's
+/// lifetime — on the tick where its `adult` flag flips from false to
+/// true. Iterates only the body parts that have an actual mesh
+/// (`regrowable && !ocg.is_empty()`).
+fn smooth_all_body_part_meshes(
+    organism:        &Organism,
+    root_entity:     Entity,
+    meshes:          &mut Assets<Mesh>,
+    children_q:      &Query<&Children>,
+    body_part_idx_q: &Query<&BodyPartIndex>,
+    mesh3d_q:        &Query<&Mesh3d>,
+) {
+    for (idx, bp) in organism.body_parts.iter().enumerate() {
+        if !bp.is_alive() || !bp.regrowable || bp.ocg.is_empty() { continue; }
+        let Some(part_entity) = find_body_part_entity(
+            root_entity, idx, children_q, body_part_idx_q,
+        ) else { continue };
+        let Ok(mesh3d) = mesh3d_q.get(part_entity) else { continue };
+        if let Some(mesh) = meshes.get_mut(&mesh3d.0) {
+            *mesh = crate::volumetric_growth::build_smoothed_mesh_from_ocg(&bp.ocg);
         }
     }
 }
@@ -172,6 +265,7 @@ fn grow_new_branch(
         OrganismMesh,
         BodyPartIndex(new_idx),
         ShowGizmo,
+        bevy::light::NotShadowCaster,
     )).id();
 
     if let Some(parent_entity) = find_body_part_entity(
@@ -181,6 +275,11 @@ fn grow_new_branch(
     }
 
     organism.body_parts.push(new_part);
+    // The new branch extends the cell envelope further out from the
+    // root, so the cached bounding radius needs refreshing before the
+    // next per-frame movement / floor / collision tick reads it.
+    // O(cells) — only runs at growth events.
+    organism.recompute_bounding_radius();
 }
 
 
@@ -217,6 +316,10 @@ fn extend_root_part(
         CellType::Photo    => organism.photo_cell_count    += 1,
         CellType::NonPhoto => organism.non_photo_cell_count += 1,
     }
+    // Cached bounding radius needs refreshing — the new cell may extend
+    // the envelope. Only one body part has changed; the function still
+    // walks all alive body parts but at 30 cells max it's cheap.
+    organism.recompute_bounding_radius();
 
     // Replace the existing mesh asset's contents in place. Bevy's asset
     // change detection flags the asset, the renderer re-uploads the new

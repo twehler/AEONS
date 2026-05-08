@@ -70,6 +70,7 @@ fn reproduction_system(
     mut meshes:     ResMut<Assets<Mesh>>,
     mut materials:  ResMut<Assets<StandardMaterial>>,
     heightmap:      Option<Res<HeightmapSampler>>,
+    smoothing:      Res<crate::simulation_settings::Smoothing>,
     mut query:      Query<
         (Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>),
         With<OrganismRoot>,
@@ -85,7 +86,7 @@ fn reproduction_system(
     let mut pending_births: Vec<PendingBirth> = Vec::new();
     let mut rng = rand::rng();
 
-    for (_entity, mut organism, transform, is_photo, is_hetero) in &mut query {
+    for (parent_entity, mut organism, transform, is_photo, is_hetero) in &mut query {
         if pending_births.len() >= spawn_budget { break; }
 
         if organism.reproduced { continue; }
@@ -157,25 +158,43 @@ fn reproduction_system(
                 }
             }
             Symmetry::Bilateral => {
-                // Grow the right half by one cell (constrained to x ≥
-                // MIN_X_BILATERAL), then re-mirror to update the left half.
-                // No branching for bilateral organisms — that would
-                // require pairing every branch with a mirror branch, which
-                // is deferred to a later iteration.
+                // Bilateral organisms have ONE body part whose OCG
+                // contains both halves (right cells with x > 0 plus
+                // their mirrors). Growth: extract the right half from
+                // the combined OCG, mutate it (constrained to
+                // x ≥ MIN_X_BILATERAL), mirror, and reassemble. The
+                // combined-OCG mesh build then welds the seam and
+                // drops interior faces automatically. No branching
+                // for bilateral organisms.
                 let mut parts = organism.body_parts.clone();
-                if parts.len() < 2 { continue; } // safety net
+                if parts.is_empty() { continue; }
+
+                // Extract right-half cells with fresh sequential
+                // indices — `mutate_bilateral` expects a contiguous
+                // [0..N) ledger as input.
+                let right_ocg: Vec<(usize, Vec3, CellType)> = parts[0].ocg.iter()
+                    .filter(|(_, p, _)| p.x > 0.0)
+                    .enumerate()
+                    .map(|(i, (_, p, ct))| (i, *p, *ct))
+                    .collect();
+                if right_ocg.is_empty() { continue; }
+
                 let Some(grown_right) =
-                    crate::mutation::mutate_bilateral(&parts[0].ocg, &mut rng)
+                    crate::mutation::mutate_bilateral(&right_ocg, &mut rng)
                     else { continue; };
                 let grown_left = body_part::mirror_ocg_x(&grown_right);
-                parts[0].cells = grown_right.iter()
+
+                // Reassemble both halves into a single OCG with
+                // contiguous indices.
+                let combined: Vec<(usize, Vec3, CellType)> = grown_right.iter()
+                    .chain(grown_left.iter())
+                    .enumerate()
+                    .map(|(i, (_, p, ct))| (i, *p, *ct))
+                    .collect();
+                parts[0].cells = combined.iter()
                     .map(|(_, p, ct)| Cell::new(*p, *ct))
                     .collect();
-                parts[0].ocg = grown_right;
-                parts[1].cells = grown_left.iter()
-                    .map(|(_, p, ct)| Cell::new(*p, *ct))
-                    .collect();
-                parts[1].ocg = grown_left;
+                parts[0].ocg = combined;
                 parts
             }
         };
@@ -198,43 +217,82 @@ fn reproduction_system(
             body_parts: child_body_parts,
             energy:     offspring_energy,
             kind,
-            // Offspring inherit the parent's symmetry, sessility, and
-            // variable-form trait verbatim. Per design: a variable-form
-            // parent always produces a variable-form (sessile) child;
-            // a bilateral mobile parent always produces a bilateral
-            // mobile child.
-            symmetry:          organism.symmetry,
-            has_variable_form: organism.has_variable_form,
-            is_sessile:        organism.is_sessile,
+            // Offspring inherit the parent's symmetry, sessility,
+            // variable-form, and intelligence_level traits verbatim.
+            symmetry:           organism.symmetry,
+            has_variable_form:  organism.has_variable_form,
+            is_sessile:         organism.is_sessile,
+            intelligence_level: organism.intelligence_level,
+            // Captured here so the brain pool can copy parent → child
+            // weights when `assign_brains_*` runs next PreUpdate.
+            // Skip the inheritance link for Level0: the sessile
+            // organisms have no MLP rows to copy, and attaching the
+            // marker would just leak a stale Entity reference until
+            // the entity is despawned.
+            parent_for_brain_inheritance: if matches!(
+                organism.intelligence_level,
+                crate::organism::IntelligenceLevel::Level0
+            ) {
+                None
+            } else {
+                Some(parent_entity)
+            },
         });
     }
 
+    // Skip the asset registration entirely on ticks where no births
+    // are pending. Each `OrganismMaterials::new` call inserts 3
+    // StandardMaterial assets — cheap individually but every 2-second
+    // tick was creating them unconditionally.
+    if pending_births.is_empty() { return; }
     let organism_materials = OrganismMaterials::new(&mut materials);
 
     for birth in pending_births {
-        spawn_organism(
+        let child_root = spawn_organism(
             birth.pos,
             birth.body_parts,
             birth.kind,
             birth.symmetry,
             birth.has_variable_form,
             birth.is_sessile,
+            birth.intelligence_level,
+            smoothing.0,
             birth.energy,
             &mut commands,
             &mut meshes,
             &organism_materials,
             &mut rng,
         );
+        if let Some(parent) = birth.parent_for_brain_inheritance {
+            // The brain pool's PreUpdate `assign_brains_*` will see
+            // this component, look up the parent's slot, copy its
+            // weights into the new slot, and remove the marker. If
+            // the parent has died before that runs (rare), the
+            // lookup fails silently and the offspring just keeps
+            // the recycled slot's previous tenant's weights.
+            commands.entity(child_root)
+                .try_insert(crate::rl_helpers::BrainInheritance(parent));
+        }
     }
 }
 
 
 struct PendingBirth {
-    pos:               Vec3,
-    body_parts:        Vec<BodyPart>,
-    energy:            f32,
-    kind:              OrganismKind,
-    symmetry:          Symmetry,
-    has_variable_form: bool,
-    is_sessile:        bool,
+    pos:                Vec3,
+    body_parts:         Vec<BodyPart>,
+    energy:             f32,
+    kind:               OrganismKind,
+    symmetry:           Symmetry,
+    has_variable_form:  bool,
+    is_sessile:         bool,
+    /// Inherited verbatim from the parent — see the doc on
+    /// `IntelligenceLevel`. Initial spawn rolls this; reproduction
+    /// passes it through.
+    intelligence_level: IntelligenceLevel,
+    /// Parent entity, captured so that after the offspring's root
+    /// entity is spawned we can attach `BrainInheritance(parent)` and
+    /// the brain pool's `assign_brains_*` system will copy parent's
+    /// row into the offspring's slot. `None` for Level0 offspring
+    /// (no pool to inherit from).
+    parent_for_brain_inheritance: Option<Entity>,
 }

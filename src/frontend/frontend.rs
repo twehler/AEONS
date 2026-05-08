@@ -30,7 +30,7 @@ use bevy::window::PrimaryWindow;
 use crate::statistics_panel::{
     self, GraphState, OrganismCounts, StatisticsPanel,
 };
-use crate::simulation_settings::{PlayerControlsActive, SimulationRunning};
+use crate::simulation_settings::{PlayerControlsActive, SimulationRunning, Smoothing};
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -105,6 +105,7 @@ impl Plugin for FrontendPlugin {
             .init_resource::<DividerDragState>()
             .init_resource::<SimulationRunning>()
             .init_resource::<PlayerControlsActive>()
+            .init_resource::<Smoothing>()
             .insert_resource(GraphState::new())
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
             .add_systems(Startup, setup_panes)
@@ -123,8 +124,18 @@ impl Plugin for FrontendPlugin {
                 statistics_panel::handle_save_button,
                 statistics_panel::update_start_stop_label,
                 apply_player_controls_state,
-                draw_orientation_gizmos,
             ));
+        // Gizmos run only when the F3-toggled overlay is active. Putting
+        // the check on the system registration (rather than inside the
+        // body) means the scheduler skips the system entirely in the
+        // common-off state, avoiding the per-frame query iteration over
+        // thousands of `ShowGizmo` body-part children.
+        app.add_systems(
+            Update,
+            draw_orientation_gizmos.run_if(
+                |vs: Res<ViewportSettings>| vs.show_advanced_viewport
+            ),
+        );
     }
 }
 
@@ -367,13 +378,13 @@ pub fn toggle_advanced_viewport(
 
 pub fn draw_orientation_gizmos(
     // Only queries entities explicitly tagged with `ShowGizmo` — terrain
-    // chunks, UI, lights etc. are never included.
-    query:             Query<&Transform, With<ShowGizmo>>,
-    mut gizmos:        Gizmos,
-    viewport_settings: Res<ViewportSettings>,
+    // chunks, UI, lights etc. are never included. The
+    // `viewport_settings.show_advanced_viewport` toggle is enforced by
+    // a `.run_if` on the system registration so this body only runs
+    // when gizmos are wanted.
+    query:      Query<&Transform, With<ShowGizmo>>,
+    mut gizmos: Gizmos,
 ) {
-    if !viewport_settings.show_advanced_viewport { return; }
-
     for transform in &query {
         let pos    = transform.translation;
         let length = 1.5; // Scaled to cell size (~1 unit), not terrain scale

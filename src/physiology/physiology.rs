@@ -154,6 +154,13 @@ fn photosynthesise(
             }
         }
 
+        // Shadowed photo cells produce half their nominal energy.
+        // `Organism::in_sunlight` is maintained by
+        // `photosynthesis::update_sunlight` in PreUpdate.
+        if !organism.in_sunlight {
+            produced *= 0.5;
+        }
+
         organism.energy += produced;
     }
 }

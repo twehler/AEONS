@@ -14,11 +14,16 @@
 #[path = "growth/mutation.rs"]              mod mutation;
 #[path = "growth/continuous_growth.rs"]     mod continuous_growth;
 
-#[path = "behaviour/behaviour.rs"]            mod behaviour;
-#[path = "behaviour/intelligence_level_1.rs"] mod intelligence_level_1;
-#[path = "behaviour/intelligence_level_3.rs"] mod intelligence_level_3;
-#[path = "behaviour/predation.rs"]            mod predation;
-#[path = "behaviour/photosynthesis.rs"]       mod photosynthesis;
+#[path = "behaviour/behaviour.rs"]                  mod behaviour;
+#[path = "behaviour/world_model.rs"]                mod world_model;
+#[path = "behaviour/rl_helpers.rs"]                 mod rl_helpers;
+#[path = "behaviour/intelligence_level_0.rs"]       mod intelligence_level_0;
+#[path = "behaviour/intelligence_level_1_photo.rs"] mod intelligence_level_1_photo;
+#[path = "behaviour/intelligence_level_1_hetero.rs"] mod intelligence_level_1_hetero;
+#[path = "behaviour/intelligence_level_2.rs"]       mod intelligence_level_2;
+#[path = "behaviour/intelligence_level_3.rs"]       mod intelligence_level_3;
+#[path = "behaviour/predation.rs"]                  mod predation;
+#[path = "behaviour/photosynthesis.rs"]             mod photosynthesis;
 
 #[path = "movement_physics/movement.rs"]           mod movement;
 #[path = "movement_physics/organism_collision.rs"] mod organism_collision;
@@ -348,13 +353,28 @@ fn run_simulation(choice: LauncherChoice) {
 
 
 fn setup(mut commands: Commands) {
-    // Light
+    // Light. Bevy's default `CascadeShadowConfig` uses 4 cascades and
+    // re-extracts the full caster set per cascade per frame — at our
+    // mesh-entity counts that's the dominant render-pipeline cost.
+    // Override to a single cascade with the same far-plane as the camera
+    // (300 units): one extract pass, one shadow draw, identical visual
+    // for our flat-ish maps. `DirectionalLightShadowMap::size = 2048` is
+    // also the Bevy default; halving it cheapens the shadow-pass GPU
+    // workload without visible aliasing on our terrain scale.
+    commands.insert_resource(bevy::light::DirectionalLightShadowMap { size: 1024 });
     commands.spawn((
         DirectionalLight {
             illuminance: 10000.0,
             shadows_enabled: true,
             ..default()
         },
+        bevy::light::CascadeShadowConfigBuilder {
+            num_cascades:             1,
+            minimum_distance:         0.1,
+            maximum_distance:         200.0,
+            first_cascade_far_bound:  200.0,
+            overlap_proportion:       0.2,
+        }.build(),
         Transform::from_rotation(Quat::from_euler(
             EulerRot::XYZ,
             -std::f32::consts::FRAC_PI_4,
