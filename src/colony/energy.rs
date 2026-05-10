@@ -61,14 +61,14 @@ fn manage_energy(
     // unmodified for the procedural organisms; the only cost is one extra
     // archetype filter at query construction time.
     mut organisms: Query<
-        (Entity, &mut Organism, &Transform),
+        (Entity, &mut Organism, &Transform, Has<Heterotroph>),
         (With<OrganismRoot>, Without<Krishi>),
     >,
 ) {
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
-    for (entity, mut organism, transform) in organisms.iter_mut() {
+    for (entity, mut organism, transform, is_hetero) in organisms.iter_mut() {
         let max_energy = get_max_energy(&organism);
 
         // Cached cell counts — kept in sync by physiology / predation, no
@@ -106,7 +106,15 @@ fn manage_energy(
         organism.energy = (organism.energy - consumption).clamp(0.0, max_energy);
 
         if organism.energy <= 0.0 {
-            commands.entity(entity).despawn();
+            // Heterotroph-movement RL debug mode: keep starved heterotrophs
+            // alive (energy stays clamped at 0) so the training environment
+            // can keep running without losing the subject. Hunger still
+            // accrues — only the despawn step is suppressed.
+            let suppress_despawn = is_hetero
+                && !crate::simulation_settings::HETEROTROPH_MOVEMENT_AI_DEBUGGING;
+            if !suppress_despawn {
+                commands.entity(entity).despawn();
+            }
         }
     }
 }

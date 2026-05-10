@@ -13,12 +13,13 @@ use std::fmt::Write as _;
 
 use bevy::prelude::*;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::input::keyboard::KeyboardInput;
 use bevy::render::render_resource::Extent3d;
 use bevy::render::render_resource::TextureFormat;
 
 use crate::colony::{Photoautotroph, Heterotroph, Organism, OrganismRoot, SaveRequested};
 use crate::frontend::PANEL_BG_COLOR;
-use crate::simulation_settings::SimulationRunning;
+use crate::simulation_settings::{SimulationRunning, TimeSpeed};
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -60,6 +61,16 @@ const BUTTON_COLOR_HOVER:     Color = Color::srgb(0.30, 0.30, 0.30);
 
 /// Save button styling — sits in the bottom-right of the panel.
 const BUTTON_COLOR_SAVE:      Color = Color::srgb(0.20, 0.40, 0.65); // calm blue
+
+/// Speed-input visual constants. Two background colours so the user
+/// can immediately see when the field is editable.
+const SPEED_INPUT_WIDTH_PX:   f32   = 88.0;
+const SPEED_INPUT_HEIGHT_PX:  f32   = 26.0;
+const SPEED_INPUT_BG_IDLE:    Color = Color::srgb(0.20, 0.20, 0.22);
+const SPEED_INPUT_BG_FOCUSED: Color = Color::srgb(0.32, 0.30, 0.18);
+/// Maximum length of the editable buffer. Bounded so the user can't
+/// paste in an arbitrary long string and clog formatting.
+const SPEED_BUFFER_MAX_LEN:   usize = 8;
 
 
 // ── Resources ────────────────────────────────────────────────────────────────
@@ -117,6 +128,37 @@ pub struct FpsText { timer: Timer }
 
 #[derive(Component)]
 pub struct CellCountText { timer: Timer }
+
+/// Marker on the simulation-clock text that sits between the vertical
+/// separator and the population graph. Reads `Time<Virtual>` so it
+/// pauses automatically with the simulation. The internal timer just
+/// throttles the formatting work to twice a second — the value only
+/// changes once per simulation second anyway.
+#[derive(Component)]
+pub struct SimTimerText { timer: Timer }
+
+/// Marker on the clickable speed-input box (the outer Node + Button).
+/// `apply_time_speed_input` queries on this to detect "click on the
+/// input" vs "click outside".
+#[derive(Component)]
+pub struct TimeSpeedInput;
+
+/// Marker on the Text child inside the speed-input box. Updated by
+/// `update_time_speed_text` to reflect either the committed value
+/// or the in-progress edit buffer.
+#[derive(Component)]
+pub struct TimeSpeedText;
+
+/// Edit-state for the speed-input field. Lives outside the Node so
+/// the focused state can be inspected by sibling systems.
+#[derive(Resource, Default)]
+pub struct TimeSpeedEditState {
+    /// Live edit buffer (only meaningful when `focused == true`).
+    pub buffer:  String,
+    /// True while the user is actively typing into the field.
+    /// Click-on-input → true; Enter/Escape/click-outside → false.
+    pub focused: bool,
+}
 
 #[derive(Component)]
 pub struct PhotoCountText;
@@ -217,6 +259,75 @@ pub fn spawn_panel(
             },
             BackgroundColor(VERTICAL_LINE_COLOR),
         ));
+
+        // ── Simulation clock (DD:HH:MM:SS).
+        // Lives between the vertical separator and the spacer so it
+        // sits to the LEFT of the absolutely-positioned graph (which
+        // starts at 25 vw). Width is fixed so this column never
+        // overflows into the graph area.
+        panel
+            .spawn(Node {
+                flex_direction: FlexDirection::Column,
+                align_items:    AlignItems::FlexStart,
+                margin:         UiRect::left(Val::Px(12.0)),
+                flex_shrink:    0.0,
+                ..default()
+            })
+            .with_children(|col| {
+                col.spawn((
+                    Text::new("Sim Time"),
+                    TextFont { font_size: 12.0, ..default() },
+                    TextColor(Color::srgb(0.70, 0.70, 0.70)),
+                    Pickable::IGNORE,
+                ));
+                col.spawn((
+                    Text::new("000:000:00:00:00"),
+                    TextFont { font_size: 20.0, ..default() },
+                    TextColor(Color::WHITE),
+                    SimTimerText {
+                        timer: Timer::from_seconds(0.5, TimerMode::Repeating),
+                    },
+                ));
+
+                // ── Speed-input field. ───────────────────────────────
+                col.spawn((
+                    Text::new("Speed"),
+                    TextFont { font_size: 12.0, ..default() },
+                    TextColor(Color::srgb(0.70, 0.70, 0.70)),
+                    Node { margin: UiRect::top(Val::Px(6.0)), ..default() },
+                    Pickable::IGNORE,
+                ));
+                col
+                    .spawn((
+                        TimeSpeedInput,
+                        Button,
+                        Node {
+                            width:   Val::Px(SPEED_INPUT_WIDTH_PX),
+                            height:  Val::Px(SPEED_INPUT_HEIGHT_PX),
+                            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                            align_items:     AlignItems::Center,
+                            justify_content: JustifyContent::FlexStart,
+                            ..default()
+                        },
+                        BackgroundColor(SPEED_INPUT_BG_IDLE),
+                    ))
+                    .with_children(|btn| {
+                        btn.spawn((
+                            TimeSpeedText,
+                            Text::new("1.00x"),
+                            TextFont { font_size: 14.0, ..default() },
+                            TextColor(Color::WHITE),
+                            Pickable::IGNORE,
+                        ));
+                    });
+                col.spawn((
+                    Text::new("(Be careful with this!)"),
+                    TextFont { font_size: 11.0, ..default() },
+                    TextColor(Color::srgb(0.95, 0.55, 0.15)),
+                    Node { margin: UiRect::top(Val::Px(2.0)), ..default() },
+                    Pickable::IGNORE,
+                ));
+            });
 
         // ── Spacer so the right section pushes to the panel's right
         //    edge while the graph + button float over it via absolute
@@ -348,6 +459,62 @@ pub fn update_fps_text(
                 }
             }
         }
+    }
+}
+
+
+/// Format `total_secs` as `YYY:DDD:HH:MM:SS`.
+///
+/// Day length: 86 400 s. Year length: 365 days (no leap-day
+/// correction — this is a simulation, calendars don't apply).
+///
+/// Year field width:
+///   * `< 1000` years  → `{:03}` zero-padded ("000".."999")
+///   * `≥ 1000` years  → `{:.2e}` scientific ("1.00e3", "1.23e9", …)
+/// The scientific branch widens the field by ~3 chars exactly once,
+/// at the 1000-year mark. Past that the year field stays bounded at
+/// 7 characters (worst case: `1.84e19` for u64::MAX seconds).
+fn format_dhms(total_secs: u64) -> String {
+    const SECS_PER_DAY:  u64 = 86_400;
+    const SECS_PER_YEAR: u64 = SECS_PER_DAY * 365;
+
+    let years = total_secs / SECS_PER_YEAR;
+    let rem   = total_secs % SECS_PER_YEAR;
+    let days  = rem / SECS_PER_DAY;
+    let hours = (rem / 3_600) % 24;
+    let mins  = (rem / 60)    % 60;
+    let secs  = rem           % 60;
+
+    if years >= 1_000 {
+        format!(
+            "{:.2e}:{:03}:{:02}:{:02}:{:02}",
+            years as f64, days, hours, mins, secs,
+        )
+    } else {
+        format!(
+            "{:03}:{:03}:{:02}:{:02}:{:02}",
+            years, days, hours, mins, secs,
+        )
+    }
+}
+
+
+pub fn update_sim_timer_text(
+    real_time:    Res<Time>,
+    virtual_time: Res<Time<Virtual>>,
+    mut query:    Query<(&mut Text, &mut SimTimerText)>,
+) {
+    for (mut text, mut marker) in &mut query {
+        // Tick the throttle on REAL time so the refresh keeps firing
+        // even when the simulation is paused (otherwise the displayed
+        // value would lag a tick after un-pausing). The displayed
+        // value itself uses virtual elapsed seconds, which IS frozen
+        // while paused — exactly the desired behaviour.
+        marker.timer.tick(real_time.delta());
+        if !marker.timer.just_finished() { continue; }
+        let total_secs = virtual_time.elapsed_secs() as u64;
+        text.0.clear();
+        text.0.push_str(&format_dhms(total_secs));
     }
 }
 
@@ -598,6 +765,136 @@ pub fn update_start_stop_label(
     for mut bg in &mut buttons {
         *bg = BackgroundColor(color);
     }
+}
+
+
+// ── Time-speed input handlers ───────────────────────────────────────────────
+
+/// Click + keyboard router for the speed-input field.
+///
+///   * LMB on the input box → focus the field, prefill the buffer
+///     with the current committed value.
+///   * LMB elsewhere while focused → commit the buffer (parse +
+///     apply, or discard if unparseable) and unfocus.
+///   * While focused, KeyboardInput events:
+///       Enter / NumpadEnter   → commit + unfocus
+///       Escape                → cancel + unfocus (no commit)
+///       Backspace             → drop trailing buffer char
+///       digit / '.'           → append (bounded by SPEED_BUFFER_MAX_LEN)
+///
+/// The committed value writes through to the `TimeSpeed` resource;
+/// `apply_time_speed` then mirrors it onto `Time<Virtual>` and the
+/// scaling propagates to every system reading `Res<Time>`.
+pub fn handle_time_speed_input(
+    mouse:           Res<ButtonInput<MouseButton>>,
+    mut keyboard:    MessageReader<KeyboardInput>,
+    interaction_q:   Query<&Interaction, With<TimeSpeedInput>>,
+    mut state:       ResMut<TimeSpeedEditState>,
+    mut speed:       ResMut<TimeSpeed>,
+) {
+    let click_on_input = mouse.just_pressed(MouseButton::Left)
+        && interaction_q.iter().any(|i| matches!(i, Interaction::Pressed));
+    let click_outside  = mouse.just_pressed(MouseButton::Left) && !click_on_input;
+
+    // ── Focus on click-on-input. ───────────────────────────────────
+    if click_on_input && !state.focused {
+        state.focused = true;
+        state.buffer.clear();
+        let _ = write!(state.buffer, "{:.2}", speed.0);
+    }
+
+    // ── Commit on click-outside. Always drains keyboard regardless
+    //    so events don't pile up; consumed events get dropped when
+    //    the field isn't focused. ────────────────────────────────
+    if click_outside && state.focused {
+        commit_time_speed(&mut state, &mut speed);
+    }
+
+    if !state.focused {
+        // Drain to avoid event-buffer growth.
+        for _ in keyboard.read() {}
+        return;
+    }
+
+    for ev in keyboard.read() {
+        if !ev.state.is_pressed() { continue; }
+        match ev.key_code {
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                commit_time_speed(&mut state, &mut speed);
+            }
+            KeyCode::Escape => {
+                state.focused = false;
+                state.buffer.clear();
+            }
+            KeyCode::Backspace => {
+                state.buffer.pop();
+            }
+            _ => {
+                if let Some(text) = ev.text.as_ref() {
+                    for c in text.chars() {
+                        if state.buffer.len() >= SPEED_BUFFER_MAX_LEN { break; }
+                        // Allow digits and a single decimal point.
+                        if c.is_ascii_digit() {
+                            state.buffer.push(c);
+                        } else if c == '.' && !state.buffer.contains('.') {
+                            state.buffer.push(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse the buffer; if it's a valid non-negative finite number,
+/// write it into `TimeSpeed`. Always unfocus + clear the buffer.
+fn commit_time_speed(state: &mut TimeSpeedEditState, speed: &mut TimeSpeed) {
+    if let Ok(v) = state.buffer.parse::<f32>() {
+        if v.is_finite() && v >= 0.0 {
+            speed.0 = v;
+        }
+    }
+    state.focused = false;
+    state.buffer.clear();
+}
+
+/// Sync the input box's text + background colour with the current
+/// committed `TimeSpeed` and edit state. Runs every frame; the early
+/// return on `!is_changed()` keeps it free in steady state.
+pub fn update_time_speed_text(
+    state:    Res<TimeSpeedEditState>,
+    speed:    Res<TimeSpeed>,
+    mut text_q: Query<&mut Text, With<TimeSpeedText>>,
+    mut bg_q:   Query<&mut BackgroundColor, With<TimeSpeedInput>>,
+) {
+    if !state.is_changed() && !speed.is_changed() { return; }
+
+    let display = if state.focused {
+        // Cursor indicator so the user can tell where typing lands.
+        format!("{}_", state.buffer)
+    } else {
+        format!("{:.2}x", speed.0)
+    };
+    for mut text in &mut text_q {
+        text.0 = display.clone();
+    }
+
+    let bg = if state.focused { SPEED_INPUT_BG_FOCUSED } else { SPEED_INPUT_BG_IDLE };
+    for mut b in &mut bg_q {
+        if b.0 != bg { *b = BackgroundColor(bg); }
+    }
+}
+
+/// Mirror `TimeSpeed` onto `Time<Virtual>::set_relative_speed`. Runs
+/// any frame the resource is changed (including the first frame after
+/// `init_resource`, which seeds 1.0 onto virtual time — harmless).
+pub fn apply_time_speed(
+    speed:           Res<TimeSpeed>,
+    mut virtual_time: ResMut<Time<Virtual>>,
+) {
+    if !speed.is_changed() { return; }
+    let s = speed.0.max(0.0);
+    virtual_time.set_relative_speed(s);
 }
 
 

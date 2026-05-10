@@ -13,12 +13,12 @@ pub use crate::organism::*;
 /// Hard cap on simulation population. Both brain pools size their tensors to
 /// this constant — exceeding it would silently miss organisms in the batched
 /// MLP forward pass.
-pub const MAXIMUM_ORGANISMS: usize = 2000;
+pub const MAXIMUM_ORGANISMS: usize = 30;
 
 /// Initial population of each trophic strategy. Photoautotrophs dominate so
 /// the food web has plenty of prey for the smaller heterotroph predator pool.
-const INITIAL_PHOTOAUTOTROPHS: u32 = 1000;
-const INITIAL_HETEROTROPHS:    u32 = 200;
+const INITIAL_PHOTOAUTOTROPHS: u32 = 10;
+const INITIAL_HETEROTROPHS:    u32 = 1;
 
 /// Initial Krishi cohort size. `pub` so `krishi.rs` reads it directly —
 /// keeps every "how many of X spawn at startup" knob in one place.
@@ -828,7 +828,14 @@ fn spawn_colony(
         );
     }
 
-    for _ in 0..INITIAL_HETEROTROPHS {
+    // Heterotroph-movement RL debug mode seeds a single heterotroph so the
+    // training environment is isolated to one subject.
+    let heterotroph_count = if crate::simulation_settings::HETEROTROPH_MOVEMENT_AI_DEBUGGING {
+        INITIAL_HETEROTROPHS
+    } else {
+        1
+    };
+    for _ in 0..heterotroph_count {
         let x = rng.random_range(0.0_f32..MAP_MAX_X);
         let z = rng.random_range(0.0_f32..MAP_MAX_Z);
         let y = heightmap.height_at(x, z) + 1.0;

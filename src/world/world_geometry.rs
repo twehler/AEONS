@@ -51,8 +51,8 @@ const TRIANGLE_GRID_BUCKET: f32 = 4.0;
 /// Per-axis minimum world extent enforced at load time, and the spawn area
 /// upper bound used by `colony.rs` / `reproduction.rs`. After normalisation
 /// the world is guaranteed to span at least `[0, MAP_MAX_X] x [0, MAP_MAX_Z]`.
-pub const MAP_MAX_X: f32 = 1024.0;
-pub const MAP_MAX_Z: f32 = 1024.0;
+pub const MAP_MAX_X: f32 = 104.0;
+pub const MAP_MAX_Z: f32 = 104.0;
 
 
 // ── Plugin ──────────────────────────────────────────────────────────────────
@@ -349,10 +349,31 @@ fn compute_normalisation(triangles: &[[Vec3; 3]]) -> (f32, Vec3) {
 
 // ── glTF traversal helpers ──────────────────────────────────────────────────
 
+/// Normalise a user-supplied world path into something Bevy's `AssetServer`
+/// can resolve (it expects paths relative to `assets/`). Handles three input
+/// shapes:
+///
+///   * `world.glb` / `./world.glb`            → unchanged
+///   * `assets/world.glb` / `assets\world.glb` → strips the leading `assets`
+///     segment
+///   * absolute paths like `/home/u/repo/assets/world.glb` (produced by the
+///     launcher's "Open…" file dialog) → returns the suffix after the LAST
+///     `assets/` (or `assets\`) segment
+///
+/// The launcher's file dialog returns absolute paths; without the third
+/// branch the AssetServer silently fails to load and the world never spawns.
 fn strip_assets_prefix(p: &str) -> String {
     let trimmed = p.trim_start_matches("./");
-    if let Some(rest) = trimmed.strip_prefix("assets/") { return rest.to_string(); }
+    if let Some(rest) = trimmed.strip_prefix("assets/")  { return rest.to_string(); }
     if let Some(rest) = trimmed.strip_prefix("assets\\") { return rest.to_string(); }
+    // Absolute or otherwise-prefixed path that still contains an `assets`
+    // directory somewhere — take everything after the LAST occurrence.
+    if let Some(idx) = trimmed.rfind("/assets/") {
+        return trimmed[idx + "/assets/".len()..].to_string();
+    }
+    if let Some(idx) = trimmed.rfind("\\assets\\") {
+        return trimmed[idx + "\\assets\\".len()..].to_string();
+    }
     trimmed.to_string()
 }
 

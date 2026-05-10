@@ -13,6 +13,24 @@
 use bevy::prelude::*;
 
 
+/// Global switch for the heterotroph-movement RL debugging environment.
+///
+/// Following the user-specified polarity:
+///   * `false` → **debug mode active**. Heterotrophs never despawn even when
+///     their energy hits zero, and they never reproduce. Hunger (energy
+///     drain) still happens. Companion call sites also disable the Krishi
+///     plugin and reduce the initial heterotroph cohort to a single
+///     organism so the RL training environment is isolated.
+///   * `true`  → **normal simulation**. Starvation despawn, reproduction,
+///     Krishi plugin, and the full initial heterotroph cohort are all
+///     active.
+///
+/// Read at compile time by `energy.rs` (despawn skip), `reproduction.rs`
+/// (heterotroph reproduction skip), `main.rs` (Krishi plugin gate), and
+/// `colony.rs` (initial heterotroph count).
+pub const HETEROTROPH_MOVEMENT_AI_DEBUGGING: bool = false;
+
+
 /// True when the simulation is advancing (`Time<Virtual>` is unpaused) and
 /// every gameplay system that depends on virtual time is doing useful work.
 /// Toggled by the Start/Stop button in the statistics panel.
@@ -40,6 +58,27 @@ impl Default for SimulationRunning {
 /// player camera idle.
 #[derive(Resource, Default)]
 pub struct PlayerControlsActive(pub bool);
+
+
+/// Global simulation-time multiplier. Drives `Time<Virtual>::set_relative_speed`,
+/// so every system reading `Res<Time>` inherits the scaled delta —
+/// energy ticks, brain ticks, photosynthesis, predation, movement,
+/// reproduction, the panel timer, all of it.
+///
+/// The player camera is not affected: it reads `Res<Time<Real>>`
+/// directly so the user can still navigate at normal speed while
+/// the simulation runs at e.g. 10x.
+///
+/// 1.0 = baseline (real-time-ish). 0.0 freezes virtual time without
+/// invoking the explicit pause path. Values past ~5–10 will start
+/// stressing the GPU brain pools (more ticks per real second) — the
+/// user is expected to dial this up empirically.
+#[derive(Resource)]
+pub struct TimeSpeed(pub f32);
+
+impl Default for TimeSpeed {
+    fn default() -> Self { Self(1.0) }
+}
 
 
 /// When `true`, adult organisms get their body-part meshes smoothed via

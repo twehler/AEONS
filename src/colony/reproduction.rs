@@ -91,6 +91,15 @@ fn reproduction_system(
 
         if organism.reproduced { continue; }
 
+        // Heterotroph-movement RL debug mode: heterotrophs do not reproduce
+        // so the training population stays at the seeded count. Photoautotrophs
+        // still reproduce normally so prey continues to repopulate.
+        if is_hetero
+            && !crate::simulation_settings::HETEROTROPH_MOVEMENT_AI_DEBUGGING
+        {
+            continue;
+        }
+
         let max_energy = (organism.grown_cell_count() as f32) * MAX_ENERGY_PER_CELL;
         if max_energy <= 0.0 { continue; }
         if organism.energy < max_energy * REPRODUCTION_ENERGY_THRESHOLD { continue; }

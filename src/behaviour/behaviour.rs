@@ -60,20 +60,40 @@ use crate::photosynthesis::PhotosynthesisPlugin;
 use crate::world_model::{WorldModelGrid, rebuild_world_model_grid};
 
 
-/// Brain tick rate. Each tick fires one batched forward + REINFORCE
-/// step per pool, evaluating every organism's private MLP in
-/// parallel on the GPU. Between ticks, organisms continue to consume
-/// their last commanded `movement_*` per frame in `apply_movement`,
-/// so the simulation stays smooth.
+/// Photoautotroph brain tick rate (30 Hz).
 ///
-/// 33 ms == 30 Hz. Slower than per-frame keeps the GPU pipeline full
-/// between ticks (vs the 200 Hz earlier rate which forced 200
-/// host→device→GPU→device→host round-trips per second per pool and
-/// produced the "low CPU + low GPU + low FPS" symptom).
+/// Each tick fires one batched forward + REINFORCE step per pool,
+/// evaluating every organism's private MLP in parallel on the GPU.
+/// Between ticks, organisms continue to consume their last commanded
+/// `movement_*` per frame in `apply_movement`, so the simulation
+/// stays smooth.
 ///
-/// `on_timer` ticks with `Time<Virtual>::delta()`, so brains naturally
-/// pause when the simulation is paused.
-const BRAIN_TICK_INTERVAL: Duration = Duration::from_millis(33);
+/// 33 ms keeps the GPU pipeline full between ticks (vs the 200 Hz
+/// earlier rate which forced 200 host→device→GPU→device→host
+/// round-trips per second per pool and produced the "low CPU + low
+/// GPU + low FPS" symptom).
+///
+/// `on_timer` ticks with `Time<Virtual>::delta()`, so brains
+/// naturally pause when the simulation is paused.
+const PHOTO_BRAIN_TICK_INTERVAL:  Duration = Duration::from_millis(33);
+
+/// Heterotroph brain tick rate (≈ 6.7 Hz).
+///
+/// Slower than the photo brain because the heterotroph's reward
+/// signal is sparse: photos gain energy continuously from sunlight
+/// (per-tick signal), but heterotrophs lose a tiny amount per
+/// energy-plugin tick (0.5 s) and only receive a positive jump on
+/// the rare predation event. At 30 Hz the σ-noise on actions
+/// dominated displacement and rewards averaged to ~0 per tick — the
+/// brain saw mostly noise. Slowing to ~150 ms gives:
+///   * less visible direction jitter (one fresh action sample per
+///     ~150 ms instead of ~33 ms),
+///   * larger per-tick energy deltas (about 1/3 of an energy-plugin
+///     tick fits inside one brain tick), and
+///   * the reward shaper in `intelligence_level_1_hetero.rs` —
+///     progress + facing — gets a meaningful per-tick state delta
+///     to base its signal on.
+const HETERO_BRAIN_TICK_INTERVAL: Duration = Duration::from_millis(150);
 
 
 pub struct BehaviourPlugin;
@@ -110,24 +130,33 @@ impl Plugin for BehaviourPlugin {
         app.add_systems(PreUpdate, (assign_brains_l2,        free_brains_l2)       .chain());
         app.add_systems(PreUpdate, (assign_brains_l3,        free_brains_l3)       .chain());
 
-        // ── Update: world-model rebuild + four apply systems. ────────
-        // Single chain on a shared 30 Hz timer. Order matters:
-        //   * rebuild must run before any hetero apply.
-        //   * The four apply systems each take a `NonSendMut` of
-        //     their own pool, so they're main-thread-bound and
-        //     serialise anyway.
-        // The chain is the simplest correct ordering.
+        // ── Update: split into a fast photo chain and a slow hetero
+        // chain. They share no read/write set with each other (each
+        // pool has its own `NonSendMut` resource and the photo brain
+        // doesn't read the world-model grid), so the two timers fire
+        // independently and may both run on the same frame.
+        //
+        // Fast chain: photo apply only, 30 Hz.
+        app.add_systems(
+            Update,
+            apply_intelligence_level_1_photo
+                .run_if(on_timer(PHOTO_BRAIN_TICK_INTERVAL)),
+        );
+
+        // Slow chain: world-model rebuild + every hetero pool apply,
+        // ~6.7 Hz. The chain ordering is load-bearing — rebuild must
+        // run before any hetero apply so they all read the same
+        // up-to-date grid in the same tick.
         app.add_systems(
             Update,
             (
                 rebuild_world_model_grid,
-                apply_intelligence_level_1_photo,
                 apply_intelligence_level_1_hetero,
                 apply_intelligence_level_2,
                 apply_intelligence_level_3,
             )
                 .chain()
-                .run_if(on_timer(BRAIN_TICK_INTERVAL)),
+                .run_if(on_timer(HETERO_BRAIN_TICK_INTERVAL)),
         );
     }
 }

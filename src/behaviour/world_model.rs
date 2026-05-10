@@ -37,9 +37,15 @@ pub enum OrganismType { Photo, Hetero }
 /// XZ spatial hash of all live organisms, rebuilt every brain tick.
 /// Bucket size = `WORLD_MODEL_RADIUS` so probing 3×3 buckets around any
 /// query position covers the full neighbourhood.
+///
+/// Each entry is `(world_position, type, entity)`. The `entity` is
+/// what enables identity-aware reward shaping: the IL1-hetero pool
+/// uses it to detect when the "nearest prey" changes between ticks
+/// and zero its progress signal across that boundary, avoiding the
+/// spurious-reinforcement-on-identity-flip pathology.
 #[derive(Resource, Default)]
 pub struct WorldModelGrid {
-    pub grid: HashMap<(i32, i32), Vec<(Vec3, OrganismType)>>,
+    pub grid: HashMap<(i32, i32), Vec<(Vec3, OrganismType, Entity)>>,
 }
 
 
@@ -48,20 +54,20 @@ pub struct WorldModelGrid {
 /// timer in `behaviour.rs`).
 pub fn rebuild_world_model_grid(
     mut grid: ResMut<WorldModelGrid>,
-    photos:  Query<&Transform, With<Photoautotroph>>,
-    heteros: Query<&Transform, With<Heterotroph>>,
+    photos:  Query<(Entity, &Transform), With<Photoautotroph>>,
+    heteros: Query<(Entity, &Transform), With<Heterotroph>>,
 ) {
     grid.grid.clear();
     let bucket = WORLD_MODEL_RADIUS;
-    for tf in photos.iter() {
+    for (e, tf) in photos.iter() {
         let p = tf.translation;
         let key = ((p.x / bucket).floor() as i32, (p.z / bucket).floor() as i32);
-        grid.grid.entry(key).or_default().push((p, OrganismType::Photo));
+        grid.grid.entry(key).or_default().push((p, OrganismType::Photo, e));
     }
-    for tf in heteros.iter() {
+    for (e, tf) in heteros.iter() {
         let p = tf.translation;
         let key = ((p.x / bucket).floor() as i32, (p.z / bucket).floor() as i32);
-        grid.grid.entry(key).or_default().push((p, OrganismType::Hetero));
+        grid.grid.entry(key).or_default().push((p, OrganismType::Hetero, e));
     }
 }
 
@@ -89,7 +95,10 @@ pub fn fill_world_model(
     for dx in -1..=1 {
         for dz in -1..=1 {
             if let Some(bucket_entries) = grid.grid.get(&(kx + dx, kz + dz)) {
-                for &(p, ty) in bucket_entries {
+                // The grid carries an `Entity` per entry now (used by
+                // `nearest_prey` for identity tracking); the world-model
+                // input vector itself doesn't need it, hence the `_`.
+                for &(p, ty, _) in bucket_entries {
                     let rel = p - self_pos;
                     let d2  = rel.length_squared();
                     if d2 < 1e-6 { continue; }       // self-exclusion
@@ -113,4 +122,45 @@ pub fn fill_world_model(
         out[off + 2] = if matches!(ty, OrganismType::Photo)  { 1.0 } else { 0.0 };
         out[off + 3] = if matches!(ty, OrganismType::Hetero) { 1.0 } else { 0.0 };
     }
+}
+
+
+/// Find the nearest **photoautotroph** within `WORLD_MODEL_RADIUS` of
+/// `self_pos`. Returns `(rel_pos, distance, entity)` or `None` when
+/// no prey is in range.
+///
+/// Used by the heterotroph reward shaper to compute the per-tick
+/// "did I get closer to prey?" (progress) and "am I facing prey?"
+/// (alignment) signals. The returned `Entity` lets the caller detect
+/// when the nearest prey CHANGES between ticks: in that case the
+/// progress reward is meaningless (the delta would compare distances
+/// against two different organisms) and the caller zeroes it.
+///
+/// Same 3×3 bucket probe as `fill_world_model`; the tiny duplication
+/// is preferable to threading nearest-prey state through the latter's
+/// signature because the call sites have different mutability needs.
+pub fn nearest_prey(grid: &WorldModelGrid, self_pos: Vec3) -> Option<(Vec3, f32, Entity)> {
+    let bucket    = WORLD_MODEL_RADIUS;
+    let radius_sq = WORLD_MODEL_RADIUS * WORLD_MODEL_RADIUS;
+    let kx = (self_pos.x / bucket).floor() as i32;
+    let kz = (self_pos.z / bucket).floor() as i32;
+
+    let mut best: Option<(f32, Vec3, Entity)> = None; // (distance², rel, entity)
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if let Some(entries) = grid.grid.get(&(kx + dx, kz + dz)) {
+                for &(p, ty, ent) in entries {
+                    if !matches!(ty, OrganismType::Photo) { continue; }
+                    let rel = p - self_pos;
+                    let d2  = rel.length_squared();
+                    if d2 < 1e-6 { continue; }       // self / coincident
+                    if d2 > radius_sq { continue; }
+                    if best.map_or(true, |(b, _, _)| d2 < b) {
+                        best = Some((d2, rel, ent));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(d2, rel, ent)| (rel, d2.sqrt(), ent))
 }

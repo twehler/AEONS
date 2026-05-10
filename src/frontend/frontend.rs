@@ -1,25 +1,27 @@
 // Frontend plugin — owns the entire UI: viewport render-target, layout
-// composition, divider dragging, statistics panel (bottom), simulation
-// settings panel (left), orientation gizmos. The actual panel contents
-// live in their own files (`statistics_panel.rs`, `simulation_settings.rs`)
-// so the layout stays readable.
+// composition, divider dragging, statistics panel (bottom), individuum
+// navigator panel (right), in-world identifier labels, orientation
+// gizmos. The actual panel contents live in their own files
+// (`statistics_panel.rs`, `individuum_navigator.rs`) so the layout
+// stays readable.
 //
 // Layout:
 //
-//   ┌──────────────┬──────────────────────────────────────┐
-//   │ sim_settings │            3D viewport               │
-//   │   (10vw)     │       (flex_grow inside top-row)     │
-//   │              │                                      │
-//   │              │                                      │
-//   ├──────────────┴──────────────────────────────────────┤  ← divider
-//   │                  statistics panel                   │
-//   └─────────────────────────────────────────────────────┘
+//   ┌─────────────────────────────────┬─┬───────────┐
+//   │            3D viewport          │V│ individuum│
+//   │       (flex_grow inside top-row)│ │ navigator │
+//   │                                 │ │           │
+//   ├─────────────────────────────────┴─┴───────────┤  ← horizontal divider
+//   │                  statistics panel              │
+//   └────────────────────────────────────────────────┘
 //
-// Dragging the divider resizes the statistics panel; the top-row absorbs
-// the remaining height, and both children inside it (sim_settings on the
-// left, viewport on the right) stretch to fill that height — so the
-// simulation-settings panel grows / shrinks "from the bottom" with the
-// same slider, exactly as specified.
+// "V" is the vertical drag-handle between the viewport and the
+// navigator panel. Dragging it resizes the navigator panel's width;
+// dragging the horizontal divider resizes the statistics panel's
+// height. Both panels share the top-row's height, so the navigator
+// panel's height tracks the statistics panel's slider automatically.
+// A transparent screen-overlay container (also added to the layout
+// root) hosts the per-organism floating identifier labels.
 
 use bevy::prelude::*;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -30,7 +32,10 @@ use bevy::window::PrimaryWindow;
 use crate::statistics_panel::{
     self, GraphState, OrganismCounts, StatisticsPanel,
 };
-use crate::simulation_settings::{PlayerControlsActive, SimulationRunning, Smoothing};
+use crate::individuum_navigator::{
+    self, IndividuumNavigatorPlugin,
+};
+use crate::simulation_settings::{PlayerControlsActive, SimulationRunning, Smoothing, TimeSpeed};
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -86,8 +91,11 @@ struct ViewportRender {
 #[derive(Component)]
 pub struct ShowGizmo;
 
+/// Marker on the off-screen image-node that displays the 3D camera's
+/// render target. `pub` so the navigator's label-projection system can
+/// query the node's screen-space rect to anchor floating labels.
 #[derive(Component)]
-struct ViewportImage;
+pub struct ViewportImage;
 
 #[derive(Component)]
 struct PanelDivider;
@@ -106,8 +114,11 @@ impl Plugin for FrontendPlugin {
             .init_resource::<SimulationRunning>()
             .init_resource::<PlayerControlsActive>()
             .init_resource::<Smoothing>()
+            .init_resource::<TimeSpeed>()
+            .init_resource::<statistics_panel::TimeSpeedEditState>()
             .insert_resource(GraphState::new())
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
+            .add_plugins(IndividuumNavigatorPlugin)
             .add_systems(Startup, setup_panes)
             .add_systems(Update, (
                 bind_main_camera_to_viewport,
@@ -115,6 +126,7 @@ impl Plugin for FrontendPlugin {
                 toggle_advanced_viewport,
                 statistics_panel::update_fps_text,
                 statistics_panel::update_cell_count_text,
+                statistics_panel::update_sim_timer_text,
                 statistics_panel::track_organism_births,
                 statistics_panel::track_organism_deaths,
                 statistics_panel::update_counter_texts,
@@ -123,6 +135,9 @@ impl Plugin for FrontendPlugin {
                 statistics_panel::handle_start_stop_button,
                 statistics_panel::handle_save_button,
                 statistics_panel::update_start_stop_label,
+                statistics_panel::handle_time_speed_input,
+                statistics_panel::update_time_speed_text,
+                statistics_panel::apply_time_speed,
                 apply_player_controls_state,
             ));
         // Gizmos run only when the F3-toggled overlay is active. Putting
@@ -196,34 +211,49 @@ fn setup_panes(
             Pickable::IGNORE,
         ))
         .with_children(|root| {
-            // Top: 3D viewport. The previously-planned left-side
-            // simulation-settings panel was scrapped — the
-            // simulation_settings module now exposes runtime control
-            // state instead.
-            root.spawn((
-                ViewportImage,
-                ImageNode::new(image_handle),
-                Node {
-                    width:      Val::Percent(100.0),
-                    flex_grow:  1.0,
-                    flex_basis: Val::Px(0.0),
-                    min_height: Val::Px(0.0),
-                    ..default()
-                },
-                // Explicit Pickable so the picking backend registers
-                // hits on this entity. Without it, bevy_picking's UI
-                // backend skips the bare ImageNode (it auto-registers
-                // nodes with `BackgroundColor` like the divider, but
-                // not plain image nodes). `should_block_lower: false`
-                // because nothing meaningful sits behind the viewport
-                // — the click just needs to reach this entity's
-                // observer.
-                Pickable {
-                    should_block_lower: false,
-                    is_hoverable:       true,
-                },
-            ))
-            .observe(viewport_click);
+            // Top row: viewport (flex-grow) + vertical divider +
+            // navigator panel. Wrapping these in a single row container
+            // means the horizontal divider below resizes the row as a
+            // whole, so the navigator panel's height automatically
+            // tracks the viewport's height.
+            root.spawn(Node {
+                width:          Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                flex_grow:      1.0,
+                flex_basis:     Val::Px(0.0),
+                min_height:     Val::Px(0.0),
+                ..default()
+            })
+            .with_children(|top_row| {
+                top_row.spawn((
+                    ViewportImage,
+                    ImageNode::new(image_handle),
+                    Node {
+                        height:    Val::Percent(100.0),
+                        flex_grow: 1.0,
+                        flex_basis: Val::Px(0.0),
+                        min_width: Val::Px(0.0),
+                        ..default()
+                    },
+                    // Explicit Pickable so the picking backend
+                    // registers hits on this entity. Without it,
+                    // bevy_picking's UI backend skips the bare
+                    // ImageNode (it auto-registers nodes with
+                    // `BackgroundColor` like the divider, but not
+                    // plain image nodes). `should_block_lower: false`
+                    // because nothing meaningful sits behind the
+                    // viewport — the click just needs to reach this
+                    // entity's observer.
+                    Pickable {
+                        should_block_lower: false,
+                        is_hoverable:       true,
+                    },
+                ))
+                .observe(viewport_click);
+
+                individuum_navigator::spawn_vertical_divider(top_row);
+                individuum_navigator::spawn_navigator_panel(top_row);
+            });
 
             // Horizontal divider — drag handle. Drives the statistics
             // panel's height; the top row above auto-fills the rest.
@@ -247,6 +277,10 @@ fn setup_panes(
                 &mut graph,
                 initial_panel_logical,
             );
+            // Per-organism floating identifier labels are spawned by
+            // `individuum_navigator::manage_label_lifecycle` directly
+            // as children of the `ViewportImage` — no separate
+            // overlay container needed.
         });
 }
 
