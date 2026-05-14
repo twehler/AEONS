@@ -11,10 +11,18 @@ use std::sync::mpsc;
 
 use eframe::egui;
 
+use crate::simulation_settings::{DEFAULT_MAX_ORGANISMS, DEFAULT_MAP_X, DEFAULT_MAP_Z};
+
+/// Soft practical upper bound for the launcher's "Max Organisms" field.
+/// Higher values still work (the simulation simply allocates a larger
+/// GPU brain pool), but the DragValue would feel runaway at very high
+/// magnitudes. Picked to comfortably exceed any realistic colony size.
+const LAUNCHER_MAX_ORGANISMS_CAP: usize = 100_000;
+
 
 // ── Layout constants ─────────────────────────────────────────────────────────
 
-const LAUNCHER_WINDOW_SIZE:    egui::Vec2 = egui::vec2(800.0, 540.0);
+const LAUNCHER_WINDOW_SIZE:    egui::Vec2 = egui::vec2(800.0, 600.0);
 const BANNER_PATH:             &str       = "logos/dna.png";
 const BANNER_POS:              egui::Pos2 = egui::pos2(0.0, 0.0);
 const BANNER_SIZE:             egui::Vec2 = egui::vec2(800.0, 200.0);
@@ -28,11 +36,35 @@ const OPEN_BTN_SIZE:           egui::Vec2 = egui::vec2(90.0, 32.0);
 const OPEN_MAP_BTN_POS:        egui::Pos2 = egui::pos2(650.0, 230.0);
 const OPEN_COLONY_BTN_POS:     egui::Pos2 = egui::pos2(650.0, 295.0);
 
+// Map-size row, sits between the colony textfield and the action
+// buttons. Two `DragValue` widgets (X / Z) plus a heading label.
+const MAPSIZE_ROW_TOP:         f32        = 345.0;
+const MAPSIZE_LABEL_POS:       egui::Pos2 = egui::pos2(60.0, MAPSIZE_ROW_TOP);
+const MAPSIZE_LABEL_SIZE:      egui::Vec2 = egui::vec2(130.0, 32.0);
+const MAPSIZE_X_LABEL_POS:     egui::Pos2 = egui::pos2(200.0, MAPSIZE_ROW_TOP);
+const MAPSIZE_X_DRAG_POS:      egui::Pos2 = egui::pos2(225.0, MAPSIZE_ROW_TOP);
+const MAPSIZE_Z_LABEL_POS:     egui::Pos2 = egui::pos2(345.0, MAPSIZE_ROW_TOP);
+const MAPSIZE_Z_DRAG_POS:      egui::Pos2 = egui::pos2(370.0, MAPSIZE_ROW_TOP);
+const MAPSIZE_FIELD_SIZE:      egui::Vec2 = egui::vec2(110.0, 32.0);
+const MAPSIZE_MIN:             f32        = 50.0;
+const MAPSIZE_MAX:             f32        = 8192.0;
+
+// Max-organisms row. Single `DragValue` capped at
+// `LAUNCHER_MAX_ORGANISMS_CAP`. The chosen value is forwarded to the
+// child subprocess via `--max-organisms N` argv and sizes both the
+// GPU brain-pool tensors (`OrganismPoolSize`) AND the initial
+// reproduction soft cap (`MaxOrganisms`) at simulation startup.
+const MAXORG_ROW_TOP:          f32        = 385.0;
+const MAXORG_LABEL_POS:        egui::Pos2 = egui::pos2(60.0, MAXORG_ROW_TOP);
+const MAXORG_LABEL_SIZE:       egui::Vec2 = egui::vec2(180.0, 32.0);
+const MAXORG_DRAG_POS:         egui::Pos2 = egui::pos2(245.0, MAXORG_ROW_TOP);
+const MAXORG_FIELD_SIZE:       egui::Vec2 = egui::vec2(110.0, 32.0);
+
 // Two side-by-side buttons. "START AEONS" on the left, "COLONY EDITOR"
 // on the right — both styled the same so neither feels like a footnote.
 const ACTION_BTN_SIZE:         egui::Vec2 = egui::vec2(330.0, 90.0);
 const ACTION_BTN_GAP:          f32        = 20.0;
-const ACTION_ROW_TOP:          f32        = 380.0;
+const ACTION_ROW_TOP:          f32        = 445.0;
 const ACTION_BTN_FONT_SIZE:    f32        = 24.0;
 const START_BTN_LABEL:         &str       = "START AEONS";
 const EDITOR_BTN_LABEL:        &str       = "COLONY EDITOR";
@@ -47,13 +79,18 @@ const DEFAULT_COLONY_PATH:     &str       = "";
 pub enum LaunchMode {
     /// Boot the full simulation (Bevy + Burn brain pools + every plugin).
     RunSimulation {
-        map_path:    String,
-        colony_path: Option<String>,
-        wireframe:   bool,
+        map_path:      String,
+        colony_path:   Option<String>,
+        wireframe:     bool,
+        map_x:         f32,
+        map_z:         f32,
+        max_organisms: usize,
     },
     /// Boot the colony editor (Bevy + minimal plugin set, no AI).
     RunEditor {
         map_path: String,
+        map_x:    f32,
+        map_z:    f32,
     },
 }
 
@@ -86,23 +123,32 @@ pub fn run_launcher() -> Option<LaunchMode> {
 // ── Internals ────────────────────────────────────────────────────────────────
 
 struct LauncherApp {
-    map_path:    String,
-    colony_path: String,
-    wireframe:   bool,
-    banner:      Option<egui::TextureHandle>,
-    status:      String,
-    tx:          mpsc::Sender<LaunchMode>,
+    map_path:      String,
+    colony_path:   String,
+    wireframe:     bool,
+    map_x:         f32,
+    map_z:         f32,
+    max_organisms: usize,
+    banner:        Option<egui::TextureHandle>,
+    status:        String,
+    tx:            mpsc::Sender<LaunchMode>,
 }
 
 impl LauncherApp {
     fn new(cc: &eframe::CreationContext<'_>, tx: mpsc::Sender<LaunchMode>) -> Self {
         let wireframe = env::args().any(|a| a == "--wireframe");
         Self {
-            map_path:    DEFAULT_MAP_PATH.to_string(),
-            colony_path: DEFAULT_COLONY_PATH.to_string(),
+            map_path:      DEFAULT_MAP_PATH.to_string(),
+            colony_path:   DEFAULT_COLONY_PATH.to_string(),
             wireframe,
-            banner:      load_banner(&cc.egui_ctx),
-            status:      String::new(),
+            map_x:         DEFAULT_MAP_X,
+            map_z:         DEFAULT_MAP_Z,
+            // Default seed: the global "starter" value. The user can
+            // dial it freely up to `LAUNCHER_MAX_ORGANISMS_CAP`; the
+            // chosen value flows through to the GPU brain-pool size.
+            max_organisms: DEFAULT_MAX_ORGANISMS,
+            banner:        load_banner(&cc.egui_ctx),
+            status:        String::new(),
             tx,
         }
     }
@@ -115,9 +161,12 @@ impl LauncherApp {
         }
         let colony = self.colony_path.trim();
         let mode = LaunchMode::RunSimulation {
-            map_path:    map.to_string(),
-            colony_path: if colony.is_empty() { None } else { Some(colony.to_string()) },
-            wireframe:   self.wireframe,
+            map_path:      map.to_string(),
+            colony_path:   if colony.is_empty() { None } else { Some(colony.to_string()) },
+            wireframe:     self.wireframe,
+            map_x:         self.map_x,
+            map_z:         self.map_z,
+            max_organisms: self.max_organisms.max(1),
         };
         let _ = self.tx.send(mode);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -134,6 +183,8 @@ impl LauncherApp {
         // may have typed it and then changed their mind.
         let _ = self.tx.send(LaunchMode::RunEditor {
             map_path: map.to_string(),
+            map_x:    self.map_x,
+            map_z:    self.map_z,
         });
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -221,6 +272,72 @@ impl eframe::App for LauncherApp {
                         self.colony_path = p.to_string_lossy().into_owned();
                     }
                 }
+
+                // ── Map-size row ────────────────────────────────────
+                // Two DragValue widgets that bind to the X and Z
+                // dimensions the loaded world is normalised to. The
+                // values are forwarded to the child subprocess via
+                // `--map-size X Z` argv and inserted into the `MapSize`
+                // resource at simulation / editor startup.
+                let mapsize_label_rect = egui::Rect::from_min_size(
+                    MAPSIZE_LABEL_POS, MAPSIZE_LABEL_SIZE);
+                ui.put(
+                    mapsize_label_rect,
+                    egui::Label::new(
+                        egui::RichText::new("Map size:").size(TEXTFIELD_FONT_SIZE),
+                    ),
+                );
+
+                let x_label_rect = egui::Rect::from_min_size(
+                    MAPSIZE_X_LABEL_POS, egui::vec2(20.0, 32.0));
+                ui.put(x_label_rect, egui::Label::new(
+                    egui::RichText::new("X").size(TEXTFIELD_FONT_SIZE),
+                ));
+                let x_drag_rect = egui::Rect::from_min_size(
+                    MAPSIZE_X_DRAG_POS, MAPSIZE_FIELD_SIZE);
+                ui.put(
+                    x_drag_rect,
+                    egui::DragValue::new(&mut self.map_x)
+                        .range(MAPSIZE_MIN..=MAPSIZE_MAX)
+                        .speed(8.0),
+                );
+
+                let z_label_rect = egui::Rect::from_min_size(
+                    MAPSIZE_Z_LABEL_POS, egui::vec2(20.0, 32.0));
+                ui.put(z_label_rect, egui::Label::new(
+                    egui::RichText::new("Z").size(TEXTFIELD_FONT_SIZE),
+                ));
+                let z_drag_rect = egui::Rect::from_min_size(
+                    MAPSIZE_Z_DRAG_POS, MAPSIZE_FIELD_SIZE);
+                ui.put(
+                    z_drag_rect,
+                    egui::DragValue::new(&mut self.map_z)
+                        .range(MAPSIZE_MIN..=MAPSIZE_MAX)
+                        .speed(8.0),
+                );
+
+                // ── Max-organisms row ───────────────────────────────
+                // This value sizes the GPU brain-pool tensors at
+                // simulation startup. After launch the statistics-panel
+                // "Max Organisms" field can lower this soft cap further,
+                // but never above what was allocated here. Ignored by
+                // the editor.
+                let maxorg_label_rect = egui::Rect::from_min_size(
+                    MAXORG_LABEL_POS, MAXORG_LABEL_SIZE);
+                ui.put(
+                    maxorg_label_rect,
+                    egui::Label::new(
+                        egui::RichText::new("Max Organisms:").size(TEXTFIELD_FONT_SIZE),
+                    ),
+                );
+                let maxorg_drag_rect = egui::Rect::from_min_size(
+                    MAXORG_DRAG_POS, MAXORG_FIELD_SIZE);
+                ui.put(
+                    maxorg_drag_rect,
+                    egui::DragValue::new(&mut self.max_organisms)
+                        .range(1..=LAUNCHER_MAX_ORGANISMS_CAP)
+                        .speed(1.0),
+                );
 
                 // ── Action buttons row ──────────────────────────────
                 let total_w  = ACTION_BTN_SIZE.x * 2.0 + ACTION_BTN_GAP;

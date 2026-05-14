@@ -48,11 +48,25 @@ pub const HEIGHTMAP_CELL_SIZE: f32 = 4.0;
 /// triangle queries. Smaller = fewer triangles per query but more memory.
 const TRIANGLE_GRID_BUCKET: f32 = 4.0;
 
-/// Per-axis minimum world extent enforced at load time, and the spawn area
-/// upper bound used by `colony.rs` / `reproduction.rs`. After normalisation
-/// the world is guaranteed to span at least `[0, MAP_MAX_X] x [0, MAP_MAX_Z]`.
-pub const MAP_MAX_X: f32 = 104.0;
-pub const MAP_MAX_Z: f32 = 104.0;
+/// Per-axis minimum world extent enforced at load time, and the spawn-area
+/// upper bound used by `colony.rs`, `reproduction.rs`, the IL1 photo
+/// brain, and the colony editor. After normalisation the world is
+/// guaranteed to span at least `[0, MapSize::x] x [0, MapSize::z]`.
+///
+/// Runtime resource (was a `pub const` pair). Inserted by `main.rs`
+/// from the launcher's two map-size input fields, defaulted to 2048²
+/// when no launcher value is provided.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct MapSize {
+    pub x: f32,
+    pub z: f32,
+}
+
+impl Default for MapSize {
+    fn default() -> Self {
+        Self { x: 2048.0, z: 2048.0 }
+    }
+}
 
 
 // ── Plugin ──────────────────────────────────────────────────────────────────
@@ -219,6 +233,7 @@ fn finish_load_world(
     assets_node:      Res<Assets<GltfNode>>,
     assets_gltf_mesh: Res<Assets<GltfMesh>>,
     assets_mesh:      Res<Assets<Mesh>>,
+    map_size:         Res<MapSize>,
 ) {
     let Some(mut pending) = pending else { return };
     if pending.done { return; }
@@ -268,7 +283,7 @@ fn finish_load_world(
     //    `[0, *) ^ 3` and forces both XZ extents to meet the map minimums.
     //    Applied in-place to every triangle and forwarded to the SceneRoot
     //    so visuals match the collision geometry exactly.
-    let (scale, translation) = compute_normalisation(&triangles);
+    let (scale, translation) = compute_normalisation(&triangles, *map_size);
     if scale != 1.0 || translation != Vec3::ZERO {
         for tri in triangles.iter_mut() {
             for v in tri.iter_mut() {
@@ -311,12 +326,12 @@ fn finish_load_world(
 /// Returns `(uniform_scale, translation)` applied as `v * scale + translation`
 /// to every world-space vertex. Guarantees post-transform invariants:
 ///
-///   - `x_extent >= MAP_MAX_X` and `z_extent >= MAP_MAX_Z` (uniform up-scale
+///   - `x_extent >= map_size.x` and `z_extent >= map_size.z` (uniform up-scale
 ///     when needed; never down-scaled).
 ///   - AABB min corner is `(0, 0, 0)` — i.e. no negative coordinates anywhere.
 ///
 /// On an empty triangle list returns `(1.0, ZERO)` so callers can no-op safely.
-fn compute_normalisation(triangles: &[[Vec3; 3]]) -> (f32, Vec3) {
+fn compute_normalisation(triangles: &[[Vec3; 3]], map_size: MapSize) -> (f32, Vec3) {
     if triangles.is_empty() { return (1.0, Vec3::ZERO); }
 
     let mut lo = Vec3::splat(f32::INFINITY);
@@ -336,8 +351,8 @@ fn compute_normalisation(triangles: &[[Vec3; 3]]) -> (f32, Vec3) {
     // extent on either axis can't be made larger by scaling (scaling a
     // point still gives a point), so we skip it rather than produce an
     // infinite ratio.
-    let need_x = if extent.x > EPS { (MAP_MAX_X / extent.x).max(1.0) } else { 1.0 };
-    let need_z = if extent.z > EPS { (MAP_MAX_Z / extent.z).max(1.0) } else { 1.0 };
+    let need_x = if extent.x > EPS { (map_size.x / extent.x).max(1.0) } else { 1.0 };
+    let need_z = if extent.z > EPS { (map_size.z / extent.z).max(1.0) } else { 1.0 };
     let scale  = need_x.max(need_z);
 
     // Translation cancels the scaled min: post-transform_min = scale*lo + t = 0.

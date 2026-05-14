@@ -1,41 +1,47 @@
-// Intelligence Level 1 — Heterotroph REINFORCE pool (smallest hetero pool).
+// Intelligence Level 1 — Heterotroph REINFORCE pool (Monte-Carlo
+// rollouts, no value head).
 //
-// Mechanically identical to `intelligence_level_1_photo.rs` — same
-// REINFORCE loop, same per-organism MLP, same Gaussian policy with
-// fixed σ. The only differences are:
+// Complete rewrite of the previous A2C variant. The brain is the
+// smallest thing that still teaches a heterotroph to hunt:
 //
-//   * the input vector (heterotrophs read a per-organism world model
-//     instead of position + sunlight),
-//   * the marker / slot component types (so heterotrophs land in
-//     this pool's row catalogue instead of the photoautotroph one),
-//   * a slight wider input width because of the 16-dim world-model
-//     contribution (`IN = 17` vs photoautotroph's 5).
+//   * Network: 17 inputs → 32 hidden ReLU → 3 outputs (tanh).
+//   * Inputs (17): normalised energy + 16-dim world model (K = 4
+//     nearest neighbours, each (rel_x_norm, rel_z_norm, is_photo,
+//     is_hetero)).
+//   * Outputs (3): `(speed_a, heading_x, heading_y)`. Speed maps via
+//     `max(0, speed_a) * MAX_SPEED` so the lower half of action
+//     space is "stand still". Heading is the cos/sin pair, renormalised
+//     to a unit vector on the XZ plane before being applied — angles
+//     never wrap, every direction is reachable.
 //
-// Inputs (17):
-//   * normalised energy        (∈ [0, 1])             — 1 dim
-//   * world model               (`WORLD_MODEL_DIMS`)  — 16 dims
+// Reward (every brain tick, attributed to the previous action):
 //
-// The world model packs the K=4 nearest neighbouring organisms within
-// `WORLD_MODEL_RADIUS = 60`, each encoded as `(rel_x_norm, rel_z_norm,
-// is_photo, is_hetero)` — see `world_model.rs`. That gives the brain
-// just enough spatial awareness to seek prey (cells flagged
-// `is_photo`) and avoid same-species collisions, without paying for a
-// full per-tick neighbour scan inside this system (the scan happens
-// once per tick in `rebuild_world_model_grid`).
+//   r =  K_EAT       on a predation contact (detected via energy
+//                    spike — heterotrophs only gain energy by eating)
+//      + K_REPRO     on a reproduction event (detected via
+//                    `Organism::reproductions` increment)
+//      + LAMBDA · min(0, ΔE)   when energy went DOWN (movement
+//                    drain, passive starvation — punishment for
+//                    expended energy)
+//      + K_CURIOSITY · normalized_speed   curiosity / aggression
+//                    bonus — turns wandering into a net-positive
+//                    baseline so the policy doesn't collapse into
+//                    "stand still = minimise energy cost = local
+//                    optimum". Empirically the dominant failure
+//                    mode of the previous formulation.
 //
-// Outputs (4): same as the photo pool — tanh-squashed `(speed, dir.x,
-// dir.y, dir.z)`. Speed remapped to `[0, MAX_SPEED]`, dir.y forced 0
-// on apply (heterotroph motion is xz-planar), dir renormalised when
-// non-trivial.
+// `K_EAT < K_REPRO` so reproduction is the strongest pull; a
+// successful eat is large enough that the agent learns "chase the
+// green dots" within minutes of wall-clock once it's moving at all.
 //
-// Hidden width (16) deliberately matches the photo L1 pool: this is
-// the *smallest* heterotroph brain. Levels 2 and 3 use 32 / 64
-// respectively for the same input/output shape — that's the only
-// thing the level number selects in the new RL world.
-//
-// See `intelligence_level_1_photo.rs` for the full REINFORCE
-// derivation and per-tick flow narration; this file mirrors it
-// without re-narrating.
+// Algorithm: pure Monte Carlo REINFORCE with a per-slot EMA baseline.
+// Every brain tick fills the previous action's reward, samples a new
+// action, and stores both in a per-slot ring buffer of length
+// `ROLLOUT_LEN = 32`. Every 32 ticks the whole pool trains in one
+// batched forward + backward — discounted returns `G_t = Σ γ^(i-t)·r_i`
+// distribute sparse jackpots (eat / reproduce) back over the
+// trajectory of actions that produced them, giving real credit
+// assignment without the bug surface of an actor-critic value head.
 
 use bevy::prelude::*;
 use burn::module::{Initializer, Module, Param};
@@ -44,79 +50,126 @@ use burn::tensor::{Tensor, TensorData, backend::Backend};
 use burn_cuda::CudaDevice;
 use std::collections::HashMap;
 
-use crate::colony::{IntelligenceLevel, Organism, Heterotroph, MAXIMUM_ORGANISMS};
-use crate::energy::get_max_energy;
+use crate::colony::{IntelligenceLevel, Organism, Heterotroph};
 use crate::rl_helpers::{BrainInheritance, BrainRestore, MyBackend, PoolSnapshot, gaussian_noise};
+use crate::simulation_settings::{
+    OrganismPoolSize,
+    L1_SIGMA_RANGE,
+    L1_K_EAT_RANGE,
+    L1_K_REPRO_RANGE,
+    L1_LAMBDA_ENERGY_RANGE,
+    L1_K_CURIOSITY_RANGE,
+    L1_K_PROGRESS_RANGE,
+    L1_GENE_MUTATION_REL_STDDEV,
+    L1_TARGET_LOCK_SECS,
+    L1_TARGET_SWITCH_MARGIN,
+    L1_SPEED_MOMENTUM_ALPHA,
+};
 use crate::world_model::{
-    WorldModelGrid, WORLD_MODEL_DIMS, WORLD_MODEL_RADIUS,
-    fill_world_model, nearest_prey,
+    WorldModelGrid, WORLD_MODEL_DIMS, WORLD_MODEL_K, OrganismType,
+    collect_neighbours, encode_neighbours,
 };
 
 
 // ── Architecture constants ──────────────────────────────────────────────────
-
-const N:         usize = MAXIMUM_ORGANISMS;
-/// 1 (energy) + WORLD_MODEL_DIMS (= 16, K=4 neighbours × 4 dims) = 17.
-const IN:        usize = 1 + WORLD_MODEL_DIMS;
-const HIDDEN:    usize = 16;
-const OUT:       usize = 4;
-const MAX_SPEED: f32   = 20.0;
-const LR:        f64   = 1e-3;
-
-/// Standard deviation of the Gaussian exploration noise added to the
-/// policy mean before sampling actions. Larger σ ⇒ broader
-/// exploration each tick, which the actor-critic baseline can
-/// absorb (the value head learns to subtract the average return
-/// from each state, leaving only the per-action signal in the
-/// advantage). Bumped from 0.2 → 0.5 so the heterotroph genuinely
-/// "tries things out" instead of barely deviating from a still-
-/// undertrained policy mean.
-const SIGMA:          f32 = 0.5;
-/// Discount factor for the TD bootstrap target `r + γ·V(s')`. With
-/// the brain ticking at ~6.7 Hz, γ = 0.95 means a reward stays
-/// "valuable" for roughly 1/(1-γ) = 20 ticks ≈ 3 seconds — long
-/// enough for the brain to associate "approached prey" with the
-/// eventual eat event.
-const GAMMA:          f32 = 0.95;
-/// Weight on the value-loss term relative to the policy-loss term
-/// in the combined A2C objective. Standard A2C value: 0.5.
-const VALUE_COEF:     f32 = 0.5;
-/// Hard clip on the energy-delta component of the reward. Predation
-/// can dump several units of energy in one tick; this clamp keeps
-/// that one event from saturating the gradient.
-const REWARD_CLAMP:   f32 = 1.0;
-
-// ── Reward-shaping weights ─────────────────────────────────────────────────
 //
-// The energy delta alone is a near-zero signal at brain-tick scale —
-// per-cell upkeep is tiny, predation is rare, photosynthesis doesn't
-// apply to heterotrophs. The brain saw effectively no signal across
-// most ticks, so REINFORCE was learning from pure noise. We add two
-// dense components:
+// Input layout (31 dims):
+//   [0]          : self energy / max_energy
+//   [1..25]      : world model — 4 neighbours × (rel_x, rel_z, vel_x,
+//                  vel_z, is_photo, is_hetero), normalised
+//   [25..30]     : previous action sample (speed_a + 4 target logits)
+//                  — provides policy memory / recurrence at the input
+//                  side so the network can condition on its own past
+//                  decision without an explicit recurrent layer.
+//   [30]         : has_locked_target (0 / 1) — single bit signalling
+//                  whether the agent is currently committed.
 //
-//   * `W_PROGRESS · (Δdistance to nearest prey) / WORLD_MODEL_RADIUS`
-//     — positive when this tick's action moved the heterotroph closer
-//     to its nearest in-range prey. State-delta signal, ~0.05/tick at
-//     full speed.
-//   * `W_FACING · cos(angle between forward and unit-vec-to-prey)`
-//     — positive when the heterotroph is currently pointing at prey,
-//     even at zero speed. Always present (in [-1, +1]) when prey is
-//     in range; gives the brain something to learn early when speed
-//     is still ≈ 0 from the random-init policy.
-//
-// Weights chosen so that:
-//   * a successful predation event still dominates (energy term
-//     pegged at +REWARD_CLAMP),
-//   * a typical "moving toward prey" tick has reward roughly
-//     +0.025 (progress) + 0.05 (facing) = +0.075 vs "idle drifting"
-//     at -0.005 — enough separation to drive gradient descent
-//     without drowning out the energy signal.
-const W_ENERGY:    f32 = 1.0;
-const W_PROGRESS:  f32 = 0.5;
-const W_FACING:    f32 = 0.05;
+// Output layout (5 dims):
+//   [0]    : speed_a  — tanh, mapped to `max(0, speed_a) · MAX_SPEED`
+//                       and EMA-smoothed before being written to
+//                       `Organism::movement_speed`.
+//   [1..5] : target_logits — one tanh score per neighbour slot.
+//                       Direction is NOT output by the network; it
+//                       is derived geometrically from the chosen
+//                       target's position. The target is the argmax
+//                       over slots whose neighbour is a Photo (prey).
+
+const PREV_ACTION_DIMS:    usize = 5;
+const LOCKED_FLAG_DIMS:    usize = 1;
+
+/// Brain-tick interval in *virtual* seconds. Mirrors
+/// `behaviour.rs::HETERO_BRAIN_TICK_INTERVAL` (150 ms) — kept here as
+/// an `f32` so the target-lock seconds-to-ticks conversion can run
+/// at const time. If you change one, change the other.
+const HETERO_BRAIN_TICK_SECS: f32 = 0.150;
+
+/// Number of brain ticks the target-lock window spans, derived from
+/// `L1_TARGET_LOCK_SECS / HETERO_BRAIN_TICK_SECS` (ceiled). Since the
+/// brain runs on `Time<Virtual>`, the constant tick count
+/// automatically gives a constant *virtual*-time lock duration, which
+/// in turn scales with `TimeSpeed` for real-time observation —
+/// exactly what we want.
+///
+/// `u16` because 10 virtual seconds × 6.67 ticks/s ≈ 67 fits but
+/// longer lock windows would overflow `u8`. The cost vs `u8` is
+/// negligible (one extra byte per slot).
+const L1_TARGET_LOCK_TICKS: u16 = {
+    // `ceil` via cast: add (denom − 1) / denom to round up positive
+    // f32→u16 conversions in const context.
+    let f = L1_TARGET_LOCK_SECS / HETERO_BRAIN_TICK_SECS;
+    let truncated = f as u16;
+    if (truncated as f32) < f { truncated + 1 } else { truncated }
+};
+const IN:      usize = 1 + WORLD_MODEL_DIMS + PREV_ACTION_DIMS + LOCKED_FLAG_DIMS;
+const HIDDEN:  usize = 64;
+/// `(speed_a, target_logit_0, target_logit_1, target_logit_2, target_logit_3)`.
+const OUT:     usize = 1 + WORLD_MODEL_K;
+/// Rollout length in brain ticks. At ~6.7 Hz (150 ms tick) this is
+/// ~4.8 s of trajectory per training update — long enough for the
+/// reproduction jackpot to credit-assign back to the actions that
+/// led to it (γ^32 ≈ 0.19 with γ=0.95, so ~80% of the signal
+/// decays inside one rollout).
+const ROLLOUT_LEN: usize = 32;
+const MAX_SPEED:   f32   = 20.0;
+const LR:          f64   = 1e-3;
+
+/// Discount for the Monte Carlo return.
+const GAMMA:           f32 = 0.95;
+/// EMA decay rate for the per-slot baseline (mean of recent returns).
+const BASELINE_ALPHA:  f32 = 0.05;
 
 
-// ── Slot component ──────────────────────────────────────────────────────────
+// Reward + exploration tuning RANGES (`L1_*_RANGE`) live in
+// `simulation_settings.rs`. Per-organism samples are stored on the
+// pool as `Vec<f32>` indexed by slot (see `BrainPoolL1Hetero` below):
+// at slot assignment, an organism either samples uniformly from the
+// range (initial spawn / fresh slot) or inherits its parent's values
+// with small Gaussian mutation. Selection on those traits emerges
+// from differential reproduction.
+
+/// Sigma value used inside `warmup()` for kernel-compilation only.
+/// The runtime per-slot σ tensor takes over from the first real
+/// training step, so this value never affects gameplay.
+const WARMUP_SIGMA: f32 = 0.5;
+
+
+/// Uniform sample within `(min, max)`.
+fn sample_range(range: (f32, f32), rng: &mut impl rand::Rng) -> f32 {
+    use rand::RngExt;
+    let (lo, hi) = range;
+    lo + (hi - lo) * rng.random::<f32>()
+}
+
+/// Mutate `value` by Gaussian noise of `L1_GENE_MUTATION_REL_STDDEV ×
+/// (max − min)`, clamped back into `range`.
+fn mutate_in_range(value: f32, range: (f32, f32), rng: &mut impl rand::Rng) -> f32 {
+    let (lo, hi) = range;
+    let stddev = L1_GENE_MUTATION_REL_STDDEV * (hi - lo);
+    (value + stddev * crate::rl_helpers::gaussian_noise(rng)).clamp(lo, hi)
+}
+
+
+// ── Slot marker ─────────────────────────────────────────────────────────────
 
 #[derive(Component, Clone, Copy)]
 pub struct BrainSlotL1Hetero(pub u32);
@@ -124,88 +177,53 @@ pub struct BrainSlotL1Hetero(pub u32);
 
 // ── Per-organism MLP ────────────────────────────────────────────────────────
 //
-// Two-headed actor-critic on a shared trunk:
-//
-//   trunk:  ReLU(input · w1 + b1)             [HIDDEN]
-//   policy: tanh(trunk · w2  + b2)            [OUT = 4]   — Gaussian mean
-//   value:       (trunk · v_w + v_b)          [1]         — V(s) baseline
-//
-// `forward_full` returns both in one pass; the apply tick uses the
-// value head as a state-dependent baseline for the policy gradient
-// (replacing the per-slot scalar EMA we had before).
+// Per-organism weights packed as `[N, ...]` tensors so a single
+// matmul evaluates every slot's MLP in parallel on the GPU.
 
 #[derive(Module, Debug)]
 pub struct PoolMlpL1Hetero<B: Backend> {
-    w1:  Param<Tensor<B, 3>>,
-    b1:  Param<Tensor<B, 2>>,
-    w2:  Param<Tensor<B, 3>>,
-    b2:  Param<Tensor<B, 2>>,
-    /// Value head: per-slot `[HIDDEN, 1]` row that maps the trunk
-    /// activations to a scalar V(s). Linear (no tanh) so values can
-    /// span the full reward range.
-    v_w: Param<Tensor<B, 3>>,
-    v_b: Param<Tensor<B, 2>>,
+    w1: Param<Tensor<B, 3>>,  // [N, IN, HIDDEN]
+    b1: Param<Tensor<B, 2>>,  // [N, HIDDEN]
+    w2: Param<Tensor<B, 3>>,  // [N, HIDDEN, OUT]
+    b2: Param<Tensor<B, 2>>,  // [N, OUT]
 }
 
 impl<B: Backend> PoolMlpL1Hetero<B> {
-    fn new(device: &B::Device) -> Self {
+    fn new(device: &B::Device, n: usize) -> Self {
         let w = Initializer::Uniform { min: -0.5, max: 0.5 };
         let z = Initializer::Zeros;
         Self {
-            w1:  w.init([N, IN, HIDDEN], device),
-            b1:  z.init([N, HIDDEN], device),
-            w2:  w.init([N, HIDDEN, OUT], device),
-            b2:  z.init([N, OUT], device),
-            // Zero-init the VALUE head so V(s₀) = 0 instead of a
-            // random projection of the (small but non-zero) trunk
-            // activations. With Uniform v_w, V(s) at init was
-            // ~±2 in magnitude — about 20× the typical reward, so
-            // the bootstrap target r + γV(s') was dominated by
-            // random V for the first few hundred ticks and the
-            // policy got random-sign advantages. Starting from
-            // zero, the bootstrap target collapses to just `r`
-            // until the value head learns useful predictions; the
-            // policy gradient direction is correct from tick 1.
-            v_w: z.init([N, HIDDEN, 1], device),
-            v_b: z.init([N, 1], device),
+            w1: w.init([n, IN, HIDDEN], device),
+            b1: z.init([n, HIDDEN], device),
+            w2: w.init([n, HIDDEN, OUT], device),
+            b2: z.init([n, OUT], device),
         }
     }
 
-    /// Single-output forward — kept around so the warmup function can
-    /// trigger only the policy-trunk kernels when value-head gradients
-    /// aren't needed. Unused on the hot path.
-    #[allow(dead_code)]
+    /// Inference forward `[N, IN] → [N, OUT]`. Called once per brain
+    /// tick to sample fresh actions.
     fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        self.forward_full(x).0
-    }
-
-    /// Two-headed forward. Returns `(mu, v)` from a SINGLE trunk
-    /// activation — the trunk is computed once and `clone()`d to feed
-    /// both heads, so backprop accumulates gradients into the trunk
-    /// from both losses (standard A2C topology).
-    fn forward_full(&self, x: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
-        // Trunk: ReLU(input · w1 + b1).
         let h = x.unsqueeze_dim::<3>(1).matmul(self.w1.val()).squeeze::<2>() + self.b1.val();
         let h = burn::tensor::activation::relu(h);
+        let mu_pre = h.unsqueeze_dim::<3>(1).matmul(self.w2.val()).squeeze::<2>() + self.b2.val();
+        burn::tensor::activation::tanh(mu_pre)
+    }
 
-        // Policy head: tanh-squashed.
-        let mu_pre = h.clone()
-            .unsqueeze_dim::<3>(1)
-            .matmul(self.w2.val())
-            .squeeze::<2>() + self.b2.val();
-        let mu = burn::tensor::activation::tanh(mu_pre);
-
-        // Value head: linear scalar. The matmul output is `[N, 1, 1]`
-        // (two size-1 dims), so we cannot use the same `.squeeze::<2>()`
-        // trick the policy head uses — `squeeze::<2>()` collapses
-        // every size-1 dim and would land us at rank 1 (`[N]`),
-        // mismatching the rank-2 type. `reshape([N, 1])` is explicit
-        // about the intended target shape and is free at runtime.
-        let v = h.unsqueeze_dim::<3>(1)
-            .matmul(self.v_w.val())
-            .reshape([N, 1]) + self.v_b.val();
-
-        (mu, v)
+    /// Rollout forward `[N, T, IN] → [N, T, OUT]`. Called once per
+    /// training event to replay the buffered trajectory through the
+    /// (slightly newer) policy weights for the gradient computation.
+    /// Uses batched matmul so every slot's MLP processes all T
+    /// timesteps in a single GPU op.
+    fn forward_rollout(&self, states: Tensor<B, 3>) -> Tensor<B, 3> {
+        // states: [N, T, IN] @ w1 [N, IN, HIDDEN] = [N, T, HIDDEN]
+        let h_pre = states.matmul(self.w1.val());
+        // b1 is [N, HIDDEN]; unsqueeze to [N, 1, HIDDEN] so it
+        // broadcasts across the time axis when added.
+        let b1_b = self.b1.val().unsqueeze_dim::<3>(1);
+        let h = burn::tensor::activation::relu(h_pre + b1_b);
+        let mu_pre = h.matmul(self.w2.val());
+        let b2_b = self.b2.val().unsqueeze_dim::<3>(1);
+        burn::tensor::activation::tanh(mu_pre + b2_b)
     }
 }
 
@@ -234,55 +252,122 @@ impl<O: Optimizer<PoolMlpL1Hetero<MyBackend>, MyBackend>> BrainOptL1Hetero for O
 // ── Pool resource ───────────────────────────────────────────────────────────
 
 pub struct BrainPoolL1Hetero {
-    model:        PoolMlpL1Hetero<MyBackend>,
-    opt:          Box<dyn BrainOptL1Hetero>,
-    free:         Vec<u32>,
-    map:          HashMap<Entity, u32>,
-    prev_state:   Vec<f32>,
-    prev_action:  Vec<f32>,
-    prev_energy:  Vec<f32>,
-    has_prev:     Vec<bool>,
-    baseline:     Vec<f32>,
-    /// Distance to the nearest in-range prey at the previous brain
-    /// tick, per slot. Read by the reward shaper to compute the
-    /// per-tick "approach progress" signal (`prev - cur`). Reset
-    /// whenever no prey was in range last tick (`has_prev_prey[s] =
-    /// false`), so the next tick's progress term is zero rather than
-    /// a stale arbitrary number.
-    prev_prey_dist: Vec<f32>,
-    has_prev_prey:  Vec<bool>,
-    /// Identity of the nearest prey at the previous brain tick
-    /// (`None` when no prey was in range). Compared against this
-    /// tick's nearest-prey entity to gate the progress reward —
-    /// when the identity flips between ticks (a different photo
-    /// became closest, or one was eaten), `(prev_dist - cur_dist)`
-    /// is comparing distances to two different organisms, so we
-    /// zero `progress` for that tick to avoid spuriously
-    /// reinforcing whatever action coincidentally took the agent
-    /// across the perpendicular bisector between two photos.
-    prev_prey_entity: Vec<Option<Entity>>,
-    pub device:   CudaDevice,
+    model:      PoolMlpL1Hetero<MyBackend>,
+    opt:        Box<dyn BrainOptL1Hetero>,
+    free:       Vec<u32>,
+    map:        HashMap<Entity, u32>,
+
+    /// Per-slot rollout buffers (flat row-major, indexed by
+    /// `s * ROLLOUT_LEN * IN + t * IN + d` etc.). Filled in
+    /// time order; `buf_count[s]` tracks how many timesteps slot
+    /// `s` has accumulated since the last training event.
+    buf_states:  Vec<f32>,    // [N * ROLLOUT_LEN * IN]
+    buf_actions: Vec<f32>,    // [N * ROLLOUT_LEN * OUT]
+    buf_rewards: Vec<f32>,    // [N * ROLLOUT_LEN]
+    buf_count:   Vec<usize>,  // [N]
+
+    /// State / action stored at the previous brain tick. Used to
+    /// pair the reward computed at THIS tick with the action that
+    /// produced it. `has_prev[s] = false` for the first tick after
+    /// a slot is (re-)assigned.
+    prev_state:         Vec<f32>,
+    prev_action:        Vec<f32>,
+    prev_energy:        Vec<f32>,
+    prev_reproductions: Vec<u8>,
+    /// Eat events fired by `predation_system` (per-slot). The brain
+    /// reads `delta = predations_now - prev_predations` per tick as
+    /// the eat-event reward signal — a true predation event count,
+    /// not an energy-spike heuristic.
+    prev_predations:    Vec<u8>,
+    has_prev:           Vec<bool>,
+
+    // ── Target-lock state (per slot) ───────────────────────────────────
+    /// Entity currently locked as the prey target. `None` when no
+    /// target. The lock is reset on slot assignment / free.
+    target_entity:           Vec<Option<Entity>>,
+    /// Ticks remaining before the policy is allowed to re-evaluate
+    /// target choice. Decrements every brain tick; while > 0 the
+    /// argmax is overridden by the locked target.
+    lock_ticks_remaining:    Vec<u16>,
+    /// Distance to the locked target at the previous brain tick.
+    /// Used to compute the per-tick "distance closed" progress
+    /// reward. Only valid when `prev_target_was_same == true`.
+    prev_distance_to_target: Vec<f32>,
+    /// Was the locked target at the *previous* tick the same as at
+    /// the current tick? Reward shaping only credits progress when
+    /// the target identity is stable across the comparison.
+    prev_target_entity:      Vec<Option<Entity>>,
+
+    /// Output-side EMA-smoothed speed actually applied to the
+    /// organism. Decoupled from `prev_action[OUT.0]` so the policy
+    /// gradient still uses the raw sample (correct log-prob) while
+    /// the world sees a low-jerk trajectory.
+    applied_speed_a:    Vec<f32>,
+
+    /// Per-slot baseline (EMA over mean rollout return). Subtracted
+    /// from the return to produce the advantage that scales the
+    /// policy loss.
+    baseline:    Vec<f32>,
+
+    /// Per-slot reward-shaping + exploration hyperparameters (one
+    /// entry per slot). Sampled uniformly from `L1_*_RANGE` on initial
+    /// assignment; inherited-with-mutation on reproduction. Each
+    /// value functions as a "gene" the population can select on.
+    sigma:         Vec<f32>,
+    k_eat:         Vec<f32>,
+    k_repro:       Vec<f32>,
+    lambda_energy: Vec<f32>,
+    k_curiosity:   Vec<f32>,
+    k_progress:    Vec<f32>,
+
+    /// Brain-tick counter, incremented every call. Training fires
+    /// when `(tick % ROLLOUT_LEN) == 0` (after the per-tick rollout
+    /// fill has happened).
+    tick:        u64,
+
+    pub device:  CudaDevice,
 }
 
 impl BrainPoolL1Hetero {
-    fn new(device: CudaDevice) -> Self {
+    fn new(device: CudaDevice, n: usize) -> Self {
         Self {
-            model:            PoolMlpL1Hetero::<MyBackend>::new(&device),
-            opt:              Box::new(AdamConfig::new().init()),
-            free:             (0..N as u32).rev().collect(),
-            map:              HashMap::with_capacity(N),
-            prev_state:       vec![0.0; N * IN],
-            prev_action:      vec![0.0; N * OUT],
-            prev_energy:      vec![0.0; N],
-            has_prev:         vec![false; N],
-            baseline:         vec![0.0; N],
-            prev_prey_dist:   vec![0.0; N],
-            has_prev_prey:    vec![false; N],
-            prev_prey_entity: vec![None; N],
+            model:              PoolMlpL1Hetero::<MyBackend>::new(&device, n),
+            opt:                Box::new(AdamConfig::new().init()),
+            free:               (0..n as u32).rev().collect(),
+            map:                HashMap::with_capacity(n),
+            buf_states:         vec![0.0; n * ROLLOUT_LEN * IN],
+            buf_actions:        vec![0.0; n * ROLLOUT_LEN * OUT],
+            buf_rewards:        vec![0.0; n * ROLLOUT_LEN],
+            buf_count:          vec![0; n],
+            prev_state:              vec![0.0; n * IN],
+            prev_action:             vec![0.0; n * OUT],
+            prev_energy:             vec![0.0; n],
+            prev_reproductions:      vec![0; n],
+            prev_predations:         vec![0; n],
+            has_prev:                vec![false; n],
+
+            target_entity:           vec![None; n],
+            lock_ticks_remaining:    vec![0; n],
+            prev_distance_to_target: vec![0.0; n],
+            prev_target_entity:      vec![None; n],
+            applied_speed_a:         vec![0.0; n],
+
+            baseline:           vec![0.0; n],
+            sigma:              vec![WARMUP_SIGMA; n],
+            k_eat:              vec![0.0; n],
+            k_repro:            vec![0.0; n],
+            lambda_energy:      vec![0.0; n],
+            k_curiosity:        vec![0.0; n],
+            k_progress:         vec![0.0; n],
+            tick:               0,
             device,
         }
     }
 
+    fn n(&self) -> usize { self.buf_count.len() }
+
+    /// Copy one row out of the parent's weights into the child's
+    /// slot. Mirrors the pattern in `intelligence_level_1_photo`.
     fn inherit_row(&mut self, parent: usize, child: usize) {
         let p = self.model.w1.val().slice([parent..parent+1, 0..IN, 0..HIDDEN]);
         self.model.w1 = self.model.w1.clone().map(|t| {
@@ -300,21 +385,11 @@ impl BrainPoolL1Hetero {
         self.model.b2 = self.model.b2.clone().map(|t| {
             t.slice_assign([child..child+1, 0..OUT], p)
         });
-        // Value head — same row-slice copy. Without this the offspring
-        // would inherit the parent's policy but a stale value
-        // estimator, which would briefly mis-predict V(s) and pump
-        // bad advantages into the policy gradient.
-        let p = self.model.v_w.val().slice([parent..parent+1, 0..HIDDEN, 0..1]);
-        self.model.v_w = self.model.v_w.clone().map(|t| {
-            t.slice_assign([child..child+1, 0..HIDDEN, 0..1], p)
-        });
-        let p = self.model.v_b.val().slice([parent..parent+1, 0..1]);
-        self.model.v_b = self.model.v_b.clone().map(|t| {
-            t.slice_assign([child..child+1, 0..1], p)
-        });
     }
 
-    /// See `intelligence_level_1_photo::BrainPoolL1Photo::snapshot`.
+    /// Snapshot every slot's weights + REINFORCE state for the
+    /// `.colony` save format. Layout matches what `colony.rs`
+    /// expects (`PoolSnapshot` from `rl_helpers.rs`).
     pub fn snapshot(&self) -> PoolSnapshot {
         PoolSnapshot {
             w1:          self.model.w1.val().into_data().into_vec::<f32>().expect("w1 to vec"),
@@ -333,14 +408,16 @@ impl BrainPoolL1Hetero {
         }
     }
 
-    /// See `intelligence_level_1_photo::BrainPoolL1Photo::restore_slot`.
+    /// Restore weights + REINFORCE state into the given slot from a
+    /// saved `BrainRestore`. Mismatched dims → graceful failure (the
+    /// caller will log and fall back to recycled / default weights).
     pub fn restore_slot(&mut self, slot: usize, r: &BrainRestore) -> Result<(), String> {
-        if r.w1.len() != IN * HIDDEN { return Err(format!("w1 size {} != {}", r.w1.len(), IN * HIDDEN)); }
-        if r.b1.len() != HIDDEN      { return Err(format!("b1 size {} != {}", r.b1.len(), HIDDEN)); }
+        if r.w1.len() != IN * HIDDEN  { return Err(format!("w1 size {} != {}", r.w1.len(), IN * HIDDEN)); }
+        if r.b1.len() != HIDDEN       { return Err(format!("b1 size {} != {}", r.b1.len(), HIDDEN)); }
         if r.w2.len() != HIDDEN * OUT { return Err(format!("w2 size {} != {}", r.w2.len(), HIDDEN * OUT)); }
-        if r.b2.len() != OUT         { return Err(format!("b2 size {} != {}", r.b2.len(), OUT)); }
-        if r.prev_state.len()  != IN  { return Err(format!("prev_state size {} != {}", r.prev_state.len(), IN)); }
-        if r.prev_action.len() != OUT { return Err(format!("prev_action size {} != {}", r.prev_action.len(), OUT)); }
+        if r.b2.len() != OUT          { return Err(format!("b2 size {} != {}", r.b2.len(), OUT)); }
+        if r.prev_state.len()  != IN  { return Err(format!("prev_state {} != {}", r.prev_state.len(), IN)); }
+        if r.prev_action.len() != OUT { return Err(format!("prev_action {} != {}", r.prev_action.len(), OUT)); }
 
         let device = &self.device;
         let w1_t = Tensor::<MyBackend, 3>::from_data(
@@ -364,54 +441,63 @@ impl BrainPoolL1Hetero {
             t.slice_assign([slot..slot + 1, 0..OUT], b2_t)
         });
 
-        let in_off = slot * IN;
-        self.prev_state[in_off .. in_off + IN].copy_from_slice(&r.prev_state);
+        let in_off  = slot * IN;
         let out_off = slot * OUT;
+        self.prev_state [in_off  .. in_off + IN ].copy_from_slice(&r.prev_state);
         self.prev_action[out_off .. out_off + OUT].copy_from_slice(&r.prev_action);
-        self.prev_energy[slot] = r.prev_energy;
-        self.baseline[slot]    = r.baseline;
-        self.has_prev[slot]    = r.has_prev;
+        self.prev_energy[slot]   = r.prev_energy;
+        self.baseline[slot]      = r.baseline;
+        self.has_prev[slot]      = r.has_prev;
+        // Rollout buffer is transient training state — not part of
+        // the save format. Start the restored slot with an empty
+        // rollout window.
+        self.buf_count[slot]            = 0;
+        self.prev_reproductions[slot]   = 0;
+        self.prev_predations[slot]      = 0;
+        self.target_entity[slot]        = None;
+        self.lock_ticks_remaining[slot] = 0;
+        self.prev_distance_to_target[slot] = 0.0;
+        self.prev_target_entity[slot]   = None;
+        self.applied_speed_a[slot]      = 0.0;
         Ok(())
     }
 }
 
 impl FromWorld for BrainPoolL1Hetero {
-    fn from_world(_: &mut World) -> Self {
+    fn from_world(world: &mut World) -> Self {
+        let n = world
+            .get_resource::<OrganismPoolSize>()
+            .map(|r| r.0.max(1))
+            .unwrap_or(1);
         let device = CudaDevice::default();
-        warmup(&device);
-        Self::new(device)
+        warmup(&device, n);
+        Self::new(device, n)
     }
 }
 
 
-/// Force-compile every kernel the steady-state apply tick will use,
-/// so the user's first real frame doesn't pay the JIT cost. Mirrors
-/// the apply tick's exact tensor shapes and op chain — both heads of
-/// the forward, both loss terms, single combined backward.
-fn warmup(device: &CudaDevice) {
-    let m = PoolMlpL1Hetero::<MyBackend>::new(device);
+/// Force-compile every kernel the steady-state apply tick + training
+/// step will use, so the user's first real frame doesn't pay the JIT
+/// cost. Mirrors the runtime tensor shapes exactly.
+fn warmup(device: &CudaDevice, n: usize) {
+    let m = PoolMlpL1Hetero::<MyBackend>::new(device, n);
     let mut o: Box<dyn BrainOptL1Hetero> = Box::new(AdamConfig::new().init());
 
-    let prev_state  = Tensor::<MyBackend, 2>::zeros([N, IN],  device);
-    let prev_action = Tensor::<MyBackend, 2>::zeros([N, OUT], device);
-    let mask        = Tensor::<MyBackend, 2>::zeros([N, 1],   device);
-    let target      = Tensor::<MyBackend, 2>::zeros([N, 1],   device);
-    let adv_const   = Tensor::<MyBackend, 2>::zeros([N, 1],   device);
+    // ── Inference forward (every tick).
+    let i = Tensor::<MyBackend, 2>::zeros([n, IN], device);
+    let _ = m.forward(i);
 
-    let (mu_prev, v_prev) = m.forward_full(prev_state);
-
-    let value_diff = target - v_prev;
-    let value_loss = (value_diff.powf_scalar(2.0) * mask.clone())
-        .sum().mul_scalar(0.5).div_scalar(1.0_f32);
-
-    let diff   = prev_action - mu_prev;
-    let sum_sq = diff.powf_scalar(2.0).sum_dim(1);
-    let scale  = 0.5_f32 / (SIGMA * SIGMA);
-    let policy_loss = (sum_sq * adv_const * mask)
-        .sum().mul_scalar(scale).div_scalar(1.0_f32);
-
-    let total_loss = policy_loss + value_loss.mul_scalar(VALUE_COEF);
-    let g = GradientsParams::from_grads(total_loss.backward(), &m);
+    // ── Training forward + backward (every ROLLOUT_LEN ticks).
+    let states  = Tensor::<MyBackend, 3>::zeros([n, ROLLOUT_LEN, IN],  device);
+    let actions = Tensor::<MyBackend, 3>::zeros([n, ROLLOUT_LEN, OUT], device);
+    let mask    = Tensor::<MyBackend, 3>::zeros([n, ROLLOUT_LEN, 1],   device);
+    let adv     = Tensor::<MyBackend, 3>::zeros([n, ROLLOUT_LEN, 1],   device);
+    let mu      = m.forward_rollout(states);
+    let diff    = actions - mu;
+    let sum_sq  = diff.powf_scalar(2.0).sum_dim(2);
+    let scale   = 0.5_f32 / (WARMUP_SIGMA * WARMUP_SIGMA);
+    let loss    = (sum_sq * adv * mask).sum().mul_scalar(scale).div_scalar(1.0_f32);
+    let g = GradientsParams::from_grads(loss.backward(), &m);
     let _ = o.step(LR, m, g);
 }
 
@@ -426,19 +512,24 @@ pub fn assign_brains_l1_hetero(
     )>,
     mut commands: Commands,
 ) {
+    let mut rng = rand::rng();
     for (e, organism, inheritance, restore) in new.iter() {
-        // Filter to Level1 heterotrophs only — Level2 / Level3 go to
-        // their own pools.
+        // Only enroll Level1 heterotrophs. L0 sessile organisms are
+        // excluded by the trophic marker query; L2/L3 are placeholders
+        // and never end up here either.
         if !matches!(organism.intelligence_level, IntelligenceLevel::Level1) { continue; }
 
         let Some(slot) = pool.free.pop() else { continue };
         let s = slot as usize;
 
-        // See L1 photo's `assign_brains_l1_photo` for the priority
-        // order: BrainRestore > BrainInheritance > recycled-slot
-        // default. BrainRestore overwrites both weights AND
-        // REINFORCE prev_*; the other two reset prev_*.
+        // Priority order (same as L1 photo):
+        //   1. BrainRestore (loaded colony save) — overwrite both
+        //      weights AND REINFORCE prev_*.
+        //   2. BrainInheritance — copy parent's weights row, reset
+        //      prev_*.
+        //   3. Neither — keep recycled-slot weights, reset prev_*.
         let mut restored = false;
+        let mut inherited_genes_from: Option<usize> = None;
         if let Some(r) = restore {
             match pool.restore_slot(s, r) {
                 Ok(())   => { restored = true; }
@@ -447,16 +538,55 @@ pub fn assign_brains_l1_hetero(
         } else if let Some(BrainInheritance(parent)) = inheritance {
             if let Some(&parent_slot) = pool.map.get(parent) {
                 pool.inherit_row(parent_slot as usize, s);
+                inherited_genes_from = Some(parent_slot as usize);
             }
         }
 
+        // ── Hyperparameter genes ─────────────────────────────────
+        // Restored slots: resample (save format doesn't yet carry the
+        // genes — TODO: extend `PoolSnapshot` if breeding lineages
+        // need to survive save/load).
+        // Inherited slots: copy parent's genes + Gaussian mutation.
+        // Fresh slots: uniform sample within each range.
+        if let Some(parent_slot) = inherited_genes_from {
+            pool.sigma[s]         = mutate_in_range(pool.sigma[parent_slot],         L1_SIGMA_RANGE,         &mut rng);
+            pool.k_eat[s]         = mutate_in_range(pool.k_eat[parent_slot],         L1_K_EAT_RANGE,         &mut rng);
+            pool.k_repro[s]       = mutate_in_range(pool.k_repro[parent_slot],       L1_K_REPRO_RANGE,       &mut rng);
+            pool.lambda_energy[s] = mutate_in_range(pool.lambda_energy[parent_slot], L1_LAMBDA_ENERGY_RANGE, &mut rng);
+            pool.k_curiosity[s]   = mutate_in_range(pool.k_curiosity[parent_slot],   L1_K_CURIOSITY_RANGE,   &mut rng);
+            pool.k_progress[s]    = mutate_in_range(pool.k_progress[parent_slot],    L1_K_PROGRESS_RANGE,    &mut rng);
+        } else {
+            pool.sigma[s]         = sample_range(L1_SIGMA_RANGE,         &mut rng);
+            pool.k_eat[s]         = sample_range(L1_K_EAT_RANGE,         &mut rng);
+            pool.k_repro[s]       = sample_range(L1_K_REPRO_RANGE,       &mut rng);
+            pool.lambda_energy[s] = sample_range(L1_LAMBDA_ENERGY_RANGE, &mut rng);
+            pool.k_curiosity[s]   = sample_range(L1_K_CURIOSITY_RANGE,   &mut rng);
+            pool.k_progress[s]    = sample_range(L1_K_PROGRESS_RANGE,    &mut rng);
+        }
+
+        // Reset transient target-lock + momentum state for the new
+        // tenant. Weights, prev_action, baseline can survive recycling
+        // (already handled below); these fields cannot — a stale
+        // target_entity could point at a despawned organism.
+        pool.target_entity[s]           = None;
+        pool.lock_ticks_remaining[s]    = 0;
+        pool.prev_distance_to_target[s] = 0.0;
+        pool.prev_target_entity[s]      = None;
+        pool.applied_speed_a[s]         = 0.0;
+        pool.prev_predations[s]         = organism.predations;
+
         if !restored {
-            pool.has_prev[s]         = false;
-            pool.baseline[s]         = 0.0;
-            pool.prev_energy[s]      = organism.energy;
-            pool.has_prev_prey[s]    = false;
-            pool.prev_prey_dist[s]   = 0.0;
-            pool.prev_prey_entity[s] = None;
+            pool.has_prev[s]           = false;
+            pool.baseline[s]           = 0.0;
+            pool.prev_energy[s]        = organism.energy;
+            pool.prev_reproductions[s] = organism.reproductions;
+            pool.buf_count[s]          = 0;
+        } else {
+            // Restored slot — make `prev_reproductions` match the
+            // restored organism so the first tick doesn't fire a
+            // spurious `+K_REPRO` against a stale baseline.
+            pool.prev_reproductions[s] = organism.reproductions;
+            pool.buf_count[s]          = 0;
         }
 
         pool.map.insert(e, slot);
@@ -473,9 +603,12 @@ pub fn free_brains_l1_hetero(
     for e in removed.read() {
         if let Some(slot) = pool.map.remove(&e) {
             let s = slot as usize;
-            pool.has_prev[s]         = false;
-            pool.has_prev_prey[s]    = false;
-            pool.prev_prey_entity[s] = None;
+            pool.has_prev[s]             = false;
+            pool.buf_count[s]            = 0;
+            pool.target_entity[s]        = None;
+            pool.lock_ticks_remaining[s] = 0;
+            pool.prev_target_entity[s]   = None;
+            pool.applied_speed_a[s]      = 0.0;
             pool.free.push(slot);
         }
     }
@@ -484,277 +617,367 @@ pub fn free_brains_l1_hetero(
 
 // ── Apply / train tick ──────────────────────────────────────────────────────
 
-/// Per-active-organism scratch entry. Captures everything the
-/// reward / apply loops need so we don't re-query the ECS twice.
-/// `pub(crate)` because Bevy's system registration sees this type
-/// inside the `apply_intelligence_level_1_hetero` signature (via the
-/// `Local<Vec<ActiveEntry>>` system parameter), and its visibility
-/// must reach the registration site in `behaviour.rs`.
-pub(crate) struct ActiveEntry {
-    entity:          Entity,
-    slot:            u32,
-    energy_now:      f32,
-    /// Heterotroph forward-axis projected onto the XZ plane and
-    /// normalised. Used by the facing-alignment reward.
-    forward_xz:      Vec2,
-    /// Distance to the nearest in-range prey this tick, or `None`
-    /// when no prey is in range.
-    cur_prey_dist:   Option<f32>,
-    /// Identity of that nearest prey. Compared against the slot's
-    /// `prev_prey_entity` to gate the progress reward across
-    /// identity flips.
-    cur_prey_entity: Option<Entity>,
-    /// Unit vector toward that prey on the XZ plane (for facing).
-    prey_dir_xz:     Vec2,
-}
-
 pub fn apply_intelligence_level_1_hetero(
-    time:           Res<Time<Virtual>>,
-    world_grid:     Res<WorldModelGrid>,
-    mut pool:       NonSendMut<BrainPoolL1Hetero>,
-    mut heteros:    Query<(Entity, &mut Organism, &Transform, &BrainSlotL1Hetero), With<Heterotroph>>,
-    mut input_buf:  Local<Vec<f32>>,
-    mut adv_buf:    Local<Vec<f32>>,
-    mut mask_buf:   Local<Vec<f32>>,
-    mut active_buf: Local<Vec<ActiveEntry>>,
+    time:        Res<Time<Virtual>>,
+    world_grid:  Res<WorldModelGrid>,
+    mut pool:    NonSendMut<BrainPoolL1Hetero>,
+    mut heteros: Query<(Entity, &mut Organism, &Transform, &BrainSlotL1Hetero), With<Heterotroph>>,
+    mut input_buf: Local<Vec<f32>>,
 ) {
     if time.is_paused() { return; }
+    let n = pool.n();
 
-    input_buf.clear();   input_buf.resize(N * IN, 0.0);
-    adv_buf.clear();     adv_buf.resize(N, 0.0);
-    mask_buf.clear();    mask_buf.resize(N, 0.0);
-    active_buf.clear();
+    // ── Step 1: resolve neighbours and fill the input vector. ────
+    input_buf.clear();
+    input_buf.resize(n * IN, 0.0);
+
+    // Cache per-active-slot scratch (entity, slot, position, energy_now,
+    // reproductions_now, predations_now, neighbour list). Pre-resolving
+    // neighbours here avoids re-walking the grid in the action-apply
+    // loop where we need it for target-position lookup.
+    struct Active {
+        entity:        Entity,
+        slot:          u32,
+        pos:           Vec3,
+        energy_now:    f32,
+        reproductions: u8,
+        predations:    u8,
+        neighbours:    [Option<crate::world_model::Neighbour>; WORLD_MODEL_K],
+    }
+    let mut active: Vec<Active> = Vec::new();
 
     for (e, organism, transform, slot) in heteros.iter() {
         let s = slot.0 as usize;
-        if s >= N { continue; }
+        if s >= n { continue; }
         let pos = transform.translation;
 
-        let max_e    = get_max_energy(&organism).max(1.0);
+        let max_e    = crate::energy::get_max_energy(&organism).max(1.0);
         let energy_n = (organism.energy / max_e).clamp(0.0, 1.0);
+        let neighbours = collect_neighbours(&world_grid, pos);
 
         let off = s * IN;
         input_buf[off] = energy_n;
-        // World-model rows fill `[off + 1 .. off + 1 + WORLD_MODEL_DIMS]`.
-        let wm_slice = &mut input_buf[off + 1 .. off + 1 + WORLD_MODEL_DIMS];
-        fill_world_model(&world_grid, pos, wm_slice);
 
-        // Reward-shaping inputs — nearest-prey lookup and the
-        // organism's current forward direction. Both are evaluated
-        // here (during the input-fill pass) to avoid a second query
-        // walk further down.
-        let nearest = nearest_prey(&world_grid, pos);
-        let (cur_prey_dist, cur_prey_entity, prey_dir_xz) = match nearest {
-            Some((rel, dist, ent)) => {
-                let dir = Vec2::new(rel.x, rel.z).normalize_or_zero();
-                (Some(dist), Some(ent), dir)
+        // World-model block.
+        encode_neighbours(&neighbours, &mut input_buf[off + 1 .. off + 1 + WORLD_MODEL_DIMS]);
+
+        // Previous-action recurrence block — last sampled raw action
+        // (speed_a + 4 target logits). Zero-filled before `has_prev`.
+        let pa_off = off + 1 + WORLD_MODEL_DIMS;
+        if pool.has_prev[s] {
+            let src = s * OUT;
+            for i in 0..OUT {
+                input_buf[pa_off + i] = pool.prev_action[src + i];
             }
-            None => (None, None, Vec2::ZERO),
-        };
-        // `Transform::forward()` returns `-local_z`. But
-        // `movement_physics::apply_movement` yaws the organism so
-        // local **+Z** points along `movement_direction` — i.e. the
-        // organism's "front" is local +Z, so the actual forward
-        // axis is the *negation* of `transform.forward()`. Without
-        // this negation the facing reward would punish heading
-        // toward prey (the organism would learn to flee). The
-        // player camera applies the same sign flip in
-        // `player_plugin.rs::player_move`.
-        let forward = -transform.forward();
-        let forward_xz = Vec2::new(forward.x, forward.z).normalize_or_zero();
+        }
 
-        active_buf.push(ActiveEntry {
-            entity:          e,
-            slot:            slot.0,
-            energy_now:      organism.energy,
-            forward_xz,
-            cur_prey_dist,
-            cur_prey_entity,
-            prey_dir_xz,
+        // Locked-target flag.
+        let flag_off = pa_off + PREV_ACTION_DIMS;
+        input_buf[flag_off] = if pool.target_entity[s].is_some() { 1.0 } else { 0.0 };
+
+        active.push(Active {
+            entity: e, slot: slot.0, pos,
+            energy_now: organism.energy,
+            reproductions: organism.reproductions,
+            predations: organism.predations,
+            neighbours,
         });
     }
-    if active_buf.is_empty() { return; }
+    if active.is_empty() {
+        pool.tick = pool.tick.wrapping_add(1);
+        return;
+    }
 
-    // ── Forward CURRENT state ── produces `mu` (the action-sampling
-    // mean for THIS tick) and `v` (the value-head estimate of
-    // V(s_t), used as the bootstrap target for the previous-tick
-    // transition). Both are immediately pulled to CPU because the
-    // backward pass uses fresh forward(prev_state) calls instead of
-    // these graph nodes.
+    // ── Step 2: forward inference. ──────────────────────────────
     let cur_t = Tensor::<MyBackend, 2>::from_data(
-        TensorData::new(input_buf.clone(), [N, IN]),
+        TensorData::new(input_buf.clone(), [n, IN]),
         &pool.device,
     );
-    let (mu_cur, v_cur) = pool.model.forward_full(cur_t);
-    let mu_data    = mu_cur.into_data().into_vec::<f32>().expect("mu_cur to vec");
-    let v_cur_data = v_cur.into_data().into_vec::<f32>().expect("v_cur to vec");
-
-    // ── Shaped reward = energy + progress + facing ───────────────
-    // Build the TD target `target[s] = r + γ·V(s_t)` per active
-    // slot, plus the mask. Advantage is computed later from a fresh
-    // forward(prev_state) so it stays on the autograd graph.
-    let mut count = 0.0_f32;
-    let mut target_buf = vec![0.0_f32; N];
-    for entry in active_buf.iter() {
-        let s = entry.slot as usize;
-        if !pool.has_prev[s] { continue; }
-
-        let energy_delta = (entry.energy_now - pool.prev_energy[s])
-            .clamp(-REWARD_CLAMP, REWARD_CLAMP);
-
-        // Progress is meaningful ONLY when the nearest-prey
-        // identity is the SAME this tick as last tick. When it
-        // flips (a different photo became closest, or the previous
-        // one was eaten / left the radius), `prev_dist` and
-        // `cur_dist` are measuring distances to two different
-        // organisms — their delta would credit-assign whatever
-        // action the agent just took to a frame the agent didn't
-        // cause. Zeroing progress on identity flips drops the
-        // signal for one tick but is far better than spurious
-        // reinforcement.
-        let progress = match (
-            pool.has_prev_prey[s],
-            pool.prev_prey_entity[s],
-            entry.cur_prey_dist,
-            entry.cur_prey_entity,
-        ) {
-            (true, Some(prev_e), Some(cur_dist), Some(cur_e)) if prev_e == cur_e => {
-                let raw = (pool.prev_prey_dist[s] - cur_dist) / WORLD_MODEL_RADIUS;
-                raw.clamp(-1.0, 1.0)
-            }
-            _ => 0.0,
-        };
-
-        let facing = if entry.cur_prey_dist.is_some() {
-            entry.forward_xz.dot(entry.prey_dir_xz)
-        } else {
-            0.0
-        };
-
-        let r = W_ENERGY   * energy_delta
-              + W_PROGRESS * progress
-              + W_FACING   * facing;
-
-        target_buf[s] = r + GAMMA * v_cur_data[s];
-        mask_buf[s]   = 1.0;
-        count        += 1.0;
-    }
-
-    if count > 0.0 {
-        let prev_state_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(pool.prev_state.clone(), [N, IN]),
-            &pool.device,
-        );
-        let prev_action_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(pool.prev_action.clone(), [N, OUT]),
-            &pool.device,
-        );
-        let target_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(target_buf.clone(), [N, 1]),
-            &pool.device,
-        );
-        let mask_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(mask_buf.clone(), [N, 1]),
-            &pool.device,
-        );
-
-        // Fresh forward over the previous state — both heads' outputs
-        // are needed (mu_prev for policy loss, v_prev for value
-        // loss). Sharing the trunk means a single backward
-        // accumulates gradients on `w1`/`b1` from BOTH terms.
-        let (mu_prev, v_prev) = pool.model.forward_full(prev_state_t);
-
-        // ── Value loss = mean (target - V(s_{t-1}))² over active ─
-        // Gradient flows through `v_prev` (and the trunk via the
-        // shared `h.clone()`); `target_t` is a leaf so no gradient
-        // flows back into the bootstrap V(s_t) we read from CPU.
-        let value_diff = target_t.clone() - v_prev.clone();
-        let value_loss = (value_diff.powf_scalar(2.0) * mask_t.clone())
-            .sum().mul_scalar(0.5).div_scalar(count);
-
-        // ── Policy loss = mean (a - μ_prev)² · adv / (2σ²) ─────
-        // For policy gradient, `adv` MUST be a constant (no gradient
-        // flow through it back into the value head — that would
-        // mean the policy loss tries to drag V down whenever it
-        // also pushes μ toward the action). We materialise `adv` as
-        // numeric values on the CPU and re-tensor it so the
-        // resulting `adv_const_t` is a leaf in the autograd graph.
-        // The single ~8 KB GPU→CPU sync per tick is negligible.
-        let v_prev_data = v_prev.clone().into_data().into_vec::<f32>().expect("v_prev to vec");
-        let mut adv_buf_local = vec![0.0_f32; N];
-        for s in 0..N {
-            if mask_buf[s] > 0.5 {
-                adv_buf_local[s] = target_buf[s] - v_prev_data[s];
-            }
-        }
-        // Stash a copy into the system-local advantage scratch buf
-        // so its size stays correct (used elsewhere as a sanity
-        // mirror; the autograd loss only reads `adv_const_t`).
-        adv_buf.clone_from(&adv_buf_local);
-
-        let adv_const_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(adv_buf_local, [N, 1]),
-            &pool.device,
-        );
-
-        let diff   = prev_action_t - mu_prev;
-        let sum_sq = diff.powf_scalar(2.0).sum_dim(1);
-        let scale  = 0.5_f32 / (SIGMA * SIGMA);
-        let policy_loss = (sum_sq * adv_const_t * mask_t)
-            .sum().mul_scalar(scale).div_scalar(count);
-
-        let total_loss = policy_loss + value_loss.mul_scalar(VALUE_COEF);
-
-        let cm = pool.model.clone();
-        let gp = GradientsParams::from_grads(total_loss.backward(), &pool.model);
-        pool.model = pool.opt.step(LR, cm, gp);
-    }
+    let mu_cur  = pool.model.forward(cur_t);
+    let mu_data = mu_cur.into_data().into_vec::<f32>().expect("forward output");
 
     let mut rng = rand::rng();
-    for entry in active_buf.iter() {
-        let slot = entry.slot;
-        let s    = slot as usize;
-        let off  = s * OUT;
 
+    // ── Step 3: per-slot reward computation, action sampling,
+    //             target selection (with lock + hysteresis), apply. ─
+    for a in &active {
+        let s = a.slot as usize;
+
+        // (3a) Reward for the previous action (if any).
+        if pool.has_prev[s] {
+            // Eat detection: per-tick predation-count delta. True
+            // event-based signal, replacing the old "energy spike"
+            // heuristic that fired false positives on every energy
+            // gain.
+            let new_eats   = a.predations.wrapping_sub(pool.prev_predations[s]);
+            let new_repros = a.reproductions.saturating_sub(pool.prev_reproductions[s]);
+            let energy_delta = a.energy_now - pool.prev_energy[s];
+
+            let r_eat   = pool.k_eat[s]   * new_eats   as f32;
+            let r_repro = pool.k_repro[s] * new_repros as f32;
+            let r_energy = if energy_delta < 0.0 {
+                pool.lambda_energy[s] * energy_delta
+            } else { 0.0 };
+
+            // Curiosity / aggression bonus on speed. `applied_speed_a`
+            // is the EMA-smoothed value actually written to
+            // `Organism::movement_speed` last tick — this is what the
+            // world saw, so this is what the reward should reference.
+            let prev_speed_norm = pool.applied_speed_a[s].max(0.0);
+            let r_curiosity = pool.k_curiosity[s] * prev_speed_norm;
+
+            // Progress reward: how much closer to the locked target
+            // did we get? Only credited when the target identity is
+            // stable across the comparison window (set in step 3c
+            // last tick); otherwise progress is meaningless because
+            // we'd be comparing distances to two different organisms.
+            let r_progress = if let Some(prev_target) = pool.prev_target_entity[s] {
+                // Find prev target's current position via the
+                // freshly-resolved neighbour list.
+                let cur_d = a.neighbours.iter()
+                    .find_map(|n| n.and_then(|nn|
+                        if nn.entity == prev_target { Some(nn.rel.length()) } else { None }
+                    ));
+                match cur_d {
+                    Some(d) => {
+                        let closed = pool.prev_distance_to_target[s] - d;
+                        pool.k_progress[s] * closed.max(0.0)
+                    }
+                    None => 0.0, // target out of sight ⇒ no progress signal
+                }
+            } else { 0.0 };
+
+            let r = r_eat + r_repro + r_energy + r_curiosity + r_progress;
+
+            // Push (prev_state, prev_action, reward) into rollout.
+            let count = pool.buf_count[s];
+            if count < ROLLOUT_LEN {
+                let prev_state  = pool.prev_state[s * IN .. (s + 1) * IN].to_vec();
+                let prev_action = pool.prev_action[s * OUT .. (s + 1) * OUT].to_vec();
+                let buf_in_off  = s * ROLLOUT_LEN * IN + count * IN;
+                let buf_out_off = s * ROLLOUT_LEN * OUT + count * OUT;
+                pool.buf_states [buf_in_off  .. buf_in_off  + IN ].copy_from_slice(&prev_state);
+                pool.buf_actions[buf_out_off .. buf_out_off + OUT].copy_from_slice(&prev_action);
+                pool.buf_rewards[s * ROLLOUT_LEN + count] = r;
+                pool.buf_count[s] = count + 1;
+            }
+        }
+
+        // (3b) Sample a new action ~ N(μ, σ²) — 5 dims.
+        let off = s * OUT;
+        let sigma_s = pool.sigma[s];
         let mut action = [0.0_f32; OUT];
         for i in 0..OUT {
-            action[i] = mu_data[off + i] + SIGMA * gaussian_noise(&mut rng);
+            action[i] = mu_data[off + i] + sigma_s * gaussian_noise(&mut rng);
+        }
+        let speed_a = action[0].clamp(-1.0, 1.0);
+        let target_logits = [action[1], action[2], action[3], action[4]];
+
+        // (3c) Target selection — Level 1 hetero targets are PHOTOS
+        //      ONLY. Type-check is applied at every gate (locked-slot
+        //      match, argmax candidate) so no non-photo entity can
+        //      ever survive to drive direction, even via a stale lock
+        //      entry / reused Entity ID.
+        //
+        // Single pass over the K neighbour slots collects everything
+        // the decision needs:
+        //   * `locked_slot`  — index of the currently-locked entity if
+        //                      it's STILL a photo neighbour this tick;
+        //                      None otherwise (drops stale / non-prey
+        //                      locks for free).
+        //   * `best_slot`    — index of the photo neighbour with the
+        //                      highest target logit (argmax over the
+        //                      Photo-typed subset).
+        // After the scan, a 3-arm match picks the winner.
+        let locked_entity = pool.target_entity[s];
+        let mut locked_slot: Option<usize> = None;
+        let mut best_slot:   Option<usize> = None;
+        let mut best_logit:        f32      = f32::NEG_INFINITY;
+
+        for (i, slot) in a.neighbours.iter().enumerate() {
+            let Some(nn) = slot else { continue };
+            if !matches!(nn.ty, OrganismType::Photo) { continue; }
+            // Argmax over photo logits.
+            let l = target_logits[i];
+            if l > best_logit { best_logit = l; best_slot = Some(i); }
+            // Locked-target match (entity ID + generation).
+            if Some(nn.entity) == locked_entity { locked_slot = Some(i); }
         }
 
-        let speed_a = action[0].clamp(-1.0, 1.0);
-        let dir     = Vec3::new(action[1], 0.0, action[3]);
-        let Ok((_, mut org, _, _)) = heteros.get_mut(entry.entity) else { continue };
-        if dir.length_squared() > 0.01 { org.movement_direction = dir.normalize(); }
-        org.movement_speed = ((speed_a + 1.0) * 0.5).clamp(0.0, 1.0) * MAX_SPEED;
-
-        let in_off = s * IN;
-        for i in 0..IN  { pool.prev_state [in_off + i] = input_buf[in_off + i]; }
-        // Index 0 stores the CLAMPED speed action, not the raw
-        // (post-noise) sample. With σ=0.5, ~30% of raw samples land
-        // outside [-1, 1] but only the clamped value is what the
-        // simulator actually executed. Without the clamp the policy
-        // gradient would push μ toward unreachable values and the
-        // mean speed would saturate — visible as the agent
-        // permanently running near max-speed regardless of state.
-        pool.prev_action[off + 0] = speed_a;
-        for i in 1..OUT { pool.prev_action[off + i] = action[i]; }
-        pool.prev_energy[s] = entry.energy_now;
-        pool.has_prev[s]    = true;
-
-        // Persist this tick's nearest-prey distance AND identity
-        // for next tick's progress-reward calc. Reset has_prev_prey
-        // (and the entity slot) when prey left the radius so the
-        // next tick's progress is 0 instead of a stale delta.
-        match (entry.cur_prey_dist, entry.cur_prey_entity) {
-            (Some(d), Some(e)) => {
-                pool.prev_prey_dist[s]   = d;
-                pool.prev_prey_entity[s] = Some(e);
-                pool.has_prev_prey[s]    = true;
+        let chosen_slot: Option<usize> = match (locked_slot, best_slot) {
+            // Active lock window — keep, decrement counter, ignore
+            // logits entirely.
+            (Some(li), _) if pool.lock_ticks_remaining[s] > 0 => {
+                pool.lock_ticks_remaining[s] -= 1;
+                Some(li)
+            }
+            // Lock expired but locked target still in range — switch
+            // only if a different photo beats it by SWITCH_MARGIN.
+            (Some(li), Some(bi)) => {
+                let chosen = if bi != li
+                    && best_logit > target_logits[li] + L1_TARGET_SWITCH_MARGIN
+                { bi } else { li };
+                pool.lock_ticks_remaining[s] = L1_TARGET_LOCK_TICKS;
+                Some(chosen)
+            }
+            // No usable lock — fresh argmax pick if any photo in sight.
+            (None, Some(bi)) => {
+                pool.lock_ticks_remaining[s] = L1_TARGET_LOCK_TICKS;
+                Some(bi)
             }
             _ => {
-                pool.has_prev_prey[s]    = false;
-                pool.prev_prey_entity[s] = None;
+                pool.lock_ticks_remaining[s] = 0;
+                None
+            }
+        };
+
+        let new_target: Option<(Entity, Vec3)> = chosen_slot
+            .and_then(|i| a.neighbours[i].map(|n| (n.entity, n.rel)));
+
+        // (3d) Apply to the world: speed (EMA-smoothed) + direction
+        //      (geometric, toward target).
+        let Ok((_, mut org, _, _)) = heteros.get_mut(a.entity) else { continue };
+
+        // EMA-smooth the speed sample for low-jerk movement, then
+        // store the smoothed value so the curiosity reward next tick
+        // references what the world actually saw.
+        let smoothed = L1_SPEED_MOMENTUM_ALPHA * pool.applied_speed_a[s]
+                     + (1.0 - L1_SPEED_MOMENTUM_ALPHA) * speed_a;
+        pool.applied_speed_a[s] = smoothed;
+        org.movement_speed = smoothed.max(0.0) * MAX_SPEED;
+
+        // Direction is geometric from the chosen target. If no
+        // target was picked (no prey in neighbour window), keep
+        // last-commanded direction so the agent keeps cruising
+        // rather than freezing.
+        if let Some((_, rel)) = new_target {
+            let dx = rel.x;
+            let dz = rel.z;
+            let mag2 = dx * dx + dz * dz;
+            if mag2 > 1e-6 {
+                let inv = mag2.sqrt().recip();
+                org.movement_direction = Vec3::new(dx * inv, 0.0, dz * inv);
             }
         }
+
+        // (3e) Update pool's prev_* state for next tick.
+        let in_off = s * IN;
+        for i in 0..IN { pool.prev_state[in_off + i] = input_buf[in_off + i]; }
+        pool.prev_action[off + 0] = speed_a;
+        pool.prev_action[off + 1] = target_logits[0];
+        pool.prev_action[off + 2] = target_logits[1];
+        pool.prev_action[off + 3] = target_logits[2];
+        pool.prev_action[off + 4] = target_logits[3];
+        pool.prev_energy[s]        = a.energy_now;
+        pool.prev_reproductions[s] = a.reproductions;
+        pool.prev_predations[s]    = a.predations;
+        pool.has_prev[s]           = true;
+
+        // Target bookkeeping for next-tick reward shaping.
+        pool.prev_target_entity[s] = pool.target_entity[s];
+        if let Some((ent, rel)) = new_target {
+            pool.target_entity[s]           = Some(ent);
+            pool.prev_distance_to_target[s] = rel.length();
+        } else {
+            pool.target_entity[s]           = None;
+            pool.prev_distance_to_target[s] = 0.0;
+        }
     }
+
+    // ── Step 4: maybe train. ────────────────────────────────────
+    pool.tick = pool.tick.wrapping_add(1);
+    if pool.tick % ROLLOUT_LEN as u64 != 0 { return; }
+    train(&mut pool);
+}
+
+
+/// Run one Monte Carlo REINFORCE update over the current contents of
+/// every slot's rollout buffer. Slots with `buf_count == 0` (just
+/// assigned, no rewards yet) contribute zero to the loss via the
+/// mask. After the update, every slot's buffer is reset.
+fn train(pool: &mut BrainPoolL1Hetero) {
+    let n = pool.n();
+
+    // CPU-side: compute discounted returns + advantages per slot,
+    // populate adv_buf + mask_buf flat tensors.
+    let mut adv_buf  = vec![0.0_f32; n * ROLLOUT_LEN];
+    let mut mask_buf = vec![0.0_f32; n * ROLLOUT_LEN];
+    let mut total_count = 0.0_f32;
+
+    for s in 0..n {
+        let count = pool.buf_count[s];
+        if count == 0 { continue; }
+
+        // Discounted returns, computed backwards from the end of the
+        // valid window: G_t = r_t + γ · G_{t+1}.
+        let mut returns = vec![0.0_f32; count];
+        let mut g = 0.0_f32;
+        for t in (0..count).rev() {
+            let r = pool.buf_rewards[s * ROLLOUT_LEN + t];
+            g = r + GAMMA * g;
+            returns[t] = g;
+        }
+
+        // Per-slot baseline: EMA of mean return. Cheap variance
+        // reduction with no extra network.
+        let mean_g: f32 = returns.iter().sum::<f32>() / count as f32;
+        pool.baseline[s] = (1.0 - BASELINE_ALPHA) * pool.baseline[s]
+                         + BASELINE_ALPHA * mean_g;
+
+        for t in 0..count {
+            adv_buf [s * ROLLOUT_LEN + t] = returns[t] - pool.baseline[s];
+            mask_buf[s * ROLLOUT_LEN + t] = 1.0;
+            total_count += 1.0;
+        }
+    }
+
+    if total_count < 1.0 {
+        // Nothing accumulated yet — clear buffers and bail.
+        for s in 0..n { pool.buf_count[s] = 0; }
+        return;
+    }
+
+    // Build the GPU tensors.
+    let states_t = Tensor::<MyBackend, 3>::from_data(
+        TensorData::new(pool.buf_states.clone(),  [n, ROLLOUT_LEN, IN]),
+        &pool.device,
+    );
+    let actions_t = Tensor::<MyBackend, 3>::from_data(
+        TensorData::new(pool.buf_actions.clone(), [n, ROLLOUT_LEN, OUT]),
+        &pool.device,
+    );
+    let adv_t = Tensor::<MyBackend, 3>::from_data(
+        TensorData::new(adv_buf, [n, ROLLOUT_LEN, 1]),
+        &pool.device,
+    );
+    let mask_t = Tensor::<MyBackend, 3>::from_data(
+        TensorData::new(mask_buf, [n, ROLLOUT_LEN, 1]),
+        &pool.device,
+    );
+
+    // Per-slot loss scale = 0.5 / σ_s². Built as `[N, 1, 1]` so it
+    // broadcasts over the time + per-step axes when multiplied into
+    // the per-slot sum-of-squares.
+    let mut scale_buf = vec![0.0_f32; n];
+    for s in 0..n {
+        let sigma = pool.sigma[s].max(1e-3);
+        scale_buf[s] = 0.5 / (sigma * sigma);
+    }
+    let scale_t = Tensor::<MyBackend, 3>::from_data(
+        TensorData::new(scale_buf, [n, 1, 1]),
+        &pool.device,
+    );
+
+    let mu = pool.model.forward_rollout(states_t);          // [N, T, OUT]
+    let diff = actions_t - mu;
+    let sum_sq = diff.powf_scalar(2.0).sum_dim(2);          // [N, T, 1]
+    let loss = (sum_sq * adv_t * mask_t * scale_t).sum()
+                  .div_scalar(total_count);
+
+    let cm = pool.model.clone();
+    let gp = GradientsParams::from_grads(loss.backward(), &pool.model);
+    pool.model = pool.opt.step(LR, cm, gp);
+
+    // Reset per-slot buffers for the next rollout window.
+    for s in 0..n { pool.buf_count[s] = 0; }
 }

@@ -78,15 +78,15 @@ use burn::tensor::{Tensor, TensorData, backend::Backend};
 use burn_cuda::CudaDevice;
 use std::collections::HashMap;
 
-use crate::colony::{IntelligenceLevel, Organism, Photoautotroph, MAXIMUM_ORGANISMS};
+use crate::colony::{IntelligenceLevel, Organism, Photoautotroph};
 use crate::energy::get_max_energy;
 use crate::rl_helpers::{BrainInheritance, BrainRestore, MyBackend, PoolSnapshot, gaussian_noise};
-use crate::world_geometry::{MAP_MAX_X, MAP_MAX_Z};
+use crate::simulation_settings::OrganismPoolSize;
+use crate::world_geometry::MapSize;
 
 
 // ── Architecture constants ──────────────────────────────────────────────────
 
-const N:         usize = MAXIMUM_ORGANISMS;
 const IN:        usize = 5;
 const HIDDEN:    usize = 16;
 const OUT:       usize = 4;
@@ -137,14 +137,14 @@ pub struct PoolMlpL1Photo<B: Backend> {
 }
 
 impl<B: Backend> PoolMlpL1Photo<B> {
-    fn new(device: &B::Device) -> Self {
+    fn new(device: &B::Device, n: usize) -> Self {
         let w = Initializer::Uniform { min: -0.5, max: 0.5 };
         let z = Initializer::Zeros;
         Self {
-            w1: w.init([N, IN, HIDDEN], device),
-            b1: z.init([N, HIDDEN], device),
-            w2: w.init([N, HIDDEN, OUT], device),
-            b2: z.init([N, OUT], device),
+            w1: w.init([n, IN, HIDDEN], device),
+            b1: z.init([n, HIDDEN], device),
+            w2: w.init([n, HIDDEN, OUT], device),
+            b2: z.init([n, OUT], device),
         }
     }
 
@@ -210,21 +210,23 @@ pub struct BrainPoolL1Photo {
     /// the raw reward to give the advantage that scales the loss.
     baseline:     Vec<f32>,
     pub device:   CudaDevice,
+    pub n:        usize,
 }
 
 impl BrainPoolL1Photo {
-    fn new(device: CudaDevice) -> Self {
+    fn new(device: CudaDevice, n: usize) -> Self {
         Self {
-            model:       PoolMlpL1Photo::<MyBackend>::new(&device),
+            model:       PoolMlpL1Photo::<MyBackend>::new(&device, n),
             opt:         Box::new(AdamConfig::new().init()),
-            free:        (0..N as u32).rev().collect(),
-            map:         HashMap::with_capacity(N),
-            prev_state:  vec![0.0; N * IN],
-            prev_action: vec![0.0; N * OUT],
-            prev_energy: vec![0.0; N],
-            has_prev:    vec![false; N],
-            baseline:    vec![0.0; N],
+            free:        (0..n as u32).rev().collect(),
+            map:         HashMap::with_capacity(n),
+            prev_state:  vec![0.0; n * IN],
+            prev_action: vec![0.0; n * OUT],
+            prev_energy: vec![0.0; n],
+            has_prev:    vec![false; n],
+            baseline:    vec![0.0; n],
             device,
+            n,
         }
     }
 
@@ -330,10 +332,14 @@ impl BrainPoolL1Photo {
 }
 
 impl FromWorld for BrainPoolL1Photo {
-    fn from_world(_: &mut World) -> Self {
+    fn from_world(world: &mut World) -> Self {
+        let n = world
+            .get_resource::<OrganismPoolSize>()
+            .map(|r| r.0.max(1))
+            .unwrap_or(1);
         let device = CudaDevice::default();
-        warmup(&device);
-        Self::new(device)
+        warmup(&device, n);
+        Self::new(device, n)
     }
 }
 
@@ -341,13 +347,13 @@ impl FromWorld for BrainPoolL1Photo {
 /// Forward + backward + Adam step at the maximum batch shape so
 /// CubeCL caches every kernel the runtime tick will hit. Without
 /// this the first real tick stalls for several seconds JIT-ing.
-fn warmup(device: &CudaDevice) {
-    let m = PoolMlpL1Photo::<MyBackend>::new(device);
+fn warmup(device: &CudaDevice, n: usize) {
+    let m = PoolMlpL1Photo::<MyBackend>::new(device, n);
     let mut o: Box<dyn BrainOptL1Photo> = Box::new(AdamConfig::new().init());
-    let i        = Tensor::<MyBackend, 2>::zeros([N, IN],  device);
-    let action   = Tensor::<MyBackend, 2>::zeros([N, OUT], device);
-    let mask     = Tensor::<MyBackend, 2>::zeros([N, 1],   device);
-    let adv      = Tensor::<MyBackend, 2>::zeros([N, 1],   device);
+    let i        = Tensor::<MyBackend, 2>::zeros([n, IN],  device);
+    let action   = Tensor::<MyBackend, 2>::zeros([n, OUT], device);
+    let mask     = Tensor::<MyBackend, 2>::zeros([n, 1],   device);
+    let adv      = Tensor::<MyBackend, 2>::zeros([n, 1],   device);
     let out      = m.forward(i);
     let diff     = action - out;
     let sum_sq   = diff.powf_scalar(2.0).sum_dim(1);
@@ -442,6 +448,7 @@ pub fn free_brains_l1_photo(
 
 pub fn apply_intelligence_level_1_photo(
     time:           Res<Time<Virtual>>,
+    map_size:       Res<MapSize>,
     mut pool:       NonSendMut<BrainPoolL1Photo>,
     mut photos:     Query<(Entity, &mut Organism, &Transform, &BrainSlotL1Photo), With<Photoautotroph>>,
     mut input_buf:  Local<Vec<f32>>,
@@ -452,14 +459,14 @@ pub fn apply_intelligence_level_1_photo(
     if time.is_paused() { return; }
 
     // ── Step 1: read current state into the flat scratch buffer.
-    input_buf.clear();   input_buf.resize(N * IN, 0.0);
-    adv_buf.clear();     adv_buf.resize(N, 0.0);
-    mask_buf.clear();    mask_buf.resize(N, 0.0);
+    input_buf.clear();   input_buf.resize(pool.n * IN, 0.0);
+    adv_buf.clear();     adv_buf.resize(pool.n, 0.0);
+    mask_buf.clear();    mask_buf.resize(pool.n, 0.0);
     active_buf.clear();
 
     for (e, organism, transform, slot) in photos.iter() {
         let s = slot.0 as usize;
-        if s >= N { continue; }
+        if s >= pool.n { continue; }
         let pos = transform.translation;
 
         let in_sun_f = if organism.in_sunlight { 1.0 } else { 0.0 };
@@ -468,9 +475,9 @@ pub fn apply_intelligence_level_1_photo(
 
         let off = s * IN;
         input_buf[off    ] = in_sun_f;
-        input_buf[off + 1] = (pos.x / MAP_MAX_X).clamp(0.0, 1.0);
+        input_buf[off + 1] = (pos.x / map_size.x).clamp(0.0, 1.0);
         input_buf[off + 2] = (pos.y / Y_NORMALISATION).clamp(0.0, 1.0);
-        input_buf[off + 3] = (pos.z / MAP_MAX_Z).clamp(0.0, 1.0);
+        input_buf[off + 3] = (pos.z / map_size.z).clamp(0.0, 1.0);
         input_buf[off + 4] = energy_n;
 
         active_buf.push((e, slot.0, organism.energy));
@@ -479,7 +486,7 @@ pub fn apply_intelligence_level_1_photo(
 
     // ── Step 2: GPU forward over current state → μ_cur.
     let cur_t = Tensor::<MyBackend, 2>::from_data(
-        TensorData::new(input_buf.clone(), [N, IN]),
+        TensorData::new(input_buf.clone(), [pool.n, IN]),
         &pool.device,
     );
     let mu_cur = pool.model.forward(cur_t);
@@ -504,19 +511,19 @@ pub fn apply_intelligence_level_1_photo(
     // train against).
     if count > 0.0 {
         let prev_state_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(pool.prev_state.clone(), [N, IN]),
+            TensorData::new(pool.prev_state.clone(), [pool.n, IN]),
             &pool.device,
         );
         let prev_action_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(pool.prev_action.clone(), [N, OUT]),
+            TensorData::new(pool.prev_action.clone(), [pool.n, OUT]),
             &pool.device,
         );
         let adv_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(adv_buf.clone(), [N, 1]),
+            TensorData::new(adv_buf.clone(), [pool.n, 1]),
             &pool.device,
         );
         let mask_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(mask_buf.clone(), [N, 1]),
+            TensorData::new(mask_buf.clone(), [pool.n, 1]),
             &pool.device,
         );
 
@@ -529,6 +536,10 @@ pub fn apply_intelligence_level_1_photo(
         let cm = pool.model.clone();
         let gp = GradientsParams::from_grads(loss.backward(), &pool.model);
         pool.model = pool.opt.step(LR, cm, gp);
+        // Force burn-fusion to flush the queued backward + Adam ops so
+        // the lazy stream doesn't accumulate across ticks (see L1-hetero
+        // train_dqn for the full rationale).
+        let _ = pool.model.b2.val().into_data();
     }
 
     // ── Step 5: sample action, apply to organism, and stash prev_* for

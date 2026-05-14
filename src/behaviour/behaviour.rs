@@ -50,12 +50,10 @@ use crate::intelligence_level_1_photo::{
 use crate::intelligence_level_1_hetero::{
     BrainPoolL1Hetero, assign_brains_l1_hetero, free_brains_l1_hetero, apply_intelligence_level_1_hetero,
 };
-use crate::intelligence_level_2::{
-    BrainPoolL2, assign_brains_l2, free_brains_l2, apply_intelligence_level_2,
-};
-use crate::intelligence_level_3::{
-    BrainPoolL3, assign_brains_l3, free_brains_l3, apply_intelligence_level_3,
-};
+// Levels 2 and 3 are placeholder markers only — no pool, no systems
+// (see `intelligence_level_2.rs` / `intelligence_level_3.rs`). Initial
+// spawn rolls that would have produced L2/L3 are routed back to L1
+// inside `IntelligenceLevel::for_initial_spawn`.
 use crate::photosynthesis::PhotosynthesisPlugin;
 use crate::world_model::{WorldModelGrid, rebuild_world_model_grid};
 
@@ -114,21 +112,14 @@ impl Plugin for BehaviourPlugin {
         // ── Pool resources (non-send: CUDA state isn't Send). ───────
         app.init_non_send_resource::<BrainPoolL1Photo>();
         app.init_non_send_resource::<BrainPoolL1Hetero>();
-        app.init_non_send_resource::<BrainPoolL2>();
-        app.init_non_send_resource::<BrainPoolL3>();
 
         // ── PreUpdate: assign / free for every pool. ────────────────
-        // All four pools' assign systems read disjoint marker sets
-        // (Photoautotroph vs Heterotroph) and write disjoint slot
-        // components, so they can run in parallel — but each pool's
-        // assign must run before its free in the same tick to avoid
-        // a free→assign on the same slot index swapping order. Chain
-        // each pair, leave the four pairs unconstrained relative to
-        // each other.
+        // Two pools, two pairs. Each pool's `assign` runs before its
+        // `free` within a tick to avoid a recycled-slot ordering
+        // race; the two pairs are unconstrained relative to each
+        // other.
         app.add_systems(PreUpdate, (assign_brains_l1_photo,  free_brains_l1_photo) .chain());
         app.add_systems(PreUpdate, (assign_brains_l1_hetero, free_brains_l1_hetero).chain());
-        app.add_systems(PreUpdate, (assign_brains_l2,        free_brains_l2)       .chain());
-        app.add_systems(PreUpdate, (assign_brains_l3,        free_brains_l3)       .chain());
 
         // ── Update: split into a fast photo chain and a slow hetero
         // chain. They share no read/write set with each other (each
@@ -143,17 +134,15 @@ impl Plugin for BehaviourPlugin {
                 .run_if(on_timer(PHOTO_BRAIN_TICK_INTERVAL)),
         );
 
-        // Slow chain: world-model rebuild + every hetero pool apply,
-        // ~6.7 Hz. The chain ordering is load-bearing — rebuild must
-        // run before any hetero apply so they all read the same
-        // up-to-date grid in the same tick.
+        // Slow chain: world-model rebuild + the L1 hetero apply,
+        // ~6.7 Hz. The chain ordering is load-bearing — rebuild
+        // must run before the hetero apply so it reads the same
+        // up-to-date grid produced this tick.
         app.add_systems(
             Update,
             (
                 rebuild_world_model_grid,
                 apply_intelligence_level_1_hetero,
-                apply_intelligence_level_2,
-                apply_intelligence_level_3,
             )
                 .chain()
                 .run_if(on_timer(HETERO_BRAIN_TICK_INTERVAL)),

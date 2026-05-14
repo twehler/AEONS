@@ -1,7 +1,7 @@
 use crate::cell::*;
 use crate::frontend::ShowGizmo;
 use crate::volumetric_growth::{build_mesh_from_ocg, build_smoothed_mesh_from_ocg};
-use crate::world_geometry::{HeightmapSampler, MAP_MAX_X, MAP_MAX_Z};
+use crate::world_geometry::{HeightmapSampler, MapSize};
 use crate::movement::DirectionTimer;
 use bevy::prelude::*;
 use rand::prelude::*;
@@ -10,15 +10,10 @@ use rand::prelude::*;
 // keep finding Organism, OrganismRoot, OrganismKind, Photoautotroph, etc.
 pub use crate::organism::*;
 
-/// Hard cap on simulation population. Both brain pools size their tensors to
-/// this constant — exceeding it would silently miss organisms in the batched
-/// MLP forward pass.
-pub const MAXIMUM_ORGANISMS: usize = 30;
-
 /// Initial population of each trophic strategy. Photoautotrophs dominate so
 /// the food web has plenty of prey for the smaller heterotroph predator pool.
-const INITIAL_PHOTOAUTOTROPHS: u32 = 10;
-const INITIAL_HETEROTROPHS:    u32 = 1;
+const INITIAL_PHOTOAUTOTROPHS: u32 = 500;
+const INITIAL_HETEROTROPHS:    u32 = 80;
 
 /// Initial Krishi cohort size. `pub` so `krishi.rs` reads it directly —
 /// keeps every "how many of X spawn at startup" knob in one place.
@@ -37,8 +32,14 @@ impl Plugin for ColonyPlugin {
         // a path. Using `insert_resource` here would unconditionally
         // overwrite main.rs's value.
         app.init_resource::<ColonyLoadPath>();
+        app.init_resource::<crate::simulation_settings::AutoSpawnHeteros>();
+        app.init_resource::<crate::simulation_settings::MinHeteroCount>();
+        app.init_resource::<crate::simulation_settings::MinHeteroCountEditState>();
+        app.init_resource::<AutosaveTimer>();
         app.add_systems(Update, spawn_colony.run_if(resource_exists::<HeightmapSampler>));
         app.add_systems(Update, save_colony_system);
+        app.add_systems(Update, autosave_system);
+        app.add_systems(Update, auto_spawn_heteros);
     }
 }
 
@@ -108,7 +109,6 @@ pub struct ColonyLoadPath(pub Option<String>);
 // fully derivable from `cell_type` + `neighbour_count`, so a future loader
 // just calls `physiology::recompute_body_parts` after rehydrating.
 
-const SAVE_PATH:  &str    = "src/test.colony";
 /// Current save format magic.
 ///
 /// Version history:
@@ -128,13 +128,22 @@ const SAVE_MAGIC:             &[u8;8] = b"AEONS003";
 const SAVE_MAGIC_LEGACY_V002: &[u8;8] = b"AEONS002";
 const SAVE_MAGIC_LEGACY_V001: &[u8;8] = b"AEONS001";
 
-/// One-shot resource: when set to `true`, `save_colony_system` writes the
-/// current world to `SAVE_PATH` on the next Update tick and resets the
-/// flag. The Save button in the statistics panel is the only place that
-/// flips it on; the user-facing pause it requests is handled by the same
-/// click handler.
+/// One-shot resource: when set to `Some(path)`, `save_colony_system`
+/// writes the current world to that path on the next Update tick and
+/// resets the resource to `None`.
+///
+/// Two producers set this:
+///   * The Save button in the statistics panel opens an rfd
+///     "Save As" dialog and stores the user's chosen path.
+///   * `autosave_system` (also in `colony.rs`) fires on a real-time
+///     timer and stores an `autosaves/autosave_<timestamp>.colony`
+///     path.
+///
+/// If both fire on the same tick the later one wins. Acceptable —
+/// autosaves are 5 minutes apart by default, collisions are vanishingly
+/// rare and harmless either way.
 #[derive(Resource, Default)]
-pub struct SaveRequested(pub bool);
+pub struct SaveRequested(pub Option<std::path::PathBuf>);
 
 
 fn save_colony_system(
@@ -149,19 +158,16 @@ fn save_colony_system(
     // that the per-organism brain extraction is pure CPU work.
     pool_l1p: NonSend<crate::intelligence_level_1_photo::BrainPoolL1Photo>,
     pool_l1h: NonSend<crate::intelligence_level_1_hetero::BrainPoolL1Hetero>,
-    pool_l2:  NonSend<crate::intelligence_level_2::BrainPoolL2>,
-    pool_l3:  NonSend<crate::intelligence_level_3::BrainPoolL3>,
 ) {
-    if !save_requested.0 { return; }
-    save_requested.0 = false;
+    let Some(target_path) = save_requested.0.take() else { return };
 
     // ── Pool snapshots — one set of GPU→CPU transfers per pool. ──
     // Doing this up front (vs per-organism) drops the cost from
     // O(organisms × 4) GPU syncs to O(pools × 4) = 16 total.
     let snap_l1p = pool_l1p.snapshot();
     let snap_l1h = pool_l1h.snapshot();
-    let snap_l2  = pool_l2 .snapshot();
-    let snap_l3  = pool_l3 .snapshot();
+    // L2 / L3 pools removed during the L1 rewrite — placeholders only.
+    // Their save dispatch path emits `brain_present = 0` below.
 
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     buf.extend_from_slice(SAVE_MAGIC);
@@ -256,11 +262,14 @@ fn save_colony_system(
         // = 0` and the loader will recreate the slot with the
         // pool's default / recycled weights.
         let brain_data = match (org.intelligence_level, is_photo, is_hetero) {
-            (IntelligenceLevel::Level0, _, _) => None,
+            (IntelligenceLevel::Level0, _, _)        => None,
             (IntelligenceLevel::Level1, true,  _   ) => snap_l1p.extract(entity),
             (IntelligenceLevel::Level1, false, true) => snap_l1h.extract(entity),
-            (IntelligenceLevel::Level2, false, true) => snap_l2 .extract(entity),
-            (IntelligenceLevel::Level3, false, true) => snap_l3 .extract(entity),
+            // L2 / L3 are placeholder-only after the L1 rewrite — no
+            // pool to extract from. The loader handles `brain_present
+            // = 0` by leaving the slot at default weights.
+            (IntelligenceLevel::Level2, _, _)        => None,
+            (IntelligenceLevel::Level3, _, _)        => None,
             _ => None,  // shouldn't happen — defensive
         };
         match brain_data {
@@ -286,10 +295,71 @@ fn save_colony_system(
         }
     }
 
-    match std::fs::write(SAVE_PATH, &buf) {
-        Ok(())  => info!("colony saved to {} — {} organisms, {} bytes", SAVE_PATH, count, buf.len()),
-        Err(e)  => error!("failed to save colony to {}: {}", SAVE_PATH, e),
+    // Ensure the parent directory exists (autosave path is
+    // `autosaves/...`, which may not have been created yet).
+    if let Some(parent) = target_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                error!("failed to create save directory {}: {}", parent.display(), e);
+                return;
+            }
+        }
     }
+
+    match std::fs::write(&target_path, &buf) {
+        Ok(())  => info!("colony saved to {} — {} organisms, {} bytes",
+                        target_path.display(), count, buf.len()),
+        Err(e)  => error!("failed to save colony to {}: {}",
+                          target_path.display(), e),
+    }
+}
+
+
+// ── Autosave ────────────────────────────────────────────────────────────────
+//
+// Real-time timer-driven autosave. Every `AUTOSAVE_INTERVAL_SECS` of
+// wall-clock time (not virtual time — backups should keep firing at a
+// predictable cadence even at 10× sim speed or while paused-but-running
+// brains) the system populates `SaveRequested(Some(...))` with a
+// timestamped path under `autosaves/`. The actual write happens next
+// tick in `save_colony_system`.
+//
+// Cross-platform: `std::fs::create_dir_all` works on Linux, Windows,
+// and macOS. The folder is `autosaves` relative to the current working
+// directory (i.e. the repo root when launching via `cargo run`).
+
+/// Per-app timer state for the autosave loop. Stores the count-down
+/// to the next autosave fire. Resets to `AUTOSAVE_INTERVAL_SECS`
+/// every time we trigger.
+#[derive(Resource)]
+pub struct AutosaveTimer {
+    pub remaining_secs: f32,
+}
+
+impl Default for AutosaveTimer {
+    fn default() -> Self {
+        Self { remaining_secs: (crate::simulation_settings::AUTOSAVE_INTERVAL_MINUTES * 60.0) }
+    }
+}
+
+pub fn autosave_system(
+    real_time:          Res<Time<bevy::time::Real>>,
+    mut timer:          ResMut<AutosaveTimer>,
+    mut save_requested: ResMut<SaveRequested>,
+) {
+    timer.remaining_secs -= real_time.delta_secs();
+    if timer.remaining_secs > 0.0 { return; }
+    timer.remaining_secs = (crate::simulation_settings::AUTOSAVE_INTERVAL_MINUTES * 60.0);
+
+    // Skip if a save is already pending — avoids clobbering the
+    // user's just-chosen Save-As path before the writer has had a
+    // chance to consume it.
+    if save_requested.0.is_some() { return; }
+
+    let now = chrono::Local::now();
+    let filename = format!("autosave_{}.colony", now.format("%d-%m-%Y-%H-%M-%S"));
+    let path = std::path::Path::new("autosaves").join(filename);
+    save_requested.0 = Some(path);
 }
 
 
@@ -523,6 +593,9 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
             in_sunlight,
             reproduced,
             reproductions,
+            // predations is brain-side bookkeeping only — not part of
+            // the .colony save format. Always zero on load.
+            predations: 0,
             movement_speed,
             movement_direction,
             velocity,
@@ -737,12 +810,22 @@ fn spawn_colony(
     heightmap:       Res<HeightmapSampler>,
     load_path:       Res<ColonyLoadPath>,
     smoothing:       Res<crate::simulation_settings::Smoothing>,
+    map_size:        Res<MapSize>,
     mut spawned:     Local<bool>,
 ) {
     if *spawned { return; }
     *spawned = true;
 
     let materials = OrganismMaterials::new(&mut materials);
+    // Mirror the OrganismMaterials into a Resource so runtime spawners
+    // (`auto_spawn_heteros`) can reuse the same handles without
+    // rebuilding the StandardMaterials. Clone is cheap — each field is
+    // a Handle<StandardMaterial>.
+    commands.insert_resource(OrganismMaterials {
+        photo:      materials.photo.clone(),
+        hetero:     materials.hetero.clone(),
+        debug_blue: materials.debug_blue.clone(),
+    });
     let mut rng = rand::rng();
 
     // If a colony save file was supplied on the command line, try to
@@ -766,8 +849,8 @@ fn spawn_colony(
     }
 
     for _ in 0..INITIAL_PHOTOAUTOTROPHS {
-        let x = rng.random_range(0.0_f32..MAP_MAX_X);
-        let z = rng.random_range(0.0_f32..MAP_MAX_Z);
+        let x = rng.random_range(0.0_f32..map_size.x);
+        let z = rng.random_range(0.0_f32..map_size.z);
         let y = heightmap.height_at(x, z) + 1.0;
 
         // 80% of photoautotrophs are variable-form: NoSymmetry,
@@ -828,16 +911,9 @@ fn spawn_colony(
         );
     }
 
-    // Heterotroph-movement RL debug mode seeds a single heterotroph so the
-    // training environment is isolated to one subject.
-    let heterotroph_count = if crate::simulation_settings::HETEROTROPH_MOVEMENT_AI_DEBUGGING {
-        INITIAL_HETEROTROPHS
-    } else {
-        1
-    };
-    for _ in 0..heterotroph_count {
-        let x = rng.random_range(0.0_f32..MAP_MAX_X);
-        let z = rng.random_range(0.0_f32..MAP_MAX_Z);
+    for _ in 0..INITIAL_HETEROTROPHS {
+        let x = rng.random_range(0.0_f32..map_size.x);
+        let z = rng.random_range(0.0_f32..map_size.z);
         let y = heightmap.height_at(x, z) + 1.0;
         // Single bilateral body part — see comment for the
         // photoautotroph cohort above.
@@ -898,6 +974,11 @@ pub fn root_body_part_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> BodyPart {
 
 /// Set of shared StandardMaterial handles passed to `spawn_organism`. Sharing
 /// one handle per (kind × debug-flag) pair keeps GPU bind-group churn minimal.
+///
+/// Stored as a `Resource` so runtime spawners (`auto_spawn_heteros`,
+/// editor-mode placement) can reuse the same handles without rebuilding
+/// the `StandardMaterial`s. `spawn_colony` populates it on first run.
+#[derive(Resource)]
 pub struct OrganismMaterials {
     pub photo:       Handle<StandardMaterial>,
     pub hetero:      Handle<StandardMaterial>,
@@ -1010,6 +1091,7 @@ pub fn spawn_organism(
         in_sunlight: false,
         reproduced: false,
         reproductions: 0,
+        predations: 0,
         movement_speed: speed,
         movement_direction: direction,
         velocity: Vec3::ZERO,
@@ -1113,4 +1195,84 @@ pub fn spawn_organism(
     }
 
     root
+}
+
+
+// ── Auto-spawn heterotrophs ─────────────────────────────────────────────────
+//
+// Tops the heterotroph population up to `MinHeteroCount` whenever a
+// heterotroph death event fires AND `AutoSpawnHeteros(true)`.
+//
+// Zero-overhead in the steady state: `RemovedComponents<Heterotroph>`
+// is empty between actual death events, so the early-return after the
+// flag check costs nothing. When the flag is off we drain the reader
+// once to avoid event backlog growth.
+//
+// Newly spawned organisms have no `BrainInheritance` component, so the
+// brain pool's slot-assign path samples fresh random hyperparameter
+// genes (see `intelligence_level_1_hetero::assign_brains_l1_hetero`)
+// rather than inheriting from any parent.
+pub fn auto_spawn_heteros(
+    auto:           Res<crate::simulation_settings::AutoSpawnHeteros>,
+    min_count:      Res<crate::simulation_settings::MinHeteroCount>,
+    mut removed:    RemovedComponents<Heterotroph>,
+    heteros:        Query<(), With<Heterotroph>>,
+    org_mats:       Option<Res<OrganismMaterials>>,
+    heightmap:      Option<Res<HeightmapSampler>>,
+    map_size:       Option<Res<MapSize>>,
+    smoothing:      Option<Res<crate::simulation_settings::Smoothing>>,
+    mut commands:   Commands,
+    mut meshes:     ResMut<Assets<Mesh>>,
+) {
+    if !auto.0 {
+        for _ in removed.read() {}
+        return;
+    }
+
+    let dead = removed.read().count();
+    if dead == 0 { return; }
+
+    let (Some(org_mats), Some(heightmap), Some(map_size), Some(smoothing)) =
+        (org_mats, heightmap, map_size, smoothing) else { return };
+
+    let current = heteros.iter().count();
+    if current >= min_count.0 { return; }
+    let to_spawn = min_count.0 - current;
+
+    let mut rng = rand::rng();
+    for _ in 0..to_spawn {
+        let x = rng.random_range(0.0_f32..map_size.x);
+        let z = rng.random_range(0.0_f32..map_size.z);
+        let y = heightmap.height_at(x, z) + 1.0;
+
+        let right_seed = vec![(
+            0usize,
+            Vec3::new(crate::body_part::MIN_X_BILATERAL, 0.0, 0.0),
+            CellType::NonPhoto,
+        )];
+        let body_parts = vec![
+            crate::body_part::bilateral_body_part_from_right_ocg(&right_seed)
+        ];
+        let max_e = 2.0 * crate::energy::MAX_ENERGY_PER_CELL;
+        let intel = IntelligenceLevel::for_initial_spawn(
+            OrganismKind::Heterotroph,
+            false,
+            &mut rng,
+        );
+        spawn_organism(
+            Vec3::new(x, y, z),
+            body_parts,
+            OrganismKind::Heterotroph,
+            Symmetry::Bilateral,
+            false, // has_variable_form
+            false, // is_sessile
+            intel,
+            smoothing.0,
+            max_e * 0.5,
+            &mut commands,
+            &mut meshes,
+            &org_mats,
+            &mut rng,
+        );
+    }
 }

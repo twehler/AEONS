@@ -2,8 +2,8 @@
 //
 // Plain absolute-positioned panels overlaying the 3D viewport
 // (which renders directly to the window — no off-screen image,
-// no flex resizing). Two panels: bottom (creation) + right
-// (inventory).
+// no flex resizing). Three side panels: bottom (creation), right
+// (inventory), left (tools).
 //
 // A 2D camera with a higher render order than the 3D camera owns
 // the UI compositing pass.
@@ -13,6 +13,7 @@ use bevy::prelude::*;
 use crate::colony_editor::session::DraftOrganism;
 use crate::colony_editor::creation_panel;
 use crate::colony_editor::inventory_panel;
+use crate::colony_editor::tool_panel;
 
 
 /// Shared background colour for both panels — slightly darker than
@@ -54,6 +55,7 @@ fn setup_ui(mut commands: Commands, draft: Local<DraftOrganism>) {
             Pickable::IGNORE,
         ))
         .with_children(|root| {
+            tool_panel::spawn(root);
             inventory_panel::spawn(root);
             creation_panel::spawn(root, *draft);
         });

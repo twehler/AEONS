@@ -15,8 +15,8 @@ const NON_PHOTO_CONSUMPTION_PER_CELL: f32 = 0.01;
 
 // Movement-cost coefficients tuned so a max-speed (20) sprint is heavily
 // punitive on heavy organisms but doesn't immediately kill them.
-const K_GROUND_FRICTION: f32 = 0.008;
-const K_FLUID_DRAG:      f32 = 0.005;
+const K_GROUND_FRICTION: f32 = 0.003;
+const K_FLUID_DRAG:      f32 = 0.03;
 
 /// Energy cost per metre of elevation gained — the gravitational-PE
 /// analogue. Charged on every climb step accumulated since the last energy
@@ -84,15 +84,26 @@ fn manage_energy(
         let speed  = organism.movement_speed;
         let weight = organism.weight();
 
-        // Ground friction power ∝ weight × speed.
-        let friction_cost = ground_fraction
-            * (K_GROUND_FRICTION * weight * speed)
-            * ENERGY_TICK_INTERVAL;
-
-        // Fluid drag power ∝ weight^(2/3) × speed³ (square–cube area, drag ∝ v²).
-        let fluid_cost = submersion
-            * (K_FLUID_DRAG * weight.powf(2.0 / 3.0) * speed.powi(3))
-            * ENERGY_TICK_INTERVAL;
+        // Ground friction power ∝ weight × speed, and fluid drag
+        // power ∝ weight^(2/3) × speed³ (square–cube area, drag ∝ v²).
+        // Both terms are gated by `MOVEMENT_ENERGY_COSTS_ENABLED`
+        // so the RL training environment can switch them off and
+        // test whether movement-cost punishment is what's keeping
+        // the policy from learning to pursue prey. Per-cell upkeep
+        // and climb-cost are NOT gated — they're not movement
+        // expressions.
+        let (friction_cost, fluid_cost) =
+            if crate::simulation_settings::MOVEMENT_ENERGY_COSTS_ENABLED {
+                let friction = ground_fraction
+                    * (K_GROUND_FRICTION * weight * speed)
+                    * ENERGY_TICK_INTERVAL;
+                let fluid = submersion
+                    * (K_FLUID_DRAG * weight.powf(2.0 / 3.0) * speed.powi(3))
+                    * ENERGY_TICK_INTERVAL;
+                (friction, fluid)
+            } else {
+                (0.0, 0.0)
+            };
 
         // Photosynthesis is owned by `physiology.rs` now (per-cell,
         // neighbour-count-weighted). Only consumption + clamp + starvation
@@ -106,12 +117,11 @@ fn manage_energy(
         organism.energy = (organism.energy - consumption).clamp(0.0, max_energy);
 
         if organism.energy <= 0.0 {
-            // Heterotroph-movement RL debug mode: keep starved heterotrophs
-            // alive (energy stays clamped at 0) so the training environment
-            // can keep running without losing the subject. Hunger still
-            // accrues — only the despawn step is suppressed.
+            // AI training mode: keep starved heterotrophs alive (energy
+            // stays clamped at 0) so the RL training cohort isn't lost.
+            // Hunger still accrues; only the despawn step is suppressed.
             let suppress_despawn = is_hetero
-                && !crate::simulation_settings::HETEROTROPH_MOVEMENT_AI_DEBUGGING;
+                && crate::simulation_settings::AI_TRAINING_MODE;
             if !suppress_despawn {
                 commands.entity(entity).despawn();
             }

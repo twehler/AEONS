@@ -12,6 +12,7 @@ use crate::colony_editor::session::EditorSession;
 use crate::colony_editor::layout::PANEL_BG_COLOR;
 use crate::colony_editor::template::{form_label, intel_label, sym_label, OrganismTemplate};
 use crate::colony_editor::creation_panel::BOTTOM_PANEL_HEIGHT_PX;
+use crate::colony_editor::undo::{EditorAction, UndoStack};
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -36,6 +37,11 @@ const BACK_BTN_HEIGHT:  f32 = 30.0;
 const BACK_BTN_COLOR:   Color = Color::srgb(0.30, 0.30, 0.32);
 const BACK_BTN_HOVER:   Color = Color::srgb(0.40, 0.40, 0.42);
 
+// Clear All — destructive action, dim red.
+const CLEAR_BTN_HEIGHT: f32   = 32.0;
+const CLEAR_BTN_COLOR:  Color = Color::srgb(0.55, 0.20, 0.20);
+const CLEAR_BTN_HOVER:  Color = Color::srgb(0.70, 0.26, 0.26);
+
 
 // ── Marker components ───────────────────────────────────────────────────────
 
@@ -54,6 +60,9 @@ struct SaveButton;
 #[derive(Component)]
 struct ReturnButton;
 
+#[derive(Component)]
+struct ClearAllButton;
+
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
@@ -66,6 +75,7 @@ impl Plugin for InventoryPanelPlugin {
             handle_row_clicks,
             handle_save_button,
             handle_return_button,
+            handle_clear_all_button,
         ));
     }
 }
@@ -162,6 +172,33 @@ pub fn spawn(parent: &mut ChildSpawnerCommands) {
                 },
                 ScrollPosition::default(),
             ));
+
+            // ── Clear All — sits at the very bottom of the panel
+            //    below the scroll list. Destructive (dim red) so it
+            //    reads as different from the calm-blue Save above.
+            //    Wipes every template; reversible with Ctrl+Z.
+            panel
+                .spawn((
+                    ClearAllButton,
+                    Button,
+                    Node {
+                        width:           Val::Percent(100.0),
+                        height:          Val::Px(CLEAR_BTN_HEIGHT),
+                        margin:          UiRect::top(Val::Px(6.0)),
+                        align_items:     AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    },
+                    BackgroundColor(CLEAR_BTN_COLOR),
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        Text::new("Clear All"),
+                        TextFont { font_size: 13.0, ..default() },
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
+                });
         });
 }
 
@@ -310,6 +347,38 @@ fn handle_return_button(
             }
             Interaction::Hovered => *bg = BackgroundColor(BACK_BTN_HOVER),
             Interaction::None    => *bg = BackgroundColor(BACK_BTN_COLOR),
+        }
+    }
+}
+
+fn handle_clear_all_button(
+    mut interactions: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<ClearAllButton>)>,
+    mut session:      ResMut<EditorSession>,
+    mut undo_stack:   ResMut<UndoStack>,
+    mut commands:     Commands,
+) {
+    for (interaction, mut bg) in &mut interactions {
+        match *interaction {
+            Interaction::Pressed => {
+                *bg = BackgroundColor(CLEAR_BTN_HOVER);
+                if session.templates.is_empty() { continue; }
+
+                // Drain every template, despawn each visual entity,
+                // and snapshot the lot onto the undo stack so Ctrl+Z
+                // can restore them. `next_id` is INTENTIONALLY not
+                // reset — keeps the identifier sequence monotonic so
+                // restored templates can't clash with templates
+                // created between Clear and the eventual undo.
+                let removed: Vec<OrganismTemplate> = session.templates.drain(..).collect();
+                for t in &removed {
+                    commands.entity(t.entity).despawn();
+                }
+                session.active_id = None;
+                session.dirty     = true;
+                undo_stack.push(EditorAction::Cleared(removed));
+            }
+            Interaction::Hovered => *bg = BackgroundColor(CLEAR_BTN_HOVER),
+            Interaction::None    => *bg = BackgroundColor(CLEAR_BTN_COLOR),
         }
     }
 }

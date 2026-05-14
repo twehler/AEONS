@@ -506,6 +506,7 @@ fn spawn_volumetric_mesh(
             in_sunlight: false,
             reproduced: false,
             reproductions: 0,
+            predations: 0,
             movement_speed: 0.0,
             movement_direction: Vec3::ZERO,
             velocity: Vec3::ZERO,

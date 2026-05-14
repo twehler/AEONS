@@ -91,10 +91,16 @@ impl IntelligenceLevel {
                 IntelligenceLevel::Level1
             }
             OrganismKind::Heterotroph => {
-                let r = rng.random::<f32>();
-                if      r < 0.5 { IntelligenceLevel::Level1 }
-                else if r < 0.9 { IntelligenceLevel::Level2 }
-                else            { IntelligenceLevel::Level3 }
+                // Levels 2 and 3 are placeholder-only after the L1
+                // rewrite (see `intelligence_level_2.rs` /
+                // `intelligence_level_3.rs`). All mobile heterotroph
+                // initial-spawn rolls collapse to Level 1 so no
+                // brain-less organism is ever produced. Save files
+                // that record explicit Level2 / Level3 values still
+                // load with the level preserved — only the random
+                // roll changed.
+                let _ = rng.random::<f32>();
+                IntelligenceLevel::Level1
             }
         }
     }
@@ -163,6 +169,17 @@ pub struct Organism {
     /// to decide when to flip `reproduced` (heterotrophs flip after the
     /// first, photoautotrophs after the second).
     pub reproductions: u8,
+    /// Running count of successful predation events (body parts eaten by
+    /// THIS organism, only meaningful for heterotrophs). Incremented by
+    /// `predation_system` on every eat. Read by the Level 1 hetero brain
+    /// as the eat-event reward signal (compared per-tick against its
+    /// stored `prev_predations`) — this replaced the old "energy spike
+    /// = eat" heuristic, which fired false positives on any energy
+    /// gain and missed events that were immediately drained back.
+    /// Saturating-wraps at `u8::MAX`; for the brain that's irrelevant
+    /// since it only reads the per-tick delta. Not currently saved to
+    /// `.colony` files (resets to 0 on load).
+    pub predations: u8,
     pub movement_speed: f32,
     pub movement_direction: Vec3,
     pub velocity: Vec3,

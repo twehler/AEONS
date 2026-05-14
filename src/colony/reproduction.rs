@@ -15,7 +15,7 @@ use crate::body_part::{self, Attachment};
 use crate::cell::*;
 use crate::colony::*;
 use crate::energy::MAX_ENERGY_PER_CELL;
-use crate::world_geometry::{HeightmapSampler, MAP_MAX_X, MAP_MAX_Z};
+use crate::world_geometry::{HeightmapSampler, MapSize};
 
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -71,6 +71,8 @@ fn reproduction_system(
     mut materials:  ResMut<Assets<StandardMaterial>>,
     heightmap:      Option<Res<HeightmapSampler>>,
     smoothing:      Res<crate::simulation_settings::Smoothing>,
+    map_size:       Res<MapSize>,
+    max_organisms:  Res<crate::simulation_settings::MaxOrganisms>,
     mut query:      Query<
         (Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>),
         With<OrganismRoot>,
@@ -79,9 +81,13 @@ fn reproduction_system(
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
+    // Soft cap (runtime resource). The statistics panel already clamps
+    // commits to `OrganismPoolSize` (brain-pool batch dim chosen at
+    // startup), so we can read it without additional defence here.
+    let cap = max_organisms.0;
     let current_pop = query.iter().count();
-    if current_pop >= MAXIMUM_ORGANISMS { return; }
-    let spawn_budget = MAXIMUM_ORGANISMS - current_pop;
+    if current_pop >= cap { return; }
+    let spawn_budget = cap - current_pop;
 
     let mut pending_births: Vec<PendingBirth> = Vec::new();
     let mut rng = rand::rng();
@@ -91,11 +97,11 @@ fn reproduction_system(
 
         if organism.reproduced { continue; }
 
-        // Heterotroph-movement RL debug mode: heterotrophs do not reproduce
-        // so the training population stays at the seeded count. Photoautotrophs
-        // still reproduce normally so prey continues to repopulate.
+        // AI training mode: heterotrophs do not reproduce so the
+        // training cohort stays at the seeded identity set. Photoautotrophs
+        // still reproduce normally so prey keeps repopulating.
         if is_hetero
-            && !crate::simulation_settings::HETEROTROPH_MOVEMENT_AI_DEBUGGING
+            && crate::simulation_settings::AI_TRAINING_MODE
         {
             continue;
         }
@@ -208,8 +214,8 @@ fn reproduction_system(
             }
         };
 
-        let spawn_x = rng.random_range(0.0..MAP_MAX_X);
-        let spawn_z = rng.random_range(0.0..MAP_MAX_Z);
+        let spawn_x = rng.random_range(0.0..map_size.x);
+        let spawn_z = rng.random_range(0.0..map_size.z);
         // Spawn on the ground at the chosen XZ, with a 1.0-unit clearance
         // mirroring the initial colony spawn (`spawn_colony`). Falling back
         // to the parent's Y if the heightmap resource hasn't been inserted

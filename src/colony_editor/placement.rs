@@ -24,8 +24,9 @@ use crate::camera::{EditorCamera, ViewportClick};
 use crate::colony_editor::session::EditorSession;
 use crate::colony_editor::template::OrganismTemplate;
 use crate::colony_editor::template_marker::EditorTemplateMarker;
+use crate::colony_editor::undo::{EditorAction, UndoStack};
 use crate::volumetric_growth::build_smoothed_mesh_from_ocg;
-use crate::world_geometry::{HeightmapSampler, HEIGHTMAP_CELL_SIZE, MAP_MAX_X, MAP_MAX_Z};
+use crate::world_geometry::{HeightmapSampler, HEIGHTMAP_CELL_SIZE, MapSize};
 
 
 /// Maximum march distance along the camera ray. Past this we give up
@@ -53,11 +54,12 @@ impl Plugin for PlacementPlugin {
 // ── Right-click: delete the organism under the cursor ──────────────────────
 
 fn handle_right_click(
-    buttons:     Res<ButtonInput<MouseButton>>,
-    windows:     Query<&Window, With<PrimaryWindow>>,
-    cam_q:       Query<(&Camera, &GlobalTransform), With<EditorCamera>>,
-    mut session: ResMut<EditorSession>,
-    mut commands: Commands,
+    buttons:        Res<ButtonInput<MouseButton>>,
+    windows:        Query<&Window, With<PrimaryWindow>>,
+    cam_q:          Query<(&Camera, &GlobalTransform), With<EditorCamera>>,
+    mut session:    ResMut<EditorSession>,
+    mut commands:   Commands,
+    mut undo_stack: ResMut<UndoStack>,
 ) {
     if !buttons.just_pressed(MouseButton::Right) { return; }
 
@@ -94,6 +96,9 @@ fn handle_right_click(
         session.active_id = None;
     }
     session.dirty = true;
+    // Snapshot the removed template (including its trait set and
+    // last-seen position) so Ctrl+Z can rebuild it.
+    undo_stack.push(EditorAction::Deleted(removed));
 }
 
 
@@ -125,13 +130,15 @@ fn ray_hits_sphere(
 // ── Left-click: create a new template at the surface point ─────────────────
 
 fn handle_left_click(
-    mut clicks:    MessageReader<ViewportClick>,
-    cam_q:         Query<(&Camera, &GlobalTransform), With<EditorCamera>>,
-    heightmap:     Res<HeightmapSampler>,
-    mut session:   ResMut<EditorSession>,
-    mut commands:  Commands,
-    mut meshes:    ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut clicks:     MessageReader<ViewportClick>,
+    cam_q:          Query<(&Camera, &GlobalTransform), With<EditorCamera>>,
+    heightmap:      Res<HeightmapSampler>,
+    map_size:       Res<MapSize>,
+    mut session:    ResMut<EditorSession>,
+    mut commands:   Commands,
+    mut meshes:     ResMut<Assets<Mesh>>,
+    mut materials:  ResMut<Assets<StandardMaterial>>,
+    mut undo_stack: ResMut<UndoStack>,
 ) {
     // Drain everything; only the most recent click is meaningful, but
     // we don't want stale events accumulating.
@@ -149,65 +156,79 @@ fn handle_left_click(
 
     let Ok((camera, cam_xf)) = cam_q.single() else { return };
     let Ok(ray) = camera.viewport_to_world(cam_xf, click.cursor) else { return };
-    let Some(hit) = ray_hit_heightmap(ray.origin, *ray.direction, &heightmap) else { return };
+    let Some(hit) = ray_hit_heightmap(ray.origin, *ray.direction, &heightmap, *map_size) else { return };
 
-    spawn_template_at(hit, &mut session, &mut commands, &mut meshes, &mut materials);
+    let id = spawn_template_at(hit, &mut session, &mut commands, &mut meshes, &mut materials);
+    undo_stack.push(EditorAction::Created(vec![id]));
 }
 
 
-/// Push a new `OrganismTemplate` onto the session's list, spawn its
-/// visual marker entity at `position`, and select it as the active
-/// placement target.
+/// Create the visual entity for a given template snapshot. Pure
+/// rendering: builds the mesh + material, spawns a marker-tagged
+/// entity, and returns the new `Entity`. Does NOT touch
+/// `session.templates`, `active_id`, or `dirty` — that bookkeeping
+/// is the caller's responsibility.
 ///
-/// The visual is the same rhombic-dodecahedron mesh the simulation
-/// uses for an adult organism — built by feeding the template's OCG
-/// (single cell or bilateral pair) through
-/// `build_smoothed_mesh_from_ocg`. This lets the user see exactly
-/// how the organism will look in-sim while choosing positions.
-fn spawn_template_at(
+/// `pub(super)` so the undo handler in `undo.rs` can reuse it to
+/// restore a deleted template (the undo path re-inserts the
+/// snapshot into `session.templates` itself, with a fresh entity
+/// returned by this function).
+pub(super) fn respawn_template(
+    template:  &OrganismTemplate,
+    commands:  &mut Commands,
+    meshes:    &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+) -> Entity {
+    let ocg = template.build_ocg();
+    let mesh    = meshes.add(build_smoothed_mesh_from_ocg(&ocg));
+    let colour  = template.metabolism.preview_colour();
+    let material = materials.add(StandardMaterial {
+        base_color: colour,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        Transform::from_translation(template.position),
+        EditorTemplateMarker(template.id),
+    )).id()
+}
+
+/// Push a new `OrganismTemplate` (built from the current draft) onto
+/// the session's list, spawn its visual marker entity at `position`,
+/// and select it as the active placement target. Returns the new
+/// template's id so callers can record a `Created` entry on the
+/// undo stack.
+///
+/// `pub(super)` so the tool panel's Bulk-Add button can call this
+/// from its sibling module — left-click placement and bulk-add
+/// share the exact same per-template spawn pipeline.
+pub(super) fn spawn_template_at(
     position:  Vec3,
     session:   &mut ResMut<EditorSession>,
     commands:  &mut Commands,
     meshes:    &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
-) {
+) -> u32 {
     let draft = session.draft;
     session.next_id += 1;
     let id = session.next_id;
 
-    // Build the OCG (1 or 2 cells) and turn it into the same mesh
-    // the simulation would render for an adult organism with this
-    // body plan. `build_smoothed_mesh_from_ocg` runs the Jacobi
-    // smoother once at construction time — no per-frame cost.
-    let preview = OrganismTemplate {
+    let template = OrganismTemplate {
         id,
         metabolism:   draft.metabolism,
         intelligence: draft.intelligence,
         symmetry:     draft.symmetry,
         form:         draft.form,
         position,
-        // The entity field is filled in below; this placeholder is
-        // never read because we only call `build_ocg` on it here.
+        // Placeholder — overwritten with the real entity below.
         entity:       Entity::PLACEHOLDER,
     };
-    let ocg = preview.build_ocg();
-    let mesh    = meshes.add(build_smoothed_mesh_from_ocg(&ocg));
-    let colour  = draft.metabolism.preview_colour();
-    let material = materials.add(StandardMaterial {
-        base_color: colour,
-        ..default()
-    });
-
-    let entity = commands.spawn((
-        Mesh3d(mesh),
-        MeshMaterial3d(material),
-        Transform::from_translation(position),
-        EditorTemplateMarker(id),
-    )).id();
-
-    session.templates.push(OrganismTemplate { entity, ..preview });
+    let entity = respawn_template(&template, commands, meshes, materials);
+    session.templates.push(OrganismTemplate { entity, ..template });
     session.active_id = Some(id);
     session.dirty     = true;
+    id
 }
 
 
@@ -216,13 +237,14 @@ fn spawn_template_at(
 /// within `MAX_RAY_DISTANCE` (e.g. the ray points up into the sky, or
 /// horizontally past the map edge).
 ///
-/// We only consider hits inside `[0, MAP_MAX_X] × [0, MAP_MAX_Z]` —
+/// We only consider hits inside `[0, map_size.x] × [0, map_size.z]` —
 /// the heightmap clamps to its border outside this rect, so a hit
 /// reported outside the map's footprint would feel wrong.
 fn ray_hit_heightmap(
     origin:    Vec3,
     direction: Vec3,
     heightmap: &HeightmapSampler,
+    map_size:  MapSize,
 ) -> Option<Vec3> {
     if direction.length_squared() < 1e-12 { return None; }
     let dir = direction.normalize();
@@ -232,8 +254,8 @@ fn ray_hit_heightmap(
 
     while t < MAX_RAY_DISTANCE {
         let p = origin + dir * t;
-        let in_bounds = (0.0..=MAP_MAX_X).contains(&p.x)
-                     && (0.0..=MAP_MAX_Z).contains(&p.z);
+        let in_bounds = (0.0..=map_size.x).contains(&p.x)
+                     && (0.0..=map_size.z).contains(&p.z);
         if in_bounds {
             let ground = heightmap.height_at(p.x, p.z);
             if p.y <= ground {

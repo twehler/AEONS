@@ -28,6 +28,8 @@ pub mod save;
 pub mod session;
 pub mod template;
 pub mod template_marker;
+pub mod tool_panel;
+pub mod undo;
 
 use bevy::prelude::*;
 
@@ -49,8 +51,10 @@ impl Plugin for ColonyEditorPlugin {
             .add_plugins(layout::EditorLayoutPlugin)
             .add_plugins(creation_panel::CreationPanelPlugin)
             .add_plugins(inventory_panel::InventoryPanelPlugin)
+            .add_plugins(tool_panel::ToolPanelPlugin)
             .add_plugins(placement::PlacementPlugin)
             .add_plugins(exit_modal::ExitModalPlugin)
+            .add_plugins(undo::UndoPlugin)
             .add_systems(Startup, spawn_editor_lighting)
             .add_systems(Update, dispatch_save_requests);
     }

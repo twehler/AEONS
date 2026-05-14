@@ -29,12 +29,15 @@
 // not receive identifiers.
 
 use bevy::prelude::*;
+use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::MouseWheel;
 use bevy::ui::{ComputedNode, UiGlobalTransform};
 use bevy::window::PrimaryWindow;
+use std::fmt::Write as _;
 
 use crate::colony::{Heterotroph, IntelligenceLevel, Organism, OrganismRoot};
 use crate::frontend::{PANEL_BG_COLOR, ViewportImage};
+use crate::simulation_settings::{AutoSpawnHeteros, MinHeteroCount, MinHeteroCountEditState};
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -149,6 +152,35 @@ struct IdentifiersCheckbox;
 #[derive(Component)]
 struct IdentifiersCheckboxMark;
 
+/// Marker on the "Auto-Spawn Heterotrophs" checkbox at the bottom of
+/// the navigator panel.
+#[derive(Component)]
+struct AutoSpawnCheckbox;
+
+/// Inner-fill marker for the auto-spawn checkbox (mirrors
+/// `IdentifiersCheckboxMark`).
+#[derive(Component)]
+struct AutoSpawnCheckboxMark;
+
+/// Marker on the row containing the "Min count" input field. Hidden via
+/// `Display::None` when `AutoSpawnHeteros(false)`.
+#[derive(Component)]
+struct MinHeteroCountRow;
+
+/// Click-target for the min-heterotroph-count integer-input field.
+#[derive(Component)]
+struct MinHeteroCountInput;
+
+/// Marker on the Text child inside the min-count input box.
+#[derive(Component)]
+struct MinHeteroCountText;
+
+/// Max digits accepted in the min-count buffer — bounded so the user
+/// can't paste a runaway integer.
+const MIN_HETERO_BUFFER_MAX_LEN: usize = 6;
+const MIN_HETERO_BG_IDLE:    Color = Color::srgb(0.18, 0.18, 0.18);
+const MIN_HETERO_BG_FOCUSED: Color = Color::srgb(0.10, 0.30, 0.10);
+
 /// One per labelled organism. `target` references the OrganismRoot.
 /// Labels are spawned as children of the `ViewportImage` so their
 /// `Val::Px` positions are already in viewport-local pixel coordinates
@@ -178,6 +210,11 @@ impl Plugin for IndividuumNavigatorPlugin {
                 update_checkbox_mark,
                 handle_identifiers_checkbox,
                 navigator_scroll,
+                handle_auto_spawn_checkbox,
+                update_auto_spawn_checkbox_mark,
+                update_min_hetero_row_visibility,
+                handle_min_hetero_input,
+                update_min_hetero_text,
             ));
     }
 }
@@ -290,6 +327,103 @@ pub fn spawn_navigator_panel(parent: &mut ChildSpawnerCommands) {
             },
             ScrollPosition::default(),
         ));
+
+        // ── Footer: Auto-Spawn checkbox + (conditional) min-count input ─
+        // Sits below the scrollable list and pinned to the bottom of
+        // the panel by `flex_shrink: 0`.
+        panel.spawn(Node {
+            flex_direction: FlexDirection::Column,
+            margin:         UiRect::top(Val::Px(8.0)),
+            flex_shrink:    0.0,
+            ..default()
+        })
+        .with_children(|footer| {
+            // Checkbox row.
+            footer.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items:    AlignItems::Center,
+                ..default()
+            })
+            .with_children(|row| {
+                row.spawn((
+                    AutoSpawnCheckbox,
+                    Button,
+                    Node {
+                        width:           Val::Px(CHECKBOX_SIZE_PX),
+                        height:          Val::Px(CHECKBOX_SIZE_PX),
+                        margin:          UiRect::right(Val::Px(8.0)),
+                        align_items:     AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        flex_shrink:     0.0,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.10, 0.10, 0.10)),
+                ))
+                .with_children(|cb| {
+                    cb.spawn((
+                        AutoSpawnCheckboxMark,
+                        Node {
+                            width:   Val::Px(CHECKBOX_SIZE_PX - 6.0),
+                            height:  Val::Px(CHECKBOX_SIZE_PX - 6.0),
+                            display: Display::None, // off by default
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.85, 0.85, 0.85)),
+                        Pickable::IGNORE,
+                    ));
+                });
+
+                row.spawn((
+                    Text::new("Auto-Spawn Heterotrophs"),
+                    TextFont { font_size: 12.0, ..default() },
+                    TextColor(Color::WHITE),
+                    Pickable::IGNORE,
+                ));
+            });
+
+            // Min-count row — collapsed by default, revealed when the
+            // checkbox is ticked.
+            footer.spawn((
+                MinHeteroCountRow,
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items:    AlignItems::Center,
+                    margin:         UiRect::top(Val::Px(6.0)),
+                    display:        Display::None,
+                    ..default()
+                },
+            ))
+            .with_children(|row| {
+                row.spawn((
+                    Text::new("Min count:"),
+                    TextFont { font_size: 12.0, ..default() },
+                    TextColor(Color::WHITE),
+                    Node { margin: UiRect::right(Val::Px(6.0)), ..default() },
+                    Pickable::IGNORE,
+                ));
+                row.spawn((
+                    MinHeteroCountInput,
+                    Button,
+                    Node {
+                        flex_grow:       1.0,
+                        height:          Val::Px(22.0),
+                        padding:         UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                        align_items:     AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(MIN_HETERO_BG_IDLE),
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        MinHeteroCountText,
+                        Text::new(""),
+                        TextFont { font_size: 12.0, ..default() },
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
+                });
+            });
+        });
     });
 }
 
@@ -608,4 +742,136 @@ fn vertical_divider_drag(
     // produces a stable absolute width regardless of drag speed.
     let new_w = (state.initial_panel_width - ev.distance.x).clamp(NAV_MIN_WIDTH_PX, max_w);
     node.width = Val::Px(new_w);
+}
+
+
+// ── Auto-spawn footer handlers ──────────────────────────────────────────────
+
+/// Toggle `AutoSpawnHeteros` on click.
+fn handle_auto_spawn_checkbox(
+    interactions: Query<&Interaction, (Changed<Interaction>, With<AutoSpawnCheckbox>)>,
+    mut auto:     ResMut<AutoSpawnHeteros>,
+) {
+    for interaction in &interactions {
+        if matches!(interaction, Interaction::Pressed) {
+            auto.0 = !auto.0;
+        }
+    }
+}
+
+/// Mirror `AutoSpawnHeteros` onto the inner-fill display state.
+fn update_auto_spawn_checkbox_mark(
+    auto:       Res<AutoSpawnHeteros>,
+    mut mark_q: Query<&mut Node, With<AutoSpawnCheckboxMark>>,
+) {
+    if !auto.is_changed() { return; }
+    for mut node in &mut mark_q {
+        node.display = if auto.0 { Display::Flex } else { Display::None };
+    }
+}
+
+/// Reveal / hide the min-count input row based on the master flag.
+/// Edge-triggered on `auto` change so the layout cost is paid only at
+/// toggle events.
+fn update_min_hetero_row_visibility(
+    auto:      Res<AutoSpawnHeteros>,
+    mut row_q: Query<&mut Node, With<MinHeteroCountRow>>,
+) {
+    if !auto.is_changed() { return; }
+    for mut node in &mut row_q {
+        node.display = if auto.0 { Display::Flex } else { Display::None };
+    }
+}
+
+/// Click + keyboard router for the min-count integer-input field.
+/// Mirrors `handle_max_organisms_input` in the statistics panel:
+/// click-on-input enters edit mode, Enter commits, Escape cancels,
+/// click-outside commits. Digits-only.
+fn handle_min_hetero_input(
+    mouse:         Res<ButtonInput<MouseButton>>,
+    mut keyboard:  MessageReader<KeyboardInput>,
+    auto:          Res<AutoSpawnHeteros>,
+    interaction_q: Query<&Interaction, With<MinHeteroCountInput>>,
+    mut state:     ResMut<MinHeteroCountEditState>,
+    mut min_count: ResMut<MinHeteroCount>,
+) {
+    // When the row is hidden the user can't see / click the field, but
+    // we still drain the keyboard reader so events don't accumulate.
+    if !auto.0 {
+        for _ in keyboard.read() {}
+        if state.focused {
+            state.focused = false;
+            state.buffer.clear();
+        }
+        return;
+    }
+
+    let click_on_input = mouse.just_pressed(MouseButton::Left)
+        && interaction_q.iter().any(|i| matches!(i, Interaction::Pressed));
+    let click_outside  = mouse.just_pressed(MouseButton::Left) && !click_on_input;
+
+    if click_on_input && !state.focused {
+        state.focused = true;
+        state.buffer.clear();
+        let _ = write!(state.buffer, "{}", min_count.0);
+    }
+
+    if click_outside && state.focused {
+        commit_min_hetero(&mut state, &mut min_count);
+    }
+
+    if !state.focused {
+        for _ in keyboard.read() {}
+        return;
+    }
+
+    for ev in keyboard.read() {
+        if !ev.state.is_pressed() { continue; }
+        match ev.key_code {
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                commit_min_hetero(&mut state, &mut min_count);
+            }
+            KeyCode::Escape => {
+                state.focused = false;
+                state.buffer.clear();
+            }
+            KeyCode::Backspace => { state.buffer.pop(); }
+            _ => {
+                if let Some(text) = ev.text.as_ref() {
+                    for c in text.chars() {
+                        if state.buffer.len() >= MIN_HETERO_BUFFER_MAX_LEN { break; }
+                        if c.is_ascii_digit() { state.buffer.push(c); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn commit_min_hetero(state: &mut MinHeteroCountEditState, min_count: &mut MinHeteroCount) {
+    if let Ok(v) = state.buffer.parse::<usize>() {
+        if min_count.0 != v { min_count.0 = v; }
+    }
+    state.focused = false;
+    state.buffer.clear();
+}
+
+fn update_min_hetero_text(
+    state:      Res<MinHeteroCountEditState>,
+    min_count:  Res<MinHeteroCount>,
+    mut text_q: Query<&mut Text, With<MinHeteroCountText>>,
+    mut bg_q:   Query<&mut BackgroundColor, With<MinHeteroCountInput>>,
+) {
+    if !state.is_changed() && !min_count.is_changed() { return; }
+    let display = if state.focused {
+        format!("{}_", state.buffer)
+    } else {
+        format!("{}", min_count.0)
+    };
+    for mut text in &mut text_q { text.0 = display.clone(); }
+
+    let bg = if state.focused { MIN_HETERO_BG_FOCUSED } else { MIN_HETERO_BG_IDLE };
+    for mut b in &mut bg_q {
+        if b.0 != bg { *b = BackgroundColor(bg); }
+    }
 }

@@ -26,6 +26,7 @@ use bevy::window::PrimaryWindow;
 use crate::colony_editor::session::EditorSession;
 use crate::colony_editor::creation_panel::BOTTOM_PANEL_HEIGHT_PX;
 use crate::colony_editor::inventory_panel::PANEL_WIDTH_PX;
+use crate::colony_editor::tool_panel::TOOL_PANEL_WIDTH_PX;
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -213,6 +214,13 @@ fn handle_keyboard_move(
     // ghost movement when alt-tabbing.
     if !windows.iter().any(|w| w.focused) { return; }
 
+    // Suppress movement while a Ctrl-modifier keyboard shortcut is
+    // engaged (e.g. Ctrl+S to save, Ctrl+Z to undo). Otherwise the
+    // user's S/Z key down would simultaneously drift the camera.
+    if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+        return;
+    }
+
     let Ok((mut tf, cam)) = cam_q.single_mut() else { return };
 
     let mut dir = Vec3::ZERO;
@@ -262,6 +270,8 @@ fn cursor_over_ui_panel(cursor: Vec2, window: &Window) -> bool {
     let h = window.height();
     let in_inventory = cursor.x >= w - PANEL_WIDTH_PX
                     && cursor.y <= h - BOTTOM_PANEL_HEIGHT_PX;
+    let in_tool      = cursor.x <= TOOL_PANEL_WIDTH_PX
+                    && cursor.y <= h - BOTTOM_PANEL_HEIGHT_PX;
     let in_bottom    = cursor.y >= h - BOTTOM_PANEL_HEIGHT_PX;
-    in_inventory || in_bottom
+    in_inventory || in_tool || in_bottom
 }

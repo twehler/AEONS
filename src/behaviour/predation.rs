@@ -139,6 +139,11 @@ fn predation_system(
         // ── Credit predator ──────────────────────────────────────────────
         if let Ok(mut pred_org) = heterotrophs.get_mut(predator) {
             pred_org.energy += energy_share * ENERGY_TRANSFER_RATE;
+            // Bump the predation counter (saturating, since u8 wraps).
+            // The Level 1 hetero brain reads the per-tick delta of this
+            // field as its eat-event signal — see
+            // `intelligence_level_1_hetero::apply_intelligence_level_1_hetero`.
+            pred_org.predations = pred_org.predations.saturating_add(1);
         }
 
         // ── Despawn the eaten body part's child mesh entity ──────────────

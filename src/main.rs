@@ -35,7 +35,7 @@ mod player_plugin;
 #[path = "frontend/frontend.rs"]                mod frontend;
 #[path = "frontend/launcher.rs"]                mod launcher;
 #[path = "frontend/statistics_panel.rs"]        mod statistics_panel;
-#[path = "frontend/simulation_settings.rs"]     mod simulation_settings;
+mod simulation_settings;
 #[path = "frontend/individuum_navigator.rs"]    mod individuum_navigator;
 
 // Colony editor — alternate entry point, reuses `WorldPlugin` /
@@ -83,11 +83,11 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let show_wireframe = args.iter().any(|a| a == "--wireframe");
     let editor_flag    = args.iter().any(|a| a == "--editor");
-    let positional: Vec<String> = args.iter()
-        .skip(1)
-        .filter(|a| !a.starts_with("--"))
-        .cloned()
-        .collect();
+    // `--map-size X Z` — parse before collecting positionals so the
+    // two numeric values don't end up in the positional list.
+    let map_size = parse_map_size(&args).unwrap_or(world_geometry::MapSize::default());
+    let max_organisms = parse_max_organisms(&args);
+    let positional = collect_positionals(&args);
 
     if positional.is_empty() && !editor_flag {
         // Launcher mode — show the eframe window with both action
@@ -96,30 +96,84 @@ fn main() {
         // winit's EventLoop is a singleton).
         let Some(mode) = run_launcher() else { return; };
         match mode {
-            LaunchMode::RunSimulation { map_path, colony_path, wireframe } => {
+            LaunchMode::RunSimulation { map_path, colony_path, wireframe, map_x, map_z, max_organisms } => {
                 respawn(&[
                     Some(map_path),
                     colony_path,
                     if wireframe { Some("--wireframe".into()) } else { None },
+                    Some("--map-size".into()),
+                    Some(map_x.to_string()),
+                    Some(map_z.to_string()),
+                    Some("--max-organisms".into()),
+                    Some(max_organisms.to_string()),
                 ]);
             }
-            LaunchMode::RunEditor { map_path } => {
+            LaunchMode::RunEditor { map_path, map_x, map_z } => {
                 respawn(&[
                     Some(map_path),
                     Some("--editor".into()),
+                    Some("--map-size".into()),
+                    Some(map_x.to_string()),
+                    Some(map_z.to_string()),
                 ]);
             }
         }
     } else if editor_flag {
         // Editor mode (re-spawned child or direct CLI invocation).
         let map_path = positional.first().cloned().unwrap_or_else(|| "assets/world.glb".into());
-        run_editor(map_path);
+        run_editor(map_path, map_size);
     } else {
         // Simulation mode (re-spawned child or direct CLI invocation).
         let map_path    = positional[0].clone();
         let colony_path = positional.get(1).cloned();
-        run_simulation(map_path, colony_path, show_wireframe);
+        run_simulation(map_path, colony_path, show_wireframe, map_size, max_organisms);
     }
+}
+
+
+/// Parse `--map-size X Z` out of argv. Returns `None` if the flag is
+/// absent or either value doesn't parse as a positive f32.
+fn parse_map_size(args: &[String]) -> Option<world_geometry::MapSize> {
+    let pos = args.iter().position(|a| a == "--map-size")?;
+    let x = args.get(pos + 1)?.parse::<f32>().ok()?;
+    let z = args.get(pos + 2)?.parse::<f32>().ok()?;
+    if x <= 0.0 || z <= 0.0 { return None; }
+    Some(world_geometry::MapSize { x, z })
+}
+
+/// Parse `--max-organisms N` out of argv. Returns `None` if the flag
+/// is missing or unparseable; callers fall back to
+/// `DEFAULT_MAX_ORGANISMS` (via FrontendPlugin's `init_resource`).
+fn parse_max_organisms(args: &[String]) -> Option<usize> {
+    let pos = args.iter().position(|a| a == "--max-organisms")?;
+    args.get(pos + 1)?.parse::<usize>().ok()
+}
+
+
+/// Collect positional CLI arguments. Skips known `--flag` tokens AND
+/// the two values that follow `--map-size` (which are numeric and
+/// would otherwise be picked up as positionals).
+fn collect_positionals(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 1; // skip argv[0]
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--map-size" {
+            i += 3; // skip flag + two values
+            continue;
+        }
+        if a == "--max-organisms" {
+            i += 2; // skip flag + value
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
 }
 
 
@@ -145,7 +199,13 @@ fn respawn(parts: &[Option<String>]) {
 
 // ── Simulation (Bevy + Burn) ─────────────────────────────────────────────────
 
-fn run_simulation(map_path: String, colony_path: Option<String>, show_wireframe: bool) {
+fn run_simulation(
+    map_path:       String,
+    colony_path:    Option<String>,
+    show_wireframe: bool,
+    map_size:       world_geometry::MapSize,
+    max_organisms: Option<usize>,
+) {
     if let Ok(mut cache_path) = std::env::current_dir() {
         cache_path.push("caches");
         cache_path.push("cubecl");
@@ -164,6 +224,25 @@ fn run_simulation(map_path: String, colony_path: Option<String>, show_wireframe:
     // Inject the optional colony-load path so ColonyPlugin's spawn system
     // can pick the load-vs-generate branch.
     app.insert_resource(colony::ColonyLoadPath(colony_path));
+    // World extent — drives `compute_normalisation` plus every spawn-bound
+    // / pos-normalisation site that previously read the MAP_MAX_X/Z consts.
+    app.insert_resource(map_size);
+
+    // GPU brain-pool batch dimension AND initial reproduction cap.
+    // The launcher's "Max Organisms" field flows through here as
+    // argv `--max-organisms N` → `max_organisms = Some(N)`. Both
+    // `OrganismPoolSize` (the fixed-at-startup pool size) and the
+    // editable `MaxOrganisms` soft cap are seeded to the same value
+    // so the user gets the full pool at launch and can dial the
+    // soft cap down at runtime via the statistics panel. Falling
+    // through to `init_resource` defaults (= DEFAULT_MAX_ORGANISMS)
+    // when no flag is supplied is fine — the resources are inserted
+    // BEFORE `BehaviourPlugin` builds the brain pools.
+    if let Some(n) = max_organisms {
+        let n = n.max(1);
+        app.insert_resource(simulation_settings::OrganismPoolSize(n));
+        app.insert_resource(simulation_settings::MaxOrganisms(n));
+    }
 
     app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {
@@ -190,14 +269,8 @@ fn run_simulation(map_path: String, colony_path: Option<String>, show_wireframe:
         .add_plugins(continuous_growth::ContinuousGrowthPlugin)
         .add_plugins(water::WaterPlugin)
         .add_plugins(predation::PredationPlugin)
-        .add_plugins(behaviour::BehaviourPlugin);
-
-    // Krishi is disabled in heterotroph-movement RL debug mode so the
-    // training environment doesn't have a second predator class polluting
-    // the experiment.
-    if simulation_settings::HETEROTROPH_MOVEMENT_AI_DEBUGGING {
-        app.add_plugins(krishi::KrishiPlugin);
-    }
+        .add_plugins(behaviour::BehaviourPlugin)
+        .add_plugins(krishi::KrishiPlugin);
 
     //app.add_plugins(EguiPlugin::default());
     //app.add_plugins(WorldInspectorPlugin::new());
@@ -218,10 +291,11 @@ fn run_simulation(map_path: String, colony_path: Option<String>, show_wireframe:
 
 // ── Colony editor (Bevy, no simulation) ──────────────────────────────────────
 
-fn run_editor(map_path: String) {
+fn run_editor(map_path: String, map_size: world_geometry::MapSize) {
     let world_path_input = Path::new(&map_path);
 
     let mut app = App::new();
+    app.insert_resource(map_size);
     app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {
             features: WgpuFeatures::POLYGON_MODE_LINE,

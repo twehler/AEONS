@@ -34,7 +34,7 @@ use rand::prelude::*;
 use crate::cell::*;
 use crate::colony::*;
 use crate::movement::DirectionTimer;
-use crate::world_geometry::{HeightmapSampler, MAP_MAX_X, MAP_MAX_Z};
+use crate::world_geometry::{HeightmapSampler, MapSize};
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -165,6 +165,7 @@ fn spawn_krishi_cohort(
     mut commands:  Commands,
     krishi:        Res<KrishiAssets>,
     heightmap:     Res<HeightmapSampler>,
+    map_size:      Res<MapSize>,
     mut spawned:   Local<bool>,
 ) {
     if *spawned { return; }
@@ -173,8 +174,8 @@ fn spawn_krishi_cohort(
     let mut rng = rand::rng();
 
     for _ in 0..INITIAL_KRISHI {
-        let x = rng.random_range(0.0_f32..MAP_MAX_X);
-        let z = rng.random_range(0.0_f32..MAP_MAX_Z);
+        let x = rng.random_range(0.0_f32..map_size.x);
+        let z = rng.random_range(0.0_f32..map_size.z);
         let y = heightmap.height_at(x, z) + KRISHI_SPAWN_ALTITUDE;
         spawn_krishi(Vec3::new(x, y, z), &krishi, &mut commands, &mut rng);
     }
@@ -247,6 +248,7 @@ fn spawn_krishi(
         // never fires for an organism whose `reproduced` flag is set.
         reproduced:         true,
         reproductions:      0,
+        predations:         0,
         movement_speed:     speed,
         movement_direction: direction,
         velocity:           Vec3::ZERO,

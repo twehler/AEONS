@@ -115,7 +115,11 @@ impl Plugin for FrontendPlugin {
             .init_resource::<PlayerControlsActive>()
             .init_resource::<Smoothing>()
             .init_resource::<TimeSpeed>()
+            .init_resource::<crate::simulation_settings::MaxOrganisms>()
+            .init_resource::<crate::simulation_settings::OrganismPoolSize>()
             .init_resource::<statistics_panel::TimeSpeedEditState>()
+            .init_resource::<statistics_panel::MaxOrganismsEditState>()
+            .init_resource::<statistics_panel::CullMessage>()
             .insert_resource(GraphState::new())
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
             .add_plugins(IndividuumNavigatorPlugin)
@@ -139,6 +143,15 @@ impl Plugin for FrontendPlugin {
                 statistics_panel::update_time_speed_text,
                 statistics_panel::apply_time_speed,
                 apply_player_controls_state,
+            ))
+            // Split off the Max-Organisms + cull-notification systems into
+            // a second `add_systems` call to stay under Bevy's tuple size
+            // limit for variadic system configs.
+            .add_systems(Update, (
+                statistics_panel::handle_max_organisms_input,
+                statistics_panel::update_max_organisms_text,
+                statistics_panel::apply_max_organisms_cull,
+                statistics_panel::update_cull_message,
             ));
         // Gizmos run only when the F3-toggled overlay is active. Putting
         // the check on the system registration (rather than inside the
