@@ -41,6 +41,34 @@ pub const DEFAULT_MAP_Z:           f32        = 2048.0;
 pub const AI_TRAINING_MODE: bool = false;
 
 
+/// Top-level window-mode toggle exposed to the user via the thin top bar
+/// at the top of the frontend layout. `Simulation` is the original
+/// behaviour: stats panel + navigator + click-to-capture player camera.
+/// `EditColony` swaps in the colony-editor panels (creation / tool /
+/// inventory) and a hold-LMB-rotate flycam input mode, so the user can
+/// place organisms while the existing world keeps rendering — the
+/// simulation auto-pauses on entry so the population is frozen for
+/// edits. Switching back to Simulation does NOT auto-resume.
+#[derive(Resource, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum WindowMode {
+    Simulation,
+    EditColony,
+    /// Tree-of-life view — pauses the simulation (like EditColony)
+    /// and renders the `SpeciesRegistry`'s ancestry tree in place
+    /// of the viewport + side panels.
+    Lineages,
+    /// Species editor — pauses the simulation, hides the world, and
+    /// presents a top + bottom panel UI for manually constructing
+    /// an organism's body cell-by-cell. The output is a `.species`
+    /// binary file the user can later import into a colony.
+    SpeciesEditor,
+}
+
+impl Default for WindowMode {
+    fn default() -> Self { Self::Simulation }
+}
+
+
 /// True when the simulation is advancing (`Time<Virtual>` is unpaused) and
 /// every gameplay system that depends on virtual time is doing useful work.
 /// Toggled by the Start/Stop button in the statistics panel.
@@ -249,8 +277,15 @@ impl Default for OrganismPoolSize {
 pub const L1_SIGMA_RANGE:         (f32, f32) = (0.2, 0.8);
 
 /// Range for `K_EAT` — one-shot reward on a predation event
-/// (detected via energy spike).
-pub const L1_K_EAT_RANGE:         (f32, f32) = (1.0, 6.0);
+/// (detected via the `Organism::predations` delta). Floor raised
+/// from 1.0 to 4.0 so the eat jackpot is large enough to dominate
+/// the per-rollout K_CURIOSITY accumulation and pin the policy
+/// gradient on "actually catch prey" rather than "wander fast."
+/// At the prior 1.0 floor the eat signal was within the noise band
+/// of the dense per-tick rewards, leaving the population stuck in
+/// the "fast wanderer" attractor rather than evolving toward the
+/// "fast hunter" attractor.
+pub const L1_K_EAT_RANGE:         (f32, f32) = (4.0, 12.0);
 
 /// Range for `K_REPRO` — one-shot reward on reproduction
 /// (detected via `Organism::reproductions` increment).
@@ -260,11 +295,16 @@ pub const L1_K_REPRO_RANGE:       (f32, f32) = (5.0, 30.0);
 /// of `ΔE` per brain tick (the "energy-loss punishment").
 pub const L1_LAMBDA_ENERGY_RANGE: (f32, f32) = (0.3, 2.0);
 
-/// Range for `K_CURIOSITY` — per-tick reward proportional to the
-/// previous action's normalised speed. Lower bound is 0.0 so the
-/// population can include "no curiosity" phenotypes that only learn
-/// from real eat / repro events.
-pub const L1_K_CURIOSITY_RANGE:   (f32, f32) = (0.0, 0.5);
+/// Range for `K_CURIOSITY` — per-tick reward proportional to
+/// `applied_speed_norm − 0.5`, so stillness is negatively rewarded
+/// and full speed is positively rewarded by the same magnitude.
+/// Range widened to (0.4, 1.5) so the per-tick gradient between
+/// min-speed and max-speed trajectories is large enough to survive
+/// the per-slot EMA baseline absorption — the previous (0.15, 0.5)
+/// range produced gradients that the baseline tracked to zero within
+/// ~20 rollouts, killing the gradient pressure that was supposed to
+/// push the policy away from the standstill local optimum.
+pub const L1_K_CURIOSITY_RANGE:   (f32, f32) = (0.4, 1.5);
 
 /// Range for `K_PROGRESS` — per-tick reward proportional to the
 /// distance CLOSED to the currently-locked target. Only positive
@@ -296,10 +336,134 @@ pub const L1_TARGET_SWITCH_MARGIN: f32 = 0.15;
 
 /// EMA factor for output-side speed momentum:
 /// `applied_speed = α · prev_applied + (1 − α) · new_sample`.
-/// 0.6 means each tick the actually-executed speed moves 40% toward
-/// the freshly sampled action — smooth enough to avoid jerk, fast
-/// enough that the agent can decelerate when needed.
-pub const L1_SPEED_MOMENTUM_ALPHA: f32 = 0.6;
+/// 0.3 means each tick the actually-executed speed moves 70% toward
+/// the freshly sampled action — the agent reaches its commanded
+/// speed within ~2 ticks (≈ 300 ms) instead of 5. Was 0.6 originally
+/// to dampen post-eat overshoot, but with `L1_APPROACH_RADIUS = 3`
+/// the brake already guarantees no overshoot for any applied speed
+/// ≤ 1, so the high momentum was unnecessary friction that just
+/// made motion feel sluggish.
+pub const L1_SPEED_MOMENTUM_ALPHA: f32 = 0.3;
+
+/// XZ distance (world units) at which "arrival braking" kicks in for
+/// the L1 hetero brain. When the locked target is closer than this,
+/// the applied movement speed is scaled by
+/// `clamp(distance / L1_APPROACH_RADIUS, 0, 1)` — full speed beyond
+/// the radius, linear decel inside it, zero exactly on top of the
+/// target.
+///
+/// Sizing rationale: per-tick travel is
+/// `applied_speed_a · MAX_SPEED · TICK_SECS · brake_scale`. With
+/// `brake_scale = d / R` this becomes `applied · 3 · d / R`. For
+/// no overshoot at maximum applied (= 1), we need `3 / R ≤ 1`, so
+/// `R ≥ MAX_SPEED · TICK_SECS = 3`. Smaller radii produce
+/// rapid-fire ping-pong oscillation around the target that
+/// visually reads as "stuck in place, no motion".
+///
+/// The "agent parks outside cell-contact range" failure mode that
+/// motivated trying R = 1 is handled separately by `CELL_COLLISION_RADIUS`
+/// (cell.rs) — that controls the contact disc width and is what
+/// determines whether the bilateral V-shape actually touches prey
+/// at parking distance. Brake radius and contact radius are
+/// independent dials; tune each on its own merit.
+pub const L1_APPROACH_RADIUS: f32 = 3.0;
+
+/// Number of consecutive brain ticks the locked target can stay at
+/// the same distance (no measurable progress) before the lock is
+/// force-dropped and the brain re-picks. Solves the "stuck against
+/// a blocker" pattern where the locked photo sits past another
+/// hetero or a wall: the agent stops making distance progress, this
+/// counter fires, the lock drops, fresh argmax fires next tick.
+///
+/// At ~6.67 brain ticks per virtual second, 6 ticks ≈ 0.9 virtual
+/// seconds — long enough to ride through normal contact-bounce
+/// jitter, short enough that the agent doesn't burn its 10-second
+/// lock window on a target it can't reach.
+pub const L1_STUCK_TICKS: u16 = 6;
+
+/// Minimum distance-closed (world units) between two brain ticks
+/// that counts as "progress." Distance decreases below this
+/// threshold are treated as noise and count toward the stuck
+/// counter. 0.3 is just below the per-tick travel of a hetero
+/// approaching at 1/4 throttle — anything less than that and the
+/// agent isn't really converging on the target.
+pub const L1_STUCK_PROGRESS_EPS: f32 = 0.3;
+
+/// XZ distance (world units) below which the L1 hetero brain
+/// freezes its commanded direction at the previous tick's value
+/// instead of recomputing `(target − self).normalize()`. At very
+/// close range the unit-vector becomes hypersensitive to tiny prey
+/// wobble — a 0.05-unit lateral perturbation at d = 0.2 produces a
+/// ~14° swing — which together with the per-tick reorient produces
+/// visible micro-oscillation.
+///
+/// Earlier the threshold was 0.5, but combined with the (then 3.0)
+/// arrival brake it created a terminal absorbing state OUTSIDE the
+/// 1.2-unit cell-contact zone — the agent parked just shy of
+/// contact and never ate. 0.1 keeps the anti-jitter behaviour while
+/// only firing once the cells are essentially overlapping
+/// (root-to-root ≪ 0.1 is deep inside the contact disc), so the
+/// agent can still apply late lateral correction during the
+/// approach.
+pub const L1_DIRECTION_FREEZE_DIST: f32 = 0.1;
+
+/// Speed scale applied to the hetero when it has no locked target
+/// — i.e. no Photo entity in the K-nearest window. Without this, the
+/// brain's `speed_a` sample drives the agent at full `MAX_SPEED`
+/// even when there's nothing to chase, which produces high-energy
+/// blind cruising and turns any cluster of heteros in a prey-empty
+/// region into a thrashing collision-bounce mess.
+///
+/// 0.3 lets the agent still patrol the area (handy for finding the
+/// nearest photo when one wanders into range) without exerting
+/// enough force to deadlock against neighbouring heteros.
+pub const L1_NO_TARGET_SPEED_SCALE: f32 = 0.3;
+
+/// Minimum value the EMA-smoothed `applied_speed_a` is clamped to
+/// before being multiplied by `MAX_SPEED · brake_scale` for the
+/// world-facing movement command. Forces every hetero to ALWAYS
+/// move at least `L1_MIN_APPLIED_SPEED · MAX_SPEED · brake_scale`
+/// units/sec — stillness becomes structurally impossible no matter
+/// what the policy outputs.
+///
+/// This sits on top of (not instead of) the curiosity-based gradient
+/// pressure away from low speeds. The reward shaping still rewards
+/// high speed and penalises low speed; this floor exists because
+/// the per-slot EMA baseline can absorb constant offsets in the
+/// reward, eventually leaving the policy with no gradient pressure
+/// to escape a learned standstill. Hard-clamping the world-facing
+/// speed means the policy CANNOT learn its way back to true
+/// stillness, regardless of how the baseline drifts.
+///
+/// 0.5 = half of brake-adjusted max speed at minimum. Half-throttle
+/// cruise is the default for any hetero whose policy hasn't
+/// converged to a higher-speed output, so the population's baseline
+/// movement intensity is visibly aggressive rather than tentative.
+/// Brake-zone behaviour is unaffected because `brake_scale → 0` as
+/// d → 0 still scales the effective speed to zero at the target.
+pub const L1_MIN_APPLIED_SPEED: f32 = 0.5;
+
+/// Maximum per-brain-tick random rotation applied to `movement_direction`
+/// when the hetero has no locked target, in radians (≈ 8.6° at 0.15).
+/// Acts as a slow Brownian wander, breaking the case where multiple
+/// heteros without prey settle into a stable deadlock pointing at
+/// each other. Sampled uniformly from `[-L1_NO_TARGET_WANDER_ANGLE,
+/// +L1_NO_TARGET_WANDER_ANGLE]` each brain tick (≈ 6.7 Hz).
+pub const L1_NO_TARGET_WANDER_ANGLE: f32 = 0.15;
+
+/// Number of brain ticks a force-dropped target stays on the
+/// per-slot blacklist after stuck-detection fires. While
+/// blacklisted, the target-selection scan excludes that entity from
+/// argmax — the brain MUST pick a different photo (or none). After
+/// the cooldown the entity is re-eligible. Prevents the
+/// "force-drop → re-pick same unreachable target → force-drop"
+/// loop that otherwise produces visible oscillation against blockers.
+///
+/// At ~6.67 brain ticks per virtual second, 20 ≈ 3 virtual seconds —
+/// long enough for the agent to commit to a different bearing and
+/// physically move away from the blocker, short enough that a target
+/// that has just become reachable doesn't get ignored for long.
+pub const L1_TARGET_BLACKLIST_TICKS: u16 = 20;
 
 /// Mutation strength for offspring inheritance, expressed as a
 /// fraction of the range width. Each gene gets `N(0, σ²)` noise added
@@ -308,3 +472,20 @@ pub const L1_SPEED_MOMENTUM_ALPHA: f32 = 0.6;
 /// parent (selection acts on a coherent gradient), large enough that
 /// the population explores the range over generations.
 pub const L1_GENE_MUTATION_REL_STDDEV: f32 = 0.05;
+
+
+// ── Lineages / speciation ───────────────────────────────────────────────────
+
+/// Per-component normalised "factor of difference" at which an
+/// organism is considered to belong to a NEW species relative to a
+/// candidate species' centroid. Every DNA component lives in
+/// `[0, 1]` (see `lineages::dna`), so this threshold compares
+/// directly against the mean-absolute-difference returned by
+/// `lineages::dna::distance`. 0.05 ⇒ "5% factor difference".
+///
+/// Also gates the trimmed-mean computation in
+/// `lineages::speciation::update_species_averages`: members whose
+/// DNA is further than this from the simple mean are excluded from
+/// the trimmed mean, so a single drifting individual can't drag
+/// the whole species' centroid along with it.
+pub const SPECIES_SEPARATION_THRESHOLD: f32 = 0.05;

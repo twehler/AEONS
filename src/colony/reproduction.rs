@@ -252,6 +252,7 @@ fn reproduction_system(
             } else {
                 Some(parent_entity)
             },
+            parent_species_id: organism.species_id,
         });
     }
 
@@ -288,6 +289,20 @@ fn reproduction_system(
             commands.entity(child_root)
                 .try_insert(crate::rl_helpers::BrainInheritance(parent));
         }
+        // Inherit parent's species classification — the speciation
+        // tick will re-evaluate next time it runs and split off a
+        // new lineage if the brain genes have drifted past the
+        // threshold. We patch the Organism component directly via
+        // the same commands queue.
+        if let Some(sid) = birth.parent_species_id {
+            commands.queue(move |world: &mut World| {
+                if let Ok(mut entity_ref) = world.get_entity_mut(child_root) {
+                    if let Some(mut org) = entity_ref.get_mut::<crate::organism::Organism>() {
+                        org.species_id = Some(sid);
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -310,4 +325,11 @@ struct PendingBirth {
     /// row into the offspring's slot. `None` for Level0 offspring
     /// (no pool to inherit from).
     parent_for_brain_inheritance: Option<Entity>,
+    /// Parent's species id at the moment of reproduction. Inherited
+    /// verbatim onto the offspring's `Organism::species_id` field;
+    /// the next speciation tick re-evaluates whether the child is
+    /// still close enough to that species' centroid or needs to
+    /// fork off its own. `None` if the parent hadn't been classified
+    /// yet (the very first frame after initial spawn).
+    parent_species_id: Option<u32>,
 }

@@ -22,6 +22,7 @@
 #[path = "behaviour/intelligence_level_1_hetero.rs"] mod intelligence_level_1_hetero;
 #[path = "behaviour/intelligence_level_2.rs"]       mod intelligence_level_2;
 #[path = "behaviour/intelligence_level_3.rs"]       mod intelligence_level_3;
+#[path = "behaviour/intelligence_level_herbivore_1.rs"] mod intelligence_level_herbivore_1;
 #[path = "behaviour/predation.rs"]                  mod predation;
 #[path = "behaviour/photosynthesis.rs"]             mod photosynthesis;
 
@@ -30,6 +31,8 @@
 
 #[path = "physiology/physiology.rs"]   mod physiology;
 
+#[path = "lineages/mod.rs"]            mod lineages;
+
 mod player_plugin;
 
 #[path = "frontend/frontend.rs"]                mod frontend;
@@ -37,13 +40,22 @@ mod player_plugin;
 #[path = "frontend/statistics_panel.rs"]        mod statistics_panel;
 mod simulation_settings;
 #[path = "frontend/individuum_navigator.rs"]    mod individuum_navigator;
+#[path = "frontend/species_navigator.rs"]       mod species_navigator;
+#[path = "frontend/tree_view.rs"]               mod tree_view;
 
 // Colony editor — alternate entry point, reuses `WorldPlugin` /
 // `WaterPlugin` for terrain rendering but skips every simulation
 // plugin. The flycam in `editor_camera` is distinct from
-// `player_plugin`'s capture-and-hold camera.
-#[path = "colony_editor/camera.rs"]             mod camera;
-#[path = "colony_editor/mod.rs"]                mod colony_editor;
+// `player_plugin`'s capture-and-hold camera. The editor's source
+// now lives under `frontend/colony_editor/` since it doubles as the
+// in-engine Edit-Colony window mode.
+#[path = "frontend/colony_editor/camera.rs"]    mod camera;
+#[path = "frontend/colony_editor/mod.rs"]       mod colony_editor;
+
+// Species editor — manual organism construction with `.species` save
+// output. Lives at world position `SPECIES_EDITOR_ORIGIN` so its
+// visuals don't overlap the running simulation.
+#[path = "frontend/species_editor/mod.rs"]      mod species_editor;
 
 use bevy::{
     prelude::*,
@@ -270,7 +282,9 @@ fn run_simulation(
         .add_plugins(water::WaterPlugin)
         .add_plugins(predation::PredationPlugin)
         .add_plugins(behaviour::BehaviourPlugin)
-        .add_plugins(krishi::KrishiPlugin);
+        .add_plugins(krishi::KrishiPlugin)
+        .add_plugins(lineages::LineagesPlugin)
+        .add_plugins(species_editor::SpeciesEditorPlugin);
 
     //app.add_plugins(EguiPlugin::default());
     //app.add_plugins(WorldInspectorPlugin::new());
@@ -331,6 +345,10 @@ fn setup(mut commands: Commands) {
             shadows_enabled: true,
             ..default()
         },
+        // Render to both the default layer (0, simulation) AND the
+        // species editor layer (1) so species cells get illuminated
+        // when the camera is rendering only layer 1.
+        bevy::camera::visibility::RenderLayers::from_layers(&[0, species_editor::SPECIES_EDITOR_LAYER]),
         bevy::light::CascadeShadowConfigBuilder {
             num_cascades:             1,
             minimum_distance:         0.1,

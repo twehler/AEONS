@@ -64,6 +64,14 @@ use crate::simulation_settings::{
     L1_TARGET_LOCK_SECS,
     L1_TARGET_SWITCH_MARGIN,
     L1_SPEED_MOMENTUM_ALPHA,
+    L1_APPROACH_RADIUS,
+    L1_STUCK_TICKS,
+    L1_STUCK_PROGRESS_EPS,
+    L1_DIRECTION_FREEZE_DIST,
+    L1_NO_TARGET_SPEED_SCALE,
+    L1_MIN_APPLIED_SPEED,
+    L1_NO_TARGET_WANDER_ANGLE,
+    L1_TARGET_BLACKLIST_TICKS,
 };
 use crate::world_model::{
     WorldModelGrid, WORLD_MODEL_DIMS, WORLD_MODEL_K, OrganismType,
@@ -298,6 +306,30 @@ pub struct BrainPoolL1Hetero {
     /// the target identity is stable across the comparison.
     prev_target_entity:      Vec<Option<Entity>>,
 
+    /// Smallest XZ distance to the currently-locked target observed
+    /// since the lock was created (or last refreshed by a target
+    /// switch). Together with `ticks_since_progress` this implements
+    /// the "drop the lock if not making progress" failsafe — handles
+    /// the blocker case where the lock would otherwise persist for
+    /// the full `L1_TARGET_LOCK_SECS` window on an unreachable prey.
+    min_dist_to_target:      Vec<f32>,
+    /// Brain ticks elapsed since `min_dist_to_target` last decreased
+    /// by at least `L1_STUCK_PROGRESS_EPS`. Resets to 0 on target
+    /// change or on real progress. Triggers a force-drop when it
+    /// reaches `L1_STUCK_TICKS`.
+    ticks_since_progress:    Vec<u16>,
+
+    /// Most recently force-dropped target. While
+    /// `blacklist_ticks_remaining > 0` the target-selection scan
+    /// excludes this entity, so the brain MUST pick a different
+    /// prey (or none). Prevents the "drop-stuck-target → fresh-pick
+    /// same target → drop-stuck-target" cycle observed when a
+    /// blocker stands persistently between agent and locked prey.
+    blacklisted_target:      Vec<Option<Entity>>,
+    /// Ticks remaining on the per-slot blacklist. Counts down each
+    /// brain tick; clears `blacklisted_target` when it reaches 0.
+    blacklist_ticks_remaining: Vec<u16>,
+
     /// Output-side EMA-smoothed speed actually applied to the
     /// organism. Decoupled from `prev_action[OUT.0]` so the policy
     /// gradient still uses the raw sample (correct log-prob) while
@@ -313,12 +345,15 @@ pub struct BrainPoolL1Hetero {
     /// entry per slot). Sampled uniformly from `L1_*_RANGE` on initial
     /// assignment; inherited-with-mutation on reproduction. Each
     /// value functions as a "gene" the population can select on.
-    sigma:         Vec<f32>,
-    k_eat:         Vec<f32>,
-    k_repro:       Vec<f32>,
-    lambda_energy: Vec<f32>,
-    k_curiosity:   Vec<f32>,
-    k_progress:    Vec<f32>,
+    /// `pub` so the lineages plugin's `sync_dna_from_brain_pool` can
+    /// read each slot's current gene values without going through an
+    /// accessor on every Organism every tick.
+    pub sigma:         Vec<f32>,
+    pub k_eat:         Vec<f32>,
+    pub k_repro:       Vec<f32>,
+    pub lambda_energy: Vec<f32>,
+    pub k_curiosity:   Vec<f32>,
+    pub k_progress:    Vec<f32>,
 
     /// Brain-tick counter, incremented every call. Training fires
     /// when `(tick % ROLLOUT_LEN) == 0` (after the per-tick rollout
@@ -350,6 +385,10 @@ impl BrainPoolL1Hetero {
             lock_ticks_remaining:    vec![0; n],
             prev_distance_to_target: vec![0.0; n],
             prev_target_entity:      vec![None; n],
+            min_dist_to_target:      vec![f32::INFINITY; n],
+            ticks_since_progress:    vec![0; n],
+            blacklisted_target:      vec![None; n],
+            blacklist_ticks_remaining: vec![0; n],
             applied_speed_a:         vec![0.0; n],
 
             baseline:           vec![0.0; n],
@@ -458,6 +497,10 @@ impl BrainPoolL1Hetero {
         self.lock_ticks_remaining[slot] = 0;
         self.prev_distance_to_target[slot] = 0.0;
         self.prev_target_entity[slot]   = None;
+        self.min_dist_to_target[slot]   = f32::INFINITY;
+        self.ticks_since_progress[slot] = 0;
+        self.blacklisted_target[slot]      = None;
+        self.blacklist_ticks_remaining[slot] = 0;
         self.applied_speed_a[slot]      = 0.0;
         Ok(())
     }
@@ -572,6 +615,10 @@ pub fn assign_brains_l1_hetero(
         pool.lock_ticks_remaining[s]    = 0;
         pool.prev_distance_to_target[s] = 0.0;
         pool.prev_target_entity[s]      = None;
+        pool.min_dist_to_target[s]      = f32::INFINITY;
+        pool.ticks_since_progress[s]    = 0;
+        pool.blacklisted_target[s]      = None;
+        pool.blacklist_ticks_remaining[s] = 0;
         pool.applied_speed_a[s]         = 0.0;
         pool.prev_predations[s]         = organism.predations;
 
@@ -608,6 +655,10 @@ pub fn free_brains_l1_hetero(
             pool.target_entity[s]        = None;
             pool.lock_ticks_remaining[s] = 0;
             pool.prev_target_entity[s]   = None;
+            pool.min_dist_to_target[s]   = f32::INFINITY;
+            pool.ticks_since_progress[s] = 0;
+            pool.blacklisted_target[s]      = None;
+            pool.blacklist_ticks_remaining[s] = 0;
             pool.applied_speed_a[s]      = 0.0;
             pool.free.push(slot);
         }
@@ -719,12 +770,27 @@ pub fn apply_intelligence_level_1_hetero(
                 pool.lambda_energy[s] * energy_delta
             } else { 0.0 };
 
-            // Curiosity / aggression bonus on speed. `applied_speed_a`
-            // is the EMA-smoothed value actually written to
-            // `Organism::movement_speed` last tick — this is what the
-            // world saw, so this is what the reward should reference.
+            // Curiosity / aggression — speed-dependent reward with an
+            // explicit penalty for standing still. Formula:
+            //   r = K_CURIOSITY · (applied_speed_norm − 0.5)
+            // so stillness produces NEGATIVE reward (−0.5·K_CURIOSITY)
+            // and full speed produces +0.5·K_CURIOSITY. The earlier
+            // formulation (just K_CURIOSITY · speed.max(0)) left
+            // standing still as a zero-reward plateau, which is
+            // attractive to a risk-averse Gaussian policy versus the
+            // higher-variance "move" trajectory. The new formula
+            // gives the policy an explicit gradient AWAY from
+            // stillness regardless of energy / progress signals, so
+            // saturated "do-nothing" policies get pushed back into
+            // the moving regime where K_PROGRESS and K_EAT can
+            // compound and pin them.
+            //
+            // `applied_speed_a` is the EMA-smoothed value actually
+            // written to `Organism::movement_speed` last tick — this
+            // is what the world saw, so this is what the reward
+            // should reference.
             let prev_speed_norm = pool.applied_speed_a[s].max(0.0);
-            let r_curiosity = pool.k_curiosity[s] * prev_speed_norm;
+            let r_curiosity = pool.k_curiosity[s] * (prev_speed_norm - 0.5);
 
             // Progress reward: how much closer to the locked target
             // did we get? Only credited when the target identity is
@@ -773,6 +839,73 @@ pub fn apply_intelligence_level_1_hetero(
         let speed_a = action[0].clamp(-1.0, 1.0);
         let target_logits = [action[1], action[2], action[3], action[4]];
 
+        // (3c-pre) Stuck detection.
+        //
+        // Find the locked target's current XZ distance (if still in
+        // the neighbour list). If it has decreased by at least
+        // `L1_STUCK_PROGRESS_EPS` vs. the running minimum, reset the
+        // stuck counter; otherwise increment it. When the counter
+        // reaches `L1_STUCK_TICKS` the lock is force-dropped this
+        // tick — the agent is committed to a target it can't reach
+        // (blocked by another organism, on the wrong side of a wall,
+        // etc.) and should re-pick.
+        //
+        // Force-dropping works by zeroing the `locked_entity` we
+        // hand to the target-selection scan: that scan will simply
+        // not find a locked slot, falling through to a fresh argmax
+        // pick. The book-keeping reset happens after the decision
+        // (see (3c-post) below) regardless of which arm fired.
+        let cur_locked_dist = pool.target_entity[s].and_then(|tgt| {
+            a.neighbours.iter().find_map(|n|
+                n.and_then(|nn| if nn.entity == tgt {
+                    Some((nn.rel.x * nn.rel.x + nn.rel.z * nn.rel.z).sqrt())
+                } else { None })
+            )
+        });
+        if let Some(d) = cur_locked_dist {
+            if d + L1_STUCK_PROGRESS_EPS < pool.min_dist_to_target[s] {
+                pool.min_dist_to_target[s] = d;
+                pool.ticks_since_progress[s] = 0;
+            } else if d > L1_APPROACH_RADIUS {
+                // Only count as "stuck" when OUTSIDE the brake zone.
+                // Inside the brake zone the brake scales per-tick travel
+                // proportional to `d`, so legitimate controlled approach
+                // produces displacements smaller than
+                // `L1_STUCK_PROGRESS_EPS` and would otherwise be flagged
+                // as failure-to-progress — causing the lock to drop, the
+                // prey to be blacklisted, and the agent to turn away
+                // from food it was about to eat ("shy heterotroph"
+                // pattern). The brake guarantees geometric decay to
+                // d → 0, so contact fires before any reasonable timeout
+                // even without stuck-protection here. The stuck
+                // detector still fires correctly for its original use
+                // case: genuinely blocked approach in the cruising
+                // zone (d > L1_APPROACH_RADIUS).
+                pool.ticks_since_progress[s] = pool.ticks_since_progress[s].saturating_add(1);
+            }
+        }
+        let force_drop = pool.ticks_since_progress[s] >= L1_STUCK_TICKS;
+
+        // Decrement the blacklist cooldown each tick; clear the
+        // entry when it expires so the previously-blacklisted
+        // entity becomes eligible again. Done BEFORE the scan so a
+        // just-expired entity can be re-picked this tick.
+        if pool.blacklist_ticks_remaining[s] > 0 {
+            pool.blacklist_ticks_remaining[s] -= 1;
+            if pool.blacklist_ticks_remaining[s] == 0 {
+                pool.blacklisted_target[s] = None;
+            }
+        }
+        // If we're about to force-drop, write the to-be-dropped
+        // target into the blacklist NOW so the very same scan that
+        // follows treats it as ineligible. The cooldown clock
+        // starts from this tick.
+        if force_drop {
+            pool.blacklisted_target[s] = pool.target_entity[s];
+            pool.blacklist_ticks_remaining[s] = L1_TARGET_BLACKLIST_TICKS;
+        }
+        let blacklisted_entity = pool.blacklisted_target[s];
+
         // (3c) Target selection — Level 1 hetero targets are PHOTOS
         //      ONLY. Type-check is applied at every gate (locked-slot
         //      match, argmax candidate) so no non-photo entity can
@@ -789,7 +922,7 @@ pub fn apply_intelligence_level_1_hetero(
         //                      highest target logit (argmax over the
         //                      Photo-typed subset).
         // After the scan, a 3-arm match picks the winner.
-        let locked_entity = pool.target_entity[s];
+        let locked_entity = if force_drop { None } else { pool.target_entity[s] };
         let mut locked_slot: Option<usize> = None;
         let mut best_slot:   Option<usize> = None;
         let mut best_logit:        f32      = f32::NEG_INFINITY;
@@ -797,6 +930,11 @@ pub fn apply_intelligence_level_1_hetero(
         for (i, slot) in a.neighbours.iter().enumerate() {
             let Some(nn) = slot else { continue };
             if !matches!(nn.ty, OrganismType::Photo) { continue; }
+            // Skip blacklisted entities entirely — they're invisible
+            // to both argmax AND the locked-slot match, so a hetero
+            // that just dropped target T won't even consider T as
+            // "still locked" while the cooldown runs.
+            if Some(nn.entity) == blacklisted_entity { continue; }
             // Argmax over photo logits.
             let l = target_logits[i];
             if l > best_logit { best_logit = l; best_slot = Some(i); }
@@ -844,19 +982,86 @@ pub fn apply_intelligence_level_1_hetero(
         let smoothed = L1_SPEED_MOMENTUM_ALPHA * pool.applied_speed_a[s]
                      + (1.0 - L1_SPEED_MOMENTUM_ALPHA) * speed_a;
         pool.applied_speed_a[s] = smoothed;
-        org.movement_speed = smoothed.max(0.0) * MAX_SPEED;
 
-        // Direction is geometric from the chosen target. If no
-        // target was picked (no prey in neighbour window), keep
-        // last-commanded direction so the agent keeps cruising
-        // rather than freezing.
-        if let Some((_, rel)) = new_target {
-            let dx = rel.x;
-            let dz = rel.z;
-            let mag2 = dx * dx + dz * dz;
-            if mag2 > 1e-6 {
-                let inv = mag2.sqrt().recip();
-                org.movement_direction = Vec3::new(dx * inv, 0.0, dz * inv);
+        // Arrival braking + no-target speed cap.
+        //
+        // With a locked target: scale speed by
+        // `clamp(dist_xz / L1_APPROACH_RADIUS, 0, 1)` — full speed
+        // past R, linear decel inside, zero at the target. Kills
+        // post-eat overshoot.
+        //
+        // Without a target: scale speed by `L1_NO_TARGET_SPEED_SCALE`
+        // (0.3). The agent still patrols slowly so a wandering photo
+        // can be discovered, but doesn't generate enough collision
+        // force to deadlock against neighbouring heteros in
+        // prey-empty regions.
+        let brake_scale = match new_target {
+            Some((_, rel)) => {
+                let d_xz = (rel.x * rel.x + rel.z * rel.z).sqrt();
+                (d_xz / L1_APPROACH_RADIUS).clamp(0.0, 1.0)
+            }
+            None => L1_NO_TARGET_SPEED_SCALE,
+        };
+        // Hard floor on world-facing speed: even if the policy outputs
+        // negative speed_a or the EMA is deeply negative, the world
+        // sees at least `L1_MIN_APPLIED_SPEED · MAX_SPEED · brake_scale`.
+        // This makes the standstill phenotype structurally impossible
+        // — the curiosity reward already pushes the gradient AWAY from
+        // stillness, but the per-slot EMA baseline tends to absorb
+        // constant offsets over time, so policy-level pressure alone
+        // proved insufficient. This clamp is the environment-side
+        // safeguard.
+        //
+        // `pool.applied_speed_a` still stores the unclamped EMA value
+        // because that's what the policy gradient references — keeping
+        // those consistent preserves the Gaussian log-prob math.
+        let applied_floored = smoothed.max(L1_MIN_APPLIED_SPEED);
+        org.movement_speed = applied_floored * MAX_SPEED * brake_scale;
+
+        // Direction is geometric from the chosen target, BUT we
+        // freeze it at the previous tick's value when the target is
+        // inside `L1_DIRECTION_FREEZE_DIST`. At very-close range the
+        // unit-vector is hypersensitive to tiny prey wobble (a
+        // 0.05-unit lateral wiggle at d = 0.2 produces a ~14° angle
+        // swing), and the recompute-every-tick rule would visibly
+        // micro-oscillate the agent. Combined with the arrival
+        // brake the agent simply parks against the target until the
+        // lock resolves naturally (eat / despawn / 10 s expiry).
+        //
+        // If no target picked, apply a small random rotation each
+        // tick — a slow Brownian wander that breaks the case where
+        // two heteros without prey settle into a stable mutual
+        // deadlock. Combined with the no-target speed cap above,
+        // the wander is gentle but enough to migrate out of an
+        // empty region over a few seconds of virtual time.
+        match new_target {
+            Some((_, rel)) => {
+                let dx = rel.x;
+                let dz = rel.z;
+                let mag2 = dx * dx + dz * dz;
+                if mag2 > L1_DIRECTION_FREEZE_DIST * L1_DIRECTION_FREEZE_DIST {
+                    let inv = mag2.sqrt().recip();
+                    org.movement_direction = Vec3::new(dx * inv, 0.0, dz * inv);
+                }
+            }
+            None => {
+                use rand::RngExt;
+                // Uniform sample in [-L1_NO_TARGET_WANDER_ANGLE,
+                //                    +L1_NO_TARGET_WANDER_ANGLE].
+                let angle = (rng.random::<f32>() - 0.5) * 2.0 * L1_NO_TARGET_WANDER_ANGLE;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let dx = org.movement_direction.x;
+                let dz = org.movement_direction.z;
+                let new_dx = dx * cos_a - dz * sin_a;
+                let new_dz = dx * sin_a + dz * cos_a;
+                // Defensive renormalisation against drift (composing
+                // many small rotations slowly inflates the norm).
+                let len_sq = new_dx * new_dx + new_dz * new_dz;
+                if len_sq > 1e-6 {
+                    let inv = len_sq.sqrt().recip();
+                    org.movement_direction = Vec3::new(new_dx * inv, 0.0, new_dz * inv);
+                }
             }
         }
 
@@ -874,13 +1079,35 @@ pub fn apply_intelligence_level_1_hetero(
         pool.has_prev[s]           = true;
 
         // Target bookkeeping for next-tick reward shaping.
-        pool.prev_target_entity[s] = pool.target_entity[s];
+        let prev_target_ent = pool.target_entity[s];
+        pool.prev_target_entity[s] = prev_target_ent;
+        let new_target_ent = new_target.map(|(e, _)| e);
         if let Some((ent, rel)) = new_target {
             pool.target_entity[s]           = Some(ent);
             pool.prev_distance_to_target[s] = rel.length();
         } else {
             pool.target_entity[s]           = None;
             pool.prev_distance_to_target[s] = 0.0;
+        }
+
+        // (3c-post) Stuck-detection book-keeping.
+        //
+        // If the target changed this tick (force-drop fired, switch
+        // hysteresis chose a different photo, or the lock collapsed
+        // because the previous target left the neighbour window),
+        // reset the running-minimum distance to the new target's
+        // current distance and zero the counter. The new lock window
+        // gets `L1_STUCK_TICKS` fresh ticks to prove progress.
+        //
+        // If the target is the SAME as last tick (most common —
+        // pure lock-hold), the increment-or-reset already happened
+        // in (3c-pre) before the selection scan. Nothing more to do.
+        if new_target_ent != prev_target_ent {
+            pool.min_dist_to_target[s] = match new_target {
+                Some((_, rel)) => (rel.x * rel.x + rel.z * rel.z).sqrt(),
+                None           => f32::INFINITY,
+            };
+            pool.ticks_since_progress[s] = 0;
         }
     }
 

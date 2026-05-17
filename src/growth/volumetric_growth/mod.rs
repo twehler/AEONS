@@ -257,6 +257,40 @@ pub fn grow_ocg_one_step(
     new_ocg
 }
 
+/// Return ALL valid next-cell centre positions given the current OCG.
+/// `min_x = Some(v)` filters to candidates with `centre.x >= v − 1e-3`
+/// (used by the bilateral right-half-only path). `min_x = None` means
+/// no constraint.
+///
+/// Exposed for interactive tools (the Species Editor) that need to
+/// enumerate the lattice frontier instead of picking randomly.
+/// Internally this is the same machinery `grow_ocg_one_step` uses;
+/// just without the final random `pick`.
+pub fn candidate_centers_for_ocg(
+    ocg:   &[(usize, Vec3, CellType)],
+    min_x: Option<f32>,
+) -> Vec<Vec3> {
+    if ocg.is_empty() { return Vec::new(); }
+    let mut state = VolumetricState::empty();
+    for (_, center, _) in ocg.iter() {
+        state.centers.push(*center);
+        update_lattice_bookkeeping(&mut state, *center);
+    }
+    if matches!(GROWTH_MODE, GrowthMode::Tetrahedron) {
+        let (v, t) = rebuild_mesh(&state.centers);
+        state.vertices = v;
+        state.triangles = t;
+    }
+    let raw = collect_candidates(&state);
+    match min_x {
+        Some(v) => {
+            let threshold = v - 1e-3;
+            raw.into_iter().filter(|c| c.center.x >= threshold).map(|c| c.center).collect()
+        }
+        None => raw.into_iter().map(|c| c.center).collect(),
+    }
+}
+
 /// As `grow_ocg_one_step`, but only candidate cells with `x >= min_x` are
 /// considered. Returns the parent OCG unchanged when no candidate satisfies
 /// the constraint. Used by the bilateral pipeline to keep the right half
@@ -513,6 +547,17 @@ fn spawn_volumetric_mesh(
             is_climbing: false,
             climb_energy_debt: 0.0,
             cached_bounding_radius: 0.0,
+            // Dev sandbox spawn — give it a structurally correct DNA
+            // vector even though this entity is never seen by the
+            // speciation system in practice (the sandbox plugin is
+            // not wired into the regular simulation app).
+            dna: crate::lineages::dna::structural_dna(
+                crate::organism::OrganismKind::Photoautotroph,
+                crate::organism::Symmetry::NoSymmetry,
+                false, false,
+                crate::organism::IntelligenceLevel::Level1,
+            ),
+            species_id: None,
         },
     ));
 }

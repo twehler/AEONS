@@ -42,6 +42,7 @@ fn predation_system(
     mut contact_events:     MessageReader<OrganismContactEvent>,
     mut heterotrophs:       Query<&mut Organism, (With<Heterotroph>, Without<Photoautotroph>)>,
     mut phototrophs:        Query<&mut Organism, (With<Photoautotroph>, Without<Heterotroph>)>,
+    carnivores:             Query<(), With<crate::colony::Carnivore>>,
     children_query:         Query<&Children>,
     body_part_idx_query:    Query<&BodyPartIndex>,
     mut already_eaten:      Local<HashSet<(Entity, usize)>>,
@@ -58,58 +59,57 @@ fn predation_system(
     already_despawned.clear();
 
     for event in contact_events.read() {
-        // Identify predator + prey + which body-part index belongs to prey.
-        let a_is_pred = heterotrophs.contains(event.a);
-        let b_is_pred = heterotrophs.contains(event.b);
-        let a_is_prey = phototrophs.contains(event.a);
-        let b_is_prey = phototrophs.contains(event.b);
+        // Predator-prey routing:
+        //   * Heterotroph + Photoautotroph  ⇒  hetero eats photo (legacy).
+        //   * Carnivore (a heterotroph subset) + Heterotroph  ⇒
+        //     carnivore eats the other hetero, regardless of the
+        //     prey's own classification. A carnivore eating another
+        //     carnivore is allowed (food-chain dynamics).
+        let a_is_hetero = heterotrophs.contains(event.a);
+        let b_is_hetero = heterotrophs.contains(event.b);
+        let a_is_photo  = phototrophs.contains(event.a);
+        let b_is_photo  = phototrophs.contains(event.b);
+        let a_is_carn   = carnivores.contains(event.a);
+        let b_is_carn   = carnivores.contains(event.b);
 
-        let (predator, prey, prey_bp_idx) = if a_is_pred && b_is_prey {
-            (event.a, event.b, event.body_part_b)
-        } else if b_is_pred && a_is_prey {
-            (event.b, event.a, event.body_part_a)
-        } else {
-            // Either both predators, both prey, or one despawned — nothing
-            // for predation to do.
-            continue;
-        };
+        // (predator, prey, prey_bp_idx, prey_is_photo)
+        let (predator, prey, prey_bp_idx, prey_is_photo) =
+            if a_is_hetero && b_is_photo {
+                (event.a, event.b, event.body_part_b, true)
+            } else if b_is_hetero && a_is_photo {
+                (event.b, event.a, event.body_part_a, true)
+            } else if a_is_carn && b_is_hetero && event.a != event.b {
+                (event.a, event.b, event.body_part_b, false)
+            } else if b_is_carn && a_is_hetero && event.a != event.b {
+                (event.b, event.a, event.body_part_a, false)
+            } else {
+                continue;
+            };
 
         if already_despawned.contains(&prey) { continue; }
         if !already_eaten.insert((prey, prey_bp_idx)) { continue; }
 
         // ── Mutate prey: consume the body part, decrement energy ─────────
-        let (energy_share, prey_dead) = {
-            let Ok(mut prey_org) = phototrophs.get_mut(prey) else { continue };
-
+        //
+        // Shared mutation logic for either prey type. Returns
+        // `(energy_share, prey_dead)` or `None` if the prey reference
+        // can't be acquired or the body-part index is stale.
+        let mutate_prey = |prey_org: &mut Organism, commands: &mut Commands,
+                           already_despawned: &mut HashSet<Entity>| -> Option<(f32, bool)> {
             let alive = prey_org.alive_body_part_count();
             if alive == 0 {
-                // No alive body parts — should already be despawned. Be
-                // defensive and despawn now.
                 already_despawned.insert(prey);
                 commands.entity(prey).despawn();
-                continue;
+                return None;
             }
-
-            // Bounds + already-eaten guards. Necessary because
-            // `consumed_body_parts` is a per-frame set; multiple events
-            // for the same body part are rare but possible across frames
-            // if the contact persists.
             if prey_bp_idx >= prey_org.body_parts.len()
                 || !prey_org.body_parts[prey_bp_idx].is_alive()
             {
-                continue;
+                return None;
             }
-
-            // Even split of remaining prey energy across alive body parts.
-            // The eaten body part's share moves to the predator (minus
-            // metabolic loss); remaining parts retain their shares.
             let share = prey_org.energy / alive as f32;
             prey_org.energy = (prey_org.energy - share).max(0.0);
 
-            // Decrement the cached cell counts BEFORE clearing the part,
-            // since the cell types are read from `bp.cells`. The
-            // `Organism::{photo,non_photo}_cell_count` fields are updated
-            // only at composition-change events; predation is one of them.
             let bp_counts = prey_org.body_parts[prey_bp_idx].cell_counts();
             prey_org.photo_cell_count     -= bp_counts.0 as i32;
             prey_org.non_photo_cell_count -= bp_counts.1 as i32;
@@ -117,24 +117,28 @@ fn predation_system(
             let bp = &mut prey_org.body_parts[prey_bp_idx];
             bp.consumed = true;
             bp.cells.clear();
-            // Each body part now owns its OCG too; clear it so cell-count
-            // accessors and is_alive() agree the part is gone.
             bp.ocg.clear();
 
-            // Composition changed — refresh the cached bounding radius
-            // so movement / floor / collision queries don't keep using
-            // the pre-consumption envelope.
             prey_org.recompute_bounding_radius();
-
             let new_alive = prey_org.alive_body_part_count();
-            // Bilateral organisms cannot survive losing a half — once one
-            // body part is consumed, the whole organism dies. This avoids
-            // visually-bisected zombies that would otherwise wander on
-            // half a body. Asymmetric (NoSymmetry) organisms degrade
-            // gradually as before.
+            // Bilateral organisms can't survive losing a half.
             let bilateral_collapse = matches!(prey_org.symmetry, Symmetry::Bilateral);
-            (share, new_alive == 0 || bilateral_collapse)
+            Some((share, new_alive == 0 || bilateral_collapse))
         };
+
+        let mutation_result = if prey_is_photo {
+            let Ok(mut prey_org) = phototrophs.get_mut(prey) else { continue };
+            mutate_prey(&mut prey_org, &mut commands, &mut already_despawned)
+        } else {
+            // Carnivore eating a heterotroph. Same logic, different
+            // query. Predator credit (below) re-borrows heterotrophs
+            // mutably for the predator entity — that's safe because
+            // the prey borrow ends with this block, and Bevy's NLL
+            // releases the reference before the next get_mut.
+            let Ok(mut prey_org) = heterotrophs.get_mut(prey) else { continue };
+            mutate_prey(&mut prey_org, &mut commands, &mut already_despawned)
+        };
+        let Some((energy_share, prey_dead)) = mutation_result else { continue };
 
         // ── Credit predator ──────────────────────────────────────────────
         if let Ok(mut pred_org) = heterotrophs.get_mut(predator) {

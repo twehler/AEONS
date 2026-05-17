@@ -255,6 +255,19 @@ fn spawn_krishi(
         is_climbing:        false,
         climb_energy_debt:  0.0,
         cached_bounding_radius: 0.0,
+        // Krishi is structurally a Heterotroph + NoSymmetry + L3
+        // organism. Brain-gene slots stay 0 (Krishi doesn't use
+        // the L1 hetero pool); the speciation system will park it
+        // in its own species on the first tick because its
+        // intelligence dim differs from L1 heteros.
+        dna: crate::lineages::dna::structural_dna(
+            crate::organism::OrganismKind::Heterotroph,
+            Symmetry::NoSymmetry,
+            false, // has_variable_form
+            false, // is_sessile
+            IntelligenceLevel::Level3,
+        ),
+        species_id: None,
     };
     organism.recompute_cell_counts();
 

@@ -55,9 +55,17 @@ pub const RD_HALF_SIZE: f32 = 0.5;
 pub const MESH_PADDING: f32 = CELL_SPACING * 0.55;
 
 /// Effective collision radius of a single cell — sphere-vs-sphere narrow
-/// phase uses this. Sized just over half a cell-spacing so two cells from
-/// different organisms touch when within `CELL_SPACING`.
-pub const CELL_COLLISION_RADIUS: f32 = CELL_SPACING * 0.55;
+/// phase uses this. Sized so the cell-cell contact threshold
+/// (`CELL_COLLISION_RADIUS * 2 = 1.4`) gives generous along-axis
+/// tolerance for the bilateral body-plan's perpendicular cell offset
+/// of `MIN_X_BILATERAL ≈ 1.155`. The along-axis contact window for
+/// the closest flanking cell is `√(1.4² − 1.155²) ≈ 0.79` units,
+/// which absorbs both the brake's parking position (root-to-root
+/// → 0) and any minor angular misalignment of the approach. With
+/// the previous radius of 0.6 (threshold 1.2) the along-axis window
+/// shrunk to ~0.32 units, and the V-shape would silently flank prey
+/// without ever triggering predation when the approach was off-axis.
+pub const CELL_COLLISION_RADIUS: f32 = CELL_SPACING * 0.7;
 
 
 // ── Cell type ────────────────────────────────────────────────────────────────

@@ -604,6 +604,21 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
             // Will be derived from the loaded body_parts on the next
             // line — saving the value would have been redundant.
             cached_bounding_radius: 0.0,
+            // Structural slots filled in here; brain genes will be
+            // populated later by `sync_dna_from_brain_pool` once the
+            // brain pool's `assign_brains_l1_hetero` claims a slot.
+            dna: crate::lineages::dna::structural_dna(
+                kind,
+                symmetry,
+                has_variable_form,
+                is_sessile,
+                intelligence_level,
+            ),
+            // Will be classified on the first speciation tick after
+            // load — species ids aren't persisted to `.colony` files
+            // (they're a runtime classification, not a property of
+            // the saved organism).
+            species_id: None,
         };
         organism.recompute_bounding_radius();
 
@@ -1099,6 +1114,22 @@ pub fn spawn_organism(
         climb_energy_debt: 0.0,
         // Populated by recompute_cell_counts below.
         cached_bounding_radius: 0.0,
+        // Structural DNA slots — filled here so newly-reproduced /
+        // user-placed organisms enter the speciation system with a
+        // valid vector from frame 1. Brain-gene slots stay 0 until
+        // `sync_dna_from_brain_pool` runs.
+        dna: crate::lineages::dna::structural_dna(
+            kind,
+            symmetry,
+            has_variable_form,
+            is_sessile,
+            intelligence_level,
+        ),
+        // Inherited from parent (when reproducing) in a separate
+        // post-spawn step by `reproduction.rs`; left `None` for
+        // initial-cohort spawns + editor placements so the
+        // classification tick assigns them.
+        species_id: None,
     };
     organism.recompute_cell_counts();
 

@@ -195,6 +195,24 @@ pub struct Organism {
     /// buoyancy queries — caching this avoids an O(cells) walk per
     /// access × thousands of accesses per frame.
     pub cached_bounding_radius: f32,
+
+    /// Fixed-dimension genome vector — see `lineages::dna`. Slots
+    /// 0..5 (structural / metabolic fields) are filled at
+    /// `spawn_organism` time and never change after birth; slots
+    /// 5..11 (L1 hetero brain genes) start at 0.0 and are populated
+    /// by `lineages::speciation::sync_dna_from_brain_pool` once the
+    /// brain-pool slot is assigned. Used by the speciation system
+    /// to classify organisms into species.
+    pub dna: Vec<f32>,
+
+    /// Which species this organism belongs to. `None` immediately
+    /// after spawn and until the first speciation tick. The
+    /// speciation system either keeps the value (drift still within
+    /// 5% of species centroid), reassigns it to a better-fitting
+    /// existing species, or forks a brand-new species. Offspring
+    /// inherit the parent's `species_id` at reproduction; the next
+    /// speciation tick re-evaluates whether the child still fits.
+    pub species_id: Option<u32>,
 }
 
 impl Organism {
@@ -300,6 +318,17 @@ pub struct Photoautotroph;
 /// Marks an organism as a heterotroph (energy from consuming other organisms).
 #[derive(Component, Clone, Copy)]
 pub struct Heterotroph;
+
+/// Sub-classification of heterotrophs — `Carnivore` targets and
+/// consumes other heterotrophs; the absence of this marker on a
+/// heterotroph means "herbivore" (default), which targets and
+/// consumes photoautotrophs (existing behaviour). The Species
+/// Editor's Classification cycler controls which marker is added at
+/// spawn time. Brain pools (IL2 / IL3 / IL herbivore_1) read this
+/// marker to decide which neighbour type to chase. Initial-spawn
+/// heterotrophs (no species file) default to herbivore.
+#[derive(Component, Clone, Copy)]
+pub struct Carnivore;
 
 #[derive(Component)]
 pub struct OrganismRoot;

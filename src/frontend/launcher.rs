@@ -339,23 +339,19 @@ impl eframe::App for LauncherApp {
                         .speed(1.0),
                 );
 
-                // ── Action buttons row ──────────────────────────────
-                let total_w  = ACTION_BTN_SIZE.x * 2.0 + ACTION_BTN_GAP;
+                // ── Action button ───────────────────────────────────
+                // Single launch button now that the standalone Colony
+                // Editor entry has been removed. Editor / species-editor
+                // modes are reachable from the in-app mode bar after
+                // the simulation starts.
+                let total_w  = ACTION_BTN_SIZE.x;
                 let row_left = (LAUNCHER_WINDOW_SIZE.x - total_w) * 0.5;
                 let start_pos  = egui::pos2(row_left, ACTION_ROW_TOP);
-                let editor_pos = egui::pos2(row_left + ACTION_BTN_SIZE.x + ACTION_BTN_GAP, ACTION_ROW_TOP);
+                let start_rect = egui::Rect::from_min_size(start_pos, ACTION_BTN_SIZE);
+                let start_label = egui::RichText::new(START_BTN_LABEL).size(ACTION_BTN_FONT_SIZE).strong();
 
-                let start_rect  = egui::Rect::from_min_size(start_pos,  ACTION_BTN_SIZE);
-                let editor_rect = egui::Rect::from_min_size(editor_pos, ACTION_BTN_SIZE);
-
-                let start_label  = egui::RichText::new(START_BTN_LABEL).size(ACTION_BTN_FONT_SIZE).strong();
-                let editor_label = egui::RichText::new(EDITOR_BTN_LABEL).size(ACTION_BTN_FONT_SIZE).strong();
-
-                if ui.put(start_rect,  egui::Button::new(start_label)).clicked() {
+                if ui.put(start_rect, egui::Button::new(start_label)).clicked() {
                     self.launch_simulation(ctx);
-                }
-                if ui.put(editor_rect, egui::Button::new(editor_label)).clicked() {
-                    self.launch_editor(ctx);
                 }
 
                 if !self.status.is_empty() {

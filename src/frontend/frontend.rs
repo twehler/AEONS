@@ -33,9 +33,12 @@ use crate::statistics_panel::{
     self, GraphState, OrganismCounts, StatisticsPanel,
 };
 use crate::individuum_navigator::{
-    self, IndividuumNavigatorPlugin,
+    self, IndividuumNavigatorPlugin, NavigatorPanel,
 };
-use crate::simulation_settings::{PlayerControlsActive, SimulationRunning, Smoothing, TimeSpeed};
+use crate::simulation_settings::{
+    PlayerControlsActive, SimulationRunning, Smoothing, TimeSpeed, WindowMode,
+};
+use crate::colony_editor::{self, EditorOverlayPlugin, EditorOverlayPanel};
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -55,6 +58,14 @@ const VIEWPORT_MIN_PX: f32 = 50.0;
 /// Shared background colour for both UI panels (statistics + simulation
 /// settings). Re-exported so the panel modules don't duplicate the value.
 pub const PANEL_BG_COLOR: Color = Color::srgb(0.15, 0.15, 0.15);
+
+/// Thin top bar that hosts the WindowMode buttons (Simulation Mode /
+/// Edit Colony). Sits above every other panel — never hidden — so the
+/// user always has a way to switch back out of whichever mode they're
+/// in. `pub` so the editor overlay can reserve a matching gap at the
+/// top of the screen (used as `top_offset_px` when spawning editor
+/// panels and as the `CursorTopReservedPx` resource value).
+pub const TOP_BAR_HEIGHT_PX: f32 = 36.0;
 
 
 // ── Resources ────────────────────────────────────────────────────────────────
@@ -100,6 +111,23 @@ pub struct ViewportImage;
 #[derive(Component)]
 struct PanelDivider;
 
+/// Marker on the top mode-switcher bar — never hidden, but tagged so
+/// other systems can size around it (e.g. for cursor-hit rect tests).
+#[derive(Component)]
+pub struct TopModeBar;
+
+/// Marker on each mode-switch button. The variant tells us which
+/// `WindowMode` to switch to on click.
+#[derive(Component, Clone, Copy)]
+pub struct ModeSwitchButton(pub WindowMode);
+
+/// Marker on the wrapping row that hosts the (viewport + vertical
+/// divider + navigator) trio. We toggle this row's `Display` along
+/// with the navigator panel itself so the row's flex layout doesn't
+/// leave a phantom rule when the navigator is hidden.
+#[derive(Component)]
+struct ViewportRow;
+
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
@@ -117,12 +145,43 @@ impl Plugin for FrontendPlugin {
             .init_resource::<TimeSpeed>()
             .init_resource::<crate::simulation_settings::MaxOrganisms>()
             .init_resource::<crate::simulation_settings::OrganismPoolSize>()
+            .init_resource::<WindowMode>()
             .init_resource::<statistics_panel::TimeSpeedEditState>()
             .init_resource::<statistics_panel::MaxOrganismsEditState>()
             .init_resource::<statistics_panel::CullMessage>()
             .insert_resource(GraphState::new())
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
+            // Lineages tree-view pan/zoom state + layout cache.
+            // Render-target image is created inside `setup_panes`
+            // (needs `Assets<Image>`) and inserted as
+            // `LineagesViewportRender` after the layout root is
+            // built; `setup_lineages_camera` consumes it on the
+            // following Startup tick.
+            .add_systems(Startup, crate::tree_view::setup_lineages_camera.after(setup_panes));
+        crate::tree_view::init_resources(app);
+        app
             .add_plugins(IndividuumNavigatorPlugin)
+            .add_plugins(crate::species_navigator::SpeciesNavigatorPlugin)
+            // Editor lives behind the EditColony WindowMode. The
+            // overlay plugin (re)uses the existing 3D camera +
+            // lighting from the simulation; it only contributes
+            // editor UI + the editor's input handlers (the latter
+            // gated on EditColony at the system level).
+            .add_plugins(EditorOverlayPlugin)
+            .add_systems(Update, (
+                handle_mode_switch_buttons,
+                apply_mode_transition,
+                // Tree-of-life renderer lives in `tree_view.rs`
+                // (frontend folder); `LineagesPlugin` owns the
+                // `SpeciesRegistry`, the renderer turns it into a
+                // pan/zoom 2D scene.
+                crate::tree_view::resize_lineages_target,
+                crate::tree_view::rebuild_tree_layout,
+                crate::tree_view::rebuild_tree_visuals,
+                crate::tree_view::lineages_zoom_wheel,
+                crate::tree_view::apply_lineages_camera_state,
+                crate::tree_view::apply_label_lod,
+            ))
             .add_systems(Startup, setup_panes)
             .add_systems(Update, (
                 bind_main_camera_to_viewport,
@@ -200,6 +259,13 @@ fn setup_panes(
         current_size: UVec2::new(0, 0),
     });
 
+    // Lineages render-target image is created inside
+    // `spawn_lineages_panel` below; we capture its handle here so we
+    // can insert the matching `LineagesViewportRender` resource
+    // after `with_children` returns (commands can't be enqueued
+    // from inside the child-spawner closure).
+    let mut spawned_lineages_image: Option<Handle<Image>> = None;
+
     // 2D camera owns the window output and is marked as the default UI
     // camera so UI propagation never picks the player's Camera3d (which
     // we redirect to the off-screen image below). Higher order so it
@@ -224,20 +290,33 @@ fn setup_panes(
             Pickable::IGNORE,
         ))
         .with_children(|root| {
+            // ── Top mode-switcher bar ─────────────────────────────────
+            spawn_top_mode_bar(root);
+
             // Top row: viewport (flex-grow) + vertical divider +
             // navigator panel. Wrapping these in a single row container
             // means the horizontal divider below resizes the row as a
             // whole, so the navigator panel's height automatically
             // tracks the viewport's height.
-            root.spawn(Node {
-                width:          Val::Percent(100.0),
-                flex_direction: FlexDirection::Row,
-                flex_grow:      1.0,
-                flex_basis:     Val::Px(0.0),
-                min_height:     Val::Px(0.0),
-                ..default()
-            })
+            root.spawn((
+                ViewportRow,
+                Node {
+                    width:          Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    flex_grow:      1.0,
+                    flex_basis:     Val::Px(0.0),
+                    min_height:     Val::Px(0.0),
+                    ..default()
+                },
+            ))
             .with_children(|top_row| {
+                // Left-side species navigator — flex sibling of the
+                // viewport image so it shares the row's vertical
+                // extent and ends exactly at the horizontal divider
+                // above the statistics panel. Spawned BEFORE the
+                // viewport so flex-row places it on the left.
+                crate::species_navigator::spawn_species_navigator(top_row);
+
                 top_row.spawn((
                     ViewportImage,
                     ImageNode::new(image_handle),
@@ -262,7 +341,8 @@ fn setup_panes(
                         is_hoverable:       true,
                     },
                 ))
-                .observe(viewport_click);
+                .observe(viewport_click)
+                .observe(viewport_press);
 
                 individuum_navigator::spawn_vertical_divider(top_row);
                 individuum_navigator::spawn_navigator_panel(top_row);
@@ -294,7 +374,49 @@ fn setup_panes(
             // `individuum_navigator::manage_label_lifecycle` directly
             // as children of the `ViewportImage` — no separate
             // overlay container needed.
+
+            // ── Editor overlay panels ────────────────────────────────
+            // Children of the root so their absolute positioning (e.g.
+            // `bottom: 0`, `right: 0`) resolves against the window. We
+            // spawn them up-front and tag them with both their natural
+            // panel marker (CreationPanel, ToolPanel, InventoryPanel)
+            // and an `EditorOverlayPanel` marker so the mode-transition
+            // system can flip every editor panel's `Display` in one
+            // query. Initial state is `Display::None` because we boot
+            // in `WindowMode::Simulation`.
+            colony_editor::spawn_overlay_panels(root, TOP_BAR_HEIGHT_PX);
+
+            // ── Species editor panels ────────────────────────────────
+            // Top + bottom panels for the manual species-construction
+            // mode. Both spawn with `Display::None`; the mode-transition
+            // system flips them to `Flex` when WindowMode::SpeciesEditor.
+            crate::species_editor::spawn_overlay_panels(root, TOP_BAR_HEIGHT_PX);
+
+            // (The simulation-mode species navigator is now spawned
+            // inside the ViewportRow above so it shares the row's
+            // vertical extent — see the `top_row.with_children`
+            // block.)
+
+            // Lineages mode panel — full-content-area tree-of-life
+            // view. Spawned hidden; the mode-transition system
+            // toggles its `Display` like the editor panels.
+            let lineages_image = crate::tree_view::spawn_lineages_panel(
+                root, TOP_BAR_HEIGHT_PX, &mut images,
+            );
+            // Stash the render-target handle as a resource that
+            // `setup_lineages_camera` consumes once Startup
+            // finishes. Inserting via Commands inside `with_children`
+            // is awkward, so we use the closure's captured `commands`
+            // queue at the outer call site below (after this
+            // `with_children` block ends).
+            spawned_lineages_image = Some(lineages_image);
         });
+    if let Some(handle) = spawned_lineages_image {
+        commands.insert_resource(crate::tree_view::LineagesViewportRender {
+            image:        handle,
+            current_size: UVec2::ZERO,
+        });
+    }
 }
 
 
@@ -379,11 +501,51 @@ fn resize_render_target(
 fn viewport_click(
     ev:                 On<Pointer<Click>>,
     mut player_active:  ResMut<PlayerControlsActive>,
+    window_mode:        Res<WindowMode>,
+    windows:            Query<&Window, With<PrimaryWindow>>,
+    mut click_writer:   MessageWriter<crate::camera::ViewportClick>,
 ) {
     // Only respond to the primary (left) mouse button so right-clicks /
     // middle-clicks pass through cleanly.
     if !matches!(ev.button, PointerButton::Primary) { return; }
+    // In EditColony mode, left-click is the editor's "place organism"
+    // verb — emit a `ViewportClick` at the cursor and let
+    // `colony_editor::placement::handle_left_click` ray-cast against
+    // the heightmap. `Pointer<Click>` fires only on a clean tap
+    // (press+release without intervening drag), so a hold-LMB camera
+    // rotation never spawns an unintended template.
+    if *window_mode == WindowMode::EditColony {
+        if let Ok(window) = windows.single() {
+            if let Some(cursor) = window.cursor_position() {
+                click_writer.write(crate::camera::ViewportClick { cursor });
+            }
+        }
+        return;
+    }
+    // Species-editor mode handles its own left-click semantics
+    // (placing a cell at the cursor-snapped lattice position) in
+    // `species_editor::placement::handle_left_click_place`. The player
+    // controls must stay released so the cursor remains visible and
+    // usable for that pointer-based placement workflow.
+    if *window_mode == WindowMode::SpeciesEditor { return; }
     player_active.0 = !player_active.0;
+}
+
+/// Sets `EditorLookActive(true)` whenever the user presses LMB on the
+/// viewport image while in EditColony mode. The flag persists until
+/// LMB release (cleared by `release_editor_look_on_lmb_up` in
+/// `player_plugin`). A press on any UI panel (mode bar, editor
+/// panels, etc.) does NOT fire this observer because Bevy's picking
+/// routes the event to the panel button instead — that's exactly the
+/// "press over UI suppresses rotation" semantics we want.
+fn viewport_press(
+    ev:              On<Pointer<Press>>,
+    window_mode:     Res<WindowMode>,
+    mut editor_look: ResMut<crate::player_plugin::EditorLookActive>,
+) {
+    if !matches!(ev.button, PointerButton::Primary) { return; }
+    if *window_mode != WindowMode::EditColony { return; }
+    editor_look.0 = true;
 }
 
 /// Mirror `PlayerControlsActive` onto the OS cursor's grab state. Runs
@@ -398,14 +560,29 @@ fn apply_player_controls_state(
 ) {
     let (mut window, mut cursor) = window_q.into_inner();
     let want_grab = player_active.0;
-    let currently_grabbed = matches!(cursor.grab_mode, bevy::window::CursorGrabMode::Confined);
+    let currently_grabbed = matches!(cursor.grab_mode, bevy::window::CursorGrabMode::Locked);
     if want_grab == currently_grabbed { return; }
     if want_grab {
-        cursor.grab_mode = bevy::window::CursorGrabMode::Confined;
+        // Warp the cursor to the window centre BEFORE locking. With
+        // `CursorGrabMode::Locked` the cursor stays pinned at this
+        // position for the duration of the grab — UI hover events
+        // fire at the centre only (inside the viewport image, not on
+        // any panel buttons), so panels no longer light up
+        // "randomly" while the user moves the mouse to look around.
+        // The mouse-look system reads relative motion from
+        // `MouseMotion` events, which Bevy delivers correctly under
+        // `Locked` regardless of the visible cursor position.
+        let center = Vec2::new(window.width() / 2.0, window.height() / 2.0);
+        window.set_cursor_position(Some(center));
+        cursor.grab_mode = bevy::window::CursorGrabMode::Locked;
         cursor.visible   = false;
     } else {
         cursor.grab_mode = bevy::window::CursorGrabMode::None;
         cursor.visible   = true;
+        // Release the cursor from the centre — the user can now move
+        // it freely. Set its initial position to the centre as well
+        // so the released pointer doesn't appear over a random UI
+        // element it might accidentally trigger.
         let center = Vec2::new(window.width() / 2.0, window.height() / 2.0);
         window.set_cursor_position(Some(center));
     }
@@ -439,5 +616,222 @@ pub fn draw_orientation_gizmos(
         gizmos.arrow(pos, pos + transform.right()   * length, Color::srgb(1.0, 0.0, 0.0));
         gizmos.arrow(pos, pos + transform.up()      * length, Color::srgb(1.0, 1.0, 0.0));
         gizmos.arrow(pos, pos + transform.forward() * length, Color::srgb(0.0, 0.0, 1.0));
+    }
+}
+
+
+// ── Top mode-switch bar ──────────────────────────────────────────────────────
+//
+// Sits above the rest of the layout (first flex child of the root) and
+// always stays visible. Two wide buttons — Simulation Mode and Edit
+// Colony — each tagged with `ModeSwitchButton(WindowMode::...)`.
+// `handle_mode_switch_buttons` reads `Changed<Interaction>` to flip
+// `WindowMode`. The actual visibility / pause work is done in
+// `apply_mode_transition`, which fires when `WindowMode` flips.
+
+const MODE_BUTTON_ACTIVE:   Color = Color::srgb(0.30, 0.50, 0.30);
+const MODE_BUTTON_INACTIVE: Color = Color::srgb(0.22, 0.22, 0.22);
+const MODE_BUTTON_HOVER:    Color = Color::srgb(0.32, 0.32, 0.32);
+
+fn spawn_top_mode_bar(parent: &mut ChildSpawnerCommands) {
+    parent
+        .spawn((
+            TopModeBar,
+            Node {
+                width:           Val::Percent(100.0),
+                height:          Val::Px(TOP_BAR_HEIGHT_PX),
+                flex_shrink:     0.0,
+                flex_direction:  FlexDirection::Row,
+                align_items:     AlignItems::Stretch,
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.10, 0.10, 0.10)),
+        ))
+        .with_children(|bar| {
+            mode_button(bar, "Simulation Mode", WindowMode::Simulation,   true);
+            mode_button(bar, "Edit Colony",     WindowMode::EditColony,   false);
+            mode_button(bar, "Lineages",        WindowMode::Lineages,     false);
+            mode_button(bar, "Species Editor",  WindowMode::SpeciesEditor, false);
+        });
+}
+
+fn mode_button(
+    parent:  &mut ChildSpawnerCommands,
+    label:   &str,
+    mode:    WindowMode,
+    active:  bool,
+) {
+    let bg = if active { MODE_BUTTON_ACTIVE } else { MODE_BUTTON_INACTIVE };
+    parent
+        .spawn((
+            ModeSwitchButton(mode),
+            Button,
+            Node {
+                flex_grow:       1.0,
+                flex_basis:      Val::Px(0.0),
+                height:          Val::Percent(100.0),
+                align_items:     AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(bg),
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label.to_string()),
+                TextFont { font_size: 16.0, ..default() },
+                TextColor(Color::WHITE),
+                Pickable::IGNORE,
+            ));
+        });
+}
+
+/// Click router for the two mode buttons. On `Pressed`, writes the
+/// chosen mode into the `WindowMode` resource — actual side-effects
+/// (panel show/hide, pause, etc.) are applied by
+/// `apply_mode_transition`, which keys off `Res::is_changed()`.
+fn handle_mode_switch_buttons(
+    mut interactions: Query<
+        (&Interaction, &ModeSwitchButton, &mut BackgroundColor),
+        Changed<Interaction>,
+    >,
+    mut window_mode:  ResMut<WindowMode>,
+) {
+    for (interaction, button, mut bg) in &mut interactions {
+        let target_mode = button.0;
+        let is_active   = *window_mode == target_mode;
+        match *interaction {
+            Interaction::Pressed => {
+                if !is_active {
+                    *window_mode = target_mode;
+                }
+                *bg = BackgroundColor(MODE_BUTTON_HOVER);
+            }
+            Interaction::Hovered => {
+                *bg = BackgroundColor(MODE_BUTTON_HOVER);
+            }
+            Interaction::None => {
+                *bg = BackgroundColor(if is_active { MODE_BUTTON_ACTIVE } else { MODE_BUTTON_INACTIVE });
+            }
+        }
+    }
+}
+
+/// Drive the per-mode side-effects whenever `WindowMode` flips:
+///   * Pause the simulation on entry into `EditColony` (Time<Virtual>
+///     is paused via the resource flag; the sim systems read this).
+///   * Release `PlayerControlsActive` on entry into `EditColony` so
+///     the cursor isn't grabbed under the editor panels.
+///   * Toggle `Display` on the simulation panels (statistics +
+///     navigator + dividers + viewport-row container) vs the editor
+///     overlay panels.
+///   * Refresh the mode-bar button colours so the active mode is
+///     visually distinct.
+fn apply_mode_transition(
+    window_mode:        Res<WindowMode>,
+    mut sim_running:    ResMut<SimulationRunning>,
+    mut player_active:  ResMut<PlayerControlsActive>,
+    mut virtual_time:   ResMut<Time<Virtual>>,
+    mut stats_q:        Query<&mut Node, (With<StatisticsPanel>,
+                                          Without<NavigatorPanel>,
+                                          Without<PanelDivider>,
+                                          Without<ViewportRow>,
+                                          Without<EditorOverlayPanel>,
+                                          Without<crate::tree_view::LineagesPanel>,
+                                          Without<crate::species_editor::SpeciesEditorPanel>,
+                                          Without<crate::species_navigator::SpeciesNavigatorPanel>,
+                                          Without<ModeSwitchButton>)>,
+    mut nav_q:          Query<&mut Node, (With<NavigatorPanel>,
+                                          Without<StatisticsPanel>,
+                                          Without<PanelDivider>,
+                                          Without<ViewportRow>,
+                                          Without<EditorOverlayPanel>,
+                                          Without<crate::tree_view::LineagesPanel>,
+                                          Without<crate::species_editor::SpeciesEditorPanel>,
+                                          Without<crate::species_navigator::SpeciesNavigatorPanel>,
+                                          Without<ModeSwitchButton>)>,
+    mut divider_q:      Query<&mut Node, (With<PanelDivider>,
+                                          Without<StatisticsPanel>,
+                                          Without<NavigatorPanel>,
+                                          Without<ViewportRow>,
+                                          Without<EditorOverlayPanel>,
+                                          Without<crate::tree_view::LineagesPanel>,
+                                          Without<crate::species_editor::SpeciesEditorPanel>,
+                                          Without<crate::species_navigator::SpeciesNavigatorPanel>,
+                                          Without<ModeSwitchButton>)>,
+    mut editor_panels:  Query<&mut Node, (With<EditorOverlayPanel>,
+                                          Without<StatisticsPanel>,
+                                          Without<NavigatorPanel>,
+                                          Without<PanelDivider>,
+                                          Without<ViewportRow>,
+                                          Without<crate::tree_view::LineagesPanel>,
+                                          Without<crate::species_editor::SpeciesEditorPanel>,
+                                          Without<crate::species_navigator::SpeciesNavigatorPanel>,
+                                          Without<ModeSwitchButton>)>,
+    mut lineages_panel: Query<&mut Node, (With<crate::tree_view::LineagesPanel>,
+                                          Without<StatisticsPanel>,
+                                          Without<NavigatorPanel>,
+                                          Without<PanelDivider>,
+                                          Without<ViewportRow>,
+                                          Without<EditorOverlayPanel>,
+                                          Without<crate::species_editor::SpeciesEditorPanel>,
+                                          Without<ModeSwitchButton>)>,
+    mut species_nav_p:  Query<&mut Node, (With<crate::species_navigator::SpeciesNavigatorPanel>,
+                                          Without<StatisticsPanel>,
+                                          Without<NavigatorPanel>,
+                                          Without<PanelDivider>,
+                                          Without<ViewportRow>,
+                                          Without<EditorOverlayPanel>,
+                                          Without<crate::tree_view::LineagesPanel>,
+                                          Without<crate::species_editor::SpeciesEditorPanel>,
+                                          Without<ModeSwitchButton>)>,
+    mut species_panels: Query<&mut Node, (With<crate::species_editor::SpeciesEditorPanel>,
+                                          Without<StatisticsPanel>,
+                                          Without<NavigatorPanel>,
+                                          Without<PanelDivider>,
+                                          Without<ViewportRow>,
+                                          Without<EditorOverlayPanel>,
+                                          Without<crate::tree_view::LineagesPanel>,
+                                          Without<crate::species_navigator::SpeciesNavigatorPanel>,
+                                          Without<ModeSwitchButton>)>,
+    mut buttons_q:      Query<(&ModeSwitchButton, &mut BackgroundColor)>,
+) {
+    if !window_mode.is_changed() { return; }
+
+    // Per-mode visibility table. Simulation mode shows the stats /
+    // navigator stack; EditColony shows the editor overlays;
+    // Lineages shows only the tree-of-life panel (sim viewport
+    // stays hidden because the panel covers the whole content
+    // area).
+    let mode = *window_mode;
+    let sim_visible      = mode == WindowMode::Simulation;
+    let editor_visible   = mode == WindowMode::EditColony;
+    let lineages_visible = mode == WindowMode::Lineages;
+    let species_visible  = mode == WindowMode::SpeciesEditor;
+    let to_display = |v| if v { Display::Flex } else { Display::None };
+
+    for mut n in &mut stats_q        { n.display = to_display(sim_visible);      }
+    for mut n in &mut nav_q          { n.display = to_display(sim_visible);      }
+    for mut n in &mut divider_q      { n.display = to_display(sim_visible);      }
+    for mut n in &mut editor_panels  { n.display = to_display(editor_visible);   }
+    for mut n in &mut lineages_panel { n.display = to_display(lineages_visible); }
+    for mut n in &mut species_panels { n.display = to_display(species_visible);  }
+    // Species Navigator (left side) — Simulation mode only.
+    for mut n in &mut species_nav_p  { n.display = to_display(sim_visible);      }
+
+    // Refresh mode-bar button colours so the active mode is highlighted
+    // immediately on the transition tick.
+    for (button, mut bg) in &mut buttons_q {
+        let is_active = mode == button.0;
+        *bg = BackgroundColor(if is_active { MODE_BUTTON_ACTIVE } else { MODE_BUTTON_INACTIVE });
+    }
+
+    // Modes other than Simulation pause the simulation on entry. The
+    // user can resume manually via the statistics-panel button after
+    // returning to Simulation mode.
+    if editor_visible || lineages_visible || species_visible {
+        sim_running.0 = false;
+        virtual_time.pause();
+        player_active.0 = false;
     }
 }

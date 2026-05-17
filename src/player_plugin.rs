@@ -2,7 +2,7 @@ use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use crate::simulation_settings::PlayerControlsActive;
+use crate::simulation_settings::{PlayerControlsActive, WindowMode};
 
 // Major credit goes to: https://github.com/sburris0/bevy_flycam
 //
@@ -82,6 +82,18 @@ impl Default for KeyBindings {
 pub struct FlyCam;
 
 
+/// True while the player is holding LMB AFTER pressing it over the
+/// viewport image, in `WindowMode::EditColony`. Drives the editor's
+/// "hold-LMB-to-rotate" semantics in `player_look`. Set to `true`
+/// by the viewport's `Pointer<Pressed>` observer (in `frontend.rs`),
+/// cleared by `release_editor_look_on_lmb_up` on every LMB release.
+///
+/// In Simulation mode this resource is unused — `player_look` reads
+/// `PlayerControlsActive` instead.
+#[derive(Resource, Default)]
+pub struct EditorLookActive(pub bool);
+
+
 fn setup_player(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
@@ -96,7 +108,13 @@ fn setup_player(mut commands: Commands) {
             ..default()
         }),
         FlyCam,
-        Transform::from_xyz(20.0, 100.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y),
+        // Spawn at altitude 100 looking down-away from the origin (the
+        // OPPOSITE XZ direction from the previous toward-origin gaze).
+        // The XZ delta from camera position to target is (+20, +20) —
+        // exactly the negation of the (-20, -20) delta the old
+        // `Vec3::ZERO` target produced — and the Y drop stays the same
+        // so the pitch matches the prior frame.
+        Transform::from_xyz(20.0, 100.0, 20.0).looking_at(Vec3::new(40.0, 0.0, 40.0), Vec3::Y),
         AmbientLight {
             color: Color::srgb(0.8, 0.8, 1.0),
             brightness: 500.0,
@@ -106,18 +124,32 @@ fn setup_player(mut commands: Commands) {
 }
 
 
-// Handles keyboard input and movement. Gated on `PlayerControlsActive`
-// — when the player hasn't clicked into the viewport (or just pressed
-// Esc), the camera stays still.
+// Handles keyboard input and movement. Active in Simulation mode
+// while `PlayerControlsActive` is on (post-click cursor capture); in
+// EditColony mode the camera is always WASD-controllable (cursor is
+// never grabbed but movement still applies — matches the standalone
+// editor's WASD-always semantics).
 fn player_move(
     keys:          Res<ButtonInput<KeyCode>>,
     real_time:     Res<Time<Real>>,
     player_active: Res<PlayerControlsActive>,
+    window_mode:   Res<WindowMode>,
     settings:      Res<MovementSettings>,
     key_bindings:  Res<KeyBindings>,
     mut query:     Query<(&FlyCam, &mut Transform)>,
 ) {
-    if !player_active.0 { return; }
+    let active = match *window_mode {
+        WindowMode::Simulation    => player_active.0,
+        WindowMode::EditColony    => true,
+        // Lineages mode hides the viewport entirely (tree view
+        // covers it) — no point letting WASD drive the camera.
+        WindowMode::Lineages      => false,
+        // Species editor uses its own orbit camera system that
+        // controls the same FlyCam transform; the flycam itself
+        // stays inactive.
+        WindowMode::SpeciesEditor => false,
+    };
+    if !active { return; }
 
     for (_camera, mut transform) in query.iter_mut() {
         let mut velocity = Vec3::ZERO;
@@ -145,10 +177,22 @@ fn player_look(
     settings:        Res<MovementSettings>,
     primary_window:  Query<&Window, With<PrimaryWindow>>,
     player_active:   Res<PlayerControlsActive>,
+    window_mode:     Res<WindowMode>,
+    editor_look:     Res<EditorLookActive>,
     mut state:       MessageReader<MouseMotion>,
     mut query:       Query<&mut Transform, With<FlyCam>>,
 ) {
-    if !player_active.0 {
+    // In Simulation mode rotation is gated on the captured-cursor
+    // flag; in EditColony mode it's gated on the editor's hold-LMB
+    // state — set when the user presses LMB on the viewport image
+    // (not over a panel) and cleared on LMB release.
+    let active = match *window_mode {
+        WindowMode::Simulation    => player_active.0,
+        WindowMode::EditColony    => editor_look.0,
+        WindowMode::Lineages      => false,
+        WindowMode::SpeciesEditor => false,
+    };
+    if !active {
         // Drain the queue anyway so accumulated motion doesn't snap the
         // camera the next time controls are activated.
         for _ in state.read() {}
@@ -185,15 +229,33 @@ fn release_player_controls_on_esc(
 }
 
 
+/// Clears `EditorLookActive` whenever the user releases LMB. The
+/// flag is set by the viewport's `Pointer<Pressed>` observer in
+/// `frontend.rs` — pressing the viewport image in EditColony mode
+/// starts a rotation hold; releasing the button ends it, regardless
+/// of where the cursor is at release time (so a drag that wanders
+/// over a panel still ends cleanly).
+pub fn release_editor_look_on_lmb_up(
+    mouse:           Res<ButtonInput<MouseButton>>,
+    mut editor_look: ResMut<EditorLookActive>,
+) {
+    if mouse.just_released(MouseButton::Left) && editor_look.0 {
+        editor_look.0 = false;
+    }
+}
+
+
 pub struct PlayerPlugin;
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MovementSettings>()
             .init_resource::<KeyBindings>()
+            .init_resource::<EditorLookActive>()
             .add_systems(Startup, setup_player)
             .add_systems(Update, player_move)
             .add_systems(Update, player_look)
             .add_systems(Update, release_player_controls_on_esc)
+            .add_systems(Update, release_editor_look_on_lmb_up)
             .add_systems(Update, change_speed_on_scroll);
     }
 }

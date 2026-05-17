@@ -191,6 +191,13 @@ struct IndividualLabel { target: Entity }
 #[derive(Component)]
 struct IndividualLabelText;
 
+/// Marker on the species-name sub-text inside the floating label.
+/// `update_label_species_text` rewrites this text whenever the
+/// target organism's `species_id` changes so the label always shows
+/// the current species classification under the individual name.
+#[derive(Component)]
+struct IndividualLabelSpecies { target: Entity }
+
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
@@ -207,6 +214,7 @@ impl Plugin for IndividuumNavigatorPlugin {
                 manage_label_lifecycle,
                 manage_navigator_list,
                 update_label_positions,
+                update_label_species_text,
                 update_checkbox_mark,
                 handle_identifiers_checkbox,
                 navigator_scroll,
@@ -436,16 +444,21 @@ fn assign_individual_identifiers(
     mut commands: Commands,
     mut counter:  ResMut<HeterotrophCounter>,
     new_q:        Query<
-        Entity,
+        (Entity, &Organism, Option<&crate::colony::Carnivore>),
         (Added<Heterotroph>, With<OrganismRoot>, Without<IndividualIdentifier>),
     >,
 ) {
-    for entity in &new_q {
-        counter.0 += 1;
-        // `try_insert` matches the convention used elsewhere when
-        // mutating arbitrary entities — a despawn race wouldn't panic.
+    for (entity, organism, carn) in &new_q {
+        counter.0 += 1; // kept for diagnostic stats; not used in the label
+        let kind = if carn.is_some() { "Carnivore" } else { "Herbivore" };
+        let level = match organism.intelligence_level {
+            IntelligenceLevel::Level0 => "L0",
+            IntelligenceLevel::Level1 => "L1",
+            IntelligenceLevel::Level2 => "L2",
+            IntelligenceLevel::Level3 => "L3",
+        };
         commands.entity(entity)
-            .try_insert(IndividualIdentifier(format!("Heterotroph {}", counter.0)));
+            .try_insert(IndividualIdentifier(format!("{kind} {level}")));
     }
 }
 
@@ -480,6 +493,12 @@ fn manage_label_lifecycle(
                 top:           Val::Px(-9999.0),
                 left:          Val::Px(-9999.0),
                 padding:       UiRect::axes(Val::Px(5.0), Val::Px(2.0)),
+                // Two-line label: individual name on top, species
+                // name underneath. Column so the species text wraps
+                // beneath the individual name even at long species
+                // labels.
+                flex_direction: FlexDirection::Column,
+                align_items:    AlignItems::Center,
                 ..default()
             },
             BackgroundColor(LABEL_BG),
@@ -492,6 +511,20 @@ fn manage_label_lifecycle(
                 Text::new(ident.0.clone()),
                 TextFont { font_size: LABEL_FONT_SIZE, ..default() },
                 TextColor(Color::WHITE),
+                Pickable::IGNORE,
+            ));
+            // Species sub-line. Empty until the speciation system
+            // classifies the organism; `update_label_species_text`
+            // (registered alongside the panel systems) fills it in
+            // and keeps it in sync with `Organism::species_id`.
+            wrap.spawn((
+                IndividualLabelSpecies { target: entity },
+                Text::new(String::new()),
+                TextFont {
+                    font_size: LABEL_FONT_SIZE * 0.85,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.75, 0.85, 1.0)),
                 Pickable::IGNORE,
             ));
         })
@@ -513,12 +546,20 @@ fn manage_label_lifecycle(
 /// never bleed onto the navigator / statistics panels.
 fn update_label_positions(
     show:        Res<ShowIndividualIdentifiers>,
+    window_mode: Res<crate::simulation_settings::WindowMode>,
     cameras:     Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     viewport_q:  Query<&ComputedNode, With<ViewportImage>>,
     organism_q:  Query<&GlobalTransform, With<OrganismRoot>>,
     mut labels:  Query<(&IndividualLabel, &ComputedNode, &mut Node, &mut Visibility)>,
 ) {
-    if !show.0 {
+    // Hide all labels when the user is in any mode other than the
+    // simulation (Edit Colony, Lineages, Species Editor). The labels
+    // are UI nodes parented under the viewport image, so `RenderLayers`
+    // doesn't filter them out the way it does the 3D mesh entities —
+    // they need an explicit visibility gate.
+    let labels_disabled = !show.0
+        || *window_mode != crate::simulation_settings::WindowMode::Simulation;
+    if labels_disabled {
         for (_, _, _, mut v) in &mut labels {
             *v = Visibility::Hidden;
         }
@@ -598,14 +639,9 @@ fn manage_navigator_list(
 ) {
     let Ok(list) = list_q.single() else { return };
 
-    for (entity, ident, organism) in &new_q {
-        let intel_label = match organism.intelligence_level {
-            IntelligenceLevel::Level0 => "Intelligence: Level 0",
-            IntelligenceLevel::Level1 => "Intelligence: Level 1",
-            IntelligenceLevel::Level2 => "Intelligence: Level 2",
-            IntelligenceLevel::Level3 => "Intelligence: Level 3",
-        };
-
+    for (entity, ident, _organism) in &new_q {
+        // Intelligence level is now baked into the identifier
+        // ("Carnivore L2"), so a separate subtext line is redundant.
         let btn = commands.spawn((
             NavigatorButton { target: entity },
             Button,
@@ -628,12 +664,6 @@ fn manage_navigator_list(
                 Text::new(ident.0.clone()),
                 TextFont { font_size: 13.0, ..default() },
                 TextColor(Color::WHITE),
-                Pickable::IGNORE,
-            ));
-            btn.spawn((
-                Text::new(intel_label),
-                TextFont { font_size: NAV_BUTTON_SUBTEXT_FONT, ..default() },
-                TextColor(NAV_BUTTON_SUBTEXT_COLOR),
                 Pickable::IGNORE,
             ));
         })
@@ -873,5 +903,30 @@ fn update_min_hetero_text(
     let bg = if state.focused { MIN_HETERO_BG_FOCUSED } else { MIN_HETERO_BG_IDLE };
     for mut b in &mut bg_q {
         if b.0 != bg { *b = BackgroundColor(bg); }
+    }
+}
+
+
+/// Refresh each label's species sub-text. Reads the species id off
+/// the target organism (`Organism::species_id`) and resolves it to a
+/// name via `SpeciesRegistry`. The check is cheap — both queries are
+/// O(label count), and we only write when the rendered string would
+/// actually change (avoids needless `Changed<Text>` traffic).
+fn update_label_species_text(
+    organisms:    Query<&crate::organism::Organism>,
+    registry:     Res<crate::lineages::species::SpeciesRegistry>,
+    mut texts:    Query<(&IndividualLabelSpecies, &mut Text)>,
+) {
+    for (marker, mut text) in &mut texts {
+        let new = match organisms.get(marker.target) {
+            Ok(org) => match org.species_id {
+                Some(id) => registry.get(id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default(),
+                None => String::new(),
+            },
+            Err(_) => String::new(),
+        };
+        if text.0 != new { text.0 = new; }
     }
 }
