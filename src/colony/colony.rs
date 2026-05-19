@@ -36,10 +36,12 @@ impl Plugin for ColonyPlugin {
         app.init_resource::<crate::simulation_settings::MinHeteroCount>();
         app.init_resource::<crate::simulation_settings::MinHeteroCountEditState>();
         app.init_resource::<AutosaveTimer>();
+        app.init_resource::<crate::dataset_export::ExportDatasetRequested>();
         app.add_systems(Update, spawn_colony.run_if(resource_exists::<HeightmapSampler>));
         app.add_systems(Update, save_colony_system);
         app.add_systems(Update, autosave_system);
         app.add_systems(Update, auto_spawn_heteros);
+        app.add_systems(Update, crate::dataset_export::export_dataset_system);
     }
 }
 
@@ -346,7 +348,16 @@ pub fn autosave_system(
     real_time:          Res<Time<bevy::time::Real>>,
     mut timer:          ResMut<AutosaveTimer>,
     mut save_requested: ResMut<SaveRequested>,
+    sim_running:        Res<crate::simulation_settings::SimulationRunning>,
 ) {
+    // Freeze the autosave countdown while the simulation is paused.
+    // Otherwise the real-time clock keeps ticking and an autosave
+    // fires mid-pause — clobbering the state the user expects to
+    // stay frozen on disk too. Resuming continues the countdown from
+    // wherever it was, so a long pause doesn't immediately trigger
+    // a save on resume either.
+    if !sim_running.0 { return; }
+
     timer.remaining_secs -= real_time.delta_secs();
     if timer.remaining_secs > 0.0 { return; }
     timer.remaining_secs = (crate::simulation_settings::AUTOSAVE_INTERVAL_MINUTES * 60.0);
@@ -596,6 +607,15 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
             // predations is brain-side bookkeeping only — not part of
             // the .colony save format. Always zero on load.
             predations: 0,
+            hunger: 0.0,
+            // Not serialised in the .colony format — defaults to 0
+            // on load. The first depletion tick + first reward event
+            // will set it from there.
+            dopamine: 0.0,
+            // Sentinel = SENSORY_RADIUS ("out of range"). The first
+            // sensory tick after load overwrites this with a real
+            // distance if a photo is nearby.
+            target_distance: crate::sensory::SENSORY_RADIUS,
             movement_speed,
             movement_direction,
             velocity,
@@ -864,8 +884,17 @@ fn spawn_colony(
     }
 
     for _ in 0..INITIAL_PHOTOAUTOTROPHS {
-        let x = rng.random_range(0.0_f32..map_size.x);
-        let z = rng.random_range(0.0_f32..map_size.z);
+        // Spawn strictly inside the WORLD_SAFETY_MARGIN inset so the
+        // organism is born inside the same XZ band that
+        // `apply_world_bounds` keeps it within at runtime.
+        let x = rng.random_range(
+            crate::world_geometry::WORLD_SAFETY_MARGIN
+                ..(map_size.x - crate::world_geometry::WORLD_SAFETY_MARGIN),
+        );
+        let z = rng.random_range(
+            crate::world_geometry::WORLD_SAFETY_MARGIN
+                ..(map_size.z - crate::world_geometry::WORLD_SAFETY_MARGIN),
+        );
         let y = heightmap.height_at(x, z) + 1.0;
 
         // 80% of photoautotrophs are variable-form: NoSymmetry,
@@ -927,8 +956,17 @@ fn spawn_colony(
     }
 
     for _ in 0..INITIAL_HETEROTROPHS {
-        let x = rng.random_range(0.0_f32..map_size.x);
-        let z = rng.random_range(0.0_f32..map_size.z);
+        // Spawn strictly inside the WORLD_SAFETY_MARGIN inset so the
+        // organism is born inside the same XZ band that
+        // `apply_world_bounds` keeps it within at runtime.
+        let x = rng.random_range(
+            crate::world_geometry::WORLD_SAFETY_MARGIN
+                ..(map_size.x - crate::world_geometry::WORLD_SAFETY_MARGIN),
+        );
+        let z = rng.random_range(
+            crate::world_geometry::WORLD_SAFETY_MARGIN
+                ..(map_size.z - crate::world_geometry::WORLD_SAFETY_MARGIN),
+        );
         let y = heightmap.height_at(x, z) + 1.0;
         // Single bilateral body part — see comment for the
         // photoautotroph cohort above.
@@ -1107,6 +1145,9 @@ pub fn spawn_organism(
         reproduced: false,
         reproductions: 0,
         predations: 0,
+        hunger: 0.0,
+        dopamine: 0.0,
+        target_distance: crate::sensory::SENSORY_RADIUS,
         movement_speed: speed,
         movement_direction: direction,
         velocity: Vec3::ZERO,
@@ -1272,8 +1313,17 @@ pub fn auto_spawn_heteros(
 
     let mut rng = rand::rng();
     for _ in 0..to_spawn {
-        let x = rng.random_range(0.0_f32..map_size.x);
-        let z = rng.random_range(0.0_f32..map_size.z);
+        // Spawn strictly inside the WORLD_SAFETY_MARGIN inset so the
+        // organism is born inside the same XZ band that
+        // `apply_world_bounds` keeps it within at runtime.
+        let x = rng.random_range(
+            crate::world_geometry::WORLD_SAFETY_MARGIN
+                ..(map_size.x - crate::world_geometry::WORLD_SAFETY_MARGIN),
+        );
+        let z = rng.random_range(
+            crate::world_geometry::WORLD_SAFETY_MARGIN
+                ..(map_size.z - crate::world_geometry::WORLD_SAFETY_MARGIN),
+        );
         let y = heightmap.height_at(x, z) + 1.0;
 
         let right_seed = vec![(

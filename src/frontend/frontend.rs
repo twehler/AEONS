@@ -148,7 +148,10 @@ impl Plugin for FrontendPlugin {
             .init_resource::<WindowMode>()
             .init_resource::<statistics_panel::TimeSpeedEditState>()
             .init_resource::<statistics_panel::MaxOrganismsEditState>()
+            .init_resource::<statistics_panel::MaxHerbivoresEditState>()
             .init_resource::<statistics_panel::CullMessage>()
+            .init_resource::<crate::simulation_settings::AiTrainingMode>()
+            .init_resource::<crate::simulation_settings::MaxHerbivores>()
             .insert_resource(GraphState::new())
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
             // Lineages tree-view pan/zoom state + layout cache.
@@ -211,6 +214,11 @@ impl Plugin for FrontendPlugin {
                 statistics_panel::update_max_organisms_text,
                 statistics_panel::apply_max_organisms_cull,
                 statistics_panel::update_cull_message,
+                statistics_panel::handle_ai_training_checkbox,
+                statistics_panel::update_ai_training_checkbox_mark,
+                statistics_panel::handle_max_herbivores_input,
+                statistics_panel::update_max_herbivores_text,
+                statistics_panel::handle_export_dataset_button,
             ));
         // Gizmos run only when the F3-toggled overlay is active. Putting
         // the check on the system registration (rather than inside the

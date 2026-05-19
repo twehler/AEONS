@@ -20,6 +20,7 @@
 
 pub mod bottom_panel;
 pub mod camera;
+pub mod clear_modal;
 pub mod placement;
 pub mod save;
 pub mod session;
@@ -70,6 +71,7 @@ pub struct SpeciesEditorPlugin;
 impl Plugin for SpeciesEditorPlugin {
     fn build(&self, app: &mut App) {
         app
+            .add_plugins(clear_modal::ClearModalPlugin)
             .init_resource::<session::SpeciesSession>()
             .init_resource::<placement::PlacementSnap>()
             .init_resource::<camera::StashedSimCameraTransform>()
@@ -108,4 +110,5 @@ impl Plugin for SpeciesEditorPlugin {
 pub fn spawn_overlay_panels(parent: &mut ChildSpawnerCommands, top_offset_px: f32) {
     top_panel::spawn_top_panel(parent, top_offset_px);
     bottom_panel::spawn_bottom_panel(parent);
+    clear_modal::spawn_clear_new_button(parent);
 }

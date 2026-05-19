@@ -99,7 +99,7 @@ fn predation_system(
             let alive = prey_org.alive_body_part_count();
             if alive == 0 {
                 already_despawned.insert(prey);
-                commands.entity(prey).despawn();
+                commands.entity(prey).try_despawn();
                 return None;
             }
             if prey_bp_idx >= prey_org.body_parts.len()
@@ -148,6 +148,10 @@ fn predation_system(
             // field as its eat-event signal — see
             // `intelligence_level_1_hetero::apply_intelligence_level_1_hetero`.
             pred_org.predations = pred_org.predations.saturating_add(1);
+            // RL reward: +0.6 dopamine on every successful consumption,
+            // clamped at 1.0. The herbivore brain's REINFORCE update
+            // consumes the per-tick `Δdopamine` as its reward signal.
+            pred_org.dopamine = (pred_org.dopamine + 0.6).min(1.0);
         }
 
         // ── Despawn the eaten body part's child mesh entity ──────────────
@@ -159,7 +163,7 @@ fn predation_system(
             for child in children.iter() {
                 if let Ok(idx) = body_part_idx_query.get(child) {
                     if idx.0 == prey_bp_idx {
-                        commands.entity(child).despawn();
+                        commands.entity(child).try_despawn();
                         break;
                     }
                 }
@@ -168,7 +172,7 @@ fn predation_system(
 
         // ── Despawn the prey root once every body part has been eaten ─────
         if prey_dead {
-            commands.entity(prey).despawn();
+            commands.entity(prey).try_despawn();
             already_despawned.insert(prey);
         }
     }

@@ -249,7 +249,10 @@ fn handle_left_click(
     // option stays `None` and the template falls back to a preview
     // mesh.
     let smoothing_on = smoothing.as_deref().map(|s| s.0).unwrap_or(true);
-    let id = spawn_template_at(
+    // Species-driven placement: if no species is selected, the call
+    // returns `None` and the click is a no-op. The Species Navigator
+    // panel is where the user picks one.
+    let Some(id) = spawn_template_at(
         hit,
         &mut session,
         &mut commands,
@@ -257,7 +260,7 @@ fn handle_left_click(
         &mut materials,
         org_materials.as_deref(),
         smoothing_on,
-    );
+    ) else { return; };
     undo_stack.push(EditorAction::Created(vec![id]));
 }
 
@@ -369,6 +372,20 @@ fn spawn_real_organism(
     if template.is_carnivore {
         commands.entity(entity).try_insert(crate::colony::Carnivore);
     }
+    // Tag organisms that originated from a `.species` file so the
+    // speciation system treats them as a fresh founder lineage rather
+    // than classifying them into the nearest existing species. The
+    // marker carries the filename stem (e.g. "herbivore1"), which the
+    // registry then uses as the species' display name — the floating
+    // label sub-line reads `Species::name` directly so this is what
+    // the user sees in the viewport.
+    if let Some(ref species_name) = template.species_name {
+        commands.entity(entity).try_insert(
+            crate::lineages::species::ImportedSpeciesOrigin {
+                name: species_name.clone(),
+            },
+        );
+    }
     entity
 }
 
@@ -389,39 +406,16 @@ pub(super) fn spawn_template_at(
     materials:     &mut ResMut<Assets<StandardMaterial>>,
     org_materials: Option<&OrganismMaterials>,
     smoothing:     bool,
-) -> u32 {
-    // Dispatch: if a species is selected, use the species pipeline;
-    // otherwise fall back to the cycler-driven default-shape path.
-    if let Some(species_id) = session.selected_species_id {
-        if let Some(species) = session.loaded_species.iter().find(|s| s.id == species_id).cloned() {
-            return spawn_species_template_at(
-                position, &species, session, commands, meshes, materials, org_materials, smoothing,
-            );
-        }
-    }
-
-    let draft = session.draft;
-    session.next_id += 1;
-    let id = session.next_id;
-
-    let template = OrganismTemplate {
-        id,
-        metabolism:   draft.metabolism,
-        intelligence: draft.intelligence,
-        symmetry:     draft.symmetry,
-        form:         draft.form,
-        position,
-        // Placeholder — overwritten with the real entity below.
-        entity:       Entity::PLACEHOLDER,
-        custom_ocg:   None,
-        species_name: None,
-        is_carnivore: false,
-    };
-    let entity = respawn_template(&template, commands, meshes, materials, org_materials, smoothing);
-    session.templates.push(OrganismTemplate { entity, ..template });
-    session.active_id = Some(id);
-    session.dirty     = true;
-    id
+) -> Option<u32> {
+    // Placement is species-driven: every spawn requires the user to
+    // have a `.species` file selected in the navigator. The four
+    // trait cyclers that used to drive a default-shape fallback
+    // were retired together with the bottom panel's button strip.
+    let species_id = session.selected_species_id?;
+    let species = session.loaded_species.iter().find(|s| s.id == species_id).cloned()?;
+    Some(spawn_species_template_at(
+        position, &species, session, commands, meshes, materials, org_materials, smoothing,
+    ))
 }
 
 /// Spawn one instance of a loaded species at `position`. The

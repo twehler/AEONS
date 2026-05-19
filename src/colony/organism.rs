@@ -83,12 +83,13 @@ impl IntelligenceLevel {
         if is_sessile { return IntelligenceLevel::Level0; }
         match kind {
             OrganismKind::Photoautotroph => {
-                // Mobile photoautotrophs (the bilateral 20% of the
-                // initial photo cohort) all get Level 1. The "80%
-                // Level 0" target falls out of the sessile branch
-                // above, since 80% of photoautotrophs are
-                // has_variable_form (and therefore is_sessile).
-                IntelligenceLevel::Level1
+                // Photoautotrophs are now always Level 0 — the L1
+                // photo brain was silenced (it produced a "river of
+                // algae" flow-field behaviour that wasn't useful at
+                // the simulation's current scale). Mobile photos
+                // still exist as a body plan but they sit on Level 0
+                // alongside the sessile variable-form ones.
+                IntelligenceLevel::Level0
             }
             OrganismKind::Heterotroph => {
                 // Levels 2 and 3 are placeholder-only after the L1
@@ -180,6 +181,43 @@ pub struct Organism {
     /// since it only reads the per-tick delta. Not currently saved to
     /// `.colony` files (resets to 0 on load).
     pub predations: u8,
+    /// Continuous hunger signal in `[0, 1]`: 0 = no urge to feed, 1 =
+    /// maximum urge. Recomputed every energy tick by
+    /// `energy::update_hunger_levels`. The formula is
+    /// classification-specific:
+    ///   * Photoautotroph        → 0 (they photosynthesise; no
+    ///                             pursuit motivation).
+    ///   * Heterotroph (Herbivore, no Carnivore marker)
+    ///                           → `clamp(5^(-E + 0.1), 0, 1)` where
+    ///                             `E = energy / max_energy`.
+    ///   * Heterotroph (Carnivore)
+    ///                           → reserved; currently mirrors the
+    ///                             herbivore formula but the
+    ///                             function in `energy.rs` is set up
+    ///                             so a different curve can be
+    ///                             plugged in without touching the
+    ///                             call sites.
+    ///
+    /// Read by the herbivore brain to continuously scale aggression:
+    /// hunger 1 → full-speed beeline at the nearest food; hunger 0
+    /// → relaxed cruise. Read by future carnivore behaviour too.
+    pub hunger: f32,
+    /// Continuous reward signal in `[0, 1]` used by the herbivore RL
+    /// brain. Bumped by +0.6 (clamped at 1.0) on every successful
+    /// predation event and set to exactly 1.0 on every successful
+    /// reproduction. Depletes every virtual second by `hunger / 3`
+    /// (so hungry organisms forget rewards faster, sated ones keep
+    /// the afterglow longer). The brain reads the per-tick delta of
+    /// this field as its policy-gradient reward signal.
+    pub dopamine: f32,
+    /// Distance (world units) to the nearest photoautotroph within
+    /// `behaviour::sensory::SENSORY_RADIUS` (= 50). Written every
+    /// brain tick by `update_target_distance`; saturates at the
+    /// radius value when no photo is in range. Consumed by the
+    /// herbivore RL brain as both an input observation AND as a
+    /// secondary reward channel (Δ < 0 ⇒ reward, Δ > 0 ⇒ penalty),
+    /// complementing the primary `dopamine` signal.
+    pub target_distance: f32,
     pub movement_speed: f32,
     pub movement_direction: Vec3,
     pub velocity: Vec3,

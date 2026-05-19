@@ -14,7 +14,7 @@ use bevy::transform::TransformSystems;
 use crate::cell::*;
 use crate::colony::*;
 use crate::organism_collision;
-use crate::world_geometry::{HeightmapSampler, WorldMesh, HEIGHTMAP_CELL_SIZE};
+use crate::world_geometry::{HeightmapSampler, MapSize, WorldMesh, WORLD_SAFETY_MARGIN};
 
 const MIN_DIRECTION_INTERVAL: f32 = 1.0;
 const MAX_DIRECTION_INTERVAL: f32 = 10.0;
@@ -317,15 +317,19 @@ fn apply_floor_collision(
 // ── World boundaries ─────────────────────────────────────────────────────────
 
 fn apply_world_bounds(
-    heightmap: Res<HeightmapSampler>,
+    map_size:  Res<MapSize>,
     mut query: Query<&mut Transform, With<OrganismRoot>>,
 ) {
-    // heightmap.{min_x, min_z, width, depth} are in CELL units; multiply by
-    // HEIGHTMAP_CELL_SIZE to clamp in world units.
-    let min_x = heightmap.min_x as f32 * HEIGHTMAP_CELL_SIZE;
-    let max_x = (heightmap.min_x + heightmap.width as i32 - 1) as f32 * HEIGHTMAP_CELL_SIZE;
-    let min_z = heightmap.min_z as f32 * HEIGHTMAP_CELL_SIZE;
-    let max_z = (heightmap.min_z + heightmap.depth as i32 - 1) as f32 * HEIGHTMAP_CELL_SIZE;
+    // Operative bounds are the user-defined map area inset by
+    // WORLD_SAFETY_MARGIN on each edge. The underlying terrain mesh
+    // is normalised to be ≥ MapSize, so this clamp is always inside
+    // the world geometry; the margin then keeps organisms from
+    // wandering all the way to the visible edge (e.g. falling off
+    // border cliffs or sticking to the world AABB).
+    let min_x = WORLD_SAFETY_MARGIN;
+    let max_x = (map_size.x - WORLD_SAFETY_MARGIN).max(WORLD_SAFETY_MARGIN);
+    let min_z = WORLD_SAFETY_MARGIN;
+    let max_z = (map_size.z - WORLD_SAFETY_MARGIN).max(WORLD_SAFETY_MARGIN);
 
     for mut transform in &mut query {
         transform.translation.x = transform.translation.x.clamp(min_x, max_x);

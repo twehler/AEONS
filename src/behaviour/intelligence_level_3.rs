@@ -129,7 +129,7 @@ const L1_TARGET_LOCK_TICKS: u16 = {
     if (truncated as f32) < f { truncated + 1 } else { truncated }
 };
 const IN:      usize = 1 + WORLD_MODEL_DIMS + PREV_ACTION_DIMS + LOCKED_FLAG_DIMS;
-const HIDDEN:  usize = 64;
+const HIDDEN:  usize = 32;
 /// `(speed_a, target_logit_0, target_logit_1, target_logit_2, target_logit_3)`.
 const OUT:     usize = 1 + WORLD_MODEL_K;
 /// Rollout length in brain ticks. At ~6.7 Hz (150 ms tick) this is
@@ -138,7 +138,7 @@ const OUT:     usize = 1 + WORLD_MODEL_K;
 /// led to it (γ^32 ≈ 0.19 with γ=0.95, so ~80% of the signal
 /// decays inside one rollout).
 const ROLLOUT_LEN: usize = 32;
-const MAX_SPEED:   f32   = 20.0;
+const MAX_SPEED:   f32   = 40.0;
 const LR:          f64   = 1e-3;
 
 /// Discount for the Monte Carlo return.
@@ -557,10 +557,12 @@ pub fn assign_brains_l3(
 ) {
     let mut rng = rand::rng();
     for (e, organism, inheritance, restore) in new.iter() {
-        // Only enroll Level1 heterotrophs. L0 sessile organisms are
-        // excluded by the trophic marker query; L2/L3 are placeholders
-        // and never end up here either.
-        if !matches!(organism.intelligence_level, IntelligenceLevel::Level1) { continue; }
+        // Enrol only Level3 heterotrophs. See the matching comment in
+        // `assign_brains_l2` — the previous `Level1` check produced a
+        // triple-enrolment with `assign_brains_herbivore_1` and
+        // `assign_brains_l2` that silently overwrote the herbivore
+        // brain on every tick.
+        if !matches!(organism.intelligence_level, IntelligenceLevel::Level3) { continue; }
 
         let Some(slot) = pool.free.pop() else { continue };
         let s = slot as usize;

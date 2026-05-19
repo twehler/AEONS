@@ -63,7 +63,11 @@ const SPECIES_ROW_HEIGHT: f32 = 30.0;
 const SPECIES_ROW_GAP:    f32 = 3.0;
 const SPECIES_ROW_IDLE:        Color = Color::srgb(0.20, 0.20, 0.22);
 const SPECIES_ROW_HOVER:       Color = Color::srgb(0.30, 0.30, 0.34);
-const SPECIES_ROW_SELECTED:    Color = Color::srgb(0.18, 0.50, 0.30);
+/// Blue highlight applied to the currently-selected species row so
+/// the user can see which species the next Bulk-Spawn / left-click
+/// placement will use. Chosen to read clearly against the dark
+/// panel background.
+const SPECIES_ROW_SELECTED:    Color = Color::srgb(0.20, 0.45, 0.85);
 
 const COUNT_FIELD_HEIGHT:   f32   = 30.0;
 const COUNT_BUFFER_MAX_LEN: usize = 4;

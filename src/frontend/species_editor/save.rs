@@ -51,10 +51,13 @@ pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
 
     let bytes = encode_species(&session);
     match std::fs::write(&path, &bytes) {
-        Ok(()) => info!(
-            "species saved to {} — {} cells, {} bytes",
-            path.display(), session.ocg.len(), bytes.len(),
-        ),
+        Ok(()) => {
+            info!(
+                "species saved to {} — {} cells, {} bytes",
+                path.display(), session.ocg.len(), bytes.len(),
+            );
+            session.dirty = false;
+        }
         Err(e) => error!("species save: write to {} failed: {}", path.display(), e),
     }
 }

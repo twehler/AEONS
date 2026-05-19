@@ -129,7 +129,7 @@ const L1_TARGET_LOCK_TICKS: u16 = {
     if (truncated as f32) < f { truncated + 1 } else { truncated }
 };
 const IN:      usize = 1 + WORLD_MODEL_DIMS + PREV_ACTION_DIMS + LOCKED_FLAG_DIMS;
-const HIDDEN:  usize = 32;
+const HIDDEN:  usize = 16;
 /// `(speed_a, target_logit_0, target_logit_1, target_logit_2, target_logit_3)`.
 const OUT:     usize = 1 + WORLD_MODEL_K;
 /// Rollout length in brain ticks. At ~6.7 Hz (150 ms tick) this is
@@ -138,7 +138,7 @@ const OUT:     usize = 1 + WORLD_MODEL_K;
 /// led to it (γ^32 ≈ 0.19 with γ=0.95, so ~80% of the signal
 /// decays inside one rollout).
 const ROLLOUT_LEN: usize = 32;
-const MAX_SPEED:   f32   = 20.0;
+const MAX_SPEED:   f32   = 40.0;
 const LR:          f64   = 1e-3;
 
 /// Discount for the Monte Carlo return.
@@ -557,10 +557,19 @@ pub fn assign_brains_l2(
 ) {
     let mut rng = rand::rng();
     for (e, organism, inheritance, restore) in new.iter() {
-        // Only enroll Level1 heterotrophs. L0 sessile organisms are
-        // excluded by the trophic marker query; L2/L3 are placeholders
-        // and never end up here either.
-        if !matches!(organism.intelligence_level, IntelligenceLevel::Level1) { continue; }
+        // Enrol only Level2 heterotrophs. Previously the check was
+        // `Level1`, which collided with `assign_brains_herbivore_1`
+        // and `assign_brains_l3` — both also enrolled Level1 heteros
+        // — producing triple-enrolment: every Level1 organism ended
+        // up with `BrainSlotHerbivore1 + BrainSlotL2 + BrainSlotL3`
+        // simultaneously, three apply systems ran chained, and IL3
+        // (last in the chain) silently overwrote the herbivore
+        // brain's movement command on every tick. The triple-write
+        // surfaced as the "heteros lock onto each other and don't
+        // let go" deadlock: IL3's arrival brake + direction freeze
+        // ran on herbivores that should have been driven by the
+        // simpler full-speed-toward-photo logic.
+        if !matches!(organism.intelligence_level, IntelligenceLevel::Level2) { continue; }
 
         let Some(slot) = pool.free.pop() else { continue };
         let s = slot as usize;

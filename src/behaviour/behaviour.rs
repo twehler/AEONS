@@ -44,9 +44,13 @@ use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use std::time::Duration;
 
-use crate::intelligence_level_1_photo::{
-    BrainPoolL1Photo, assign_brains_l1_photo, free_brains_l1_photo, apply_intelligence_level_1_photo,
-};
+// L1 photo (the sun-direction supervised wander brain) was silenced
+// — photoautotrophs now spawn at Level 0 and never enrol in this
+// pool. The type stays imported so we can still `init_non_send_resource`
+// the pool below; the colony save/load code reads it via
+// `NonSend<BrainPoolL1Photo>` for backward compatibility with v003
+// files. Its assign/free/apply systems are NOT registered.
+use crate::intelligence_level_1_photo::BrainPoolL1Photo;
 // L1 hetero (REINFORCE) is no longer the active hetero dispatcher —
 // the herbivore_1 supervised pool now owns IL1 for non-carnivore
 // heterotrophs, and carnivores route through IL2 / IL3. The pool
@@ -85,6 +89,10 @@ use crate::world_model::{WorldModelGrid, rebuild_world_model_grid};
 ///
 /// `on_timer` ticks with `Time<Virtual>::delta()`, so brains
 /// naturally pause when the simulation is paused.
+// `PHOTO_BRAIN_TICK_INTERVAL` was retired with the L1-photo brain;
+// kept here only as a documentation breadcrumb until the photo
+// pool is removed entirely:
+#[allow(dead_code)]
 const PHOTO_BRAIN_TICK_INTERVAL:  Duration = Duration::from_millis(33);
 
 /// Heterotroph brain tick rate (≈ 6.7 Hz).
@@ -122,40 +130,38 @@ impl Plugin for BehaviourPlugin {
         app.init_resource::<WorldModelGrid>();
 
         // ── Pool resources (non-send: CUDA state isn't Send). ───────
-        // Four pools now: photo (existing), herbivore_1 (supervised,
-        // replaces L1 hetero), L2, L3 (both predator-style, generic
-        // over carnivore vs herbivore target type).
-        app.init_non_send_resource::<BrainPoolL1Photo>();
+        // Three active pools: herbivore_1 (supervised), L2, L3 (both
+        // predator-style, generic over carnivore vs herbivore target
+        // type). The L1 photo and L1 hetero pool resources are kept
+        // alive for save/load compatibility but their systems are
+        // NOT registered, so no organism ever enrols in them.
         app.init_non_send_resource::<BrainPoolHerbivore1>();
         app.init_non_send_resource::<BrainPoolL2>();
         app.init_non_send_resource::<BrainPoolL3>();
-        // Stub L1 hetero — kept alive for save/load compatibility,
-        // no systems registered so no organism enrols.
+        app.init_non_send_resource::<BrainPoolL1Photo>();
         app.init_non_send_resource::<BrainPoolL1Hetero>();
 
-        // ── PreUpdate: assign / free for every pool. ────────────────
-        app.add_systems(PreUpdate, (assign_brains_l1_photo,  free_brains_l1_photo) .chain());
+        // ── PreUpdate: assign / free for every active pool. ─────────
         app.add_systems(PreUpdate, (assign_brains_herbivore_1, free_brains_herbivore_1).chain());
-        app.add_systems(PreUpdate, (assign_brains_l2,        free_brains_l2)        .chain());
-        app.add_systems(PreUpdate, (assign_brains_l3,        free_brains_l3)        .chain());
+        app.add_systems(PreUpdate, (assign_brains_l2,          free_brains_l2)         .chain());
+        app.add_systems(PreUpdate, (assign_brains_l3,          free_brains_l3)         .chain());
 
-        // ── Update: photo at 30 Hz, hetero pools at ~6.7 Hz. ────────
-        app.add_systems(
-            Update,
-            apply_intelligence_level_1_photo
-                .run_if(on_timer(PHOTO_BRAIN_TICK_INTERVAL)),
-        );
-
-        // Hetero chain: shared world-model rebuild then each of the
-        // three hetero pools' apply systems. The chain ordering
-        // ensures the grid is fresh before any apply reads it. The
-        // three apply systems are independent (each touches its own
-        // pool's NonSend resource) but we run them in series for
-        // determinism and to share the same brain-tick cadence.
+        // ── Update: hetero pools at ~6.7 Hz. ────────────────────────
+        // Shared world-model rebuild then each of the three hetero
+        // pools' apply systems. The chain ordering ensures the grid
+        // is fresh before any apply reads it. The three apply systems
+        // are independent (each touches its own pool's NonSend
+        // resource) but we run them in series for determinism and to
+        // share the same brain-tick cadence.
         app.add_systems(
             Update,
             (
                 rebuild_world_model_grid,
+                // Sensory layer — must run AFTER the world-model
+                // rebuild (it consumes the grid) and BEFORE the
+                // herbivore brain (which reads target_distance both
+                // as an input observation and as a reward signal).
+                crate::sensory::update_target_distance,
                 apply_intelligence_level_herbivore_1,
                 apply_intelligence_level_2,
                 apply_intelligence_level_3,

@@ -301,6 +301,7 @@ pub fn handle_spawn_first_cell(
                 session.ocg.clear();
                 session.ocg.push((0usize, pos, starter));
                 session.first_cell_spawned = true;
+                session.dirty = true;
                 *bg = BackgroundColor(ACTION_BG_HOVER);
             }
             Interaction::Pressed => *bg = BackgroundColor(ACTION_BG_DISABLED),

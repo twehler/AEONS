@@ -43,9 +43,15 @@ const ORGANISM_BROAD_RADIUS: f32 = 10.0;
 /// 1100-organism scale, and contacts emerge cleanly at 10 Hz.
 const COLLISION_TICK: f32 = 0.1;
 
-/// Fraction of (averaged) movement speed converted into a deflection push
-/// when two organisms touch. Push is along the cell-pair contact axis.
-const PUSH_STRENGTH: f32 = 1.0;
+/// Maximum positional separation applied to any single organism per
+/// collision tick (XZ plane, world units). Caps the integrated push
+/// so deeply-overlapping organisms — e.g. a 30-cell vs 30-cell pair
+/// can generate up to 900 narrow-phase contacts in one tick — don't
+/// snap apart by an absurd amount. At 10 Hz this allows a maximum
+/// separation speed of 5 world units / second, fast enough to
+/// resolve any plausible penetration within ~1 s yet slow enough
+/// that the eye reads it as a firm push rather than a teleport.
+const MAX_SEPARATION_PER_TICK: f32 = 0.5;
 
 
 // ── Timer resource ───────────────────────────────────────────────────────────
@@ -102,14 +108,23 @@ struct BodyPartSnapshot {
 struct OrganismSnapshot {
     entity:         Entity,
     root_world_pos: Vec3,
-    movement_speed: f32,
+    /// Type flags captured so the push accumulator can detect
+    /// predator-prey pairs and skip them. Predation handles
+    /// "separation" by consuming the prey one body part at a time —
+    /// pushing the predator away from the prey only fights that
+    /// resolution and produces the visible "approach → contact →
+    /// pushed back → re-approach" dance.
+    is_photo:       bool,
+    is_carnivore:   bool,
     body_parts:     Vec<BodyPartSnapshot>,
 }
 
 fn snapshot(
-    entity:    Entity,
-    organism:  &Organism,
-    transform: &Transform,
+    entity:       Entity,
+    organism:     &Organism,
+    transform:    &Transform,
+    is_photo:     bool,
+    is_carnivore: bool,
 ) -> OrganismSnapshot {
     // One snapshot per alive body part. Each body part's OCG lives in its
     // own local frame; for branches that frame is offset from the root by
@@ -149,7 +164,8 @@ fn snapshot(
     OrganismSnapshot {
         entity,
         root_world_pos: transform.translation,
-        movement_speed: organism.movement_speed,
+        is_photo,
+        is_carnivore,
         body_parts,
     }
 }
@@ -162,8 +178,12 @@ pub fn apply_organism_collision(
     mut timer:          ResMut<OrganismCollisionTimer>,
     mut contact_events: MessageWriter<OrganismContactEvent>,
     mut params: ParamSet<(
-        Query<(&Organism, &Transform, Entity), With<OrganismRoot>>,
-        Query<&mut Organism, With<OrganismRoot>>,
+        Query<(
+            &Organism, &Transform, Entity,
+            Has<crate::colony::Photoautotroph>,
+            Has<crate::colony::Carnivore>,
+        ), With<OrganismRoot>>,
+        Query<&mut Transform, With<OrganismRoot>>,
     )>,
 ) {
     timer.timer.tick(time.delta());
@@ -171,7 +191,7 @@ pub fn apply_organism_collision(
 
     // ── 1. Snapshot every organism (immutable read of (Organism, Transform))
     let snapshots: Vec<OrganismSnapshot> = params.p0().iter()
-        .map(|(o, t, e)| snapshot(e, o, t))
+        .map(|(o, t, e, is_photo, is_carn)| snapshot(e, o, t, is_photo, is_carn))
         .collect();
 
     if snapshots.is_empty() { return; }
@@ -185,8 +205,8 @@ pub fn apply_organism_collision(
             .push(i);
     }
 
-    // Push accumulators + dedup set for emitted events.
-    let mut pushes: HashMap<Entity, Vec3> = HashMap::new();
+    // Dedup set for emitted events. Positional separation accumulator
+    // removed — see the comment in the narrow phase below.
     let mut emitted: HashSet<(Entity, Entity, usize, usize)> = HashSet::new();
 
     let cell_contact_d  = CELL_COLLISION_RADIUS * 2.0;
@@ -244,16 +264,29 @@ pub fn apply_organism_collision(
                                     });
                                 }
 
-                                // Deflection push proportional to penetration
-                                // and average speed. Splits 50/50 between the
-                                // pair so the system is symmetric.
-                                let push_dir = (cb - ca) / d2.sqrt();
-                                let pen      = 1.0 - d2.sqrt() / cell_contact_d;
-                                let avg_v    = (snap_a.movement_speed + snap_b.movement_speed) * 0.5;
-                                let mag      = PUSH_STRENGTH * pen * avg_v;
-
-                                *pushes.entry(snap_a.entity).or_insert(Vec3::ZERO) -= push_dir * mag;
-                                *pushes.entry(snap_b.entity).or_insert(Vec3::ZERO) += push_dir * mag;
+                                // Positional separation removed. Every
+                                // push variant we tried (speed-scaled
+                                // deflection, half-overlap shove,
+                                // sessile-aware routing, predator-prey
+                                // skip) introduced a different failure
+                                // mode. Most recently: two herbivores
+                                // converging on the same photo got
+                                // shoved off-axis perpendicular to
+                                // their shared photo-axis on every
+                                // collision tick, while the brain
+                                // pulled them back; the result was an
+                                // axis-locked slide-on-one-spot that
+                                // never released until the organism
+                                // starved.
+                                //
+                                // Conclusion: the collision system now
+                                // ONLY emits events (so predation
+                                // continues to fire). Geometric overlap
+                                // between two herbivores is tolerated
+                                // — they stack visually for the brief
+                                // window before predation finishes the
+                                // shared photo, then naturally
+                                // separate as they re-target.
                             }
                         }
                     }
@@ -262,13 +295,10 @@ pub fn apply_organism_collision(
         }
     }
 
-    // ── 4. Apply accumulated pushes
-    let mut write_query = params.p1();
-    for (entity, push) in &pushes {
-        let Ok(mut org) = write_query.get_mut(*entity) else { continue };
-        let new_dir = org.movement_direction + *push;
-        if new_dir.length_squared() > 1e-6 {
-            org.movement_direction = new_dir.normalize();
-        }
-    }
+    // No push-application step — see the narrow-phase comment for
+    // why positional separation was removed. `params.p1()` (the
+    // `&mut Transform` query) is now unused; we keep it on the
+    // signature so the previous pushed-write code can be reinstated
+    // by uncommenting if a future failure mode requires it.
+    let _ = params;
 }

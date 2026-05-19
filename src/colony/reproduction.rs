@@ -73,8 +73,9 @@ fn reproduction_system(
     smoothing:      Res<crate::simulation_settings::Smoothing>,
     map_size:       Res<MapSize>,
     max_organisms:  Res<crate::simulation_settings::MaxOrganisms>,
+    max_herbivores: Res<crate::simulation_settings::MaxHerbivores>,
     mut query:      Query<
-        (Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>),
+        (Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
         With<OrganismRoot>,
     >,
 ) {
@@ -89,19 +90,31 @@ fn reproduction_system(
     if current_pop >= cap { return; }
     let spawn_budget = cap - current_pop;
 
+    // Herbivore-specific cap: count live herbivores (Heterotroph minus
+    // Carnivore) up-front. The reproduction loop refuses to schedule
+    // a new herbivore birth once the running total (live + pending)
+    // reaches this number — the population is held flat from there
+    // until enough have died for the count to drop again.
+    let max_herb        = max_herbivores.0;
+    let live_herbivores = query.iter()
+        .filter(|(_, _, _, _, is_hetero, is_carn)| *is_hetero && !*is_carn)
+        .count();
+    let mut pending_herbivore_births: usize = 0;
+
     let mut pending_births: Vec<PendingBirth> = Vec::new();
     let mut rng = rand::rng();
 
-    for (parent_entity, mut organism, transform, is_photo, is_hetero) in &mut query {
+    for (parent_entity, mut organism, transform, is_photo, is_hetero, is_carn) in &mut query {
         if pending_births.len() >= spawn_budget { break; }
 
         if organism.reproduced { continue; }
 
-        // AI training mode: heterotrophs do not reproduce so the
-        // training cohort stays at the seeded identity set. Photoautotrophs
-        // still reproduce normally so prey keeps repopulating.
-        if is_hetero
-            && crate::simulation_settings::AI_TRAINING_MODE
+        // Herbivore cap: if reproducing this parent would push the
+        // running herbivore total at/above `max_herb`, skip. Carnivores
+        // and photoautotrophs are unaffected.
+        let is_herbivore = is_hetero && !is_carn;
+        if is_herbivore
+            && (live_herbivores + pending_herbivore_births) >= max_herb
         {
             continue;
         }
@@ -113,6 +126,10 @@ fn reproduction_system(
         let offspring_energy = max_energy * OFFSPRING_ENERGY_FRACTION;
         organism.energy      -= offspring_energy;
         organism.reproductions = organism.reproductions.saturating_add(1);
+        // RL reward: reproduction grants the maximum dopamine reward
+        // outright (the strongest evolutionary signal the agent can
+        // receive). Child starts at 0 — clean slate.
+        organism.dopamine = 1.0;
 
         let cap = if is_photo { PHOTOAUTOTROPH_REPRODUCTION_CAP } else { HETEROTROPH_REPRODUCTION_CAP };
         if organism.reproductions >= cap { organism.reproduced = true; }
@@ -214,8 +231,16 @@ fn reproduction_system(
             }
         };
 
-        let spawn_x = rng.random_range(0.0..map_size.x);
-        let spawn_z = rng.random_range(0.0..map_size.z);
+        // Stay inside the WORLD_SAFETY_MARGIN inset — same band the
+        // initial cohort and `apply_world_bounds` agree on.
+        let spawn_x = rng.random_range(
+            crate::world_geometry::WORLD_SAFETY_MARGIN
+                ..(map_size.x - crate::world_geometry::WORLD_SAFETY_MARGIN),
+        );
+        let spawn_z = rng.random_range(
+            crate::world_geometry::WORLD_SAFETY_MARGIN
+                ..(map_size.z - crate::world_geometry::WORLD_SAFETY_MARGIN),
+        );
         // Spawn on the ground at the chosen XZ, with a 1.0-unit clearance
         // mirroring the initial colony spawn (`spawn_colony`). Falling back
         // to the parent's Y if the heightmap resource hasn't been inserted
@@ -226,6 +251,8 @@ fn reproduction_system(
             None     => transform.translation.y,
         };
         let spawn_pos = Vec3::new(spawn_x, spawn_y, spawn_z);
+
+        if is_herbivore { pending_herbivore_births += 1; }
 
         pending_births.push(PendingBirth {
             pos:        spawn_pos,

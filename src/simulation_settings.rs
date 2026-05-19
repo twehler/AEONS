@@ -24,21 +24,39 @@ pub const DEFAULT_MAP_X:           f32        = 2048.0;
 pub const DEFAULT_MAP_Z:           f32        = 2048.0;
 
 
-/// Secret AI-training mode for the heterotroph movement-RL experiment.
+/// AI-training mode toggle for the heterotroph movement-RL
+/// experiment. Runtime-editable via the "AI-training mode"
+/// checkbox in the statistics panel.
 ///
-///   * `true`  → training mode active. Heterotrophs never despawn (energy
-///     drain still happens; the value just clamps at 0) and never
-///     reproduce, so the training cohort stays at a fixed identity for
-///     the duration of the run. Every other system — predation,
-///     photoautotroph reproduction, Krishi, initial-cohort sizing — runs
-///     exactly as in a normal simulation.
-///   * `false` → normal simulation. Heterotrophs reproduce and starve as
-///     usual.
+///   * `true`  → training mode active. Heterotrophs never despawn
+///               (energy still drains and clamps at 0); only the
+///               despawn step is suppressed. Reproduction is NOT
+///               gated by this flag anymore (so the +1.0 dopamine
+///               reproduction reward still fires in training mode).
+///   * `false` → normal simulation. Starved heterotrophs despawn.
 ///
-/// Read at compile time by `energy.rs` (heterotroph despawn skip) and
-/// `reproduction.rs` (heterotroph reproduction skip). No other site
-/// gates on this flag.
-pub const AI_TRAINING_MODE: bool = false;
+/// Read by `energy.rs::manage_energy` only. Other systems no
+/// longer gate on this flag.
+#[derive(Resource, Default)]
+pub struct AiTrainingMode(pub bool);
+
+
+/// Upper bound on the live herbivore (heterotroph - carnivore) count.
+/// When the population reaches or exceeds this number,
+/// `reproduction_system` skips all reproduction events for
+/// herbivores until enough have died for the count to fall below
+/// the cap again. Runtime-editable via the "Max Herbivores" text
+/// field in the statistics panel.
+///
+/// Default `100` is a starting value; the field is intended to
+/// be tuned at runtime as the player explores the parameter space.
+/// `0` effectively disables herbivore reproduction.
+#[derive(Resource)]
+pub struct MaxHerbivores(pub usize);
+
+impl Default for MaxHerbivores {
+    fn default() -> Self { Self(100) }
+}
 
 
 /// Top-level window-mode toggle exposed to the user via the thin top bar
@@ -488,4 +506,4 @@ pub const L1_GENE_MUTATION_REL_STDDEV: f32 = 0.05;
 /// DNA is further than this from the simple mean are excluded from
 /// the trimmed mean, so a single drifting individual can't drag
 /// the whole species' centroid along with it.
-pub const SPECIES_SEPARATION_THRESHOLD: f32 = 0.05;
+pub const SPECIES_SEPARATION_THRESHOLD: f32 = 0.10;

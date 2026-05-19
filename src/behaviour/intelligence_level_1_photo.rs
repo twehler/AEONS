@@ -90,7 +90,7 @@ use crate::world_geometry::MapSize;
 const IN:        usize = 5;
 const HIDDEN:    usize = 16;
 const OUT:       usize = 4;
-const MAX_SPEED: f32   = 20.0;
+const MAX_SPEED: f32   = 40.0;
 const LR:        f64   = 1e-3;
 
 /// Vertical extent used to normalise `pos.y` into roughly `[0, 1]`. Picked

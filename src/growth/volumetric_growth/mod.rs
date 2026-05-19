@@ -81,10 +81,10 @@ pub const GROWTH_MODE: GrowthMode = GrowthMode::Dodecahedron;
 const EDGE_LEN: f32 = 1.0;
 const MIN_CENTER_DIST: f32 = 0.5;
 /// Sandbox and OCG growth stops after this many cells are appended to the seed.
-pub const MAX_CELLS: usize = 30;
+pub const MAX_CELLS: usize = 60;
 
 /// Vertex-weld tolerance. RD's smallest inter-vertex distance is 1.0; expected
-/// float drift across ≤30 translations is ~30·ε_f32 ≈ 4e-6, so 1e-4 is safe.
+/// float drift across ≤60 translations is ~60·ε_f32 ≈ 8e-6, so 1e-4 is safe.
 const WELD_EPS: f32 = 1e-4;
 
 #[inline]
@@ -541,6 +541,9 @@ fn spawn_volumetric_mesh(
             reproduced: false,
             reproductions: 0,
             predations: 0,
+            hunger: 0.0,
+            dopamine: 0.0,
+            target_distance: crate::sensory::SENSORY_RADIUS,
             movement_speed: 0.0,
             movement_direction: Vec3::ZERO,
             velocity: Vec3::ZERO,

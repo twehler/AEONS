@@ -27,7 +27,7 @@ pub mod species;
 use bevy::prelude::*;
 
 use crate::lineages::speciation::{
-    classify_organisms, sync_dna_from_brain_pool, update_species_averages,
+    classify_organisms, sync_dna_from_phenotype, update_species_averages,
     SpeciationTimer,
 };
 use crate::lineages::species::SpeciesRegistry;
@@ -49,7 +49,7 @@ impl Plugin for LineagesPlugin {
                 // to a single 1 Hz cadence (the timer is owned by
                 // `update_species_averages` and queried by
                 // `classify_organisms` via the same `Res`).
-                sync_dna_from_brain_pool,
+                sync_dna_from_phenotype,
                 update_species_averages,
                 classify_organisms,
             ).chain());

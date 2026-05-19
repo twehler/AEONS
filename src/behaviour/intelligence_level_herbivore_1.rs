@@ -1,31 +1,51 @@
-// Intelligence Level 1 — Herbivore SUPERVISED pool.
+// Intelligence Level 1 — Herbivore RL pool.
 //
-// Replaces the previous `intelligence_level_1_hetero.rs` REINFORCE
-// brain for the herbivore (default-heterotroph) case. The network is
-// trained by supervised regression against an oracle that always
-// knows the right answer:
+// Pure REINFORCE policy gradient over a per-organism MLP. There is
+// NO hand-coded movement logic in this file: every speed and every
+// direction commanded onto an organism comes from the network
+// output. The agent learns to seek out and eat photoautotrophs by
+// maximising the per-tick `Δdopamine` reward.
 //
-//     oracle target = (speed = +1, direction = unit vector toward
-//                      the nearest photoautotroph)
+// Reward sources (see also `predation.rs`, `reproduction.rs`,
+// `energy.rs::deplete_dopamine`):
+//   * +0.6  dopamine on every successful photo consumption (capped 1.0)
+//   * +1.0  dopamine on every successful reproduction (sets, not adds)
+//   *  −H/3 dopamine per virtual second (H = hunger), so an idle
+//           hungry organism sees its reward signal decay and the
+//           policy is punished for inaction.
 //
-// No exploration noise, no rollouts, no policy gradient. Every brain
-// tick:
-//   1. Snapshot inputs (`energy_norm` + world-model) for every active
-//      slot.
-//   2. Forward pass on the GPU.
-//   3. Apply the predicted speed + direction to the organism.
-//   4. Build oracle target tensors. Slots with no photo in range get
-//      a `mask = 0` row (no gradient).
-//   5. Masked MSE loss + Adam step.
+// Architecture: 9 → 16 → 3 MLP with `tanh` head.
 //
-// Because the oracle is correct by construction, the network
-// converges in seconds rather than the minutes-to-hours the
-// REINFORCE pipeline needed.
+//   Inputs (9):
+//     [0] hunger              ∈ [0, 1]
+//     [1] dopamine            ∈ [0, 1]
+//     [2] nearest_photo.rel_x / WORLD_MODEL_RADIUS   (0 if no photo)
+//     [3] nearest_photo.rel_z / WORLD_MODEL_RADIUS
+//     [4] has_photo                                   (0 / 1)
+//     [5] prev_action.speed_a                         (∈ [-1, 1])
+//     [6] prev_action.dir_x
+//     [7] prev_action.dir_z
+//     [8] target_distance / SENSORY_RADIUS            ∈ [0, 1]
+//                                                     (1 = out of
+//                                                      sensory range)
 //
-// Per-organism per-slot weights — recycled-on-despawn the same way
-// every other pool in this codebase does. The pool only enrols
-// heterotrophs at `IntelligenceLevel::Level1` that are NOT marked
-// `Carnivore` (carnivores use IL2 / IL3 instead).
+//   Outputs (3, tanh):
+//     [0] speed_a    → speed     = ((speed_a + 1) / 2) · MAX_SPEED
+//     [1] dir_x      → direction.x          (XZ-unit-normalised
+//     [2] dir_z      → direction.z           before commit)
+//
+// Training: 1-step REINFORCE with EMA baseline.
+//   For every active slot whose previous tick was also active:
+//     reward    = dopamine_now − prev_dopamine
+//     advantage = reward − baseline
+//     loss      = 0.5 · Σ_o ((a_{t-1,o} − μ_{t-1,o}) / σ)² · advantage
+//     baseline  ← α · baseline + (1 − α) · reward
+//   Loss summed over slots and one Adam step taken per brain tick.
+//
+// Slot recycling preserves trained weights (instinct survives the
+// previous tenant's death) but resets prev_*/baseline/has_prev so
+// the first post-recycle tick never computes a phantom reward
+// across the slot boundary.
 
 use bevy::prelude::*;
 use burn::module::{Initializer, Module, Param};
@@ -35,38 +55,38 @@ use burn_cuda::CudaDevice;
 use std::collections::HashMap;
 
 use crate::colony::{Carnivore, IntelligenceLevel, Organism, Heterotroph};
-use crate::energy::get_max_energy;
-use crate::rl_helpers::{BrainInheritance, MyBackend};
+use crate::rl_helpers::{BrainInheritance, MyBackend, gaussian_noise};
+use crate::sensory::SENSORY_RADIUS;
 use crate::simulation_settings::OrganismPoolSize;
 use crate::world_model::{WorldModelGrid, WORLD_MODEL_RADIUS, nearest_prey};
 
 
-// ── Architecture ────────────────────────────────────────────────────────────
-//
-// Inputs (4): explicit nearest-photo block + self energy.
-//
-//   [0]  energy / max_energy                        (∈ [0, 1])
-//   [1]  nearest_photo.rel_x / WORLD_MODEL_RADIUS   (∈ [-1, 1])
-//   [2]  nearest_photo.rel_z / WORLD_MODEL_RADIUS   (∈ [-1, 1])
-//   [3]  has_photo                                   (0 or 1)
-//
-// The old design fed the 4-nearest world-model block here and used
-// `nearest_prey` for the oracle target — but the two operate over
-// DIFFERENT subsets (nearest 4 of any type vs nearest photo in range),
-// so the inputs frequently lacked information about the very photo
-// the oracle was pointing at. The supervised gradient was then
-// learning "given these heteros, output a direction" — uncorrelated
-// noise that collapses the policy toward the mean (≈ zero direction).
-//
-// With the explicit nearest-photo block, the input-output mapping is
-// trivial: output `(1, x, z)` when input is `(_, x, z, 1)`. A
-// 4-hidden-unit network would learn it in seconds; we keep 8 hidden
-// units for a little headroom against the input noise.
-const IN:        usize = 4;
-const HIDDEN:    usize = 8;
-const OUT:       usize = 3;                      // speed_a, dir_x, dir_z
-const MAX_SPEED: f32   = 20.0;
-const LR:        f64   = 1e-3;
+// ── Hyperparameters ─────────────────────────────────────────────────────────
+
+const IN:        usize = 9;
+const HIDDEN:    usize = 16;
+const OUT:       usize = 3;
+const MAX_SPEED: f32   = 40.0;
+/// Exploration noise std-dev added to each output dim before clamp.
+/// A larger σ gives noisier action selection (more exploration), a
+/// smaller σ tightens around the policy mean. 0.25 is the L2/L3
+/// brain's default.
+const SIGMA:          f32 = 0.25;
+const LR:             f64 = 1e-3;
+const BASELINE_ALPHA: f32 = 0.95;
+
+/// Weight on the per-tick Δ`target_distance` progress reward.
+/// Composed with the Δ`dopamine` reward as
+///
+///     reward = Δdopamine + PROGRESS_REWARD_WEIGHT · ((prev_td − td) / SENSORY_RADIUS)
+///
+/// The normalised progress term lies in `[-1, 1]` per tick, the
+/// same scale as Δdopamine. Picking 0.3 keeps dopamine as the
+/// dominant teaching signal while still pulling the policy toward
+/// "close the distance" when no eating event happens. A higher
+/// weight would let progress drown out the rarer eating signal;
+/// lower would leave the agent under-trained between rare meals.
+const PROGRESS_REWARD_WEIGHT: f32 = 0.3;
 
 
 // ── Slot marker ─────────────────────────────────────────────────────────────
@@ -105,7 +125,6 @@ impl<B: Backend> PoolMlpHerbivore1<B> {
     }
 }
 
-
 trait BrainOptHerbivore1 {
     fn step(
         &mut self,
@@ -130,19 +149,22 @@ impl<O: Optimizer<PoolMlpHerbivore1<MyBackend>, MyBackend>> BrainOptHerbivore1 f
 // ── Pool resource ───────────────────────────────────────────────────────────
 
 pub struct BrainPoolHerbivore1 {
-    model: PoolMlpHerbivore1<MyBackend>,
-    opt:   Box<dyn BrainOptHerbivore1>,
-    free:  Vec<u32>,
-    map:   HashMap<Entity, u32>,
-    /// Static batch dimension. Set once at construction from
-    /// `OrganismPoolSize`; matches the row count of every weight
-    /// tensor and is the only correct length to use when building
-    /// per-tick input / target / mask tensors. `Vec::capacity()` is
-    /// NOT a substitute — it's the Vec's allocation size and drifts
-    /// from the static N as items are pushed/popped (Bevy 0.18's
-    /// allocator policy can grow capacity past the initial value).
-    n:     usize,
+    model:  PoolMlpHerbivore1<MyBackend>,
+    opt:    Box<dyn BrainOptHerbivore1>,
+    free:   Vec<u32>,
+    map:    HashMap<Entity, u32>,
+    n:      usize,
     pub device: CudaDevice,
+
+    /// Flat per-slot REINFORCE state. Indexed by slot (NOT by Vec
+    /// capacity); see the matching field on the old supervised pool
+    /// for the rationale.
+    prev_state:           Vec<f32>,   // [N · IN]
+    prev_action:          Vec<f32>,   // [N · OUT]
+    prev_dopamine:        Vec<f32>,   // [N]
+    prev_target_distance: Vec<f32>,   // [N]
+    baseline:             Vec<f32>,   // [N]
+    has_prev:             Vec<bool>,  // [N]
 }
 
 impl BrainPoolHerbivore1 {
@@ -154,6 +176,16 @@ impl BrainPoolHerbivore1 {
             map:   HashMap::with_capacity(n),
             n,
             device,
+            prev_state:           vec![0.0;            n * IN],
+            prev_action:          vec![0.0;            n * OUT],
+            prev_dopamine:        vec![0.0;            n],
+            // Initialise to the "out of range" sentinel so the
+            // first Δ on a freshly-recycled slot reads zero
+            // when no photo is in range (target_distance also
+            // starts at SENSORY_RADIUS).
+            prev_target_distance: vec![SENSORY_RADIUS; n],
+            baseline:             vec![0.0;            n],
+            has_prev:             vec![false;          n],
         }
     }
     fn n(&self) -> usize { self.n }
@@ -168,6 +200,19 @@ impl BrainPoolHerbivore1 {
         let p = self.model.b2.val().slice([parent..parent+1, 0..OUT]);
         self.model.b2 = self.model.b2.clone().map(|t| t.slice_assign([child..child+1, 0..OUT], p));
     }
+
+    /// Wipe the REINFORCE bookkeeping for one slot. Called every time
+    /// a slot is freshly assigned so the first tick after assignment
+    /// does NOT try to compute a reward against the previous tenant's
+    /// dopamine value. Trained weights survive this reset (instinct).
+    fn reset_slot_state(&mut self, s: usize) {
+        for i in 0..IN  { self.prev_state [s * IN  + i] = 0.0; }
+        for i in 0..OUT { self.prev_action[s * OUT + i] = 0.0; }
+        self.prev_dopamine[s]        = 0.0;
+        self.prev_target_distance[s] = SENSORY_RADIUS;
+        self.baseline[s]             = 0.0;
+        self.has_prev[s]             = false;
+    }
 }
 
 impl FromWorld for BrainPoolHerbivore1 {
@@ -179,21 +224,22 @@ impl FromWorld for BrainPoolHerbivore1 {
     }
 }
 
+/// Force CubeCL to compile the forward + backward kernels at the
+/// max batch shape so the first real brain tick doesn't stall.
 fn warmup(device: &CudaDevice, n: usize) {
     let m = PoolMlpHerbivore1::<MyBackend>::new(device, n);
     let mut o: Box<dyn BrainOptHerbivore1> = Box::new(AdamConfig::new().init());
     let i = Tensor::<MyBackend, 2>::zeros([n, IN], device);
     let mu = m.forward(i.clone());
     let target = Tensor::<MyBackend, 2>::zeros([n, OUT], device);
-    let mask   = Tensor::<MyBackend, 2>::zeros([n, OUT], device);
     let diff = mu - target;
-    let loss = (diff.powf_scalar(2.0) * mask).sum().div_scalar(1.0_f32);
+    let loss = diff.powf_scalar(2.0).sum().div_scalar(1.0_f32);
     let g = GradientsParams::from_grads(loss.backward(), &m);
     let _ = o.step(LR, m, g);
 }
 
 
-// ── Slot assignment ─────────────────────────────────────────────────────────
+// ── Slot assignment / release ──────────────────────────────────────────────
 
 pub fn assign_brains_herbivore_1(
     mut pool:     NonSendMut<BrainPoolHerbivore1>,
@@ -218,6 +264,7 @@ pub fn assign_brains_herbivore_1(
                 pool.inherit_row(parent_slot as usize, s);
             }
         }
+        pool.reset_slot_state(s);
         pool.map.insert(e, slot);
         commands.entity(e).try_insert(BrainSlotHerbivore1(slot));
         commands.entity(e).try_remove::<BrainInheritance>();
@@ -236,102 +283,195 @@ pub fn free_brains_herbivore_1(
 }
 
 
-// ── Apply tick (forward + supervised MSE backward) ──────────────────────────
+// ── Apply tick — observe, act, learn ───────────────────────────────────────
 
 pub fn apply_intelligence_level_herbivore_1(
     time:        Res<Time<Virtual>>,
     world_grid:  Res<WorldModelGrid>,
     mut pool:    NonSendMut<BrainPoolHerbivore1>,
-    mut heteros: Query<(Entity, &mut Organism, &Transform, &BrainSlotHerbivore1), (With<Heterotroph>, Without<Carnivore>)>,
-    mut input_buf:  Local<Vec<f32>>,
-    mut target_buf: Local<Vec<f32>>,
-    mut mask_buf:   Local<Vec<f32>>,
+    mut heteros: Query<
+        (Entity, &mut Organism, &Transform, &BrainSlotHerbivore1),
+        (With<Heterotroph>, Without<Carnivore>),
+    >,
+    mut input_buf:       Local<Vec<f32>>,
+    mut prev_state_buf:  Local<Vec<f32>>,
+    mut prev_action_buf: Local<Vec<f32>>,
+    mut adv_buf:         Local<Vec<f32>>,
+    mut mask_buf:        Local<Vec<f32>>,
 ) {
     if time.is_paused() { return; }
-    // Static batch dimension — must match the weight tensors' row
-    // count exactly. See `BrainPoolHerbivore1::n` for why this is
-    // stored explicitly instead of derived from `free.capacity()`.
     let n = pool.n();
 
-    input_buf.clear();  input_buf.resize(n * IN,  0.0);
-    target_buf.clear(); target_buf.resize(n * OUT, 0.0);
-    mask_buf.clear();   mask_buf.resize(n * OUT, 0.0);
+    input_buf      .clear(); input_buf      .resize(n * IN,  0.0);
+    prev_state_buf .clear(); prev_state_buf .resize(n * IN,  0.0);
+    prev_action_buf.clear(); prev_action_buf.resize(n * OUT, 0.0);
+    adv_buf        .clear(); adv_buf        .resize(n * OUT, 0.0);
+    mask_buf       .clear(); mask_buf       .resize(n * OUT, 0.0);
 
-    // Per-slot transient: (entity, slot, pos).
-    let mut active: Vec<(Entity, u32, Vec3)> = Vec::new();
+    struct Active {
+        entity:          Entity,
+        slot:            u32,
+        dopamine:        f32,
+        target_distance: f32,
+    }
+    let mut active: Vec<Active> = Vec::new();
 
+    // ── Pass 1: build observations, compute reward/advantage,
+    //           copy prev_state + prev_action into the batch slots.
     for (e, organism, transform, slot) in heteros.iter() {
         let s = slot.0 as usize;
         if s >= n { continue; }
         let pos = transform.translation;
 
-        let max_e    = get_max_energy(&organism).max(1.0);
-        let energy_n = (organism.energy / max_e).clamp(0.0, 1.0);
+        // Current state observation.
+        let in_off = s * IN;
+        let pa_off = s * OUT;
+        let (rel_x, rel_z, has_photo) = match nearest_prey(&world_grid, pos) {
+            Some((rel, _, _)) => (
+                (rel.x / WORLD_MODEL_RADIUS).clamp(-1.0, 1.0),
+                (rel.z / WORLD_MODEL_RADIUS).clamp(-1.0, 1.0),
+                1.0,
+            ),
+            None => (0.0, 0.0, 0.0),
+        };
+        // Normalised target-distance observation. 1.0 means "no photo
+        // within sensory radius"; 0.0 means "right on top of one".
+        let td_norm = (organism.target_distance / SENSORY_RADIUS).clamp(0.0, 1.0);
 
-        let off  = s * IN;
-        let toff = s * OUT;
-        input_buf[off] = energy_n;
+        input_buf[in_off + 0] = organism.hunger;
+        input_buf[in_off + 1] = organism.dopamine;
+        input_buf[in_off + 2] = rel_x;
+        input_buf[in_off + 3] = rel_z;
+        input_buf[in_off + 4] = has_photo;
+        input_buf[in_off + 5] = pool.prev_action[pa_off + 0];
+        input_buf[in_off + 6] = pool.prev_action[pa_off + 1];
+        input_buf[in_off + 7] = pool.prev_action[pa_off + 2];
+        input_buf[in_off + 8] = td_norm;
 
-        // Single oracle lookup powers BOTH the input block and the
-        // target. Inputs and target now reference the same photo, so
-        // the supervised mapping is well-defined: the network sees
-        // exactly the position it must point at.
-        if let Some((rel, _, _)) = nearest_prey(&world_grid, pos) {
-            let mag2 = rel.x * rel.x + rel.z * rel.z;
-            if mag2 > 1e-6 {
-                let rel_x_n = rel.x / WORLD_MODEL_RADIUS;
-                let rel_z_n = rel.z / WORLD_MODEL_RADIUS;
-                input_buf[off + 1] = rel_x_n;
-                input_buf[off + 2] = rel_z_n;
-                input_buf[off + 3] = 1.0;          // has_photo flag
-
-                let inv = mag2.sqrt().recip();
-                target_buf[toff + 0] = 1.0;        // speed = full
-                target_buf[toff + 1] = rel.x * inv;
-                target_buf[toff + 2] = rel.z * inv;
-                mask_buf[toff + 0]   = 1.0;
-                mask_buf[toff + 1]   = 1.0;
-                mask_buf[toff + 2]   = 1.0;
+        // Reward + advantage from the previous step, if we have one.
+        if pool.has_prev[s] {
+            // Primary reward: Δdopamine (eating, reproducing → big
+            // positive spikes; idle decay → small negatives).
+            let r_dopamine = organism.dopamine - pool.prev_dopamine[s];
+            // Secondary reward: progress on closing the distance to
+            // the nearest photo. Positive when the target got closer
+            // this tick, negative when it moved away (or disappeared
+            // from sensory range, which jumps `target_distance` up to
+            // `SENSORY_RADIUS`).
+            let r_progress = (pool.prev_target_distance[s] - organism.target_distance)
+                             / SENSORY_RADIUS;
+            let reward    = r_dopamine + PROGRESS_REWARD_WEIGHT * r_progress;
+            let baseline  = pool.baseline[s];
+            let advantage = reward - baseline;
+            // Per-output broadcast of the slot's scalar advantage
+            // and mask. Inactive slots stay 0 in both → contribute
+            // nothing to the loss.
+            for o in 0..OUT {
+                adv_buf [s * OUT + o] = advantage;
+                mask_buf[s * OUT + o] = 1.0;
             }
+            pool.baseline[s] = BASELINE_ALPHA * baseline
+                             + (1.0 - BASELINE_ALPHA) * reward;
+            // Snapshot prev_state / prev_action into the GPU batch.
+            for i in 0..IN  { prev_state_buf [in_off + i] = pool.prev_state [in_off + i]; }
+            for i in 0..OUT { prev_action_buf[pa_off + i] = pool.prev_action[pa_off + i]; }
         }
-        // else: input dims [1..3] stay zero, has_photo stays zero,
-        // mask stays zero → no gradient.
 
-        active.push((e, slot.0, pos));
+        active.push(Active {
+            entity:          e,
+            slot:            slot.0,
+            dopamine:        organism.dopamine,
+            target_distance: organism.target_distance,
+        });
     }
     if active.is_empty() { return; }
 
-    // ── Forward inference. ──────────────────────────────────────
-    let cur_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(input_buf.clone(),  [n, IN]),  &pool.device);
-    let mu_cur = pool.model.forward(cur_t.clone());
-    let mu_data = mu_cur.clone().into_data().into_vec::<f32>().expect("forward output");
+    // ── Forward pass on CURRENT state — picks this tick's μ. ──
+    let cur_t = Tensor::<MyBackend, 2>::from_data(
+        TensorData::new(input_buf.clone(), [n, IN]),
+        &pool.device,
+    );
+    let mu_cur      = pool.model.forward(cur_t);
+    let mu_cur_data = mu_cur.into_data().into_vec::<f32>().expect("forward output");
 
-    // ── Apply predicted action to each active organism. ──────────
-    for &(entity, slot, _pos) in active.iter() {
-        let s = slot as usize;
+    // ── Sample a_t = μ_t + σ · ε, drive movement directly from a_t. ──
+    let mut rng = rand::rng();
+    let mut sampled_action = vec![0.0_f32; n * OUT];
+    for a in active.iter() {
+        let s   = a.slot as usize;
         let off = s * OUT;
-        let speed_a = mu_data[off + 0].clamp(-1.0, 1.0).max(0.0);
-        let dx      = mu_data[off + 1];
-        let dz      = mu_data[off + 2];
+        let mut act = [0.0_f32; OUT];
+        for o in 0..OUT {
+            let mu    = mu_cur_data[off + o];
+            let noise = gaussian_noise(&mut rng);
+            act[o]    = (mu + SIGMA * noise).clamp(-1.0, 1.0);
+            sampled_action[off + o] = act[o];
+        }
 
-        let Ok((_, mut org, _, _)) = heteros.get_mut(entity) else { continue };
-        org.movement_speed = speed_a * MAX_SPEED;
-        let mag2 = dx * dx + dz * dz;
-        if mag2 > 1e-6 {
-            let inv = mag2.sqrt().recip();
-            org.movement_direction = Vec3::new(dx * inv, 0.0, dz * inv);
+        // Network output → organism. No clamps beyond what tanh +
+        // the clamp() above already provide; no hand-coded oracle
+        // or wander logic.
+        let speed_a = act[0];
+        let dir_x   = act[1];
+        let dir_z   = act[2];
+        let speed   = ((speed_a + 1.0) * 0.5).clamp(0.0, 1.0) * MAX_SPEED;
+        let dir_xz  = Vec3::new(dir_x, 0.0, dir_z);
+        let mag     = dir_xz.length();
+        if let Ok((_, mut org, _, _)) = heteros.get_mut(a.entity) {
+            org.movement_speed = speed;
+            // Only update direction when the network output has
+            // discernible magnitude — at near-zero magnitude the
+            // unit vector is undefined, keep the last commanded
+            // heading so yaw doesn't snap randomly.
+            if mag > 1e-3 {
+                org.movement_direction = dir_xz / mag;
+            }
         }
     }
 
-    // ── Supervised MSE update. ──────────────────────────────────
-    let target_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(target_buf.clone(), [n, OUT]), &pool.device);
-    let mask_t   = Tensor::<MyBackend, 2>::from_data(TensorData::new(mask_buf.clone(),   [n, OUT]), &pool.device);
-    let diff   = mu_cur - target_t;
-    let sq     = diff.powf_scalar(2.0) * mask_t;
-    let denom  = (active.len() as f32).max(1.0);
-    let loss   = sq.sum().div_scalar(denom);
+    // ── REINFORCE update on the PREVIOUS step. ─────────────────
+    let active_with_prev: f32 = mask_buf.iter().step_by(OUT).sum();
+    if active_with_prev > 0.0 {
+        let prev_t = Tensor::<MyBackend, 2>::from_data(
+            TensorData::new(prev_state_buf.clone(), [n, IN]),
+            &pool.device,
+        );
+        let act_t  = Tensor::<MyBackend, 2>::from_data(
+            TensorData::new(prev_action_buf.clone(), [n, OUT]),
+            &pool.device,
+        );
+        let adv_t  = Tensor::<MyBackend, 2>::from_data(
+            TensorData::new(adv_buf.clone(),  [n, OUT]),
+            &pool.device,
+        );
+        let mask_t = Tensor::<MyBackend, 2>::from_data(
+            TensorData::new(mask_buf.clone(), [n, OUT]),
+            &pool.device,
+        );
 
-    let cm = pool.model.clone();
-    let gp = GradientsParams::from_grads(loss.backward(), &pool.model);
-    pool.model = pool.opt.step(LR, cm, gp);
+        let mu_prev = pool.model.forward(prev_t);
+        // loss = −log π(a | μ, σ) · advantage
+        //      = 0.5 · ((a − μ) / σ)² · advantage (+ const)
+        let diff    = act_t - mu_prev;
+        let half_sq = diff.powf_scalar(2.0).mul_scalar(0.5 / (SIGMA * SIGMA));
+        let rows    = half_sq * adv_t * mask_t;
+        let denom   = active_with_prev.max(1.0);
+        let loss    = rows.sum().div_scalar(denom);
+
+        let cm = pool.model.clone();
+        let gp = GradientsParams::from_grads(loss.backward(), &pool.model);
+        pool.model = pool.opt.step(LR, cm, gp);
+    }
+
+    // ── Commit current → prev for the next tick. ───────────────
+    for a in active.iter() {
+        let s = a.slot as usize;
+        let in_off = s * IN;
+        let pa_off = s * OUT;
+        for i in 0..IN  { pool.prev_state [in_off + i] = input_buf     [in_off + i]; }
+        for i in 0..OUT { pool.prev_action[pa_off + i] = sampled_action[pa_off + i]; }
+        pool.prev_dopamine[s]        = a.dopamine;
+        pool.prev_target_distance[s] = a.target_distance;
+        pool.has_prev[s]             = true;
+    }
 }

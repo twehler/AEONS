@@ -60,6 +60,31 @@ impl Species {
             extinct:      false,
         }
     }
+
+    fn founder_named(id: u32, name: String, parent_id: Option<u32>, dna: Vec<f32>) -> Self {
+        Self {
+            id,
+            name,
+            parent_id,
+            avg_dna:      dna,
+            member_count: 1,
+            extinct:      false,
+        }
+    }
+}
+
+
+/// Marker on organisms that were spawned from a `.species` import in
+/// merged-mode (Edit Colony). The string is the filename stem (no
+/// extension), e.g. `"herbivore1"` for `herbivore1.species`. Read once
+/// by `lineages::speciation::classify_organisms` to bypass the normal
+/// nearest-centroid join — imported organisms always seed their own
+/// founder species (no parent edge), so the tree-of-life view shows
+/// the imported lineage as a separate tree beside the simulation's own
+/// evolutionary history.
+#[derive(Component, Clone, Debug)]
+pub struct ImportedSpeciesOrigin {
+    pub name: String,
 }
 
 
@@ -87,6 +112,33 @@ impl SpeciesRegistry {
         let dna = if founder_dna.len() == DNA_DIM { founder_dna } else { empty_dna() };
         self.species.push(Species::founder(id, parent_id, dna));
         id
+    }
+
+    /// Create a brand-new species with an explicit display name (used
+    /// for `.species` imports — the imported lineage is named after
+    /// the source filename, not auto-numbered). `parent_id` should
+    /// normally be `None` for an import; a `Some` value would tie the
+    /// imported lineage to an existing species, which defeats the
+    /// "fresh tree beside the main one" semantics.
+    pub fn create_with_name(
+        &mut self,
+        name:        String,
+        founder_dna: Vec<f32>,
+        parent_id:   Option<u32>,
+    ) -> u32 {
+        self.next_id += 1;
+        let id = self.next_id;
+        let dna = if founder_dna.len() == DNA_DIM { founder_dna } else { empty_dna() };
+        self.species.push(Species::founder_named(id, name, parent_id, dna));
+        id
+    }
+
+    /// Find the first non-extinct species with the given display name.
+    /// Used by the `.species`-import classification path so multiple
+    /// instances loaded from the same file collapse into one species
+    /// rather than spawning a separate founder for each click.
+    pub fn find_alive_by_name(&self, name: &str) -> Option<&Species> {
+        self.species.iter().find(|s| !s.extinct && s.name == name)
     }
 
     /// Lookup by id. Returns `None` for unknown ids (shouldn't

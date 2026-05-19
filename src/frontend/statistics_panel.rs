@@ -217,6 +217,35 @@ pub struct MaxOrganismsEditState {
 #[derive(Component)]
 pub struct CullMessageText;
 
+/// Clickable square of the "AI-training mode" checkbox sitting
+/// directly to the right of the population graph. Toggles the
+/// `AiTrainingMode` resource on `Interaction::Pressed`.
+#[derive(Component)]
+pub struct AiTrainingCheckbox;
+
+/// Inner filled square that visualises the checkbox state — its
+/// `Display` is flipped between `Flex` (on) and `None` (off) by
+/// `update_ai_training_checkbox_mark`.
+#[derive(Component)]
+pub struct AiTrainingCheckboxMark;
+
+/// Outer Button-tagged Node for the "Max Herbivores" integer input.
+#[derive(Component)]
+pub struct MaxHerbivoresInput;
+
+/// Text child inside the Max-Herbivores input box.
+#[derive(Component)]
+pub struct MaxHerbivoresText;
+
+/// Edit-state for the Max-Herbivores input — mirrors
+/// `MaxOrganismsEditState`. `focused` is true while the user is
+/// actively typing; `buffer` holds the in-progress digits.
+#[derive(Resource, Default)]
+pub struct MaxHerbivoresEditState {
+    pub buffer:  String,
+    pub focused: bool,
+}
+
 /// Notification state for the random-cull toast. Set by
 /// `apply_max_organisms_cull` when the soft cap drops below the current
 /// population; auto-cleared after `CULL_MSG_VISIBLE_SECS` seconds.
@@ -247,6 +276,13 @@ pub struct StartStopButtonText;
 /// Marker on the Save button (bottom-right of the statistics panel).
 #[derive(Component)]
 pub struct SaveButton;
+
+/// Marker on the "Export Simulation Dataset" button — sits in the
+/// top strip immediately right of the Start/Stop button. Click
+/// pauses the simulation, opens a native save dialog, and writes
+/// the chosen `.csv` path into `ExportDatasetRequested`.
+#[derive(Component)]
+pub struct ExportDatasetButton;
 
 
 // ── Spawning ─────────────────────────────────────────────────────────────────
@@ -516,6 +552,115 @@ pub fn spawn_panel(
             Pickable::IGNORE,
         ));
 
+        // ── Right-of-graph control stack (absolute). Holds the
+        //    "AI-training mode" checkbox on top and the "Max
+        //    Herbivores" integer field directly beneath it. Anchored
+        //    at the graph's right edge (`left = 75vw`) so neither
+        //    control collides with the Save button (bottom-right of
+        //    the panel).
+        const AI_CHECKBOX_SIZE_PX: f32 = 16.0;
+        panel
+            .spawn(Node {
+                position_type:  PositionType::Absolute,
+                left:           Val::Vw(75.0),
+                top:            Val::Px(BUTTON_GAP_PX + BUTTON_HEIGHT_PX + BUTTON_GAP_PX),
+                margin:         UiRect::left(Val::Px(10.0)),
+                flex_direction: FlexDirection::Column,
+                align_items:    AlignItems::FlexStart,
+                ..default()
+            })
+            .with_children(|stack| {
+                // ── AI-training mode checkbox row ───────────────────
+                stack
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items:    AlignItems::Center,
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            AiTrainingCheckbox,
+                            Button,
+                            Node {
+                                width:           Val::Px(AI_CHECKBOX_SIZE_PX),
+                                height:          Val::Px(AI_CHECKBOX_SIZE_PX),
+                                margin:          UiRect::right(Val::Px(8.0)),
+                                align_items:     AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                flex_shrink:     0.0,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.10, 0.10, 0.10)),
+                        ))
+                        .with_children(|cb| {
+                            cb.spawn((
+                                AiTrainingCheckboxMark,
+                                Node {
+                                    width:   Val::Px(AI_CHECKBOX_SIZE_PX - 6.0),
+                                    height:  Val::Px(AI_CHECKBOX_SIZE_PX - 6.0),
+                                    // Hidden until the user toggles on.
+                                    display: Display::None,
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.85, 0.85, 0.85)),
+                                Pickable::IGNORE,
+                            ));
+                        });
+                        row.spawn((
+                            Text::new("AI-training mode"),
+                            TextFont { font_size: 14.0, ..default() },
+                            TextColor(Color::WHITE),
+                            Pickable::IGNORE,
+                        ));
+                    });
+
+                // ── "Max Herbivores: [N]" integer-input row ─────────
+                // Same widget pattern as Max Organisms (click-to-edit,
+                // digits-only, Enter commit / Escape cancel) but
+                // unclamped on the upper side — the value gates
+                // reproduction in `reproduction_system`, no GPU
+                // batch dim involved.
+                stack
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items:    AlignItems::Center,
+                        margin:         UiRect::top(Val::Px(8.0)),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Text::new("Max Herbivores:"),
+                            TextFont { font_size: 14.0, ..default() },
+                            TextColor(Color::WHITE),
+                            Node { margin: UiRect::right(Val::Px(8.0)), ..default() },
+                            Pickable::IGNORE,
+                        ));
+                        row
+                            .spawn((
+                                MaxHerbivoresInput,
+                                Button,
+                                Node {
+                                    width:   Val::Px(MAX_ORG_INPUT_WIDTH_PX),
+                                    height:  Val::Px(MAX_ORG_INPUT_HEIGHT_PX),
+                                    padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                                    align_items:     AlignItems::Center,
+                                    justify_content: JustifyContent::FlexStart,
+                                    ..default()
+                                },
+                                BackgroundColor(MAX_ORG_BG_IDLE),
+                            ))
+                            .with_children(|btn| {
+                                btn.spawn((
+                                    MaxHerbivoresText,
+                                    Text::new("0"),
+                                    TextFont { font_size: 14.0, ..default() },
+                                    TextColor(Color::WHITE),
+                                    Pickable::IGNORE,
+                                ));
+                            });
+                    });
+            });
+
         // ── Save button (absolute, bottom-right of the panel). ─────
         panel
             .spawn((
@@ -569,6 +714,41 @@ pub fn spawn_panel(
                     StartStopButtonText,
                     Text::new("Start"),
                     TextFont { font_size: 18.0, ..default() },
+                    TextColor(Color::WHITE),
+                    Pickable::IGNORE,
+                ));
+            });
+
+        // ── "Export Simulation Dataset" button (absolute, top strip,
+        //    sits to the right of the Start/Stop button). The
+        //    Start/Stop button is centred on `Vw(50.0)` with a
+        //    negative half-width margin; placing this one at the same
+        //    Vw anchor with a positive `BUTTON_WIDTH_PX / 2 + gap` left
+        //    margin lands it exactly one gap past Start/Stop's right
+        //    edge. Wider than Start/Stop so the full label fits.
+        const EXPORT_BUTTON_WIDTH_PX: f32 = 220.0;
+        const EXPORT_BUTTON_COLOR:    Color = Color::srgb(0.22, 0.46, 0.46); // teal
+        panel
+            .spawn((
+                ExportDatasetButton,
+                Button,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top:    Val::Px(BUTTON_GAP_PX),
+                    left:   Val::Vw(50.0),
+                    margin: UiRect::left(Val::Px(BUTTON_WIDTH_PX / 2.0 + BUTTON_GAP_PX)),
+                    width:  Val::Px(EXPORT_BUTTON_WIDTH_PX),
+                    height: Val::Px(BUTTON_HEIGHT_PX),
+                    justify_content: JustifyContent::Center,
+                    align_items:     AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(EXPORT_BUTTON_COLOR),
+            ))
+            .with_children(|btn| {
+                btn.spawn((
+                    Text::new("Export Simulation Dataset"),
+                    TextFont { font_size: 16.0, ..default() },
                     TextColor(Color::WHITE),
                     Pickable::IGNORE,
                 ));
@@ -1271,5 +1451,180 @@ fn draw_line(buf: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32,
         let e2 = 2 * err;
         if e2 >= dy { err += dy; x += sx; }
         if e2 <= dx { err += dx; y += sy; }
+    }
+}
+
+
+// ── AI-training mode checkbox handlers ──────────────────────────────────────
+
+/// Toggle the `AiTrainingMode` resource on click of the checkbox.
+pub fn handle_ai_training_checkbox(
+    interactions: Query<&Interaction, (Changed<Interaction>, With<AiTrainingCheckbox>)>,
+    mut mode:     ResMut<crate::simulation_settings::AiTrainingMode>,
+) {
+    for interaction in &interactions {
+        if matches!(interaction, Interaction::Pressed) {
+            mode.0 = !mode.0;
+        }
+    }
+}
+
+/// Sync the inner check-mark's visibility to the resource value.
+/// Mirrors the navigator's `update_checkbox_mark` pattern.
+pub fn update_ai_training_checkbox_mark(
+    mode:       Res<crate::simulation_settings::AiTrainingMode>,
+    mut mark_q: Query<&mut Node, With<AiTrainingCheckboxMark>>,
+) {
+    if !mode.is_changed() { return; }
+    for mut node in &mut mark_q {
+        node.display = if mode.0 { Display::Flex } else { Display::None };
+    }
+}
+
+
+// ── Max-Herbivores integer-input field ─────────────────────────────────────
+//
+// Click-to-edit, digits-only, Enter commits and Escape cancels —
+// the same pattern used by the Max-Organisms field. Differs in two
+// places: (a) no upper clamp (the field gates reproduction, not the
+// GPU brain-pool batch dim), and (b) the committed value lands in
+// `MaxHerbivores` instead of `MaxOrganisms`.
+
+pub fn handle_max_herbivores_input(
+    mouse:         Res<ButtonInput<MouseButton>>,
+    mut keyboard:  MessageReader<KeyboardInput>,
+    interaction_q: Query<&Interaction, With<MaxHerbivoresInput>>,
+    mut state:     ResMut<MaxHerbivoresEditState>,
+    mut max_herb:  ResMut<crate::simulation_settings::MaxHerbivores>,
+) {
+    let click_on_input = mouse.just_pressed(MouseButton::Left)
+        && interaction_q.iter().any(|i| matches!(i, Interaction::Pressed));
+    let click_outside  = mouse.just_pressed(MouseButton::Left) && !click_on_input;
+
+    if click_on_input && !state.focused {
+        state.focused = true;
+        state.buffer.clear();
+        let _ = write!(state.buffer, "{}", max_herb.0);
+    }
+
+    if click_outside && state.focused {
+        commit_max_herbivores(&mut state, &mut max_herb);
+    }
+
+    if !state.focused {
+        for _ in keyboard.read() {}
+        return;
+    }
+
+    for ev in keyboard.read() {
+        if !ev.state.is_pressed() { continue; }
+        match ev.key_code {
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                commit_max_herbivores(&mut state, &mut max_herb);
+            }
+            KeyCode::Escape => {
+                state.focused = false;
+                state.buffer.clear();
+            }
+            KeyCode::Backspace => {
+                state.buffer.pop();
+            }
+            _ => {
+                if let Some(text) = ev.text.as_ref() {
+                    for c in text.chars() {
+                        if state.buffer.len() >= MAX_ORG_BUFFER_MAX_LEN { break; }
+                        if c.is_ascii_digit() {
+                            state.buffer.push(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn commit_max_herbivores(
+    state:    &mut MaxHerbivoresEditState,
+    max_herb: &mut crate::simulation_settings::MaxHerbivores,
+) {
+    if let Ok(v) = state.buffer.parse::<usize>() {
+        if max_herb.0 != v {
+            max_herb.0 = v;
+        }
+    }
+    state.focused = false;
+    state.buffer.clear();
+}
+
+pub fn update_max_herbivores_text(
+    state:      Res<MaxHerbivoresEditState>,
+    max_herb:   Res<crate::simulation_settings::MaxHerbivores>,
+    mut text_q: Query<&mut Text, With<MaxHerbivoresText>>,
+    mut bg_q:   Query<&mut BackgroundColor, With<MaxHerbivoresInput>>,
+) {
+    if !state.is_changed() && !max_herb.is_changed() { return; }
+
+    let display = if state.focused {
+        format!("{}_", state.buffer)
+    } else {
+        format!("{}", max_herb.0)
+    };
+    for mut text in &mut text_q {
+        text.0 = display.clone();
+    }
+
+    let bg = if state.focused { MAX_ORG_BG_FOCUSED } else { MAX_ORG_BG_IDLE };
+    for mut b in &mut bg_q {
+        if b.0 != bg { *b = BackgroundColor(bg); }
+    }
+}
+
+
+// ── Export Simulation Dataset button ────────────────────────────────────────
+
+/// Idle / hover backgrounds for the Export-Dataset button. Kept local
+/// to the handler since they're only referenced here.
+const EXPORT_BUTTON_BG_IDLE:  Color = Color::srgb(0.22, 0.46, 0.46);
+const EXPORT_BUTTON_BG_HOVER: Color = Color::srgb(0.30, 0.30, 0.30);
+
+/// Click handler for the Export-Dataset button. Mirrors
+/// `handle_save_button`: on `Pressed`, pauses the simulation, opens a
+/// blocking native save dialog (rfd), and writes the chosen path into
+/// `ExportDatasetRequested` so `dataset_export::export_dataset_system`
+/// performs the actual CSV write on the next Update tick. Cancel
+/// leaves the sim paused but does no write.
+pub fn handle_export_dataset_button(
+    mut interactions: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<ExportDatasetButton>)>,
+    mut sim_running:  ResMut<SimulationRunning>,
+    mut virtual_time: ResMut<Time<Virtual>>,
+    mut request:      ResMut<crate::dataset_export::ExportDatasetRequested>,
+) {
+    for (interaction, mut bg) in &mut interactions {
+        match *interaction {
+            Interaction::Pressed => {
+                if sim_running.0 {
+                    sim_running.0 = false;
+                    virtual_time.pause();
+                }
+
+                let initial_dir = std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let default_name = format!(
+                    "simulation_dataset_{}.csv",
+                    chrono::Local::now().format("%d-%m-%Y-%H-%M-%S"),
+                );
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV (.csv)", &["csv"])
+                    .set_directory(initial_dir)
+                    .set_file_name(default_name)
+                    .save_file()
+                {
+                    request.0 = Some(path);
+                }
+                *bg = BackgroundColor(EXPORT_BUTTON_BG_HOVER);
+            }
+            Interaction::Hovered => *bg = BackgroundColor(EXPORT_BUTTON_BG_HOVER),
+            Interaction::None    => *bg = BackgroundColor(EXPORT_BUTTON_BG_IDLE),
+        }
     }
 }

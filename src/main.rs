@@ -9,6 +9,7 @@
 #[path = "colony/energy.rs"]           mod energy;
 #[path = "colony/reproduction.rs"]     mod reproduction;
 #[path = "colony/krishi.rs"]           mod krishi;
+#[path = "colony/dataset_export.rs"]   mod dataset_export;
 
 #[path = "growth/volumetric_growth/mod.rs"] mod volumetric_growth;
 #[path = "growth/mutation.rs"]              mod mutation;
@@ -25,6 +26,7 @@
 #[path = "behaviour/intelligence_level_herbivore_1.rs"] mod intelligence_level_herbivore_1;
 #[path = "behaviour/predation.rs"]                  mod predation;
 #[path = "behaviour/photosynthesis.rs"]             mod photosynthesis;
+#[path = "behaviour/sensory.rs"]                    mod sensory;
 
 #[path = "movement_physics/movement.rs"]           mod movement;
 #[path = "movement_physics/organism_collision.rs"] mod organism_collision;

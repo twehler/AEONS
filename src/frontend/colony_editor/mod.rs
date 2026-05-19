@@ -135,19 +135,20 @@ fn dispatch_save_requests(mut session: ResMut<EditorSession>) {
 }
 
 
-/// Consumes `EditorSession::load_species_path`. Reads the `.species`
-/// file at that path, decodes it, bilateral-expands the OCG if
-/// applicable, and appends a `LoadedSpecies` to the session. Errors
-/// (missing file, bad magic, truncation) log at `error!` and leave
-/// the session unchanged.
-fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
-    let Some(path) = session.load_species_path.take() else { return };
-
-    let loaded = match crate::species_editor::save::load_species(&path) {
+/// Read one `.species` file, decode it, bilateral-expand the OCG if
+/// applicable, and append a `LoadedSpecies` to the session. Returns
+/// the new species id on success, `None` on any error (missing file,
+/// bad magic, truncation — error logged). Does NOT touch
+/// `selected_species_id`; callers decide whether to auto-select.
+fn load_species_into_session(
+    session: &mut crate::colony_editor::session::EditorSession,
+    path:    &std::path::Path,
+) -> Option<u32> {
+    let loaded = match crate::species_editor::save::load_species(path) {
         Ok(l)  => l,
         Err(e) => {
             error!("failed to load species file {}: {}", path.display(), e);
-            return;
+            return None;
         }
     };
 
@@ -158,9 +159,6 @@ fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
         crate::species_editor::session::Metabolism::Heterotroph
             => crate::colony_editor::template::Metabolism::Heterotroph,
     };
-    // The colony-editor's `Form` cycler is paired with sessility in
-    // its native code path, but for species we honour the file's
-    // own has_variable_form bit directly.
     let form = if loaded.has_variable_form {
         crate::colony_editor::template::Form::Variable
     } else {
@@ -168,9 +166,7 @@ fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
     };
 
     // Bilateral species: the .species file stores RIGHT-half only.
-    // Expand to right + mirrored-left + re-indexed sequentially so
-    // downstream code (placement, save, simulation mutate-bilateral)
-    // sees the combined body part it expects.
+    // Expand to right + mirrored-left + re-indexed sequentially.
     let ocg = match loaded.symmetry {
         crate::organism::Symmetry::NoSymmetry => loaded.ocg.clone(),
         crate::organism::Symmetry::Bilateral  => {
@@ -182,7 +178,6 @@ fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
         }
     };
 
-    // Display name = filename stem (e.g. "species_15-05-2026-11-23-04").
     let display_name = path.file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
@@ -194,8 +189,9 @@ fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
     );
 
     session.next_species_id += 1;
-    let new = crate::colony_editor::session::LoadedSpecies {
-        id:           session.next_species_id,
+    let id = session.next_species_id;
+    session.loaded_species.push(crate::colony_editor::session::LoadedSpecies {
+        id,
         name:         display_name.clone(),
         metabolism,
         symmetry:     loaded.symmetry,
@@ -204,12 +200,46 @@ fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
         is_sessile:   loaded.is_sessile,
         is_carnivore,
         ocg,
-    };
-    session.loaded_species.push(new);
-    // Auto-select the newly-loaded species so the next placement
-    // click uses it without an extra step.
-    session.selected_species_id = Some(session.next_species_id);
+    });
     info!("loaded species: {}", display_name);
+    Some(id)
+}
+
+/// Consumes `EditorSession::load_species_path` (set by the Species
+/// Navigator's "Load Species" button). Loads and appends, and
+/// auto-selects the freshly-loaded species so the next placement
+/// click uses it without an extra step.
+fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
+    let Some(path) = session.load_species_path.take() else { return };
+    if let Some(id) = load_species_into_session(&mut session, &path) {
+        session.selected_species_id = Some(id);
+    }
+}
+
+/// Startup scan of the `species/` directory next to the executable.
+/// Every `*.species` file found is loaded and appended to the
+/// session, in filename-sorted order so the navigator list is
+/// deterministic across runs. No species is auto-selected — the
+/// user picks one by clicking a row. Missing or empty `species/`
+/// directories are silently ignored (logged at debug level).
+fn autoload_species_folder(mut session: ResMut<EditorSession>) {
+    let dir = std::path::Path::new("species");
+    if !dir.is_dir() {
+        debug!("no species/ directory next to the binary — nothing to autoload");
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        warn!("species/ directory exists but couldn't be read — skipping autoload");
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("species"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let _ = load_species_into_session(&mut session, &path);
+    }
 }
 
 
@@ -344,6 +374,12 @@ impl Plugin for EditorOverlayPlugin {
             .add_systems(Update, dispatch_load_species_requests.run_if(in_edit_colony_mode))
             // After Startup we attach the EditorOverlayPanel marker
             // and force-hide the editor panels (we boot in Simulation).
-            .add_systems(PostStartup, (tag_editor_overlay_panels, initial_hide_editor_panels).chain());
+            .add_systems(PostStartup, (tag_editor_overlay_panels, initial_hide_editor_panels).chain())
+            // Walk `species/` at startup and load every `.species`
+            // file into the session so the navigator list is
+            // populated the moment the user enters the colony
+            // editor. Runs after `init_resource::<EditorSession>`
+            // is committed (any Startup system).
+            .add_systems(Startup, autoload_species_folder);
     }
 }

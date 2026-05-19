@@ -312,6 +312,7 @@ pub fn handle_left_click_place(
 
     let idx = session.ocg.len();
     session.ocg.push((idx, target_local, ct));
+    session.dirty = true;
 
     // For bilateral, double-check the result by running through
     // `bilateral_body_part_from_right_ocg` — if the welding fails for

@@ -7,7 +7,7 @@
 // before they themselves reproduce.
 //
 // Three sub-steps in order:
-//   1. `sync_dna_from_brain_pool` — fills in the L1 hetero brain-gene
+//   1. `sync_dna_from_phenotype` — fills in the L1 hetero brain-gene
 //      slots of each Organism's DNA vector. The structural slots are
 //      already populated by `spawn_organism`.
 //   2. `update_species_averages` — recomputes every alive species'
@@ -28,11 +28,12 @@
 
 use bevy::prelude::*;
 
-use crate::intelligence_level_1_hetero::{BrainPoolL1Hetero, BrainSlotL1Hetero};
+use crate::intelligence_level_2::{BrainPoolL2, BrainSlotL2};
+use crate::intelligence_level_3::{BrainPoolL3, BrainSlotL3};
 use crate::lineages::dna::{
-    distance, write_l1_hetero_genes, DNA_DIM,
+    distance, empty_dna, write_l1_hetero_genes, write_phenotype_dims, DNA_DIM,
 };
-use crate::lineages::species::SpeciesRegistry;
+use crate::lineages::species::{ImportedSpeciesOrigin, SpeciesRegistry};
 use crate::organism::Organism;
 use crate::simulation_settings::SPECIES_SEPARATION_THRESHOLD;
 
@@ -52,41 +53,83 @@ impl Default for SpeciationTimer {
 }
 
 
-// ── DNA sync (from brain pool) ──────────────────────────────────────────────
+// ── DNA sync (full phenotype) ───────────────────────────────────────────────
 //
-// The Organism's DNA structural slots are populated at spawn time;
-// the six brain-gene slots are populated here once the brain pool
-// has assigned a slot to the organism. For organisms without a
-// BrainSlotL1Hetero (photoautotrophs, sessiles), the gene slots stay
-// at 0.0 — they contribute nothing to inter-organism distance.
+// Runs on every organism every frame. Reads the organism's current
+// state (body parts, classification flags, intelligence level) AND
+// any per-slot brain genes from the L2 / L3 pools when applicable.
+// This is the canonical pipeline that keeps `Organism::dna` in sync
+// with everything the lineage system compares.
+//
+// The brain-gene slots only populate for organisms that actually
+// carry brain hyperparameters — currently that's L2 / L3 organisms.
+// L0 sessiles, L1 photoautotrophs, and L1 herbivores have no gene
+// vector and leave those slots at 0, so they cluster on body-plan +
+// classification features alone.
 
-pub fn sync_dna_from_brain_pool(
-    pool:      Option<NonSend<BrainPoolL1Hetero>>,
-    mut q:     Query<(&mut Organism, &BrainSlotL1Hetero)>,
+pub fn sync_dna_from_phenotype(
+    pool_l2:   Option<NonSend<BrainPoolL2>>,
+    pool_l3:   Option<NonSend<BrainPoolL3>>,
+    mut q:     Query<(
+        &mut Organism,
+        Has<crate::colony::Photoautotroph>,
+        Has<crate::colony::Carnivore>,
+        Option<&BrainSlotL2>,
+        Option<&BrainSlotL3>,
+    )>,
 ) {
-    let Some(pool) = pool else { return };
-    for (mut organism, slot) in &mut q {
-        let s = slot.0 as usize;
-        // Defensive bounds check — the brain pool's per-slot vecs
-        // are length `OrganismPoolSize`, slot indices are stamped
-        // by `assign_brains_l1_hetero` which clamps to that. A
-        // length mismatch would mean a torn invariant.
-        if s >= pool.sigma.len() { continue; }
-        // Resize on demand — fresh organisms created at spawn time
-        // have the right length, but defensive against any caller
-        // that constructed an Organism with an empty Vec.
+    for (mut organism, is_photo, is_carnivore, slot_l2, slot_l3) in &mut q {
+        // Resize on demand — newborns spawn with `empty_dna()` of the
+        // right length, but defensive against any caller that
+        // constructed an Organism with an empty Vec.
         if organism.dna.len() != DNA_DIM {
-            organism.dna = crate::lineages::dna::empty_dna();
+            organism.dna = empty_dna();
         }
-        write_l1_hetero_genes(
-            &mut organism.dna,
-            pool.sigma[s],
-            pool.k_eat[s],
-            pool.k_repro[s],
-            pool.lambda_energy[s],
-            pool.k_curiosity[s],
-            pool.k_progress[s],
-        );
+
+        // ── Body plan + classification + body geometry (always written) ──
+        //
+        // Split the borrow: take the mutable reference to `dna` out
+        // of the Organism via a temporary swap with an empty Vec,
+        // then pass it alongside an immutable `&Organism` to
+        // `write_phenotype_dims`. Bevy's `Mut<Organism>` exposes
+        // `into_inner()` but we want change-detection unchanged, so
+        // a swap-and-restore is the cleanest split. Allocation-free:
+        // the empty Vec lives for two statements.
+        let mut dna_buf = std::mem::take(&mut organism.dna);
+        write_phenotype_dims(&mut dna_buf, &organism, is_photo, is_carnivore);
+        organism.dna = dna_buf;
+
+        // ── Brain genes: only for organisms enrolled in L2 / L3 ──
+        // (L1 herbivore is supervised and has no gene vector; the
+        // L1 photo brain's `slot_yaw` isn't a hyperparameter we
+        // currently track in the DNA.)
+        if let (Some(slot), Some(pool)) = (slot_l2, pool_l2.as_deref()) {
+            let s = slot.0 as usize;
+            if s < pool.sigma.len() {
+                write_l1_hetero_genes(
+                    &mut organism.dna,
+                    pool.sigma[s],
+                    pool.k_eat[s],
+                    pool.k_repro[s],
+                    pool.lambda_energy[s],
+                    pool.k_curiosity[s],
+                    pool.k_progress[s],
+                );
+            }
+        } else if let (Some(slot), Some(pool)) = (slot_l3, pool_l3.as_deref()) {
+            let s = slot.0 as usize;
+            if s < pool.sigma.len() {
+                write_l1_hetero_genes(
+                    &mut organism.dna,
+                    pool.sigma[s],
+                    pool.k_eat[s],
+                    pool.k_repro[s],
+                    pool.lambda_energy[s],
+                    pool.k_curiosity[s],
+                    pool.k_progress[s],
+                );
+            }
+        }
     }
 }
 
@@ -179,7 +222,8 @@ fn mean_of(dnas: &[Vec<f32>]) -> Vec<f32> {
 
 pub fn classify_organisms(
     mut registry: ResMut<SpeciesRegistry>,
-    mut q:        Query<&mut Organism>,
+    mut commands: Commands,
+    mut q:        Query<(Entity, &mut Organism, Option<&ImportedSpeciesOrigin>)>,
     timer:        Res<SpeciationTimer>,
 ) {
     // Piggy-back on `update_species_averages`'s timer — both fire
@@ -189,8 +233,31 @@ pub fn classify_organisms(
     // off-tick frames are cheap.
     if !timer.0.just_finished() { return; }
 
-    for mut org in &mut q {
+    for (entity, mut org, imported) in &mut q {
         if org.dna.len() != DNA_DIM { continue; }
+
+        // ── Imported-species short-circuit ────────────────────────
+        // If the organism was spawned from a `.species` import and
+        // hasn't been classified yet, route it into a name-keyed
+        // founder species (parent = None, so it sits in its own
+        // tree besides the main lineages). Multiple imports from the
+        // same file collapse into one species. After assignment we
+        // strip the marker so subsequent ticks run the normal drift
+        // logic on the imported organism — its descendants can fork
+        // off sub-species through the standard pipeline.
+        if let (Some(origin), None) = (imported, org.species_id) {
+            let species_id = match registry.find_alive_by_name(&origin.name) {
+                Some(s) => s.id,
+                None    => registry.create_with_name(
+                    origin.name.clone(),
+                    org.dna.clone(),
+                    None,
+                ),
+            };
+            org.species_id = Some(species_id);
+            commands.entity(entity).try_remove::<ImportedSpeciesOrigin>();
+            continue;
+        }
 
         // Find the nearest alive species + its distance.
         let (nearest_id, nearest_dist) = nearest_species(&registry, &org.dna);

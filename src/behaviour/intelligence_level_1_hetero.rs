@@ -138,7 +138,7 @@ const OUT:     usize = 1 + WORLD_MODEL_K;
 /// led to it (γ^32 ≈ 0.19 with γ=0.95, so ~80% of the signal
 /// decays inside one rollout).
 const ROLLOUT_LEN: usize = 32;
-const MAX_SPEED:   f32   = 20.0;
+const MAX_SPEED:   f32   = 40.0;
 const LR:          f64   = 1e-3;
 
 /// Discount for the Monte Carlo return.

@@ -213,7 +213,15 @@ pub fn nearest_prey(grid: &WorldModelGrid, self_pos: Vec3) -> Option<(Vec3, f32,
                     if !matches!(e.ty, OrganismType::Photo) { continue; }
                     let rel = e.pos - self_pos;
                     let d2  = rel.length_squared();
-                    if d2 < 1e-6 { continue; }
+                    // No self-exclusion needed — the type filter above
+                    // restricts to Photoautotrophs, and the caller is
+                    // always a Heterotroph. The previous `d2 < 1e-6`
+                    // skip was a hangover from a generic version of
+                    // this function. It produced the "dance on one
+                    // spot" bug: a herbivore parked exactly on a photo
+                    // (d_root < 0.001) lost its target, fell through
+                    // to the wander branch, drifted away, re-targeted,
+                    // approached, parked, wandered — forever.
                     if d2 > radius_sq { continue; }
                     if best.map_or(true, |(b, _, _)| d2 < b) {
                         best = Some((d2, rel, e.entity));

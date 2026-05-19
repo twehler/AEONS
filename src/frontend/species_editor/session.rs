@@ -229,12 +229,25 @@ pub struct SpeciesSession {
     /// Save dispatch: when `Some(path)`, the next Update tick writes a
     /// `.species` binary file to `path` and clears this field.
     pub save_requested: Option<PathBuf>,
+
+    /// `true` whenever the user has made changes that have not yet been
+    /// saved. Set by every mutating action (first-cell spawn, cell
+    /// placement); cleared on successful `.species` write in
+    /// `save.rs::dispatch_save_requests`. Consumed by the Clear/New
+    /// button to decide whether to show the unsaved-changes
+    /// confirmation modal.
+    pub dirty: bool,
+
+    /// Rising-edge flag toggled by the Clear/New button when the
+    /// session is dirty. The clear-modal lifecycle system spawns the
+    /// modal on `true` and despawns it on `false`.
+    pub show_clear_modal: bool,
 }
 
 impl SpeciesSession {
-    /// Reset to a fresh state. Currently called only by a hypothetical
-    /// future "Clear" button; `Default` covers the spawn-time case.
-    #[allow(dead_code)]
+    /// Reset to a fresh state. Called by the Clear/New flow once the
+    /// user confirms (or unconditionally, if there were no unsaved
+    /// changes); `Default` covers the spawn-time case.
     pub fn reset(&mut self) {
         *self = Self::default();
     }
