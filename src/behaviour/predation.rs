@@ -123,7 +123,18 @@ fn predation_system(
             let new_alive = prey_org.alive_body_part_count();
             // Bilateral organisms can't survive losing a half.
             let bilateral_collapse = matches!(prey_org.symmetry, Symmetry::Bilateral);
-            Some((share, new_alive == 0 || bilateral_collapse))
+            // Losing body_parts[0] (the structural root / trunk) kills
+            // the organism. For variable-form plants this matters
+            // visually: after the flat-hierarchy fix branches no
+            // longer cascade with their nominal parent body part, so
+            // eating the trunk would otherwise leave the surviving
+            // branches floating in space (and unable to grow back,
+            // since `continuous_growth` seeds from
+            // `body_parts[0].ocg`). Treating index-0 consumption as
+            // fatal restores the intuitive "plant is dead once the
+            // trunk is gone" semantics across every symmetry.
+            let trunk_lost = prey_bp_idx == 0;
+            Some((share, new_alive == 0 || bilateral_collapse || trunk_lost))
         };
 
         let mutation_result = if prey_is_photo {

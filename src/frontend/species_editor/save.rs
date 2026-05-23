@@ -28,12 +28,23 @@ use crate::colony::{IntelligenceLevel, Symmetry};
 
 use super::session::{Classification, Metabolism, SpeciesSession};
 
-/// v2 introduces the `classification` byte (Herbivore / Carnivore)
-/// after `is_sessile`. v1 files are still accepted by `load_species`
-/// — they default to `Classification::Herbivore`.
+/// v3 appends an optional brain block immediately after the OCG
+/// entries: one byte `brain_present`, and if 1 the same payload
+/// `colony.rs` writes for `AEONS004` colony files (the shared
+/// helpers in `intelligence_level_herbivore_1::{encode,decode}_brain_restore`).
+/// The species editor itself always writes `brain_present = 0`
+/// (random init is regenerated at spawn time, not baked into the
+/// file); the "export trained organism as a species" workflow in
+/// the Individuum Navigator writes `brain_present = 1` with the
+/// organism's live brain snapshotted from the pool.
+///
+/// v2 introduced the `classification` byte (Herbivore / Carnivore)
+/// after `is_sessile`. v1 files are still accepted by
+/// `load_species` and default to `Classification::Herbivore`.
+const MAGIC_V3:     &[u8; 8] = b"AEONSS03";
 const MAGIC_V2:     &[u8; 8] = b"AEONSS02";
 const MAGIC_V1:     &[u8; 8] = b"AEONSS01";
-const MAGIC: &[u8; 8] = MAGIC_V2;
+const MAGIC: &[u8; 8] = MAGIC_V3;
 
 
 pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
@@ -113,6 +124,79 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
         };
         buf.push(ct_byte);
     }
+    // v3 brain block — editor saves write `brain_present = 0`. The
+    // weights are regenerated as fresh random init when the species
+    // is later spawned. Only the "export trained" workflow writes a
+    // non-zero brain block; it bypasses this function and uses
+    // `encode_species_with_brain` instead.
+    buf.push(0);
+    buf
+}
+
+
+/// Variant of `encode_species` that ALSO carries a saved brain
+/// payload. Used by the per-row "export trained organism as a
+/// species" button in the Individuum Navigator: the snapshot is
+/// taken from the running pool at click time, and the .species
+/// file becomes a genuine trained template that any later import
+/// will spawn copies of.
+///
+/// Builds the same metadata header as `encode_species` but writes
+/// `brain_present = 1` and serialises the supplied
+/// `BrainRestoreHerbivore1` via the shared helper.
+pub fn encode_species_with_brain(
+    metabolism:        Metabolism,
+    symmetry:          Symmetry,
+    intelligence:      IntelligenceLevel,
+    has_variable_form: bool,
+    is_sessile:        bool,
+    classification:    Classification,
+    ocg:               &[(usize, Vec3, CellType)],
+    brain:             &crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1,
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(64 + ocg.len() * 17 + 32 * 1024);
+    buf.extend_from_slice(MAGIC);
+
+    let kind_byte: u8 = match metabolism {
+        Metabolism::Photoautotroph => 0,
+        Metabolism::Heterotroph    => 1,
+    };
+    let sym_byte: u8 = match symmetry {
+        Symmetry::NoSymmetry => 0,
+        Symmetry::Bilateral  => 1,
+    };
+    let intel_byte: u8 = match intelligence {
+        IntelligenceLevel::Level0 => 0,
+        IntelligenceLevel::Level1 => 1,
+        IntelligenceLevel::Level2 => 2,
+        IntelligenceLevel::Level3 => 3,
+    };
+    let var_byte:     u8 = if has_variable_form { 1 } else { 0 };
+    let sessile_byte: u8 = if is_sessile        { 1 } else { 0 };
+    let classification_byte: u8 = match classification {
+        Classification::Herbivore => 0,
+        Classification::Carnivore => 1,
+    };
+    buf.push(kind_byte);
+    buf.push(sym_byte);
+    buf.push(intel_byte);
+    buf.push(var_byte);
+    buf.push(sessile_byte);
+    buf.push(classification_byte);
+    buf.extend_from_slice(&(ocg.len() as u32).to_le_bytes());
+    for &(idx, pos, ct) in ocg {
+        buf.extend_from_slice(&(idx as u32).to_le_bytes());
+        buf.extend_from_slice(&pos.x.to_le_bytes());
+        buf.extend_from_slice(&pos.y.to_le_bytes());
+        buf.extend_from_slice(&pos.z.to_le_bytes());
+        let ct_byte: u8 = match ct {
+            CellType::Photo    => 0,
+            CellType::NonPhoto => 1,
+        };
+        buf.push(ct_byte);
+    }
+    buf.push(1);   // brain_present
+    crate::intelligence_level_herbivore_1::encode_brain_restore(&mut buf, brain);
     buf
 }
 
@@ -138,6 +222,11 @@ pub struct LoadedSpecies {
     /// v1 files default this to `Herbivore`; v2 reads it from disk.
     pub classification:    Classification,
     pub ocg:               Vec<(usize, Vec3, CellType)>,
+    /// `Some` when the file carries trained brain weights (v3 with
+    /// `brain_present = 1`). Spawning from such a species attaches
+    /// the restore payload to every copy so all spawned instances
+    /// boot with the saved weights instead of fresh random init.
+    pub brain: Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>,
 }
 
 
@@ -147,9 +236,12 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     fn err(msg: &str) -> Error { Error::new(ErrorKind::InvalidData, msg.to_string()) }
 
     if bytes.len() < 8 + 5 + 4 { return Err(err("species file too short for header")); }
+    let is_v3 = &bytes[..8] == MAGIC_V3;
     let is_v2 = &bytes[..8] == MAGIC_V2;
     let is_v1 = &bytes[..8] == MAGIC_V1;
-    if !is_v2 && !is_v1 { return Err(err("species magic mismatch (expected AEONSS01 or AEONSS02)")); }
+    if !is_v3 && !is_v2 && !is_v1 {
+        return Err(err("species magic mismatch (expected AEONSS01, AEONSS02 or AEONSS03)"));
+    }
 
     let mut c = 8usize;
     let kind_byte    = bytes[c]; c += 1;
@@ -157,7 +249,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let intel_byte   = bytes[c]; c += 1;
     let var_byte     = bytes[c]; c += 1;
     let sessile_byte = bytes[c]; c += 1;
-    let classification = if is_v2 {
+    let classification = if is_v2 || is_v3 {
         let b = bytes[c]; c += 1;
         match b {
             0 => Classification::Herbivore,
@@ -207,7 +299,33 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
         ocg.push((idx, Vec3::new(x, y, z), ct));
     }
 
+    // v3 brain block. Layout:
+    //   u8 brain_present
+    //   if 1 → 12 length-prefixed Vec<f32> + prev_state + prev_action
+    //          + 2× f32 (prev_dopamine, prev_target_distance).
+    // v1/v2 don't carry a brain block; default to None.
+    let brain = if is_v3 {
+        if c >= bytes.len() {
+            // Malformed: header promised v3 but file ends before
+            // the brain_present byte. Be conservative and treat as
+            // "no brain" rather than erroring.
+            None
+        } else {
+            let brain_present = bytes[c]; c += 1;
+            if brain_present == 1 {
+                Some(crate::intelligence_level_herbivore_1::decode_brain_restore(
+                    bytes, &mut c,
+                )?)
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(LoadedSpecies {
-        metabolism, symmetry, intelligence, has_variable_form, is_sessile, classification, ocg,
+        metabolism, symmetry, intelligence, has_variable_form, is_sessile,
+        classification, ocg, brain,
     })
 }

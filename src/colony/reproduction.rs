@@ -65,10 +65,12 @@ impl Plugin for ReproductionPlugin {
 
 fn reproduction_system(
     time:           Res<Time>,
+    virtual_time:   Res<Time<Virtual>>,
     mut timer:      ResMut<ReproductionTimer>,
     mut commands:   Commands,
     mut meshes:     ResMut<Assets<Mesh>>,
-    mut materials:  ResMut<Assets<StandardMaterial>>,
+    materials:      ResMut<Assets<StandardMaterial>>,
+    organism_mats:  Option<Res<OrganismMaterials>>,
     heightmap:      Option<Res<HeightmapSampler>>,
     smoothing:      Res<crate::simulation_settings::Smoothing>,
     map_size:       Res<MapSize>,
@@ -79,6 +81,12 @@ fn reproduction_system(
         With<OrganismRoot>,
     >,
 ) {
+    // Silence unused-mut warning on `materials` — kept in the
+    // signature for the unlikely case that a future code path inside
+    // this system needs to mint a material from scratch (e.g. user
+    // dropping in a new species at runtime). Currently every birth
+    // reuses the shared `OrganismMaterials` resource.
+    let _ = materials;
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
@@ -280,15 +288,25 @@ fn reproduction_system(
                 Some(parent_entity)
             },
             parent_species_id: organism.species_id,
+            lineage_parent:    parent_entity,
         });
     }
 
-    // Skip the asset registration entirely on ticks where no births
-    // are pending. Each `OrganismMaterials::new` call inserts 3
-    // StandardMaterial assets — cheap individually but every 2-second
-    // tick was creating them unconditionally.
     if pending_births.is_empty() { return; }
-    let organism_materials = OrganismMaterials::new(&mut materials);
+    // Reuse the shared `OrganismMaterials` resource populated by
+    // `spawn_colony`. The earlier code minted three fresh
+    // `StandardMaterial` assets per reproduction tick — those
+    // assets leaked over the simulation's lifetime because
+    // `Assets<StandardMaterial>` only GC's when the LAST strong
+    // handle drops, and every spawned body part held a strong
+    // copy. Over 60 minutes of reproduction every 2 s, that's
+    // ~5400 dead-but-retained materials in VRAM. The same fix
+    // applies to `continuous_growth.rs`.
+    let Some(organism_materials) = organism_mats.as_deref() else {
+        warn!("reproduction_system: OrganismMaterials resource missing — \
+               spawn_colony hasn't run yet. Skipping this tick's births.");
+        return;
+    };
 
     for birth in pending_births {
         let child_root = spawn_organism(
@@ -303,7 +321,7 @@ fn reproduction_system(
             birth.energy,
             &mut commands,
             &mut meshes,
-            &organism_materials,
+            organism_materials,
             &mut rng,
         );
         if let Some(parent) = birth.parent_for_brain_inheritance {
@@ -316,6 +334,36 @@ fn reproduction_system(
             commands.entity(child_root)
                 .try_insert(crate::rl_helpers::BrainInheritance(parent));
         }
+
+        // Lineage record on the offspring. Attached here so the
+        // default `assign_lineage_records` (which only handles
+        // entities without a record) skips this one — we want
+        // `parent_id = Some(parent)`, not the default `None`.
+        let spawn_time = virtual_time.elapsed_secs();
+        commands.entity(child_root).try_insert(
+            crate::organism::LineageRecord::new_offspring(
+                birth.lineage_parent,
+                spawn_time,
+            ),
+        );
+
+        // Bump the parent's reproduction counter. The
+        // `LineageRecord` mutation goes through Commands so it
+        // doesn't conflict with the active `&mut Organism` query
+        // (Bevy's reproduction loop holds the parent's Organism
+        // borrow already). The closure handles the case where the
+        // parent died before this tick's command queue flushed.
+        let parent_entity_for_queue = birth.lineage_parent;
+        commands.queue(move |world: &mut World| {
+            if let Ok(mut entity_ref) = world.get_entity_mut(parent_entity_for_queue) {
+                if let Some(mut lr) =
+                    entity_ref.get_mut::<crate::organism::LineageRecord>()
+                {
+                    lr.times_reproduced_self =
+                        lr.times_reproduced_self.saturating_add(1);
+                }
+            }
+        });
         // Inherit parent's species classification — the speciation
         // tick will re-evaluate next time it runs and split off a
         // new lineage if the brain genes have drifted past the
@@ -359,4 +407,10 @@ struct PendingBirth {
     /// fork off its own. `None` if the parent hadn't been classified
     /// yet (the very first frame after initial spawn).
     parent_species_id: Option<u32>,
+    /// Parent entity, captured unconditionally for the lineage
+    /// `parent_id` link (distinct from `parent_for_brain_inheritance`,
+    /// which is gated on intelligence level). Every offspring needs
+    /// a lineage parent regardless of whether brain weights are
+    /// inheritable.
+    lineage_parent: Entity,
 }

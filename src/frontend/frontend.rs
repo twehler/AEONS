@@ -219,6 +219,11 @@ impl Plugin for FrontendPlugin {
                 statistics_panel::handle_max_herbivores_input,
                 statistics_panel::update_max_herbivores_text,
                 statistics_panel::handle_export_dataset_button,
+                // TEMPORARY: log the breakdown of "what's a
+                // Photoautotroph" buckets every 5 s, to track down
+                // why the displayed count diverges from the visual
+                // population. Remove once the bug is found.
+                statistics_panel::diag_photo_breakdown,
             ));
         // Gizmos run only when the F3-toggled overlay is active. Putting
         // the check on the system registration (rather than inside the

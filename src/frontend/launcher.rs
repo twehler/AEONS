@@ -60,17 +60,25 @@ const MAXORG_LABEL_SIZE:       egui::Vec2 = egui::vec2(180.0, 32.0);
 const MAXORG_DRAG_POS:         egui::Pos2 = egui::pos2(245.0, MAXORG_ROW_TOP);
 const MAXORG_FIELD_SIZE:       egui::Vec2 = egui::vec2(110.0, 32.0);
 
+// AI-training-mode checkbox — sits between the Max-Organisms row and
+// the action button. The checkbox is the final word on whether the
+// child process boots with training mode active: it initialises from
+// the `--trainingmode` flag (if the launcher itself was invoked with
+// it) but the user can override the initial value by toggling, and
+// the final committed state is forwarded via
+// `LaunchMode::RunSimulation::training_mode`.
+const TRAININGMODE_ROW_TOP:    f32        = 420.0;
+const TRAININGMODE_POS:        egui::Pos2 = egui::pos2(60.0, TRAININGMODE_ROW_TOP);
+const TRAININGMODE_SIZE:       egui::Vec2 = egui::vec2(400.0, 24.0);
+
 // Two side-by-side buttons. "START AEONS" on the left, "COLONY EDITOR"
 // on the right — both styled the same so neither feels like a footnote.
 const ACTION_BTN_SIZE:         egui::Vec2 = egui::vec2(330.0, 90.0);
-const ACTION_BTN_GAP:          f32        = 20.0;
 const ACTION_ROW_TOP:          f32        = 445.0;
 const ACTION_BTN_FONT_SIZE:    f32        = 24.0;
 const START_BTN_LABEL:         &str       = "START AEONS";
-const EDITOR_BTN_LABEL:        &str       = "COLONY EDITOR";
-
-const DEFAULT_MAP_PATH:        &str       = "assets/world.glb";
-const DEFAULT_COLONY_PATH:     &str       = "";
+const DEFAULT_MAP_PATH:        &str       = "assets/world_superflat.glb";
+const DEFAULT_COLONY_PATH:     &str       = "colonies/Starter.colony";
 
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -85,6 +93,12 @@ pub enum LaunchMode {
         map_x:         f32,
         map_z:         f32,
         max_organisms: usize,
+        /// Final AI-training-mode state at click-of-START — the
+        /// launcher's checkbox is the source of truth. It seeds
+        /// from `--trainingmode` if that argv flag was set when the
+        /// launcher process started, but the user may toggle it
+        /// before clicking and the toggle wins.
+        training_mode: bool,
     },
     /// Boot the colony editor (Bevy + minimal plugin set, no AI).
     RunEditor {
@@ -129,6 +143,11 @@ struct LauncherApp {
     map_x:         f32,
     map_z:         f32,
     max_organisms: usize,
+    /// AI-training-mode checkbox state. Initialised from
+    /// `--trainingmode` in argv; mutable while the launcher is open.
+    /// Whatever value is held when the user clicks START AEONS is
+    /// what the child process boots with.
+    training_mode: bool,
     banner:        Option<egui::TextureHandle>,
     status:        String,
     tx:            mpsc::Sender<LaunchMode>,
@@ -136,7 +155,8 @@ struct LauncherApp {
 
 impl LauncherApp {
     fn new(cc: &eframe::CreationContext<'_>, tx: mpsc::Sender<LaunchMode>) -> Self {
-        let wireframe = env::args().any(|a| a == "--wireframe");
+        let wireframe     = env::args().any(|a| a == "--wireframe");
+        let training_mode = env::args().any(|a| a == "--trainingmode");
         Self {
             map_path:      DEFAULT_MAP_PATH.to_string(),
             colony_path:   DEFAULT_COLONY_PATH.to_string(),
@@ -147,6 +167,7 @@ impl LauncherApp {
             // dial it freely up to `LAUNCHER_MAX_ORGANISMS_CAP`; the
             // chosen value flows through to the GPU brain-pool size.
             max_organisms: DEFAULT_MAX_ORGANISMS,
+            training_mode,
             banner:        load_banner(&cc.egui_ctx),
             status:        String::new(),
             tx,
@@ -167,6 +188,7 @@ impl LauncherApp {
             map_x:         self.map_x,
             map_z:         self.map_z,
             max_organisms: self.max_organisms.max(1),
+            training_mode: self.training_mode,
         };
         let _ = self.tx.send(mode);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -337,6 +359,19 @@ impl eframe::App for LauncherApp {
                     egui::DragValue::new(&mut self.max_organisms)
                         .range(1..=LAUNCHER_MAX_ORGANISMS_CAP)
                         .speed(1.0),
+                );
+
+                // ── AI-training-mode checkbox ────────────────────────
+                // Seeded from `--trainingmode` argv on launcher start
+                // (see `LauncherApp::new`). Whatever the user leaves
+                // it on when clicking START is what's forwarded — so
+                // the launcher checkbox overrides the argv flag and
+                // they "compete" via last-touched-wins.
+                let training_rect = egui::Rect::from_min_size(
+                    TRAININGMODE_POS, TRAININGMODE_SIZE);
+                ui.put(
+                    training_rect,
+                    egui::Checkbox::new(&mut self.training_mode, "AI-training mode"),
                 );
 
                 // ── Action button ───────────────────────────────────

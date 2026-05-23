@@ -140,6 +140,17 @@ struct NavigatorList;
 #[derive(Component)]
 struct NavigatorButton { target: Entity }
 
+/// Per-row "Export species" button. Click → file-save dialog →
+/// the pending entity + path land in `ExportSpeciesRequested` for
+/// `dispatch_export_species_requests` to consume next Update tick.
+#[derive(Component)]
+struct NavigatorExportButton { target: Entity }
+
+/// One-shot request resource: `Some((target_entity, path))` while
+/// a dialog has completed and the worker hasn't run yet.
+#[derive(Resource, Default)]
+struct ExportSpeciesRequested(Option<(Entity, std::path::PathBuf)>);
+
 #[derive(Component)]
 struct NavigatorButtonText;
 
@@ -209,6 +220,7 @@ impl Plugin for IndividuumNavigatorPlugin {
             .init_resource::<HeterotrophCounter>()
             .init_resource::<ShowIndividualIdentifiers>()
             .init_resource::<VerticalDividerDragState>()
+            .init_resource::<ExportSpeciesRequested>()
             .add_systems(Update, (
                 assign_individual_identifiers,
                 manage_label_lifecycle,
@@ -223,6 +235,8 @@ impl Plugin for IndividuumNavigatorPlugin {
                 update_min_hetero_row_visibility,
                 handle_min_hetero_input,
                 update_min_hetero_text,
+                handle_export_buttons,
+                dispatch_export_species_requests,
             ));
     }
 }
@@ -640,32 +654,54 @@ fn manage_navigator_list(
     let Ok(list) = list_q.single() else { return };
 
     for (entity, ident, _organism) in &new_q {
-        // Intelligence level is now baked into the identifier
-        // ("Carnivore L2"), so a separate subtext line is redundant.
+        // Row: identifier text on the left, "Export" button on the
+        // right. The outer container is now a layout-only Node
+        // (the previous `Button` tag had no click handler bound to
+        // it; the Export sub-button is the only interactive child).
         let btn = commands.spawn((
             NavigatorButton { target: entity },
-            Button,
             Node {
                 width:           Val::Percent(100.0),
                 height:          Val::Px(NAV_BUTTON_HEIGHT_PX),
                 margin:          UiRect::bottom(Val::Px(NAV_BUTTON_GAP_PX)),
                 padding:         UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-                flex_direction:  FlexDirection::Column,
-                align_items:     AlignItems::FlexStart,
-                justify_content: JustifyContent::Center,
+                flex_direction:  FlexDirection::Row,
+                align_items:     AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
                 flex_shrink:     0.0,
                 ..default()
             },
             BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
         ))
-        .with_children(|btn| {
-            btn.spawn((
+        .with_children(|row| {
+            row.spawn((
                 NavigatorButtonText,
                 Text::new(ident.0.clone()),
                 TextFont { font_size: 13.0, ..default() },
                 TextColor(Color::WHITE),
                 Pickable::IGNORE,
             ));
+            row.spawn((
+                NavigatorExportButton { target: entity },
+                Button,
+                Node {
+                    height:          Val::Px(24.0),
+                    padding:         UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                    align_items:     AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    flex_shrink:     0.0,
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.22, 0.46, 0.46)),
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("Export"),
+                    TextFont { font_size: 11.0, ..default() },
+                    TextColor(Color::WHITE),
+                    Pickable::IGNORE,
+                ));
+            });
         })
         .id();
         commands.entity(list).add_child(btn);
@@ -928,5 +964,155 @@ fn update_label_species_text(
             Err(_) => String::new(),
         };
         if text.0 != new { text.0 = new; }
+    }
+}
+
+
+// ── Export Trained Species — per-row button handlers ───────────────────────
+//
+// Two-stage workflow (mirrors the Save / Export Dataset pattern in the
+// statistics panel):
+//   1. `handle_export_buttons` — on `Interaction::Pressed`, pause the
+//      simulation, open a blocking native save dialog, and stash the
+//      `(target_entity, path)` pair in `ExportSpeciesRequested` if the
+//      user picked a path. Cancel leaves the sim paused (the user can
+//      resume manually). The pause is so the brain snapshot taken in
+//      step 2 doesn't get smeared by an in-progress training tick.
+//   2. `dispatch_export_species_requests` — consumes the request,
+//      pulls the trained brain via `pool.extract_slot`, extracts the
+//      organism's body plan + (bilateral-right-half) OCG, and writes a
+//      `.species` v3 file with `brain_present = 1`. Errors land in
+//      `error!`; success lands in `info!`. Resource resets to `None`
+//      either way so the next click starts fresh.
+
+/// Click handler for the per-row Export button. Blocks on a native
+/// save dialog; on success, writes `(entity, path)` into the
+/// `ExportSpeciesRequested` resource for the worker to consume.
+fn handle_export_buttons(
+    interactions: Query<
+        (&Interaction, &NavigatorExportButton),
+        Changed<Interaction>,
+    >,
+    mut sim_running:  ResMut<crate::simulation_settings::SimulationRunning>,
+    mut virtual_time: ResMut<Time<Virtual>>,
+    mut request:      ResMut<ExportSpeciesRequested>,
+) {
+    for (interaction, btn) in &interactions {
+        if !matches!(*interaction, Interaction::Pressed) { continue; }
+
+        if sim_running.0 {
+            sim_running.0 = false;
+            virtual_time.pause();
+        }
+
+        let initial_dir = std::env::current_dir()
+            .ok()
+            .map(|d| d.join("species"))
+            .unwrap_or_else(|| std::path::PathBuf::from("species"));
+        let default_name = format!(
+            "trained_species_{}.species",
+            chrono::Local::now().format("%d-%m-%Y-%H-%M-%S"),
+        );
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("AEONS species (.species)", &["species"])
+            .set_directory(initial_dir)
+            .set_file_name(default_name)
+            .save_file()
+        {
+            request.0 = Some((btn.target, path));
+        }
+    }
+}
+
+/// Worker — runs every Update. Consumes one pending export request,
+/// snapshots the organism's brain from the herbivore pool, encodes
+/// the .species v3 payload, and writes it to disk.
+fn dispatch_export_species_requests(
+    mut request: ResMut<ExportSpeciesRequested>,
+    pool:        NonSend<crate::intelligence_level_herbivore_1::BrainPoolHerbivore1>,
+    query:       Query<
+        (
+            &Organism,
+            &crate::intelligence_level_herbivore_1::BrainSlotHerbivore1,
+            Has<crate::colony::Photoautotroph>,
+            Has<Heterotroph>,
+            Has<crate::colony::Carnivore>,
+        ),
+        With<OrganismRoot>,
+    >,
+) {
+    let Some((entity, path)) = request.0.take() else { return };
+
+    let Ok((org, slot, is_photo, is_hetero, is_carn)) = query.get(entity) else {
+        warn!(
+            "export species: entity {:?} not found / has no herbivore_1 brain slot \
+             (only Level1 + Heterotroph + !Carnivore organisms can be exported)",
+            entity,
+        );
+        return;
+    };
+
+    use crate::species_editor::session::{Classification, Metabolism};
+    let metabolism = if is_photo {
+        Metabolism::Photoautotroph
+    } else if is_hetero {
+        Metabolism::Heterotroph
+    } else {
+        warn!("export species: entity {:?} has neither Photo nor Hetero marker", entity);
+        return;
+    };
+    let classification = if is_carn { Classification::Carnivore } else { Classification::Herbivore };
+
+    // OCG: bilateral organisms maintain a mirror-expanded body part 0,
+    // so for the .species file (which stores RIGHT-half only) we
+    // filter to `p.x > 0`. NoSymmetry organisms save the full OCG.
+    let ocg_full = if org.body_parts.is_empty() {
+        warn!("export species: entity {:?} has no body parts", entity);
+        return;
+    } else {
+        &org.body_parts[0].ocg
+    };
+    let ocg: Vec<_> = match org.symmetry {
+        crate::organism::Symmetry::NoSymmetry => ocg_full.clone(),
+        crate::organism::Symmetry::Bilateral  => ocg_full.iter()
+            .filter(|(_, p, _)| p.x > 0.0)
+            .copied()
+            .collect(),
+    };
+    if ocg.is_empty() {
+        warn!("export species: entity {:?} produced empty OCG after symmetry filter", entity);
+        return;
+    }
+
+    let brain = pool.extract_slot(slot.0);
+
+    let bytes = crate::species_editor::save::encode_species_with_brain(
+        metabolism,
+        org.symmetry,
+        org.intelligence_level,
+        org.has_variable_form,
+        org.is_sessile,
+        classification,
+        &ocg,
+        &brain,
+    );
+
+    // Ensure target directory exists (the default suggested by the
+    // dialog is `./species/`, but the user may have picked elsewhere).
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                error!("export species: failed to create dir {}: {}", parent.display(), e);
+                return;
+            }
+        }
+    }
+
+    match std::fs::write(&path, &bytes) {
+        Ok(()) => info!(
+            "trained species exported to {} — {} cells, {} bytes",
+            path.display(), ocg.len(), bytes.len(),
+        ),
+        Err(e) => error!("export species: write to {} failed: {}", path.display(), e),
     }
 }

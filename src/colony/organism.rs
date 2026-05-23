@@ -368,6 +368,48 @@ pub struct Heterotroph;
 #[derive(Component, Clone, Copy)]
 pub struct Carnivore;
 
+
+/// Per-organism ancestry + age tracking, for the dataset-export
+/// "lineage" diagnostic columns. Attached to every OrganismRoot at
+/// spawn time. NOT persisted to `.colony` files yet — loaded
+/// organisms re-initialise as initial-cohort (`parent_id = None`,
+/// `spawn_time_secs = current virtual time`, `times_reproduced_self
+/// = 0`). The runtime-side history is sufficient for the current
+/// diagnostic use case; bumping the .colony format to save it is a
+/// follow-up.
+#[derive(Component, Debug, Clone)]
+pub struct LineageRecord {
+    /// `Some(parent)` for offspring of a reproduction event;
+    /// `None` for initial-cohort spawns, auto-spawns, editor
+    /// placements, and loaded organisms.
+    pub parent_id:            Option<Entity>,
+    /// Virtual-time seconds when the organism was spawned.
+    pub spawn_time_secs:      f32,
+    /// Number of successful reproductions this organism has
+    /// performed. Incremented by `reproduction_system` each time it
+    /// produces a child.
+    pub times_reproduced_self: u32,
+}
+
+impl LineageRecord {
+    /// Fresh initial-cohort / auto-spawn / editor / load record.
+    pub fn new_initial(spawn_time_secs: f32) -> Self {
+        Self {
+            parent_id: None,
+            spawn_time_secs,
+            times_reproduced_self: 0,
+        }
+    }
+    /// Offspring of a reproduction event.
+    pub fn new_offspring(parent: Entity, spawn_time_secs: f32) -> Self {
+        Self {
+            parent_id: Some(parent),
+            spawn_time_secs,
+            times_reproduced_self: 0,
+        }
+    }
+}
+
 #[derive(Component)]
 pub struct OrganismRoot;
 

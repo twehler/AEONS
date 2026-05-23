@@ -1,0 +1,258 @@
+AEONS — Brain Weights Report
+Generated at 2026-05-23 14:09:11
+Milestones with brain_probe: 3 (5_MINUTES, 10_MINUTES, 30_MINUTES)
+Tensors in probe: bk_w1, bk_b1, bk_w2, bk_b2, a_w1, a_b1, a_w2, a_b2, c_w1, c_b1, c_w2, c_b2
+
+══════════════════════════════════════════════════════════════════════════════
+ 1) PER-MILESTONE PER-TENSOR DISTRIBUTION
+══════════════════════════════════════════════════════════════════════════════
+
+Mean of l2_norm per tensor (per-organism)
+  tensor         5_MINUTES    10_MINUTES    30_MINUTES
+  bk_w1            11.3315       11.3616       11.6714
+  bk_b1             0.0456        0.1462        0.6609
+  bk_w2            11.3324       11.3713       11.9829
+  bk_b2             0.0456        0.1344        0.5484
+  a_w1              5.6682        5.6724        5.7213
+  a_b1              0.0157        0.0276        0.0405
+  a_w2              0.0596        0.0835        0.1398
+  a_b2              0.0088        0.0134        0.0204
+  c_w1              5.6918        5.7563        6.4808
+  c_b1              0.0332        0.1079        0.3935
+  c_w2              0.0497        0.1272        0.4719
+  c_b2              0.0107        0.0273        0.0757
+
+Std  of l2_norm per tensor (per-organism)
+  tensor         5_MINUTES    10_MINUTES    30_MINUTES
+  bk_w1             0.1813        0.1973        0.1923
+  bk_b1             0.0168        0.0749        0.1048
+  bk_w2             0.0880        0.1014        0.1962
+  bk_b2             0.0177        0.0679        0.0867
+  a_w1              0.0757        0.0890        0.0960
+  a_b1              0.0048        0.0099        0.0132
+  a_w2              0.0074        0.0142        0.0232
+  a_b2              0.0027        0.0062        0.0071
+  c_w1              0.0652        0.0947        0.2559
+  c_b1              0.0231        0.0534        0.0664
+  c_w2              0.0217        0.0550        0.0742
+  c_b2              0.0083        0.0130        0.0107
+
+Mean of element-std per tensor
+  tensor         5_MINUTES    10_MINUTES    30_MINUTES
+  bk_w1             0.3539        0.3548        0.3637
+  bk_b1             0.0055        0.0163        0.0580
+  bk_w2             0.1771        0.1776        0.1850
+  bk_b2             0.0056        0.0151        0.0513
+  a_w1              0.1771        0.1772        0.1787
+  a_b1              0.0037        0.0062        0.0090
+  a_w2              0.0073        0.0103        0.0169
+  a_b2              0.0039        0.0063        0.0093
+  c_w1              0.1777        0.1793        0.1940
+  c_b1              0.0064        0.0168        0.0492
+  c_w2              0.0089        0.0189        0.0588
+  c_b2              0.0000        0.0000        0.0000
+
+Mean of |mean| per tensor
+  tensor         5_MINUTES    10_MINUTES    30_MINUTES
+  bk_w1             0.0090        0.0095        0.0246
+  bk_b1             0.0012        0.0079        0.0585
+  bk_w2             0.0020        0.0043        0.0281
+  bk_b2             0.0011        0.0068        0.0453
+  a_w1              0.0041        0.0039        0.0044
+  a_b1              0.0012        0.0027        0.0043
+  a_w2              0.0011        0.0013        0.0038
+  a_b2              0.0017        0.0018        0.0034
+  c_w1              0.0053        0.0117        0.0563
+  c_b1              0.0050        0.0208        0.0842
+  c_w2              0.0083        0.0253        0.1012
+  c_b2              0.0107        0.0273        0.0757
+
+══════════════════════════════════════════════════════════════════════════════
+ 2) DISTRIBUTION SHIFT: FIRST vs LAST MILESTONE
+══════════════════════════════════════════════════════════════════════════════
+First milestone: 5_MINUTES   Last milestone: 30_MINUTES
+
+  tensor      mean_5_MINUTES  mean_30_MINUTES       %change        KS_D          KS_p     Welch_p
+  bk_w1            11.3315       11.6714        +3.00%       0.700       2.5e-07     2.5e-09
+  bk_b1             0.0456        0.6609     +1350.06%       1.000      1.69e-17    6.27e-25
+  bk_w2            11.3324       11.9829        +5.74%       1.000      1.69e-17    1.43e-19
+  bk_b2             0.0456        0.5484     +1102.08%       1.000      1.69e-17    3.55e-25
+  a_w1              5.6682        5.7213        +0.94%       0.333        0.0709      0.0209
+  a_b1              0.0157        0.0405      +157.60%       0.900      5.79e-13    1.28e-11
+  a_w2              0.0596        0.1398      +134.69%       1.000      1.69e-17    3.14e-19
+  a_b2              0.0088        0.0204      +130.90%       0.833      9.24e-11    4.67e-10
+  c_w1              5.6918        6.4808       +13.86%       1.000      1.69e-17     2.5e-17
+  c_b1              0.0332        0.3935     +1086.59%       1.000      1.69e-17    4.76e-26
+  c_w2              0.0497        0.4719      +850.16%       1.000      1.69e-17    5.62e-26
+  c_b2              0.0107        0.0757      +609.95%       1.000      1.69e-17    1.22e-32
+
+  Interpretation:
+  * KS_p < 0.05 → the l2 DISTRIBUTION shifted, not just the mean.
+  * Welch_p < 0.05 → the mean shift is statistically reliable.
+  * For learning, expect: a_w2 / c_w2 (output layers) to show
+    the largest %change. If only bias tensors (b1/b2) shift,
+    the network is collapsing biases toward zero rather than
+    learning useful weights.
+
+══════════════════════════════════════════════════════════════════════════════
+ 3) BIAS-DECAY DIAGNOSTIC
+══════════════════════════════════════════════════════════════════════════════
+Biases initialise to zero; they pick up small (~1e-4) values
+from a handful of Adam updates and decay toward zero over time.
+If you see a clean monotonic decline, the optimizer is regularising
+biases — fine in isolation but indicates that the only thing
+learning is the bias channel. (Compare to the weight tensors!)
+
+bk_b1       5_MINUTES=0.045574   10_MINUTES=0.146169   30_MINUTES=0.660857 
+bk_b2       5_MINUTES=0.045619   10_MINUTES=0.134440   30_MINUTES=0.548371 
+a_b1        5_MINUTES=0.015732   10_MINUTES=0.027587   30_MINUTES=0.040525 
+a_b2        5_MINUTES=0.008824   10_MINUTES=0.013365   30_MINUTES=0.020375 
+c_b1        5_MINUTES=0.033160   10_MINUTES=0.107916   30_MINUTES=0.393474 
+c_b2        5_MINUTES=0.010668   10_MINUTES=0.027313   30_MINUTES=0.075737 
+
+══════════════════════════════════════════════════════════════════════════════
+ 4) OUTPUT-LAYER MAGNITUDE BOUND (latest milestone)
+══════════════════════════════════════════════════════════════════════════════
+
+── Actor output — a_w2 / a_b2 ────────────────────────────────────────────
+  w l2_norm mean                       0.1398
+  w l2_norm max                        0.1919
+  w element_std mean                   0.0169
+  w |mean| mean                        0.003827
+  b l2_norm mean                       0.020375
+  b |mean| mean                        0.003352
+  napkin |pre-tanh| estimate           0.0372
+  tanh of that                         0.0372
+  → Policy μ is structurally pinned near zero.
+
+── Critic output — c_w2 / c_b2 ───────────────────────────────────────────
+  w l2_norm mean                       0.4719
+  w l2_norm max                        0.6726
+  w element_std mean                   0.0588
+  w |mean| mean                        0.101213
+  b l2_norm mean                       0.075737
+  b |mean| mean                        0.075737
+  napkin |pre-tanh| estimate           0.1934
+  tanh of that                         0.1911
+  → Policy μ is small but non-trivial.
+
+── Hidden→head — a_w1 / a_b1 ─────────────────────────────────────────────
+  w l2_norm mean                       5.7213
+  w l2_norm max                        5.9621
+  w element_std mean                   0.1787
+  w |mean| mean                        0.004372
+  b l2_norm mean                       0.040525
+  b |mean| mean                        0.004259
+  napkin |pre-tanh| estimate           0.7190
+  tanh of that                         0.6163
+  → Policy μ has meaningful magnitude — checks out.
+
+── Backbone→hidden — bk_w2 / bk_b2 ───────────────────────────────────────
+  w l2_norm mean                       11.9829
+  w l2_norm max                        12.3329
+  w element_std mean                   0.1850
+  w |mean| mean                        0.028079
+  b l2_norm mean                       0.548371
+  b |mean| mean                        0.045300
+  napkin |pre-tanh| estimate           0.7852
+  tanh of that                         0.6557
+  → Policy μ has meaningful magnitude — checks out.
+
+══════════════════════════════════════════════════════════════════════════════
+ 5) ρ(per-organism weight statistic, predations) — within milestone
+══════════════════════════════════════════════════════════════════════════════
+Per-tensor Spearman correlations between (l2_norm, std, |mean|)
+and the agent's cumulative predation count. Positive ρ on actor
+output weights would mean 'the more those weights have moved
+off-zero, the more this individual ate' — i.e. learning is
+contributing to feeding success rather than being noise.
+
+── 5_MINUTES — within-milestone correlations ─────────────────────────────
+  tensor          n    ρ(l2)      p(l2)   ρ(std)     p(std)  ρ(|mean|)  p(|mean|)
+  bk_w1          30    -0.153      0.419    -0.138      0.468    -0.371     0.0436
+  bk_b1          30    +0.742   2.65e-06    +0.739   3.11e-06    +0.749   1.92e-06
+  bk_w2          30    -0.033      0.861    -0.024      0.901    +0.012      0.948
+  bk_b2          30    +0.786   2.61e-07    +0.783   3.09e-07    +0.677   3.95e-05
+  a_w1           30    +0.088      0.642    +0.070      0.712    +0.164      0.386
+  a_b1           30    -0.092      0.628    -0.142      0.455    +0.229      0.224
+  a_w2           30    +0.027      0.888    +0.101      0.595    -0.013      0.944
+  a_b2           30    +0.383     0.0367    +0.405     0.0266    +0.087      0.649
+  c_w1           30    -0.099      0.601    -0.117      0.538    +0.236       0.21
+  c_b1           30    +0.765    8.5e-07    +0.791   1.92e-07    +0.721   6.87e-06
+  c_w2           30    +0.730   4.68e-06    +0.756   1.38e-06    +0.744   2.41e-06
+  c_b2           30    +0.800   1.14e-07        NA         NA    +0.800   1.14e-07
+
+── 10_MINUTES — within-milestone correlations ────────────────────────────
+  tensor          n    ρ(l2)      p(l2)   ρ(std)     p(std)  ρ(|mean|)  p(|mean|)
+  bk_w1          30    +0.270      0.149    +0.266      0.155    -0.126      0.508
+  bk_b1          30    +0.862   9.08e-10    +0.867   5.64e-10    +0.843   5.17e-09
+  bk_w2          30    +0.459     0.0108    +0.433      0.017    +0.667   5.76e-05
+  bk_b2          30    +0.861   1.05e-09    +0.865   6.72e-10    +0.845   4.14e-09
+  a_w1           30    -0.136      0.473    -0.127      0.505    +0.373     0.0423
+  a_b1           30    +0.156       0.41    +0.141      0.459    +0.138      0.467
+  a_w2           30    -0.083      0.662    -0.064      0.739    -0.165      0.385
+  a_b2           30    +0.490    0.00596    +0.517    0.00346    -0.074      0.697
+  c_w1           30    +0.437     0.0158    +0.316     0.0887    +0.524    0.00297
+  c_b1           30    +0.879   1.73e-10    +0.882   1.14e-10    +0.859   1.22e-09
+  c_w2           30    +0.890   4.44e-11    +0.891   4.21e-11    +0.857   1.53e-09
+  c_b2           30    +0.926   2.42e-13        NA         NA    +0.926   2.42e-13
+
+── 30_MINUTES — within-milestone correlations ────────────────────────────
+  tensor          n    ρ(l2)      p(l2)   ρ(std)     p(std)  ρ(|mean|)  p(|mean|)
+  bk_w1          30    +0.099      0.602    +0.133      0.484    -0.089      0.638
+  bk_b1          30    -0.276       0.14    -0.300      0.107    -0.195      0.302
+  bk_w2          30    -0.226       0.23    -0.205      0.277    -0.215      0.254
+  bk_b2          30    -0.298      0.109    -0.270      0.149    -0.284      0.128
+  a_w1           30    -0.247      0.188    -0.248      0.186    -0.218      0.247
+  a_b1           30    -0.373      0.042    -0.357     0.0528    -0.297      0.111
+  a_w2           30    -0.601   0.000445    -0.554    0.00149    -0.366     0.0468
+  a_b2           30    -0.015      0.937    -0.036      0.849    -0.003      0.987
+  c_w1           30    -0.372      0.043    -0.387     0.0348    -0.374     0.0419
+  c_b1           30    -0.451     0.0123    +0.014       0.94    -0.501    0.00479
+  c_w2           30    -0.419     0.0212    -0.005      0.977    -0.476     0.0079
+  c_b2           30    -0.202      0.285        NA         NA    -0.202      0.285
+
+══════════════════════════════════════════════════════════════════════════════
+ 6) TOP vs BOTTOM MOVERS — latest milestone, a_w2 & c_w2
+══════════════════════════════════════════════════════════════════════════════
+
+── a_w2 — top vs bottom by |mean| ────────────────────────────────────────
+  k (per group)                        6
+  top |mean| range                     [0.0059, 0.0102]
+  bottom |mean| range                  [0.0005, 0.0015]
+  top mean predations                  239.50
+  bottom mean predations               250.17
+  top mean reproductions               0.000
+  bottom mean reproductions            0.000
+  Wilcoxon U on predations             p = 0.181
+
+── c_w2 — top vs bottom by |mean| ────────────────────────────────────────
+  k (per group)                        6
+  top |mean| range                     [0.1186, 0.1564]
+  bottom |mean| range                  [0.0641, 0.0807]
+  top mean predations                  237.50
+  bottom mean predations               255.00
+  top mean reproductions               0.000
+  bottom mean reproductions            0.000
+  Wilcoxon U on predations             p = 0.0284
+
+══════════════════════════════════════════════════════════════════════════════
+ 7) SUMMARY OF LATEST-MILESTONE TENSORS
+══════════════════════════════════════════════════════════════════════════════
+All numerics computed on 30_MINUTES
+
+  tensor          n      mean(l2)        sd(l2)       min(l2)       max(l2)
+  bk_w1          30       11.6714        0.1923       11.2091       12.1087
+  bk_b1          30        0.6609        0.1048        0.4671        0.8948
+  bk_w2          30       11.9829        0.1962       11.5011       12.3329
+  bk_b2          30        0.5484        0.0867        0.3999        0.7479
+  a_w1           30        5.7213        0.0960        5.5291        5.9621
+  a_b1           30        0.0405        0.0132        0.0193        0.0737
+  a_w2           30        0.1398        0.0232        0.1004        0.1919
+  a_b2           30        0.0204        0.0071        0.0082        0.0421
+  c_w1           30        6.4808        0.2559        6.0712        7.0725
+  c_b1           30        0.3935        0.0664        0.2804        0.5469
+  c_w2           30        0.4719        0.0742        0.3457        0.6726
+  c_b2           30        0.0757        0.0107        0.0537        0.0945
+
+=== END ===

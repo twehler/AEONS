@@ -18,10 +18,10 @@ use bevy::prelude::*;
 /// had a chance to choose. The launcher is the canonical way to raise
 /// the value; that value flows through `run_simulation` and becomes
 /// both the brain-pool size *and* the initial reproduction cap.
-pub const DEFAULT_MAX_ORGANISMS: usize = 4096;
+pub const DEFAULT_MAX_ORGANISMS: usize = 1500;
 
-pub const DEFAULT_MAP_X:           f32        = 2048.0;
-pub const DEFAULT_MAP_Z:           f32        = 2048.0;
+pub const DEFAULT_MAP_X:           f32        = 1024.0;
+pub const DEFAULT_MAP_Z:           f32        = 1024.0;
 
 
 /// AI-training mode toggle for the heterotroph movement-RL
@@ -48,14 +48,14 @@ pub struct AiTrainingMode(pub bool);
 /// the cap again. Runtime-editable via the "Max Herbivores" text
 /// field in the statistics panel.
 ///
-/// Default `100` is a starting value; the field is intended to
+/// Default `250` is a starting value; the field is intended to
 /// be tuned at runtime as the player explores the parameter space.
 /// `0` effectively disables herbivore reproduction.
 #[derive(Resource)]
 pub struct MaxHerbivores(pub usize);
 
 impl Default for MaxHerbivores {
-    fn default() -> Self { Self(100) }
+    fn default() -> Self { Self(150) }
 }
 
 

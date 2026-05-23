@@ -10,6 +10,7 @@
 #[path = "colony/reproduction.rs"]     mod reproduction;
 #[path = "colony/krishi.rs"]           mod krishi;
 #[path = "colony/dataset_export.rs"]   mod dataset_export;
+#[path = "colony/time_series_log.rs"]  mod time_series_log;
 
 #[path = "growth/volumetric_growth/mod.rs"] mod volumetric_growth;
 #[path = "growth/mutation.rs"]              mod mutation;
@@ -97,6 +98,12 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let show_wireframe = args.iter().any(|a| a == "--wireframe");
     let editor_flag    = args.iter().any(|a| a == "--editor");
+    // `--trainingmode` — boots the simulation with AI-training mode
+    // active (heterotroph despawn is suppressed at 0 energy). The
+    // statistics-panel checkbox shows as checked from the first
+    // frame because `update_ai_training_checkbox_mark` triggers on
+    // the resource's just-inserted "changed" flag.
+    let training_mode  = args.iter().any(|a| a == "--trainingmode");
     // `--map-size X Z` — parse before collecting positionals so the
     // two numeric values don't end up in the positional list.
     let map_size = parse_map_size(&args).unwrap_or(world_geometry::MapSize::default());
@@ -110,7 +117,10 @@ fn main() {
         // winit's EventLoop is a singleton).
         let Some(mode) = run_launcher() else { return; };
         match mode {
-            LaunchMode::RunSimulation { map_path, colony_path, wireframe, map_x, map_z, max_organisms } => {
+            LaunchMode::RunSimulation {
+                map_path, colony_path, wireframe, map_x, map_z, max_organisms,
+                training_mode: launcher_training_mode,
+            } => {
                 respawn(&[
                     Some(map_path),
                     colony_path,
@@ -120,6 +130,11 @@ fn main() {
                     Some(map_z.to_string()),
                     Some("--max-organisms".into()),
                     Some(max_organisms.to_string()),
+                    // The launcher's checkbox is the source of truth
+                    // for the child: even if the parent was started
+                    // with `--trainingmode`, an unchecked box here
+                    // resets it to false (and vice-versa).
+                    if launcher_training_mode { Some("--trainingmode".into()) } else { None },
                 ]);
             }
             LaunchMode::RunEditor { map_path, map_x, map_z } => {
@@ -140,7 +155,7 @@ fn main() {
         // Simulation mode (re-spawned child or direct CLI invocation).
         let map_path    = positional[0].clone();
         let colony_path = positional.get(1).cloned();
-        run_simulation(map_path, colony_path, show_wireframe, map_size, max_organisms);
+        run_simulation(map_path, colony_path, show_wireframe, map_size, max_organisms, training_mode);
     }
 }
 
@@ -219,6 +234,7 @@ fn run_simulation(
     show_wireframe: bool,
     map_size:       world_geometry::MapSize,
     max_organisms: Option<usize>,
+    training_mode:  bool,
 ) {
     if let Ok(mut cache_path) = std::env::current_dir() {
         cache_path.push("caches");
@@ -234,6 +250,24 @@ fn run_simulation(
     let movement_mode = movement::MovementMode::TwoD;
 
     let world_path_input = Path::new(&map_path);
+
+    // `Time<Virtual>` defaults its `max_delta` to 250 ms — frames
+    // that take longer have the excess silently discarded from
+    // virtual time. That's Bevy's anti-spiral-of-death safety, but
+    // it conflicts with AEONS's observational use of the simulation
+    // clock: the A2C training step, CubeCL kernel compilation, and
+    // dense predation passes all occasionally produce frames well
+    // past 250 ms, and each such frame underspends virtual time by
+    // `real_delta − 250 ms`. Over a 2-hour run this can swallow
+    // tens of minutes from the displayed sim timer.
+    //
+    // Bump the cap to 60 s so realistic frame stutters don't clip
+    // virtual-time accumulation. A genuine pathology that produces
+    // a >60 s frame is also a genuine reason to want the clock
+    // pinned anyway.
+    let mut virtual_time = Time::<Virtual>::default();
+    virtual_time.set_max_delta(std::time::Duration::from_secs(60));
+    app.insert_resource(virtual_time);
 
     // Inject the optional colony-load path so ColonyPlugin's spawn system
     // can pick the load-vs-generate branch.
@@ -257,6 +291,15 @@ fn run_simulation(
         app.insert_resource(simulation_settings::OrganismPoolSize(n));
         app.insert_resource(simulation_settings::MaxOrganisms(n));
     }
+
+    // AI-training mode — inserted BEFORE `FrontendPlugin` adds its
+    // `init_resource::<AiTrainingMode>()` so the idempotent init
+    // sees our value and preserves it. With `training_mode = true`,
+    // `energy::manage_energy` will suppress heterotroph despawns at
+    // 0 energy, and `update_ai_training_checkbox_mark` will see the
+    // resource as "changed" on the first frame and flip the
+    // statistics-panel checkbox mark to visible.
+    app.insert_resource(simulation_settings::AiTrainingMode(training_mode));
 
     app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {

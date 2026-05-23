@@ -862,26 +862,128 @@ pub fn update_cell_count_text(
 }
 
 
+/// Direct population count — the source of truth.
+///
+/// Earlier versions of this used incremental tracking via
+/// `Added<…>` + `RemovedComponents<…>`. That works in principle but
+/// drifts over multi-hour runs: `RemovedComponents` events have a
+/// bounded buffer lifetime (~2 buffer swaps) and any missed event
+/// permanently biases the counter. At high `TimeSpeed` multipliers
+/// the rate of despawns per real-time frame is high enough to
+/// occasionally lose an event, and the drift compounds invisibly
+/// until the displayed number disagrees with reality.
+///
+/// Direct counting via an archetype-iterating query is microseconds
+/// per call for a few-thousand-organism world and immune to event
+/// dropping — the count is recomputed from ground truth each frame.
+/// We still gate the resource write on a change check so
+/// `update_counter_texts` only redraws when the value moves.
 pub fn track_organism_births(
-    photo_added:  Query<Entity, Added<Photoautotroph>>,
-    hetero_added: Query<Entity, Added<Heterotroph>>,
-    mut counts:   ResMut<OrganismCounts>,
+    photo_q:    Query<(), With<Photoautotroph>>,
+    hetero_q:   Query<(), With<Heterotroph>>,
+    mut counts: ResMut<OrganismCounts>,
 ) {
-    let photo_n  = photo_added.iter().count() as i32;
-    let hetero_n = hetero_added.iter().count() as i32;
-    if photo_n > 0  { counts.photo  += photo_n;  }
-    if hetero_n > 0 { counts.hetero += hetero_n; }
+    let photo  = photo_q.iter().count()  as i32;
+    let hetero = hetero_q.iter().count() as i32;
+    if counts.photo != photo {
+        counts.photo = photo;
+    }
+    if counts.hetero != hetero {
+        counts.hetero = hetero;
+    }
 }
 
-pub fn track_organism_deaths(
-    mut photo_removed:  RemovedComponents<Photoautotroph>,
-    mut hetero_removed: RemovedComponents<Heterotroph>,
-    mut counts:         ResMut<OrganismCounts>,
+/// Kept as a public no-op so the `FrontendPlugin` registration site
+/// doesn't need to be edited. The work that used to live here is
+/// now handled by `track_organism_births` (renamed-but-not-renamed
+/// — the new system is a full population resync, so births and
+/// deaths are both observed by the same direct count).
+pub fn track_organism_deaths() {}
+
+
+/// TEMPORARY DIAGNOSTIC — breaks the photoautotroph population
+/// down by what's actually visible. Logs once every 5 real seconds.
+///
+/// `Mesh3d` lives on child body-part entities, not the
+/// `OrganismRoot`, so the previous version of this diag (which
+/// queried `With<Photoautotroph>, With<Mesh3d>`) was structurally
+/// guaranteed to report zero meshes. The new walk descends into
+/// each photoautotroph root's `Children`, finds entries carrying
+/// `BodyPartIndex`, and checks whether they have `Mesh3d`
+/// attached. Three reduced counts are reported:
+///
+///   * `roots_with_mesh_child`: at least one direct child of the
+///     root carries both `BodyPartIndex` and `Mesh3d`. These are
+///     the plants that should be rendering normally.
+///   * `roots_no_mesh_child`: at least one `BodyPartIndex`-bearing
+///     child exists but NONE of them carry `Mesh3d`. Phantom
+///     plants — the root has body-part entities but they were
+///     either never given a mesh or had it removed.
+///   * `roots_no_bp_child`: the root has no `BodyPartIndex`-bearing
+///     child at all. Children were never spawned (or got despawned)
+///     while the root survives.
+///
+/// Total photoautotroph organism count is logged as the leading
+/// number so the breakdown can be checked against the panel.
+pub fn diag_photo_breakdown(
+    real_time:           Res<Time<bevy::time::Real>>,
+    mut timer:           Local<Option<Timer>>,
+    photo_roots:         Query<(Entity, &Organism, Option<&Children>), With<Photoautotroph>>,
+    body_part_idx:       Query<&crate::cell::BodyPartIndex>,
+    mesh_query:          Query<(), With<Mesh3d>>,
+    all_bp_entities:     Query<Entity, With<crate::cell::BodyPartIndex>>,
+    organism_mesh_q:     Query<Entity, With<crate::cell::OrganismMesh>>,
 ) {
-    let photo_n  = photo_removed.read().count() as i32;
-    let hetero_n = hetero_removed.read().count() as i32;
-    if photo_n > 0  { counts.photo  -= photo_n;  }
-    if hetero_n > 0 { counts.hetero -= hetero_n; }
+    let timer = timer.get_or_insert_with(|| {
+        Timer::from_seconds(5.0, TimerMode::Repeating)
+    });
+    if !timer.tick(real_time.delta()).just_finished() { return; }
+
+    let mut total                 = 0usize;
+    let mut alive_bp_in_data      = 0usize;
+    let mut empty_bp_vec          = 0usize;
+    let mut has_children_comp     = 0usize;
+    let mut has_any_child         = 0usize;
+    let mut has_bp_child          = 0usize;
+    let mut has_mesh_bp_child     = 0usize;
+
+    for (_root, organism, children) in photo_roots.iter() {
+        total += 1;
+        if organism.body_parts.is_empty() { empty_bp_vec += 1; }
+        if organism.alive_body_part_count() > 0 { alive_bp_in_data += 1; }
+
+        let mut any_child       = false;
+        let mut bp_child        = false;
+        let mut mesh_bp_child   = false;
+        if let Some(children) = children {
+            has_children_comp += 1;
+            for c in children.iter() {
+                any_child = true;
+                if body_part_idx.get(c).is_ok() {
+                    bp_child = true;
+                    if mesh_query.get(c).is_ok() {
+                        mesh_bp_child = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if any_child      { has_any_child     += 1; }
+        if bp_child       { has_bp_child      += 1; }
+        if mesh_bp_child  { has_mesh_bp_child += 1; }
+    }
+
+    let total_bp_entities       = all_bp_entities.iter().count();
+    let total_organism_mesh_ent = organism_mesh_q.iter().count();
+
+    info!(
+        "PHOTO_DIAG | total:{}  alive_bp(data):{}  empty_bp_vec:{}  \
+         Children-comp:{}  any-child:{}  bp-child:{}  mesh-bp-child:{}  \
+         |  world_bp_entities:{}  world_organism_meshes:{}",
+        total, alive_bp_in_data, empty_bp_vec,
+        has_children_comp, has_any_child, has_bp_child, has_mesh_bp_child,
+        total_bp_entities, total_organism_mesh_ent,
+    );
 }
 
 pub fn update_counter_texts(

@@ -37,11 +37,47 @@ impl Plugin for ColonyPlugin {
         app.init_resource::<crate::simulation_settings::MinHeteroCountEditState>();
         app.init_resource::<AutosaveTimer>();
         app.init_resource::<crate::dataset_export::ExportDatasetRequested>();
+        app.init_resource::<crate::dataset_export::AutoExportSchedule>();
+        // Rotate prior-run dataset artefacts ONCE at process start,
+        // before any auto-export fires (the earliest milestone is
+        // 5 virtual minutes, so the Startup schedule has all the
+        // time it needs).
+        app.add_systems(Startup, |_w: &mut World| {
+            crate::dataset_export::rotate_existing_datasets();
+        });
+        app.init_resource::<crate::time_series_log::TimeSeriesLogger>();
         app.add_systems(Update, spawn_colony.run_if(resource_exists::<HeightmapSampler>));
         app.add_systems(Update, save_colony_system);
         app.add_systems(Update, autosave_system);
         app.add_systems(Update, auto_spawn_heteros);
+        app.add_systems(Update, crate::dataset_export::tick_auto_export_schedule);
         app.add_systems(Update, crate::dataset_export::export_dataset_system);
+        app.add_systems(Update, crate::time_series_log::tick_time_series_logger);
+        // Default lineage record attachment. Fires once per organism
+        // — on the tick AFTER spawn (Added<OrganismRoot> filter).
+        // Offspring of reproduction already get a LineageRecord
+        // explicitly inserted by `reproduction.rs` (with `parent_id`
+        // populated), so the `Without<LineageRecord>` filter skips
+        // them here.
+        app.add_systems(Update, assign_lineage_records);
+    }
+}
+
+
+/// Default attach: every OrganismRoot that doesn't already have a
+/// `LineageRecord` gets one minted as `new_initial` (parent_id =
+/// None, spawn_time = current virtual time). Covers initial cohort,
+/// auto-spawn, editor placement, and loaded organisms. Reproduction
+/// offspring already carry a `new_offspring` record by the time
+/// this runs.
+fn assign_lineage_records(
+    mut commands:  Commands,
+    virtual_time:  Res<Time<Virtual>>,
+    new_q:         Query<Entity, (Added<OrganismRoot>, Without<LineageRecord>)>,
+) {
+    let t = virtual_time.elapsed_secs();
+    for e in &new_q {
+        commands.entity(e).try_insert(LineageRecord::new_initial(t));
     }
 }
 
@@ -126,7 +162,16 @@ pub struct ColonyLoadPath(pub Option<String>);
 /// brain sections leave each organism's slot at the recycled / default
 /// initial weights, so behaviour starts un-trained but the colony
 /// composition (positions, body parts, energy) is restored correctly.
-const SAVE_MAGIC:             &[u8;8] = b"AEONS003";
+/// Save format magic. v004 (current) carries the new per-organism
+/// herbivore_1 A2C brain — backbone + actor + critic, 12 weight
+/// tensors per slot, plus the REINFORCE prev-state / prev-action /
+/// prev-dopamine / prev-target-distance scalars. v003 carried the
+/// old single-MLP REINFORCE brain (4 weight tensors); the new code
+/// can still read v003 organism structure (positions, body parts,
+/// energy) but drops the v003 brain block — the saved weights are
+/// for a different architecture and aren't restorable.
+const SAVE_MAGIC:             &[u8;8] = b"AEONS004";
+const SAVE_MAGIC_LEGACY_V003: &[u8;8] = b"AEONS003";
 const SAVE_MAGIC_LEGACY_V002: &[u8;8] = b"AEONS002";
 const SAVE_MAGIC_LEGACY_V001: &[u8;8] = b"AEONS001";
 
@@ -151,36 +196,29 @@ pub struct SaveRequested(pub Option<std::path::PathBuf>);
 fn save_colony_system(
     mut save_requested: ResMut<SaveRequested>,
     organisms: Query<
-        (Entity, &Transform, &Organism, Has<Photoautotroph>, Has<Heterotroph>),
+        (Entity, &Transform, &Organism,
+         Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
         With<OrganismRoot>,
     >,
-    // NonSend access to all four brain pools so we can read every
-    // assigned slot's GPU weights into CPU vectors once each
-    // (`pool.snapshot()` does the four GPU→CPU transfers); after
-    // that the per-organism brain extraction is pure CPU work.
-    pool_l1p: NonSend<crate::intelligence_level_1_photo::BrainPoolL1Photo>,
-    pool_l1h: NonSend<crate::intelligence_level_1_hetero::BrainPoolL1Hetero>,
+    // The herbivore_1 pool is the only one that contributes a brain
+    // block in v004. The L1-photo / L1-hetero / L2 / L3 pool stubs
+    // are kept registered as `NonSendResource` for legacy reasons
+    // but are not consulted during save — their slots have no
+    // routable organisms.
+    pool: NonSend<crate::intelligence_level_herbivore_1::BrainPoolHerbivore1>,
 ) {
     let Some(target_path) = save_requested.0.take() else { return };
-
-    // ── Pool snapshots — one set of GPU→CPU transfers per pool. ──
-    // Doing this up front (vs per-organism) drops the cost from
-    // O(organisms × 4) GPU syncs to O(pools × 4) = 16 total.
-    let snap_l1p = pool_l1p.snapshot();
-    let snap_l1h = pool_l1h.snapshot();
-    // L2 / L3 pools removed during the L1 rewrite — placeholders only.
-    // Their save dispatch path emits `brain_present = 0` below.
 
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     buf.extend_from_slice(SAVE_MAGIC);
 
     // Two-pass to write the count up front. iter() over Query is cheap.
     let count = organisms.iter()
-        .filter(|(_, _, _, is_photo, is_hetero)| *is_photo || *is_hetero)
+        .filter(|(_, _, _, is_photo, is_hetero, _)| *is_photo || *is_hetero)
         .count() as u32;
     put_u32(&mut buf, count);
 
-    for (entity, transform, org, is_photo, is_hetero) in organisms.iter() {
+    for (entity, transform, org, is_photo, is_hetero, is_carn) in organisms.iter() {
         let kind: u8 = if is_photo { 0 } else if is_hetero { 1 } else { continue };
 
         put_u8(&mut buf, kind);
@@ -256,45 +294,32 @@ fn save_colony_system(
             }
         }
 
-        // ── v003 brain section ───────────────────────────────────
-        // Look up this organism in the pool that matches its
-        // intelligence level. If the slot exists (it usually does
-        // — slot assignment runs in PreUpdate), serialise the
-        // weights + REINFORCE state. Otherwise emit `brain_present
-        // = 0` and the loader will recreate the slot with the
-        // pool's default / recycled weights.
-        let brain_data = match (org.intelligence_level, is_photo, is_hetero) {
-            (IntelligenceLevel::Level0, _, _)        => None,
-            (IntelligenceLevel::Level1, true,  _   ) => snap_l1p.extract(entity),
-            (IntelligenceLevel::Level1, false, true) => snap_l1h.extract(entity),
-            // L2 / L3 are placeholder-only after the L1 rewrite — no
-            // pool to extract from. The loader handles `brain_present
-            // = 0` by leaving the slot at default weights.
-            (IntelligenceLevel::Level2, _, _)        => None,
-            (IntelligenceLevel::Level3, _, _)        => None,
-            _ => None,  // shouldn't happen — defensive
+        // ── v004 brain section ───────────────────────────────────
+        // Only `Level1 + Heterotroph + !Carnivore` organisms have a
+        // brain in the new pool. Everyone else (photoautotrophs,
+        // carnivores, Krishi, etc.) emits `brain_present = 0`. The
+        // 12 weight tensors + REINFORCE state are pulled per-slot
+        // from the GPU. The loader's hard-error policy means saved
+        // tensor lengths must match the current architecture
+        // exactly (see HEADER_VERSION + restore_slot checks).
+        let is_l1_herbivore = matches!(org.intelligence_level, IntelligenceLevel::Level1)
+                              && is_hetero
+                              && !is_carn;
+        let brain_data = if is_l1_herbivore {
+            pool.map.get(&entity).map(|&slot| pool.extract_slot(slot))
+        } else {
+            None
         };
         match brain_data {
             None => put_u8(&mut buf, 0),
             Some(b) => {
                 put_u8(&mut buf, 1);
-                put_u32(&mut buf, b.w1.len() as u32);
-                for &x in &b.w1 { put_f32(&mut buf, x); }
-                put_u32(&mut buf, b.b1.len() as u32);
-                for &x in &b.b1 { put_f32(&mut buf, x); }
-                put_u32(&mut buf, b.w2.len() as u32);
-                for &x in &b.w2 { put_f32(&mut buf, x); }
-                put_u32(&mut buf, b.b2.len() as u32);
-                for &x in &b.b2 { put_f32(&mut buf, x); }
-                put_u32(&mut buf, b.prev_state.len() as u32);
-                for &x in &b.prev_state { put_f32(&mut buf, x); }
-                put_u32(&mut buf, b.prev_action.len() as u32);
-                for &x in &b.prev_action { put_f32(&mut buf, x); }
-                put_f32(&mut buf, b.prev_energy);
-                put_f32(&mut buf, b.baseline);
-                put_u8 (&mut buf, b.has_prev as u8);
+                // Format shared with .species v3 — see
+                // `intelligence_level_herbivore_1::encode_brain_restore`.
+                crate::intelligence_level_herbivore_1::encode_brain_restore(&mut buf, &b);
             }
         }
+        let _ = is_carn;   // referenced only above; silence unused
     }
 
     // Ensure the parent directory exists (autosave path is
@@ -391,7 +416,7 @@ struct LoadedRecord {
     /// `spawn_loaded_organism` attaches a `BrainRestore` component
     /// and the pool's `assign_brains_*` will install the weights
     /// next PreUpdate.
-    brain:     Option<crate::rl_helpers::BrainRestore>,
+    brain:     Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>,
 }
 
 
@@ -399,25 +424,27 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
     let bytes = std::fs::read(path)?;
     let mut c = 0usize;
 
-    // Magic header check. We accept v003 (current — adds brain
-    // weights + REINFORCE prev_*), v002 (adds intelligence_level
-    // byte), and v001 (oldest — none of those). For v001/v002 the
-    // loader synthesises any missing fields from the deterministic
-    // spawn-time rules.
+    // Magic header check. v004 is current (per-organism A2C brain);
+    // v003 is the previous REINFORCE single-MLP brain; v002 adds
+    // the intelligence_level byte; v001 has none. v001-v003 still
+    // load — their brain blocks just get dropped (v002/v003) or
+    // never existed (v001), and every herbivore comes up with
+    // fresh-init weights.
     if bytes.len() < SAVE_MAGIC.len() {
         return Err(std::io::Error::other("file too short — missing magic"));
     }
     let magic = &bytes[..SAVE_MAGIC.len()];
-    let format_v003 = magic == SAVE_MAGIC;
+    let format_v004 = magic == SAVE_MAGIC;
+    let format_v003 = magic == SAVE_MAGIC_LEGACY_V003;
     let format_v002 = magic == SAVE_MAGIC_LEGACY_V002;
     let format_v001 = magic == SAVE_MAGIC_LEGACY_V001;
-    if !format_v003 && !format_v002 && !format_v001 {
+    if !format_v004 && !format_v003 && !format_v002 && !format_v001 {
         return Err(std::io::Error::other(
             "magic mismatch — not an AEONS colony save (or unsupported version)",
         ));
     }
     // v002+ all share the intelligence_level byte after has_variable_form.
-    let has_intelligence_byte = format_v003 || format_v002;
+    let has_intelligence_byte = format_v004 || format_v003 || format_v002;
     c += SAVE_MAGIC.len();
 
     let count = read_u32(&bytes, &mut c)?;
@@ -544,44 +571,49 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
             });
         }
 
-        // ── v003 brain section (only if format_v003). ────────────
-        // Parsed BEFORE building the Organism so any read errors
-        // surface here rather than propagating into the spawn
-        // pipeline.
-        let brain: Option<crate::rl_helpers::BrainRestore> = if format_v003 {
-            let brain_present = read_u8(&bytes, &mut c)?;
-            if brain_present == 1 {
-                let n_w1 = read_u32(&bytes, &mut c)? as usize;
-                let mut w1 = Vec::with_capacity(n_w1);
-                for _ in 0..n_w1 { w1.push(read_f32(&bytes, &mut c)?); }
-                let n_b1 = read_u32(&bytes, &mut c)? as usize;
-                let mut b1 = Vec::with_capacity(n_b1);
-                for _ in 0..n_b1 { b1.push(read_f32(&bytes, &mut c)?); }
-                let n_w2 = read_u32(&bytes, &mut c)? as usize;
-                let mut w2 = Vec::with_capacity(n_w2);
-                for _ in 0..n_w2 { w2.push(read_f32(&bytes, &mut c)?); }
-                let n_b2 = read_u32(&bytes, &mut c)? as usize;
-                let mut b2 = Vec::with_capacity(n_b2);
-                for _ in 0..n_b2 { b2.push(read_f32(&bytes, &mut c)?); }
-                let n_ps = read_u32(&bytes, &mut c)? as usize;
-                let mut prev_state = Vec::with_capacity(n_ps);
-                for _ in 0..n_ps { prev_state.push(read_f32(&bytes, &mut c)?); }
-                let n_pa = read_u32(&bytes, &mut c)? as usize;
-                let mut prev_action = Vec::with_capacity(n_pa);
-                for _ in 0..n_pa { prev_action.push(read_f32(&bytes, &mut c)?); }
-                let prev_energy = read_f32(&bytes, &mut c)?;
-                let baseline    = read_f32(&bytes, &mut c)?;
-                let has_prev    = read_u8 (&bytes, &mut c)? != 0;
-                Some(crate::rl_helpers::BrainRestore {
-                    w1, b1, w2, b2, prev_state, prev_action,
-                    prev_energy, baseline, has_prev,
-                })
+        // ── Brain section. ───────────────────────────────────────
+        // Format depends on the magic:
+        //   * v004 — the new per-organism herbivore_1 A2C payload
+        //            (12 weight tensors + REINFORCE prev_*).
+        //            Tensor lengths are validated against the
+        //            current architecture; mismatch is a hard
+        //            error (user-selected behaviour).
+        //   * v003 — the old single-MLP REINFORCE payload (4
+        //            tensors + prev_state/action/energy/baseline).
+        //            Architectures are incompatible; we still
+        //            consume the bytes so the file parses, but
+        //            drop the data — the loaded organism comes
+        //            up with fresh-init weights.
+        //   * v001/v002 — no brain section at all.
+        let brain: Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>
+            = if format_v004 {
+                let brain_present = read_u8(&bytes, &mut c)?;
+                if brain_present == 1 {
+                    Some(crate::intelligence_level_herbivore_1::decode_brain_restore(
+                        &bytes, &mut c,
+                    )?)
+                } else {
+                    None
+                }
+            } else if format_v003 {
+                // Consume + drop the v003 brain block so the file
+                // parses; the architecture mismatch makes the data
+                // unusable. Layout: brain_present byte, then 6
+                // length-prefixed f32 vectors + 2 f32 + 1 byte.
+                let brain_present = read_u8(&bytes, &mut c)?;
+                if brain_present == 1 {
+                    for _ in 0..6 {
+                        let n = read_u32(&bytes, &mut c)? as usize;
+                        for _ in 0..n { let _ = read_f32(&bytes, &mut c)?; }
+                    }
+                    let _ = read_f32(&bytes, &mut c)?;  // prev_energy
+                    let _ = read_f32(&bytes, &mut c)?;  // baseline
+                    let _ = read_u8 (&bytes, &mut c)?;  // has_prev
+                }
+                None
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         // `adult` is not in the save format; it's derivable from
         // (`has_variable_form`, total grown cell count): non-variable
@@ -755,11 +787,11 @@ fn spawn_loaded_organism(
         }
         let child = child_cmd.id();
 
-        let parent_entity = match &bp.attachment {
-            Some(a) => bp_entities[a.parent_idx],
-            None    => root,
-        };
-        commands.entity(parent_entity).add_child(child);
+        // Flat hierarchy — see the matching block in `spawn_organism`
+        // for the rationale (phantom-organism fix on body-part despawn
+        // cascade).
+        let _ = &bp.attachment;
+        commands.entity(root).add_child(child);
 
         bp_entities.push(child);
     }
@@ -1255,13 +1287,24 @@ pub fn spawn_organism(
         }
         let child = child_cmd.id();
 
-        // Parent the entity: branches under their parent body-part entity,
-        // root under the OrganismRoot.
-        let parent_entity = match &bp.attachment {
-            Some(a) => bp_entities[a.parent_idx],
-            None    => root,
-        };
-        commands.entity(parent_entity).add_child(child);
+        // Parent EVERY body-part entity directly under the OrganismRoot
+        // — branches included. Earlier this nested branches under their
+        // parent body-part entity for "rotation-around-pivot via
+        // transform propagation", but body-part transforms are identity
+        // in practice (Quat::IDENTITY rotation, Vec3::ZERO translation
+        // on the root part) so siblings-under-root gives the same
+        // world transform. The flat layout fixes a phantom-organism bug:
+        // when predation despawned body_parts[0]'s entity, Bevy's
+        // recursive try_despawn cascaded to every branch nested under
+        // it, even though `prey_dead == false` because other body
+        // parts were still alive in the Organism data — the root
+        // entity then survived with zero children and the data
+        // continued to claim alive body parts, becoming an invisible
+        // ghost that still photosynthesised and reproduced.
+        let _ = &bp.attachment; // attachment kept on the data side for
+                                // continuous_growth's branch geometry;
+                                // the entity hierarchy is flat.
+        commands.entity(root).add_child(child);
 
         bp_entities.push(child);
     }

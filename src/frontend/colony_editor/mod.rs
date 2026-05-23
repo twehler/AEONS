@@ -200,6 +200,10 @@ fn load_species_into_session(
         is_sessile:   loaded.is_sessile,
         is_carnivore,
         ocg,
+        // v3 brain payload, if the file carried one. Spawn paths
+        // duplicate this into a per-organism component at
+        // placement time.
+        brain: loaded.brain,
     });
     info!("loaded species: {}", display_name);
     Some(id)

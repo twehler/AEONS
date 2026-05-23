@@ -452,6 +452,18 @@ pub(super) fn spawn_species_template_at(
         is_carnivore: species.is_carnivore,
     };
     let entity = respawn_template(&template, commands, meshes, materials, org_materials, smoothing);
+
+    // If the loaded species carried a trained brain, attach a copy
+    // of the restore payload to the freshly-spawned organism. The
+    // herbivore pool's `assign_brains_herbivore_1` (running next
+    // PreUpdate) sees the component, allocates a slot, restores the
+    // saved weights into that slot, and removes the component. All
+    // bulk-spawned instances get the SAME payload — they boot with
+    // identical brains and diverge through training, as designed.
+    if let Some(brain) = &species.brain {
+        commands.entity(entity).try_insert(brain.clone());
+    }
+
     session.templates.push(OrganismTemplate { entity, ..template });
     session.active_id = Some(id);
     session.dirty     = true;

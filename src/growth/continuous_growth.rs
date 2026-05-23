@@ -95,7 +95,8 @@ fn grow_variable_form_organisms(
     smoothing:           Res<crate::simulation_settings::Smoothing>,
     mut commands:        Commands,
     mut meshes:          ResMut<Assets<Mesh>>,
-    mut materials:       ResMut<Assets<StandardMaterial>>,
+    materials:           ResMut<Assets<StandardMaterial>>,
+    organism_mats:       Option<Res<OrganismMaterials>>,
     mut organisms:       Query<
         (Entity, &mut Organism, Has<Photoautotroph>, Has<Heterotroph>),
         With<OrganismRoot>,
@@ -104,6 +105,13 @@ fn grow_variable_form_organisms(
     body_part_idx_q:     Query<&BodyPartIndex>,
     mesh3d_q:            Query<&Mesh3d>,
 ) {
+    // `materials` is kept in the signature for symmetry with other
+    // spawn sites and so that any future code path inside this
+    // system that needs to mint a one-off material has direct
+    // access. Currently every branch reuses the shared
+    // `OrganismMaterials` resource.
+    let _ = materials;
+
     timer.0.tick(time.delta());
     if !timer.0.just_finished() { return; }
 
@@ -115,12 +123,21 @@ fn grow_variable_form_organisms(
     phase_counter.0 = (phase_counter.0 + 1) % GROWTH_PHASE_PERIOD;
 
     let mut rng = rand::rng();
-    // Lazy-initialised — materials are only needed by the branch path.
-    // 80% of growth ticks hit the extend path which doesn't need them,
-    // and many ticks find nothing to grow at all. Building 3 fresh
-    // StandardMaterial assets every second when most ticks don't spawn
-    // a branch is wasteful.
-    let mut materials_helper: Option<OrganismMaterials> = None;
+    // Reuse the shared `OrganismMaterials` resource (populated by
+    // `spawn_colony`). The previous code lazily called
+    // `OrganismMaterials::new(&mut materials)` on every branch tick
+    // and that minted three fresh `StandardMaterial` assets into
+    // `Assets<StandardMaterial>` — they leaked over the simulation's
+    // lifetime because each spawned body-part held a strong handle
+    // to one of them. After tens of thousands of branch growth
+    // events the asset arena had grown enough to be the dominant
+    // VRAM driver. Reading from the Resource means three handles,
+    // ever.
+    let Some(organism_materials) = organism_mats.as_deref() else {
+        // Heightmap / colony hasn't initialised yet — skip the
+        // whole tick, the resource will be present next time.
+        return;
+    };
 
     for (root_entity, mut organism, is_photo, is_hetero) in &mut organisms {
         // Phase gate: only ~1/`GROWTH_PHASE_PERIOD` of variable-form
@@ -143,12 +160,10 @@ fn grow_variable_form_organisms(
         };
 
         if body_part::should_branch(&mut rng) {
-            let mh = materials_helper
-                .get_or_insert_with(|| OrganismMaterials::new(&mut materials));
             grow_new_branch(
                 &mut organism, root_entity, kind,
                 &mut rng, &mut commands, &mut meshes,
-                mh, &children_q, &body_part_idx_q,
+                organism_materials, &children_q, &body_part_idx_q,
             );
         } else {
             extend_root_part(
@@ -268,11 +283,16 @@ fn grow_new_branch(
         bevy::light::NotShadowCaster,
     )).id();
 
-    if let Some(parent_entity) = find_body_part_entity(
-        root_entity, PARENT_IDX, children_q, body_part_idx_q,
-    ) {
-        commands.entity(parent_entity).add_child(child_entity);
-    }
+    // Flat hierarchy — new branches are direct children of the
+    // OrganismRoot, not nested under body_parts[PARENT_IDX]'s entity.
+    // Mirrors the fix in `spawn_organism`: when branches were nested,
+    // predation-despawning body_parts[0] cascaded through recursive
+    // try_despawn and killed every branch, leaving the root entity
+    // alive with `prey_dead == false` and zero children — a phantom.
+    // body_parts[PARENT_IDX]'s transform is identity for procedural
+    // organisms, so the world position is unchanged.
+    let _ = (children_q, body_part_idx_q, PARENT_IDX);
+    commands.entity(root_entity).add_child(child_entity);
 
     organism.body_parts.push(new_part);
     // The new branch extends the cell envelope further out from the

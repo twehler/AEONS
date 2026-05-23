@@ -45,6 +45,13 @@ pub struct LoadedSpecies {
     /// at load time so downstream code (placement, save) doesn't
     /// need to know the difference.
     pub ocg:               Vec<(usize, Vec3, CellType)>,
+    /// `Some` when this species was loaded from a `.species` v3 file
+    /// that carried trained brain weights. Every organism spawned
+    /// from this species gets a copy of the payload attached as a
+    /// `BrainRestoreHerbivore1` component, which the herbivore pool's
+    /// `assign_brains_herbivore_1` consumes to seed the slot. `None`
+    /// for fresh species-editor saves and legacy v1/v2 files.
+    pub brain: Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>,
 }
 
 

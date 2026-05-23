@@ -1,0 +1,310 @@
+AEONS — General Run Report
+Generated at 2026-05-23 14:09:10
+Datasets dir: /home/twehler/AEONS/datasets
+Milestones found: 3 (5_MINUTES, 10_MINUTES, 30_MINUTES)
+
+══════════════════════════════════════════════════════════════════════════════
+ 1) PER-MILESTONE SNAPSHOTS
+══════════════════════════════════════════════════════════════════════════════
+
+── Milestone 5_MINUTES  (virtual t = 300 s, 1414 rows) ───────────────────
+  Trophic class:
+    Herbivore                          202
+    Photoautotroph                     1212
+  Intelligence level:
+    Level0                             1211
+    Level1                             202
+    Level3                             1
+  Symmetry:
+    Bilateral                          201
+    NoSymmetry                         1213
+  Variable-form:
+    0                                  203
+    1                                  1211
+
+  Herbivore subgroup (n=202):
+    energy                     n=202    mean=549.128   med=133.845   sd=5805.916  min=0.000     max=82647.000 p10=99.560    p90=140.000
+    hunger                     n=202    mean=0.298     med=0.252     sd=0.131     min=0.235     max=1.000     p10=0.235     p90=0.374
+    dopamine                   n=202    mean=0.392     med=0.327     sd=0.384     min=0.000     max=1.000     p10=0.000     p90=0.946
+    target_distance            n=202    mean=31.425    med=29.826    sd=13.568    min=6.536     max=50.000    p10=13.308    p90=50.000
+    movement_speed             n=202    mean=20.731    med=20.535    sd=5.909     min=7.134     max=34.987    p10=13.068    p90=28.238
+    predations (cumulative)    n=202    mean=49.282    med=43.500    sd=33.814    min=7.000     max=255.000   p10=15.000    p90=91.900
+    reproductions              n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    age_secs                   n=202    mean=299.460   med=299.460   sd=0.000     min=299.460   max=299.460   p10=299.460   p90=299.460
+    times_reproduced_self      n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    child_alive_count          n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    brain_mu_speed             n=201    mean=0.018     med=0.015     sd=0.026     min=-0.061    max=0.141     p10=-0.009    p90=0.047
+    brain_mu_angle             n=201    mean=-0.004    med=-0.004    sd=0.028     min=-0.132    max=0.093     p10=-0.036    p90=0.025
+    brain_log_sigma_speed      n=201    mean=-1.204    med=-1.204    sd=0.024     min=-1.323    max=-1.133    p10=-1.233    p90=-1.178
+    brain_log_sigma_angle      n=201    mean=-1.221    med=-1.218    sd=0.026     min=-1.328    max=-1.163    p10=-1.256    p90=-1.192
+    brain_value_v              n=201    mean=0.113     med=0.092     sd=0.096     min=-0.017    max=0.607     p10=0.022     p90=0.258
+    brain_last_reward          n=201    mean=5.322     med=2.734     sd=24.316    min=-42.707   max=211.683   p10=-14.374   p90=16.975
+    brain_mean_reward_64       n=201    mean=3.920     med=2.976     sd=4.950     min=-8.189    max=30.999    p10=-1.077    p90=10.115
+    brain_last_eat_component   n=201    mean=4.478     med=0.000     sd=23.018    min=0.000     max=200.000   p10=0.000     p90=0.000
+    brain_last_progress_component n=201    mean=-0.341    med=0.000     sd=4.204     min=-41.010   max=4.876     p10=-2.562    p90=2.793
+    brain_last_oracle_component n=201    mean=1.185     med=0.361     sd=11.143    min=-42.707   max=47.480    p10=-11.771   p90=12.520
+
+  Photoautotroph subgroup (n=1212):
+    energy                     n=1212   mean=790.418   med=800.000   sd=134.525   min=210.000   max=1080.000  p10=610.000   p90=950.000
+    grown_cell_count           n=1212   mean=82.677    med=84.000    sd=11.526    min=21.000    max=108.000   p10=65.000    p90=97.000
+    alive_body_part_count      n=1212   mean=9.145     med=9.000     sd=4.437     min=1.000     max=21.000    p10=4.000     p90=16.000
+    age_secs                   n=1212   mean=67.474    med=42.008    sd=71.765    min=2.011     max=299.460   p10=6.004     p90=179.996
+
+  Reward channel activity (herbivores):
+    frac eat non-zero                  4.0%
+    frac progress non-zero             80.6%
+    frac oracle non-zero               90.5%
+    frac oracle > 0 (toward prey)      51.2%
+    frac oracle < 0 (away from prey)   39.3%
+
+── Milestone 10_MINUTES  (virtual t = 600 s, 1425 rows) ──────────────────
+  Trophic class:
+    Herbivore                          202
+    Photoautotroph                     1223
+  Intelligence level:
+    Level0                             1223
+    Level1                             201
+    Level3                             1
+  Symmetry:
+    Bilateral                          201
+    NoSymmetry                         1224
+  Variable-form:
+    0                                  202
+    1                                  1223
+
+  Herbivore subgroup (n=202):
+    energy                     n=202    mean=794.184   med=135.056   sd=9373.785  min=70.090    max=133360.516 p10=117.379   p90=139.962
+    hunger                     n=202    mean=0.265     med=0.249     sd=0.046     min=0.235     max=0.525     p10=0.235     p90=0.305
+    dopamine                   n=202    mean=0.451     med=0.442     sd=0.370     min=0.000     max=1.000     p10=0.000     p90=0.922
+    target_distance            n=202    mean=27.598    med=26.033    sd=11.606    min=8.917     max=50.000    p10=13.750    p90=46.689
+    movement_speed             n=202    mean=21.404    med=21.771    sd=5.600     min=5.890     max=37.257    p10=13.446    p90=28.213
+    predations (cumulative)    n=202    mean=105.064   med=93.000    sd=54.272    min=23.000    max=255.000   p10=44.100    p90=178.800
+    reproductions              n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    age_secs                   n=202    mean=599.457   med=599.457   sd=0.000     min=599.457   max=599.457   p10=599.457   p90=599.457
+    times_reproduced_self      n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    child_alive_count          n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    brain_mu_speed             n=201    mean=0.049     med=0.043     sd=0.064     min=-0.102    max=0.353     p10=-0.012    p90=0.124
+    brain_mu_angle             n=201    mean=-0.004    med=-0.006    sd=0.052     min=-0.165    max=0.347     p10=-0.058    p90=0.052
+    brain_log_sigma_speed      n=201    mean=-1.214    med=-1.206    sd=0.056     min=-1.385    max=-1.043    p10=-1.286    p90=-1.149
+    brain_log_sigma_angle      n=201    mean=-1.282    med=-1.260    sd=0.079     min=-1.608    max=-1.121    p10=-1.396    p90=-1.204
+    brain_value_v              n=201    mean=0.991     med=0.743     sd=0.885     min=0.037     max=5.556     p10=0.164     p90=2.253
+    brain_last_reward          n=201    mean=4.609     med=2.667     sd=23.330    min=-25.270   max=200.952   p10=-13.877   p90=15.029
+    brain_mean_reward_64       n=201    mean=4.557     med=3.686     sd=4.490     min=-2.814    max=25.766    p10=-0.348    p90=10.390
+    brain_last_eat_component   n=201    mean=2.985     med=0.000     sd=22.160    min=0.000     max=200.000   p10=0.000     p90=0.000
+    brain_last_progress_component n=201    mean=0.029     med=0.234     sd=2.836     min=-22.146   max=3.920     p10=-2.626    p90=2.692
+    brain_last_oracle_component n=201    mean=1.595     med=2.079     sd=9.157     min=-22.773   max=20.492    p10=-11.693   p90=11.881
+
+  Photoautotroph subgroup (n=1223):
+    energy                     n=1223   mean=1125.723  med=1160.000  sd=189.487   min=600.000   max=1550.000  p10=849.867   p90=1350.000
+    grown_cell_count           n=1223   mean=119.572   med=122.000   sd=16.421    min=60.000    max=158.000   p10=99.000    p90=139.000
+    alive_body_part_count      n=1223   mean=16.176    med=17.000    sd=4.584     min=1.000     max=26.000    p10=11.000    p90=22.000
+    age_secs                   n=1223   mean=69.882    med=36.006    sd=92.955    min=2.003     max=599.457   p10=4.006     p90=187.605
+
+  Reward channel activity (herbivores):
+    frac eat non-zero                  2.0%
+    frac progress non-zero             92.0%
+    frac oracle non-zero               95.0%
+    frac oracle > 0 (toward prey)      55.7%
+    frac oracle < 0 (away from prey)   39.3%
+
+── Milestone 30_MINUTES  (virtual t = 1800 s, 1420 rows) ─────────────────
+  Trophic class:
+    Herbivore                          202
+    Photoautotroph                     1218
+  Intelligence level:
+    Level0                             1218
+    Level1                             201
+    Level3                             1
+  Symmetry:
+    Bilateral                          201
+    NoSymmetry                         1219
+  Variable-form:
+    0                                  202
+    1                                  1218
+
+  Herbivore subgroup (n=202):
+    energy                     n=202    mean=1054.467  med=136.884   sd=13114.829 min=52.922    max=186528.359 p10=122.369   p90=140.000
+    hunger                     n=202    mean=0.262     med=0.243     sd=0.055     min=0.235     max=0.639     p10=0.235     p90=0.288
+    dopamine                   n=202    mean=0.430     med=0.493     sd=0.344     min=0.000     max=0.922     p10=0.000     p90=0.921
+    target_distance            n=202    mean=19.031    med=17.047    sd=10.226    min=2.549     max=50.000    p10=6.536     p90=32.953
+    movement_speed             n=202    mean=25.314    med=26.241    sd=7.396     min=6.793     max=39.762    p10=15.073    p90=35.091
+    predations (cumulative)    n=202    mean=253.644   med=255.000   sd=7.199     min=203.000   max=255.000   p10=255.000   p90=255.000
+    reproductions              n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    age_secs                   n=202    mean=1799.885  med=1799.885  sd=0.000     min=1799.885  max=1799.885  p10=1799.885  p90=1799.885
+    times_reproduced_self      n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    child_alive_count          n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    brain_mu_speed             n=201    mean=0.330     med=0.274     sd=0.424     min=-0.647    max=2.326     p10=-0.103    p90=0.853
+    brain_mu_angle             n=201    mean=-0.027    med=0.007     sd=0.384     min=-1.398    max=2.280     p10=-0.365    p90=0.297
+    brain_log_sigma_speed      n=201    mean=-1.292    med=-1.239    sd=0.355     min=-2.276    max=-0.409    p10=-1.758    p90=-0.872
+    brain_log_sigma_angle      n=201    mean=-2.007    med=-1.929    sd=0.510     min=-4.477    max=-1.158    p10=-2.646    p90=-1.482
+    brain_value_v              n=201    mean=34.058    med=30.885    sd=16.155    min=6.219     max=95.908    p10=16.640    p90=55.254
+    brain_last_reward          n=201    mean=0.258     med=0.036     sd=15.790    min=-46.770   max=32.926    p10=-18.202   p90=20.356
+    brain_mean_reward_64       n=201    mean=0.793     med=0.244     sd=2.835     min=-9.429    max=16.033    p10=-1.361    p90=3.443
+    brain_last_eat_component   n=201    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    brain_last_progress_component n=201    mean=-0.771    med=0.000     sd=9.645     min=-37.982   max=22.411    p10=-12.294   p90=11.997
+    brain_last_oracle_component n=201    mean=1.030     med=1.574     sd=9.244     min=-21.219   max=27.465    p10=-11.148   p90=12.067
+
+  Photoautotroph subgroup (n=1218):
+    energy                     n=1218   mean=3000.733  med=3150.000  sd=421.831   min=1428.849  max=3480.000  p10=2259.772  p90=3330.000
+    grown_cell_count           n=1218   mean=322.182   med=323.000   sd=11.526    min=279.000   max=350.000   p10=309.000   p90=337.000
+    alive_body_part_count      n=1218   mean=49.112    med=49.000    sd=3.804     min=40.000    max=59.000    p10=44.000    p90=55.000
+    age_secs                   n=1218   mean=39.748    med=27.750    sd=38.845    min=2.250     max=378.000   p10=6.000     p90=87.750
+
+  Reward channel activity (herbivores):
+    frac eat non-zero                  0.0%
+    frac progress non-zero             97.0%
+    frac oracle non-zero               99.5%
+    frac oracle > 0 (toward prey)      54.2%
+    frac oracle < 0 (away from prey)   45.3%
+
+══════════════════════════════════════════════════════════════════════════════
+ 2) CROSS-MILESTONE TRENDS
+══════════════════════════════════════════════════════════════════════════════
+Mean values of herbivore metrics across milestones
+(N/A means the column is missing in that milestone's CSV)
+
+  metric                               5_MINUTES    10_MINUTES    30_MINUTES
+  n_herbivores                               202           202           202
+  n_photoautotrophs                         1212          1223          1218
+  energy                                549.1276      794.1836     1054.4673
+  hunger                                  0.2984        0.2651        0.2621
+  dopamine                                0.3920        0.4510        0.4302
+  movement_speed                         20.7308       21.4037       25.3142
+  predations                             49.2822      105.0644      253.6436
+  reproductions                           0.0000        0.0000        0.0000
+  age_secs                              299.4600      599.4570     1799.8850
+  brain_mu_speed                          0.0184        0.0491        0.3305
+  brain_mu_angle                         -0.0042       -0.0040       -0.0267
+  brain_log_sigma_speed                  -1.2043       -1.2138       -1.2920
+  brain_log_sigma_angle                  -1.2209       -1.2821       -2.0067
+  brain_value_v                           0.1131        0.9907       34.0584
+  brain_last_reward                       5.3217        4.6091        0.2584
+  brain_mean_reward_64                    3.9202        4.5568        0.7926
+  brain_last_eat_component                4.4776        2.9851        0.0000
+  brain_last_progress_component          -0.3409        0.0286       -0.7714
+  brain_last_oracle_component             1.1850        1.5954        1.0299
+
+══════════════════════════════════════════════════════════════════════════════
+ 3) HUNTING / CHASE PERFORMANCE (herbivores)
+══════════════════════════════════════════════════════════════════════════════
+Per-milestone predation totals + per-agent and per-virtual-second rates
+
+  milestone         n_herb      total_pred   mean_pred / agent  Δrate / agent / s
+  5_MINUTES            202            9955              49.282               —
+  10_MINUTES           202           21223             105.064           0.18594
+  30_MINUTES           202           51236             253.644           0.12382
+
+Interpretation:
+  * Rising mean_pred/agent indicates herbivores accumulate predations.
+  * Rising Δrate/agent/s indicates each herbivore is eating MORE
+    PER SECOND than in the previous milestone — i.e. the policy is
+    learning to chase. A flat or falling rate means random-walk-style
+    encounters.
+
+══════════════════════════════════════════════════════════════════════════════
+ 4) POLICY-MEAN ALIGNMENT WITH ORACLE
+══════════════════════════════════════════════════════════════════════════════
+
+── 5_MINUTES — alignment μ_angle ↔ oracle reward ─────────────────────────
+  n                                    201
+  var(μ_angle)                        0.000758
+  var(oracle reward)                   124.177336
+  Pearson ρ                           -0.067
+  Spearman ρ                          -0.073
+
+── 10_MINUTES — alignment μ_angle ↔ oracle reward ────────────────────────
+  n                                    201
+  var(μ_angle)                        0.002698
+  var(oracle reward)                   83.842818
+  Pearson ρ                           -0.016
+  Spearman ρ                          0.027
+
+── 30_MINUTES — alignment μ_angle ↔ oracle reward ────────────────────────
+  n                                    201
+  var(μ_angle)                        0.147558
+  var(oracle reward)                   85.459032
+  Pearson ρ                           0.017
+  Spearman ρ                          0.055
+
+══════════════════════════════════════════════════════════════════════════════
+ 5) REPRODUCTION & LINEAGE
+══════════════════════════════════════════════════════════════════════════════
+
+── 5_MINUTES lineage ─────────────────────────────────────────────────────
+  Organisms with parent_id (offspring) 1185
+  Organisms without (initial/cohort)   229
+  max times_reproduced_self            2
+  mean                                 1.064
+  frac with ≥ 1 reproduction         55.0%
+  max child_alive_count                2
+  mean                                 0.345
+  distinct species_id present          4
+
+── 10_MINUTES lineage ────────────────────────────────────────────────────
+  Organisms with parent_id (offspring) 1219
+  Organisms without (initial/cohort)   206
+  max times_reproduced_self            2
+  mean                                 1.075
+  frac with ≥ 1 reproduction         56.6%
+  max child_alive_count                2
+  mean                                 0.314
+  distinct species_id present          3
+
+── 30_MINUTES lineage ────────────────────────────────────────────────────
+  Organisms with parent_id (offspring) 1218
+  Organisms without (initial/cohort)   202
+  max times_reproduced_self            2
+  mean                                 0.877
+  frac with ≥ 1 reproduction         46.9%
+  max child_alive_count                2
+  mean                                 0.427
+  distinct species_id present          3
+
+══════════════════════════════════════════════════════════════════════════════
+ 6) Δ PREDATIONS / Δ REPRODUCTIONS (matched cohort)
+══════════════════════════════════════════════════════════════════════════════
+
+── 5_MINUTES → 10_MINUTES  (gap = 300 s) ─────────────────────────────────
+  matched herbivores                   202
+  Δpredations mean                    55.782
+  Δpredations median                  51.000
+  Δpredations max                     190.000
+  frac with Δpred > 0                 99.5%
+  Δreproductions mean                 0.000
+  Δreproductions max                  0.000
+
+── 10_MINUTES → 30_MINUTES  (gap = 1200 s) ───────────────────────────────
+  matched herbivores                   202
+  Δpredations mean                    148.579
+  Δpredations median                  159.000
+  Δpredations max                     232.000
+  frac with Δpred > 0                 97.0%
+  Δreproductions mean                 0.000
+  Δreproductions max                  0.000
+
+══════════════════════════════════════════════════════════════════════════════
+ 7) DNA DIVERSITY (latest milestone)
+══════════════════════════════════════════════════════════════════════════════
+(Computed on 30_MINUTES, 202 herbivores)
+
+    dna_sigma                  n=202    mean=0.001     med=0.000     sd=0.021     min=0.000     max=0.292     p10=0.000     p90=0.000
+    dna_k_eat                  n=202    mean=0.000     med=0.000     sd=0.004     min=0.000     max=0.063     p10=0.000     p90=0.000
+    dna_k_repro                n=202    mean=0.003     med=0.000     sd=0.045     min=0.000     max=0.642     p10=0.000     p90=0.000
+    dna_lambda_energy          n=202    mean=0.002     med=0.000     sd=0.023     min=0.000     max=0.325     p10=0.000     p90=0.000
+    dna_k_curiosity            n=202    mean=0.000     med=0.000     sd=0.004     min=0.000     max=0.061     p10=0.000     p90=0.000
+    dna_k_progress             n=202    mean=0.002     med=0.000     sd=0.033     min=0.000     max=0.470     p10=0.000     p90=0.000
+    dna_intel_level            n=202    mean=0.337     med=0.333     sd=0.047     min=0.333     max=1.000     p10=0.333     p90=0.333
+    dna_is_carnivore           n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    dna_is_photo               n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    dna_symmetry               n=202    mean=0.995     med=1.000     sd=0.070     min=0.000     max=1.000     p10=1.000     p90=1.000
+    dna_has_variable_form      n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    dna_is_sessile             n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    dna_cell_count_norm        n=202    mean=0.233     med=0.233     sd=0.008     min=0.117     max=0.233     p10=0.233     p90=0.233
+    dna_photo_cell_ratio       n=202    mean=0.000     med=0.000     sd=0.000     min=0.000     max=0.000     p10=0.000     p90=0.000
+    dna_body_extent_x          n=202    mean=0.077     med=0.077     sd=0.002     min=0.050     max=0.077     p10=0.077     p90=0.077
+    dna_body_extent_y          n=202    mean=0.019     med=0.019     sd=0.002     min=0.019     max=0.050     p10=0.019     p90=0.019
+    dna_body_extent_z          n=202    mean=0.039     med=0.038     sd=0.001     min=0.038     max=0.050     p10=0.038     p90=0.038
+    dna_body_radius            n=202    mean=0.096     med=0.096     sd=0.002     min=0.067     max=0.096     p10=0.096     p90=0.096
+    dna_body_compactness       n=202    mean=0.522     med=0.521     sd=0.009     min=0.521     max=0.643     p10=0.521     p90=0.521
+
+=== END ===
