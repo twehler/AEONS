@@ -351,20 +351,18 @@ fn write_brain_probe_csv<W: Write>(
         ("random", &random_k),
     ];
 
-    let tensor_names = [
-        "bk_w1", "bk_b1", "bk_w2", "bk_b2",
-        "a_w1",  "a_b1",  "a_w2",  "a_b2",
-        "c_w1",  "c_b1",  "c_w2",  "c_b2",
-    ];
+    // Post-L3-port tensor layout: a single MLP (w1, b1, w2, b2). The
+    // old 12-tensor (backbone+actor+critic) layout was retired with
+    // the architecture change. CSV column counts adjust automatically
+    // — only the rows-per-organism count changes (12 → 4).
+    let tensor_names = ["w1", "b1", "w2", "b2"];
 
     let mut row = String::with_capacity(192);
     for (group_name, items) in groups.iter() {
         for &(entity, slot, predations) in *items {
             let brain = pool.extract_slot(slot);
-            let vecs: [&Vec<f32>; 12] = [
-                &brain.bk_w1, &brain.bk_b1, &brain.bk_w2, &brain.bk_b2,
-                &brain.a_w1,  &brain.a_b1,  &brain.a_w2,  &brain.a_b2,
-                &brain.c_w1,  &brain.c_b1,  &brain.c_w2,  &brain.c_b2,
+            let vecs: [&Vec<f32>; 4] = [
+                &brain.w1, &brain.b1, &brain.w2, &brain.b2,
             ];
             for (name, v) in tensor_names.iter().zip(vecs.iter()) {
                 let (n, mean, std, min, max, l2) = tensor_stats(v);

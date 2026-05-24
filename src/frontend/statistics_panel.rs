@@ -19,7 +19,7 @@ use bevy::render::render_resource::TextureFormat;
 
 use crate::colony::{Photoautotroph, Heterotroph, Organism, OrganismRoot, SaveRequested};
 use crate::frontend::PANEL_BG_COLOR;
-use crate::simulation_settings::{SimulationRunning, TimeSpeed, MaxOrganisms, OrganismPoolSize};
+use crate::simulation_settings::{SimulationRunning, TimeSpeed, MaxOrganisms};
 
 use rand::prelude::*;
 
@@ -1353,16 +1353,20 @@ pub fn apply_time_speed(
 
 /// Click + keyboard router for the Max-Organisms integer-input field.
 /// Mirrors the `handle_time_speed_input` design, but accepts digits only
-/// (no decimal point) and commits a `usize` into `MaxOrganisms`, clamped
-/// to `[0, OrganismPoolSize]` (the GPU brain-pool batch dimension chosen
-/// at startup — a hard ceiling we can't grow past at runtime).
+/// (no decimal point) and commits a `usize` into `MaxOrganisms`. The
+/// value is *not* clamped to `OrganismPoolSize` — the user is free to
+/// raise the soft cap above the GPU brain-pool batch dim chosen at
+/// startup. Organisms spawned past the pool size will simply not
+/// receive a brain slot (the `assign_brains_*` systems silently skip
+/// them when `pool.free` is empty), which is harmless: those
+/// organisms behave as if their last brain output is still in effect
+/// until they die or are recycled into a freed slot.
 pub fn handle_max_organisms_input(
     mouse:            Res<ButtonInput<MouseButton>>,
     mut keyboard:     MessageReader<KeyboardInput>,
     interaction_q:    Query<&Interaction, With<MaxOrganismsInput>>,
     mut state:        ResMut<MaxOrganismsEditState>,
     mut max_org:      ResMut<MaxOrganisms>,
-    pool_size:        Res<OrganismPoolSize>,
 ) {
     let click_on_input = mouse.just_pressed(MouseButton::Left)
         && interaction_q.iter().any(|i| matches!(i, Interaction::Pressed));
@@ -1375,7 +1379,7 @@ pub fn handle_max_organisms_input(
     }
 
     if click_outside && state.focused {
-        commit_max_organisms(&mut state, &mut max_org, pool_size.0);
+        commit_max_organisms(&mut state, &mut max_org);
     }
 
     if !state.focused {
@@ -1387,7 +1391,7 @@ pub fn handle_max_organisms_input(
         if !ev.state.is_pressed() { continue; }
         match ev.key_code {
             KeyCode::Enter | KeyCode::NumpadEnter => {
-                commit_max_organisms(&mut state, &mut max_org, pool_size.0);
+                commit_max_organisms(&mut state, &mut max_org);
             }
             KeyCode::Escape => {
                 state.focused = false;
@@ -1410,15 +1414,16 @@ pub fn handle_max_organisms_input(
     }
 }
 
-/// Parse the buffer as `usize`. On success, clamp to `[0, pool_size]`
-/// (the GPU brain-pool batch dim, fixed at startup — see
-/// `OrganismPoolSize`) and write into the resource. Always unfocus +
-/// clear the buffer.
-fn commit_max_organisms(state: &mut MaxOrganismsEditState, max_org: &mut MaxOrganisms, pool_size: usize) {
+/// Parse the buffer as `usize` and write into the resource. No clamp
+/// — the user can set the soft cap freely above or below the GPU
+/// brain-pool batch dim (`OrganismPoolSize`, fixed at startup); when
+/// the cap exceeds the pool size, new organisms simply spawn without
+/// brain slots until a slot frees up. Always unfocus + clear the
+/// buffer.
+fn commit_max_organisms(state: &mut MaxOrganismsEditState, max_org: &mut MaxOrganisms) {
     if let Ok(v) = state.buffer.parse::<usize>() {
-        let clamped = v.min(pool_size);
-        if max_org.0 != clamped {
-            max_org.0 = clamped;
+        if max_org.0 != v {
+            max_org.0 = v;
         }
     }
     state.focused = false;

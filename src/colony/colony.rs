@@ -10,10 +10,16 @@ use rand::prelude::*;
 // keep finding Organism, OrganismRoot, OrganismKind, Photoautotroph, etc.
 pub use crate::organism::*;
 
-/// Initial population of each trophic strategy. Photoautotrophs dominate so
-/// the food web has plenty of prey for the smaller heterotroph predator pool.
-const INITIAL_PHOTOAUTOTROPHS: u32 = 500;
-const INITIAL_HETEROTROPHS:    u32 = 80;
+// Initial cohort sizes are derived at spawn-time from three
+// resources (all launcher-set, defaulting to the matching
+// `DEFAULT_*` constants):
+//   * herbivores        = StartHeterotrophs    (launcher: "Start Heterotroph Number")
+//   * photoautotrophs   = MaxOrganisms − MaxHerbivores
+// The running-population cap is `MaxOrganisms` (and herbivore-only
+// cap is `MaxHerbivores`), both editable at runtime via the
+// statistics panel. Keeping the START count decoupled from the
+// CAP lets the user seed a small starter cohort and let reproduction
+// fill the room up to the cap. See `spawn_colony`.
 
 /// Initial Krishi cohort size. `pub` so `krishi.rs` reads it directly —
 /// keeps every "how many of X spawn at startup" knob in one place.
@@ -33,6 +39,7 @@ impl Plugin for ColonyPlugin {
         // overwrite main.rs's value.
         app.init_resource::<ColonyLoadPath>();
         app.init_resource::<crate::simulation_settings::AutoSpawnHeteros>();
+        app.init_resource::<crate::simulation_settings::StartHeterotrophs>();
         app.init_resource::<crate::simulation_settings::MinHeteroCount>();
         app.init_resource::<crate::simulation_settings::MinHeteroCountEditState>();
         app.init_resource::<AutosaveTimer>();
@@ -170,7 +177,8 @@ pub struct ColonyLoadPath(pub Option<String>);
 /// can still read v003 organism structure (positions, body parts,
 /// energy) but drops the v003 brain block — the saved weights are
 /// for a different architecture and aren't restorable.
-const SAVE_MAGIC:             &[u8;8] = b"AEONS004";
+const SAVE_MAGIC:             &[u8;8] = b"AEONS005";
+const SAVE_MAGIC_LEGACY_V004: &[u8;8] = b"AEONS004";
 const SAVE_MAGIC_LEGACY_V003: &[u8;8] = b"AEONS003";
 const SAVE_MAGIC_LEGACY_V002: &[u8;8] = b"AEONS002";
 const SAVE_MAGIC_LEGACY_V001: &[u8;8] = b"AEONS001";
@@ -434,17 +442,18 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         return Err(std::io::Error::other("file too short — missing magic"));
     }
     let magic = &bytes[..SAVE_MAGIC.len()];
-    let format_v004 = magic == SAVE_MAGIC;
+    let format_v005 = magic == SAVE_MAGIC;
+    let format_v004 = magic == SAVE_MAGIC_LEGACY_V004;
     let format_v003 = magic == SAVE_MAGIC_LEGACY_V003;
     let format_v002 = magic == SAVE_MAGIC_LEGACY_V002;
     let format_v001 = magic == SAVE_MAGIC_LEGACY_V001;
-    if !format_v004 && !format_v003 && !format_v002 && !format_v001 {
+    if !format_v005 && !format_v004 && !format_v003 && !format_v002 && !format_v001 {
         return Err(std::io::Error::other(
             "magic mismatch — not an AEONS colony save (or unsupported version)",
         ));
     }
     // v002+ all share the intelligence_level byte after has_variable_form.
-    let has_intelligence_byte = format_v004 || format_v003 || format_v002;
+    let has_intelligence_byte = format_v005 || format_v004 || format_v003 || format_v002;
     c += SAVE_MAGIC.len();
 
     let count = read_u32(&bytes, &mut c)?;
@@ -586,7 +595,9 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         //            up with fresh-init weights.
         //   * v001/v002 — no brain section at all.
         let brain: Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>
-            = if format_v004 {
+            = if format_v005 {
+                // New format: shared `BrainRestore` (4-tensor MLP) +
+                // the herbivore_1 8-byte magic prefix.
                 let brain_present = read_u8(&bytes, &mut c)?;
                 if brain_present == 1 {
                     Some(crate::intelligence_level_herbivore_1::decode_brain_restore(
@@ -595,11 +606,26 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
                 } else {
                     None
                 }
+            } else if format_v004 {
+                // Retired 12-tensor (backbone+actor+critic) brain
+                // block from the pre-L3-port A2C architecture. Consume
+                // + drop — fresh weights for these organisms on load.
+                // Layout: brain_present byte, then 12 length-prefixed
+                // f32 vectors + 2 length-prefixed f32 vectors
+                // (prev_state, prev_action) + 2 f32 scalars.
+                let brain_present = read_u8(&bytes, &mut c)?;
+                if brain_present == 1 {
+                    for _ in 0..14 {
+                        let n = read_u32(&bytes, &mut c)? as usize;
+                        for _ in 0..n { let _ = read_f32(&bytes, &mut c)?; }
+                    }
+                    let _ = read_f32(&bytes, &mut c)?; // prev_dopamine
+                    let _ = read_f32(&bytes, &mut c)?; // prev_target_distance
+                }
+                None
             } else if format_v003 {
-                // Consume + drop the v003 brain block so the file
-                // parses; the architecture mismatch makes the data
-                // unusable. Layout: brain_present byte, then 6
-                // length-prefixed f32 vectors + 2 f32 + 1 byte.
+                // Old single-MLP REINFORCE brain block. Consume + drop
+                // (architecture differs from the current pool).
                 let brain_present = read_u8(&bytes, &mut c)?;
                 if brain_present == 1 {
                     for _ in 0..6 {
@@ -878,6 +904,9 @@ fn spawn_colony(
     load_path:       Res<ColonyLoadPath>,
     smoothing:       Res<crate::simulation_settings::Smoothing>,
     map_size:        Res<MapSize>,
+    max_organisms:   Res<crate::simulation_settings::MaxOrganisms>,
+    max_herbivores:  Res<crate::simulation_settings::MaxHerbivores>,
+    start_heteros:   Res<crate::simulation_settings::StartHeterotrophs>,
     mut spawned:     Local<bool>,
 ) {
     if *spawned { return; }
@@ -915,7 +944,24 @@ fn spawn_colony(
         }
     }
 
-    for _ in 0..INITIAL_PHOTOAUTOTROPHS {
+    // Derive cohort sizes from the launcher-set values (defaulting
+    // to the matching `DEFAULT_*` constants). `saturating_sub` keeps
+    // a pathological `MaxHerbivores > MaxOrganisms` config from
+    // underflowing — the photoautotroph count just becomes zero.
+    // `n_herbivores` reads from `StartHeterotrophs` (the launcher's
+    // "Start Heterotroph Number" field) so the initial cohort can be
+    // smaller than the running cap (`MaxHerbivores`); reproduction
+    // then fills the population up to the cap.
+    let n_herbivores      = start_heteros.0;
+    let n_photoautotrophs = max_organisms.0.saturating_sub(max_herbivores.0);
+    info!(
+        "spawn_colony: target cohort = {} photoautotrophs + {} herbivores \
+         (MaxOrganisms={}, MaxHerbivores={}, StartHeterotrophs={})",
+        n_photoautotrophs, n_herbivores,
+        max_organisms.0, max_herbivores.0, start_heteros.0,
+    );
+
+    for _ in 0..n_photoautotrophs {
         // Spawn strictly inside the WORLD_SAFETY_MARGIN inset so the
         // organism is born inside the same XZ band that
         // `apply_world_bounds` keeps it within at runtime.
@@ -987,7 +1033,7 @@ fn spawn_colony(
         );
     }
 
-    for _ in 0..INITIAL_HETEROTROPHS {
+    for _ in 0..n_herbivores {
         // Spawn strictly inside the WORLD_SAFETY_MARGIN inset so the
         // organism is born inside the same XZ band that
         // `apply_world_bounds` keeps it within at runtime.

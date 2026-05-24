@@ -11,7 +11,10 @@ use std::sync::mpsc;
 
 use eframe::egui;
 
-use crate::simulation_settings::{DEFAULT_MAX_ORGANISMS, DEFAULT_MAP_X, DEFAULT_MAP_Z};
+use crate::simulation_settings::{
+    DEFAULT_MAX_ORGANISMS, DEFAULT_MAX_HERBIVORES, DEFAULT_START_HETEROTROPHS,
+    DEFAULT_MAP_X, DEFAULT_MAP_Z,
+};
 
 /// Soft practical upper bound for the launcher's "Max Organisms" field.
 /// Higher values still work (the simulation simply allocates a larger
@@ -22,7 +25,7 @@ const LAUNCHER_MAX_ORGANISMS_CAP: usize = 100_000;
 
 // ── Layout constants ─────────────────────────────────────────────────────────
 
-const LAUNCHER_WINDOW_SIZE:    egui::Vec2 = egui::vec2(800.0, 600.0);
+const LAUNCHER_WINDOW_SIZE:    egui::Vec2 = egui::vec2(800.0, 680.0);
 const BANNER_PATH:             &str       = "logos/dna.png";
 const BANNER_POS:              egui::Pos2 = egui::pos2(0.0, 0.0);
 const BANNER_SIZE:             egui::Vec2 = egui::vec2(800.0, 200.0);
@@ -54,7 +57,15 @@ const MAPSIZE_MAX:             f32        = 8192.0;
 // child subprocess via `--max-organisms N` argv and sizes both the
 // GPU brain-pool tensors (`OrganismPoolSize`) AND the initial
 // reproduction soft cap (`MaxOrganisms`) at simulation startup.
-const MAXORG_ROW_TOP:          f32        = 385.0;
+// Adjust-colony-dimensions checkbox. Acts as the gate over the
+// downstream spawn-control widgets (Max Organisms, AI-training mode,
+// Max Herbivores) when a colony file is loaded. The user-facing
+// contract is documented on the field in `LauncherApp`.
+const ADJUSTCOL_ROW_TOP:       f32        = 380.0;
+const ADJUSTCOL_POS:           egui::Pos2 = egui::pos2(60.0, ADJUSTCOL_ROW_TOP);
+const ADJUSTCOL_SIZE:          egui::Vec2 = egui::vec2(400.0, 24.0);
+
+const MAXORG_ROW_TOP:          f32        = 415.0;
 const MAXORG_LABEL_POS:        egui::Pos2 = egui::pos2(60.0, MAXORG_ROW_TOP);
 const MAXORG_LABEL_SIZE:       egui::Vec2 = egui::vec2(180.0, 32.0);
 const MAXORG_DRAG_POS:         egui::Pos2 = egui::pos2(245.0, MAXORG_ROW_TOP);
@@ -67,18 +78,45 @@ const MAXORG_FIELD_SIZE:       egui::Vec2 = egui::vec2(110.0, 32.0);
 // it) but the user can override the initial value by toggling, and
 // the final committed state is forwarded via
 // `LaunchMode::RunSimulation::training_mode`.
-const TRAININGMODE_ROW_TOP:    f32        = 420.0;
+const TRAININGMODE_ROW_TOP:    f32        = 450.0;
 const TRAININGMODE_POS:        egui::Pos2 = egui::pos2(60.0, TRAININGMODE_ROW_TOP);
 const TRAININGMODE_SIZE:       egui::Vec2 = egui::vec2(400.0, 24.0);
+
+// Max-herbivores row. Same layout pattern as the Max-organisms row,
+// just one slot below the AI-training-mode checkbox. The value seeds
+// the `MaxHerbivores` reproduction cap at simulation startup. Tuned
+// from the launcher so AI-training runs can fix the cohort size before
+// the brain pool is allocated.
+const MAXHERB_ROW_TOP:         f32        = 485.0;
+const MAXHERB_LABEL_POS:       egui::Pos2 = egui::pos2(60.0, MAXHERB_ROW_TOP);
+const MAXHERB_LABEL_SIZE:      egui::Vec2 = egui::vec2(180.0, 32.0);
+const MAXHERB_DRAG_POS:        egui::Pos2 = egui::pos2(245.0, MAXHERB_ROW_TOP);
+const MAXHERB_FIELD_SIZE:      egui::Vec2 = egui::vec2(110.0, 32.0);
+
+// Start-heterotrophs row. Sits one slot below "Max Herbivores",
+// shares the same label / drag layout. Drives the initial-cohort
+// herbivore count at `spawn_colony`. Independent from
+// `MaxHerbivores`, which caps the running population.
+const STARTHET_ROW_TOP:        f32        = 520.0;
+const STARTHET_LABEL_POS:      egui::Pos2 = egui::pos2(60.0, STARTHET_ROW_TOP);
+const STARTHET_LABEL_SIZE:     egui::Vec2 = egui::vec2(220.0, 32.0);
+const STARTHET_DRAG_POS:       egui::Pos2 = egui::pos2(285.0, STARTHET_ROW_TOP);
+const STARTHET_FIELD_SIZE:     egui::Vec2 = egui::vec2(110.0, 32.0);
 
 // Two side-by-side buttons. "START AEONS" on the left, "COLONY EDITOR"
 // on the right — both styled the same so neither feels like a footnote.
 const ACTION_BTN_SIZE:         egui::Vec2 = egui::vec2(330.0, 90.0);
-const ACTION_ROW_TOP:          f32        = 445.0;
+const ACTION_ROW_TOP:          f32        = 565.0;
 const ACTION_BTN_FONT_SIZE:    f32        = 24.0;
 const START_BTN_LABEL:         &str       = "START AEONS";
 const DEFAULT_MAP_PATH:        &str       = "assets/world_superflat.glb";
-const DEFAULT_COLONY_PATH:     &str       = "colonies/Starter.colony";
+// Empty by default so the launcher opens in fresh-spawn mode: the
+// Max Organisms / Max Herbivores fields drive the initial cohort
+// directly. The user can paste or browse to a `.colony` file
+// whenever they explicitly want to load one — that flips the spawn-
+// control widgets to greyed-out (gated by "Adjust colony
+// dimensions").
+const DEFAULT_COLONY_PATH:     &str       = "";
 
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -87,18 +125,26 @@ const DEFAULT_COLONY_PATH:     &str       = "colonies/Starter.colony";
 pub enum LaunchMode {
     /// Boot the full simulation (Bevy + Burn brain pools + every plugin).
     RunSimulation {
-        map_path:      String,
-        colony_path:   Option<String>,
-        wireframe:     bool,
-        map_x:         f32,
-        map_z:         f32,
-        max_organisms: usize,
+        map_path:       String,
+        colony_path:    Option<String>,
+        wireframe:      bool,
+        map_x:          f32,
+        map_z:          f32,
+        max_organisms:  usize,
+        /// Reproduction soft cap on herbivores. Forwarded to the
+        /// child as `--max-herbivores N`. Seeded from the launcher's
+        /// text field — defaults to `DEFAULT_MAX_HERBIVORES`.
+        max_herbivores: usize,
+        /// Number of heterotrophs spawned at startup. Drives the
+        /// initial cohort in `spawn_colony`; the cap (`MaxHerbivores`)
+        /// is independent. Forwarded via `--start-heteros N`.
+        start_heterotrophs: usize,
         /// Final AI-training-mode state at click-of-START — the
         /// launcher's checkbox is the source of truth. It seeds
         /// from `--trainingmode` if that argv flag was set when the
         /// launcher process started, but the user may toggle it
         /// before clicking and the toggle wins.
-        training_mode: bool,
+        training_mode:  bool,
     },
     /// Boot the colony editor (Bevy + minimal plugin set, no AI).
     RunEditor {
@@ -137,17 +183,33 @@ pub fn run_launcher() -> Option<LaunchMode> {
 // ── Internals ────────────────────────────────────────────────────────────────
 
 struct LauncherApp {
-    map_path:      String,
-    colony_path:   String,
-    wireframe:     bool,
-    map_x:         f32,
-    map_z:         f32,
-    max_organisms: usize,
+    map_path:       String,
+    colony_path:    String,
+    wireframe:      bool,
+    map_x:          f32,
+    map_z:          f32,
+    max_organisms:  usize,
+    /// Herbivore reproduction soft cap. Editable via the Max
+    /// Herbivores text field; forwarded to the child via
+    /// `--max-herbivores N`.
+    max_herbivores: usize,
+    /// Initial-cohort herbivore count. Editable via the
+    /// Start Heterotroph Number text field; forwarded via
+    /// `--start-heteros N`.
+    start_heterotrophs: usize,
     /// AI-training-mode checkbox state. Initialised from
     /// `--trainingmode` in argv; mutable while the launcher is open.
     /// Whatever value is held when the user clicks START AEONS is
     /// what the child process boots with.
-    training_mode: bool,
+    training_mode:  bool,
+    /// When a colony save is selected, the spawn-control widgets
+    /// (Max Organisms, AI-training mode, Max Herbivores) are
+    /// disabled by default so the colony loads exactly as recorded.
+    /// Checking this box re-enables those widgets so the user can
+    /// override the cap values for the loaded colony. Has no effect
+    /// when no colony is selected (the widgets are always editable
+    /// in that case).
+    adjust_colony_dimensions: bool,
     banner:        Option<egui::TextureHandle>,
     status:        String,
     tx:            mpsc::Sender<LaunchMode>,
@@ -158,18 +220,32 @@ impl LauncherApp {
         let wireframe     = env::args().any(|a| a == "--wireframe");
         let training_mode = env::args().any(|a| a == "--trainingmode");
         Self {
-            map_path:      DEFAULT_MAP_PATH.to_string(),
-            colony_path:   DEFAULT_COLONY_PATH.to_string(),
+            map_path:       DEFAULT_MAP_PATH.to_string(),
+            colony_path:    DEFAULT_COLONY_PATH.to_string(),
             wireframe,
-            map_x:         DEFAULT_MAP_X,
-            map_z:         DEFAULT_MAP_Z,
+            map_x:          DEFAULT_MAP_X,
+            map_z:          DEFAULT_MAP_Z,
             // Default seed: the global "starter" value. The user can
             // dial it freely up to `LAUNCHER_MAX_ORGANISMS_CAP`; the
             // chosen value flows through to the GPU brain-pool size.
-            max_organisms: DEFAULT_MAX_ORGANISMS,
+            max_organisms:  DEFAULT_MAX_ORGANISMS,
+            // Herbivore cap default — mirrors `MaxHerbivores::default()`.
+            // Capped at `LAUNCHER_MAX_ORGANISMS_CAP` from above for
+            // simplicity (the herbivore count can never exceed the
+            // overall organism cap anyway).
+            max_herbivores: DEFAULT_MAX_HERBIVORES,
+            // Initial herbivore cohort default. Defaults to the same
+            // value as the cap so an out-of-the-box run with default
+            // settings still produces a visible starter cohort.
+            start_heterotrophs: DEFAULT_START_HETEROTROPHS,
             training_mode,
-            banner:        load_banner(&cc.egui_ctx),
-            status:        String::new(),
+            // Default OFF — if the user pre-fills a colony path,
+            // they'll see the spawn widgets greyed out until they
+            // explicitly opt in to overriding the loaded colony's
+            // dimensions.
+            adjust_colony_dimensions: false,
+            banner:         load_banner(&cc.egui_ctx),
+            status:         String::new(),
             tx,
         }
     }
@@ -182,13 +258,15 @@ impl LauncherApp {
         }
         let colony = self.colony_path.trim();
         let mode = LaunchMode::RunSimulation {
-            map_path:      map.to_string(),
-            colony_path:   if colony.is_empty() { None } else { Some(colony.to_string()) },
-            wireframe:     self.wireframe,
-            map_x:         self.map_x,
-            map_z:         self.map_z,
-            max_organisms: self.max_organisms.max(1),
-            training_mode: self.training_mode,
+            map_path:       map.to_string(),
+            colony_path:    if colony.is_empty() { None } else { Some(colony.to_string()) },
+            wireframe:      self.wireframe,
+            map_x:          self.map_x,
+            map_z:          self.map_z,
+            max_organisms:  self.max_organisms.max(1),
+            max_herbivores: self.max_herbivores,
+            start_heterotrophs: self.start_heterotrophs,
+            training_mode:  self.training_mode,
         };
         let _ = self.tx.send(mode);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -338,41 +416,120 @@ impl eframe::App for LauncherApp {
                         .speed(8.0),
                 );
 
-                // ── Max-organisms row ───────────────────────────────
-                // This value sizes the GPU brain-pool tensors at
-                // simulation startup. After launch the statistics-panel
-                // "Max Organisms" field can lower this soft cap further,
-                // but never above what was allocated here. Ignored by
-                // the editor.
-                let maxorg_label_rect = egui::Rect::from_min_size(
-                    MAXORG_LABEL_POS, MAXORG_LABEL_SIZE);
+                // ── Adjust-colony-dimensions checkbox ───────────────
+                // Always interactive — controls whether the three
+                // spawn-control widgets below stay editable when a
+                // colony file is loaded. When no colony is loaded,
+                // the checkbox is irrelevant (spawn controls are
+                // always editable in that case) so it just acts as a
+                // user-state memo.
+                let adjustcol_rect = egui::Rect::from_min_size(
+                    ADJUSTCOL_POS, ADJUSTCOL_SIZE);
                 ui.put(
-                    maxorg_label_rect,
-                    egui::Label::new(
-                        egui::RichText::new("Max Organisms:").size(TEXTFIELD_FONT_SIZE),
+                    adjustcol_rect,
+                    egui::Checkbox::new(
+                        &mut self.adjust_colony_dimensions,
+                        "Adjust colony dimensions",
                     ),
                 );
-                let maxorg_drag_rect = egui::Rect::from_min_size(
-                    MAXORG_DRAG_POS, MAXORG_FIELD_SIZE);
-                ui.put(
-                    maxorg_drag_rect,
-                    egui::DragValue::new(&mut self.max_organisms)
-                        .range(1..=LAUNCHER_MAX_ORGANISMS_CAP)
-                        .speed(1.0),
-                );
 
-                // ── AI-training-mode checkbox ────────────────────────
-                // Seeded from `--trainingmode` argv on launcher start
-                // (see `LauncherApp::new`). Whatever the user leaves
-                // it on when clicking START is what's forwarded — so
-                // the launcher checkbox overrides the argv flag and
-                // they "compete" via last-touched-wins.
-                let training_rect = egui::Rect::from_min_size(
-                    TRAININGMODE_POS, TRAININGMODE_SIZE);
-                ui.put(
-                    training_rect,
-                    egui::Checkbox::new(&mut self.training_mode, "AI-training mode"),
-                );
+                // Editability gate for Max Organisms / AI-training /
+                // Max Herbivores: when a colony is loaded AND the
+                // user hasn't ticked "Adjust colony dimensions",
+                // these are greyed out so the colony loads as
+                // recorded. Otherwise they're editable (no colony,
+                // or user has explicitly opted in to override).
+                let spawn_widgets_enabled =
+                    self.colony_path.trim().is_empty()
+                    || self.adjust_colony_dimensions;
+
+                ui.add_enabled_ui(spawn_widgets_enabled, |ui| {
+                    // ── Max-organisms row ───────────────────────────
+                    // This value sizes the GPU brain-pool tensors at
+                    // simulation startup. After launch the
+                    // statistics-panel "Max Organisms" field can lower
+                    // this soft cap further, but never above what was
+                    // allocated here. Ignored by the editor.
+                    let maxorg_label_rect = egui::Rect::from_min_size(
+                        MAXORG_LABEL_POS, MAXORG_LABEL_SIZE);
+                    ui.put(
+                        maxorg_label_rect,
+                        egui::Label::new(
+                            egui::RichText::new("Max Organisms:").size(TEXTFIELD_FONT_SIZE),
+                        ),
+                    );
+                    let maxorg_drag_rect = egui::Rect::from_min_size(
+                        MAXORG_DRAG_POS, MAXORG_FIELD_SIZE);
+                    ui.put(
+                        maxorg_drag_rect,
+                        egui::DragValue::new(&mut self.max_organisms)
+                            .range(1..=LAUNCHER_MAX_ORGANISMS_CAP)
+                            .speed(1.0),
+                    );
+
+                    // ── AI-training-mode checkbox ───────────────────
+                    // Seeded from `--trainingmode` argv on launcher
+                    // start (see `LauncherApp::new`). Whatever the
+                    // user leaves it on when clicking START is what's
+                    // forwarded — so the launcher checkbox overrides
+                    // the argv flag and they "compete" via
+                    // last-touched-wins.
+                    let training_rect = egui::Rect::from_min_size(
+                        TRAININGMODE_POS, TRAININGMODE_SIZE);
+                    ui.put(
+                        training_rect,
+                        egui::Checkbox::new(&mut self.training_mode, "AI-training mode"),
+                    );
+
+                    // ── Max-herbivores row ──────────────────────────
+                    // Seeds the `MaxHerbivores` reproduction cap. The
+                    // statistics panel exposes the same value at
+                    // runtime so the user can lower or raise it
+                    // later, but the initial-cohort sizing is
+                    // anchored here. Clamped to
+                    // `[1, LAUNCHER_MAX_ORGANISMS_CAP]` so the
+                    // herbivore cap can never exceed the overall
+                    // pool size.
+                    let maxherb_label_rect = egui::Rect::from_min_size(
+                        MAXHERB_LABEL_POS, MAXHERB_LABEL_SIZE);
+                    ui.put(
+                        maxherb_label_rect,
+                        egui::Label::new(
+                            egui::RichText::new("Max Herbivores:").size(TEXTFIELD_FONT_SIZE),
+                        ),
+                    );
+                    let maxherb_drag_rect = egui::Rect::from_min_size(
+                        MAXHERB_DRAG_POS, MAXHERB_FIELD_SIZE);
+                    ui.put(
+                        maxherb_drag_rect,
+                        egui::DragValue::new(&mut self.max_herbivores)
+                            .range(1..=LAUNCHER_MAX_ORGANISMS_CAP)
+                            .speed(1.0),
+                    );
+
+                    // ── Start-heterotrophs row ───────────────────
+                    // Initial-cohort herbivore count, independent
+                    // from the running-population cap. Defaults to
+                    // `DEFAULT_START_HETEROTROPHS = 5`. Setting it
+                    // below `MaxHerbivores` (and `MaxOrganisms`)
+                    // leaves headroom for reproduction.
+                    let starthet_label_rect = egui::Rect::from_min_size(
+                        STARTHET_LABEL_POS, STARTHET_LABEL_SIZE);
+                    ui.put(
+                        starthet_label_rect,
+                        egui::Label::new(
+                            egui::RichText::new("Start Heterotroph Number:").size(TEXTFIELD_FONT_SIZE),
+                        ),
+                    );
+                    let starthet_drag_rect = egui::Rect::from_min_size(
+                        STARTHET_DRAG_POS, STARTHET_FIELD_SIZE);
+                    ui.put(
+                        starthet_drag_rect,
+                        egui::DragValue::new(&mut self.start_heterotrophs)
+                            .range(0..=LAUNCHER_MAX_ORGANISMS_CAP)
+                            .speed(1.0),
+                    );
+                });
 
                 // ── Action button ───────────────────────────────────
                 // Single launch button now that the standalone Colony

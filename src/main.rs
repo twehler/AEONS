@@ -107,8 +107,10 @@ fn main() {
     // `--map-size X Z` — parse before collecting positionals so the
     // two numeric values don't end up in the positional list.
     let map_size = parse_map_size(&args).unwrap_or(world_geometry::MapSize::default());
-    let max_organisms = parse_max_organisms(&args);
-    let positional = collect_positionals(&args);
+    let max_organisms      = parse_max_organisms(&args);
+    let max_herbivores     = parse_max_herbivores(&args);
+    let start_heterotrophs = parse_start_heterotrophs(&args);
+    let positional         = collect_positionals(&args);
 
     if positional.is_empty() && !editor_flag {
         // Launcher mode — show the eframe window with both action
@@ -118,7 +120,8 @@ fn main() {
         let Some(mode) = run_launcher() else { return; };
         match mode {
             LaunchMode::RunSimulation {
-                map_path, colony_path, wireframe, map_x, map_z, max_organisms,
+                map_path, colony_path, wireframe, map_x, map_z,
+                max_organisms, max_herbivores, start_heterotrophs,
                 training_mode: launcher_training_mode,
             } => {
                 respawn(&[
@@ -130,6 +133,10 @@ fn main() {
                     Some(map_z.to_string()),
                     Some("--max-organisms".into()),
                     Some(max_organisms.to_string()),
+                    Some("--max-herbivores".into()),
+                    Some(max_herbivores.to_string()),
+                    Some("--start-heteros".into()),
+                    Some(start_heterotrophs.to_string()),
                     // The launcher's checkbox is the source of truth
                     // for the child: even if the parent was started
                     // with `--trainingmode`, an unchecked box here
@@ -155,7 +162,9 @@ fn main() {
         // Simulation mode (re-spawned child or direct CLI invocation).
         let map_path    = positional[0].clone();
         let colony_path = positional.get(1).cloned();
-        run_simulation(map_path, colony_path, show_wireframe, map_size, max_organisms, training_mode);
+        run_simulation(map_path, colony_path, show_wireframe, map_size,
+                       max_organisms, max_herbivores, start_heterotrophs,
+                       training_mode);
     }
 }
 
@@ -178,6 +187,22 @@ fn parse_max_organisms(args: &[String]) -> Option<usize> {
     args.get(pos + 1)?.parse::<usize>().ok()
 }
 
+/// Parse `--max-herbivores N` out of argv. Returns `None` if the flag
+/// is missing or unparseable; callers fall back to
+/// `DEFAULT_MAX_HERBIVORES` (via `MaxHerbivores::default()`).
+fn parse_max_herbivores(args: &[String]) -> Option<usize> {
+    let pos = args.iter().position(|a| a == "--max-herbivores")?;
+    args.get(pos + 1)?.parse::<usize>().ok()
+}
+
+/// Parse `--start-heteros N` out of argv. Returns `None` if the flag
+/// is missing or unparseable; callers fall back to
+/// `DEFAULT_START_HETEROTROPHS` via `StartHeterotrophs::default()`.
+fn parse_start_heterotrophs(args: &[String]) -> Option<usize> {
+    let pos = args.iter().position(|a| a == "--start-heteros")?;
+    args.get(pos + 1)?.parse::<usize>().ok()
+}
+
 
 /// Collect positional CLI arguments. Skips known `--flag` tokens AND
 /// the two values that follow `--map-size` (which are numeric and
@@ -192,6 +217,14 @@ fn collect_positionals(args: &[String]) -> Vec<String> {
             continue;
         }
         if a == "--max-organisms" {
+            i += 2; // skip flag + value
+            continue;
+        }
+        if a == "--max-herbivores" {
+            i += 2; // skip flag + value
+            continue;
+        }
+        if a == "--start-heteros" {
             i += 2; // skip flag + value
             continue;
         }
@@ -229,12 +262,14 @@ fn respawn(parts: &[Option<String>]) {
 // ── Simulation (Bevy + Burn) ─────────────────────────────────────────────────
 
 fn run_simulation(
-    map_path:       String,
-    colony_path:    Option<String>,
-    show_wireframe: bool,
-    map_size:       world_geometry::MapSize,
-    max_organisms: Option<usize>,
-    training_mode:  bool,
+    map_path:           String,
+    colony_path:        Option<String>,
+    show_wireframe:     bool,
+    map_size:           world_geometry::MapSize,
+    max_organisms:      Option<usize>,
+    max_herbivores:     Option<usize>,
+    start_heterotrophs: Option<usize>,
+    training_mode:      bool,
 ) {
     if let Ok(mut cache_path) = std::env::current_dir() {
         cache_path.push("caches");
@@ -290,6 +325,20 @@ fn run_simulation(
         let n = n.max(1);
         app.insert_resource(simulation_settings::OrganismPoolSize(n));
         app.insert_resource(simulation_settings::MaxOrganisms(n));
+    }
+    // Herbivore reproduction cap from the launcher's "Max Herbivores"
+    // field (or `--max-herbivores N` argv). When absent, the default
+    // from `MaxHerbivores::default()` (i.e. `DEFAULT_MAX_HERBIVORES`)
+    // is used via the resource's `init_resource` registration.
+    if let Some(n) = max_herbivores {
+        app.insert_resource(simulation_settings::MaxHerbivores(n));
+    }
+    // Initial-cohort herbivore count from the launcher's "Start
+    // Heterotroph Number" field (or `--start-heteros N`). When
+    // absent, defaults to `DEFAULT_START_HETEROTROPHS` via the
+    // resource's `init_resource` registration.
+    if let Some(n) = start_heterotrophs {
+        app.insert_resource(simulation_settings::StartHeterotrophs(n));
     }
 
     // AI-training mode — inserted BEFORE `FrontendPlugin` adds its

@@ -18,10 +18,36 @@ use bevy::prelude::*;
 /// had a chance to choose. The launcher is the canonical way to raise
 /// the value; that value flows through `run_simulation` and becomes
 /// both the brain-pool size *and* the initial reproduction cap.
-pub const DEFAULT_MAX_ORGANISMS: usize = 1500;
+pub const DEFAULT_MAX_ORGANISMS: usize = 100;
 
-pub const DEFAULT_MAP_X:           f32        = 1024.0;
-pub const DEFAULT_MAP_Z:           f32        = 1024.0;
+/// Launcher-side default for the herbivore reproduction cap. The
+/// reproduction system stops scheduling new herbivore births once
+/// this number is reached. Kept small by default so a fresh launch
+/// stays manageable; the launcher text field lifts it for AI-training
+/// runs.
+pub const DEFAULT_MAX_HERBIVORES: usize = 5;
+
+/// Launcher-side default for the initial herbivore cohort size at
+/// `spawn_colony` (when no colony save is loaded). Independent from
+/// `DEFAULT_MAX_HERBIVORES` so the user can seed a small starter
+/// population and let reproduction grow it up to the cap.
+pub const DEFAULT_START_HETEROTROPHS: usize = 5;
+
+
+/// Number of heterotrophs to spawn at `spawn_colony` startup. Set
+/// from the launcher's "Start Heterotroph Number" field (or the
+/// `--start-heteros N` argv flag). Distinct from `MaxHerbivores`,
+/// which caps the running herbivore population — this resource only
+/// drives the *initial* cohort.
+#[derive(Resource)]
+pub struct StartHeterotrophs(pub usize);
+
+impl Default for StartHeterotrophs {
+    fn default() -> Self { Self(DEFAULT_START_HETEROTROPHS) }
+}
+
+pub const DEFAULT_MAP_X:           f32        = 100.0;
+pub const DEFAULT_MAP_Z:           f32        = 100.0;
 
 
 /// AI-training mode toggle for the heterotroph movement-RL
@@ -55,7 +81,7 @@ pub struct AiTrainingMode(pub bool);
 pub struct MaxHerbivores(pub usize);
 
 impl Default for MaxHerbivores {
-    fn default() -> Self { Self(150) }
+    fn default() -> Self { Self(DEFAULT_MAX_HERBIVORES) }
 }
 
 

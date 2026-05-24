@@ -148,6 +148,40 @@ pub fn collect_neighbours(
 }
 
 
+/// Count Photoautotroph grid entries within `radius` (XZ distance) of
+/// `self_pos`. Used by the herbivore reward channel to detect "how
+/// rich is this patch of the world" so the W_EAT channel can be
+/// normalised against random-walk baseline encounter rates in dense
+/// vs sparse conditions. Implementation mirrors `collect_neighbours`
+/// — scans the same 3×3 bucket window — but stops at a count rather
+/// than building a sorted list.
+pub fn count_local_prey(
+    grid:     &WorldModelGrid,
+    self_pos: Vec3,
+    radius:   f32,
+) -> u32 {
+    let bucket    = WORLD_MODEL_RADIUS;
+    let radius_sq = radius * radius;
+    let kx = (self_pos.x / bucket).floor() as i32;
+    let kz = (self_pos.z / bucket).floor() as i32;
+    let mut n: u32 = 0;
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if let Some(entries) = grid.grid.get(&(kx + dx, kz + dz)) {
+                for &e in entries {
+                    if !matches!(e.ty, OrganismType::Photo) { continue; }
+                    let rel = e.pos - self_pos;
+                    let d2  = rel.x * rel.x + rel.z * rel.z;
+                    if d2 < 1e-6 { continue; }
+                    if d2 <= radius_sq { n += 1; }
+                }
+            }
+        }
+    }
+    n
+}
+
+
 /// Encode pre-resolved neighbours into the network input slice
 /// (`out` must be exactly `WORLD_MODEL_DIMS` long). 6 dims per slot:
 /// `(rel_x_norm, rel_z_norm, vel_x_norm, vel_z_norm, is_photo, is_hetero)`.

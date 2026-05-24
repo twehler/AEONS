@@ -85,7 +85,7 @@ pub struct BrainInheritance(pub Entity);
 /// quickly from zeroed moments after load, and including them
 /// would make the save couple to Burn's internal optimiser
 /// representation which we'd rather not pin.
-#[derive(Component, Clone)]
+#[derive(Component, Clone, Debug)]
 pub struct BrainRestore {
     pub w1:           Vec<f32>,
     pub b1:           Vec<f32>,
