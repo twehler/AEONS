@@ -107,10 +107,11 @@ fn main() {
     // `--map-size X Z` — parse before collecting positionals so the
     // two numeric values don't end up in the positional list.
     let map_size = parse_map_size(&args).unwrap_or(world_geometry::MapSize::default());
-    let max_organisms      = parse_max_organisms(&args);
-    let max_herbivores     = parse_max_herbivores(&args);
-    let start_heterotrophs = parse_start_heterotrophs(&args);
-    let positional         = collect_positionals(&args);
+    let max_phototrophs        = parse_max_phototrophs(&args);
+    let max_herbivores         = parse_max_herbivores(&args);
+    let start_heterotrophs     = parse_start_heterotrophs(&args);
+    let start_photoautotrophs  = parse_start_photoautotrophs(&args);
+    let positional             = collect_positionals(&args);
 
     if positional.is_empty() && !editor_flag {
         // Launcher mode — show the eframe window with both action
@@ -121,7 +122,8 @@ fn main() {
         match mode {
             LaunchMode::RunSimulation {
                 map_path, colony_path, wireframe, map_x, map_z,
-                max_organisms, max_herbivores, start_heterotrophs,
+                max_phototrophs, max_herbivores,
+                start_heterotrophs, start_photoautotrophs,
                 training_mode: launcher_training_mode,
             } => {
                 respawn(&[
@@ -131,12 +133,14 @@ fn main() {
                     Some("--map-size".into()),
                     Some(map_x.to_string()),
                     Some(map_z.to_string()),
-                    Some("--max-organisms".into()),
-                    Some(max_organisms.to_string()),
+                    Some("--max-phototrophs".into()),
+                    Some(max_phototrophs.to_string()),
                     Some("--max-herbivores".into()),
                     Some(max_herbivores.to_string()),
                     Some("--start-heteros".into()),
                     Some(start_heterotrophs.to_string()),
+                    Some("--start-photos".into()),
+                    Some(start_photoautotrophs.to_string()),
                     // The launcher's checkbox is the source of truth
                     // for the child: even if the parent was started
                     // with `--trainingmode`, an unchecked box here
@@ -163,7 +167,8 @@ fn main() {
         let map_path    = positional[0].clone();
         let colony_path = positional.get(1).cloned();
         run_simulation(map_path, colony_path, show_wireframe, map_size,
-                       max_organisms, max_herbivores, start_heterotrophs,
+                       max_phototrophs, max_herbivores,
+                       start_heterotrophs, start_photoautotrophs,
                        training_mode);
     }
 }
@@ -179,11 +184,11 @@ fn parse_map_size(args: &[String]) -> Option<world_geometry::MapSize> {
     Some(world_geometry::MapSize { x, z })
 }
 
-/// Parse `--max-organisms N` out of argv. Returns `None` if the flag
+/// Parse `--max-phototrophs N` out of argv. Returns `None` if the flag
 /// is missing or unparseable; callers fall back to
-/// `DEFAULT_MAX_ORGANISMS` (via FrontendPlugin's `init_resource`).
-fn parse_max_organisms(args: &[String]) -> Option<usize> {
-    let pos = args.iter().position(|a| a == "--max-organisms")?;
+/// `DEFAULT_MAX_PHOTOAUTOTROPHS` (via FrontendPlugin's `init_resource`).
+fn parse_max_phototrophs(args: &[String]) -> Option<usize> {
+    let pos = args.iter().position(|a| a == "--max-phototrophs")?;
     args.get(pos + 1)?.parse::<usize>().ok()
 }
 
@@ -203,6 +208,14 @@ fn parse_start_heterotrophs(args: &[String]) -> Option<usize> {
     args.get(pos + 1)?.parse::<usize>().ok()
 }
 
+/// Parse `--start-photos N` out of argv. Returns `None` if the flag
+/// is missing or unparseable; callers fall back to
+/// `DEFAULT_START_PHOTOAUTOTROPHS` via `StartPhotoautotrophs::default()`.
+fn parse_start_photoautotrophs(args: &[String]) -> Option<usize> {
+    let pos = args.iter().position(|a| a == "--start-photos")?;
+    args.get(pos + 1)?.parse::<usize>().ok()
+}
+
 
 /// Collect positional CLI arguments. Skips known `--flag` tokens AND
 /// the two values that follow `--map-size` (which are numeric and
@@ -216,7 +229,7 @@ fn collect_positionals(args: &[String]) -> Vec<String> {
             i += 3; // skip flag + two values
             continue;
         }
-        if a == "--max-organisms" {
+        if a == "--max-phototrophs" {
             i += 2; // skip flag + value
             continue;
         }
@@ -225,6 +238,10 @@ fn collect_positionals(args: &[String]) -> Vec<String> {
             continue;
         }
         if a == "--start-heteros" {
+            i += 2; // skip flag + value
+            continue;
+        }
+        if a == "--start-photos" {
             i += 2; // skip flag + value
             continue;
         }
@@ -262,14 +279,15 @@ fn respawn(parts: &[Option<String>]) {
 // ── Simulation (Bevy + Burn) ─────────────────────────────────────────────────
 
 fn run_simulation(
-    map_path:           String,
-    colony_path:        Option<String>,
-    show_wireframe:     bool,
-    map_size:           world_geometry::MapSize,
-    max_organisms:      Option<usize>,
-    max_herbivores:     Option<usize>,
-    start_heterotrophs: Option<usize>,
-    training_mode:      bool,
+    map_path:               String,
+    colony_path:            Option<String>,
+    show_wireframe:         bool,
+    map_size:               world_geometry::MapSize,
+    max_phototrophs:        Option<usize>,
+    max_herbivores:         Option<usize>,
+    start_heterotrophs:     Option<usize>,
+    start_photoautotrophs:  Option<usize>,
+    training_mode:          bool,
 ) {
     if let Ok(mut cache_path) = std::env::current_dir() {
         cache_path.push("caches");
@@ -311,27 +329,33 @@ fn run_simulation(
     // / pos-normalisation site that previously read the MAP_MAX_X/Z consts.
     app.insert_resource(map_size);
 
-    // GPU brain-pool batch dimension AND initial reproduction cap.
-    // The launcher's "Max Organisms" field flows through here as
-    // argv `--max-organisms N` → `max_organisms = Some(N)`. Both
-    // `OrganismPoolSize` (the fixed-at-startup pool size) and the
-    // editable `MaxOrganisms` soft cap are seeded to the same value
-    // so the user gets the full pool at launch and can dial the
-    // soft cap down at runtime via the statistics panel. Falling
-    // through to `init_resource` defaults (= DEFAULT_MAX_ORGANISMS)
-    // when no flag is supplied is fine — the resources are inserted
-    // BEFORE `BehaviourPlugin` builds the brain pools.
-    if let Some(n) = max_organisms {
+    // Photoautotroph cap. The launcher's "Max Phototrophic Organisms"
+    // field flows through here as `--max-phototrophs N`. Drives ONLY
+    // the photo running-population cap; brain-pool sizing is
+    // independent (see below). Falling through to `init_resource`
+    // defaults (= DEFAULT_MAX_PHOTOAUTOTROPHS) when no flag is
+    // supplied is fine — the resources are inserted BEFORE
+    // `BehaviourPlugin` builds the brain pools.
+    if let Some(n) = max_phototrophs {
         let n = n.max(1);
-        app.insert_resource(simulation_settings::OrganismPoolSize(n));
-        app.insert_resource(simulation_settings::MaxOrganisms(n));
+        app.insert_resource(simulation_settings::MaxPhotoautotrophs(n));
     }
     // Herbivore reproduction cap from the launcher's "Max Herbivores"
     // field (or `--max-herbivores N` argv). When absent, the default
     // from `MaxHerbivores::default()` (i.e. `DEFAULT_MAX_HERBIVORES`)
     // is used via the resource's `init_resource` registration.
+    //
+    // The GPU brain-pool size (`OrganismPoolSize`) is derived from
+    // this value with generous headroom: heterotrophs are the only
+    // brain-using organisms, so the pool only needs to cover them.
+    // We multiply by 4× so the user can raise `MaxHerbivores` at
+    // runtime through the statistics panel without running out of
+    // brain slots — beyond 4× the brain pool will run dry and extra
+    // heteros spawn brain-less until a slot frees up.
     if let Some(n) = max_herbivores {
+        let n = n.max(1);
         app.insert_resource(simulation_settings::MaxHerbivores(n));
+        app.insert_resource(simulation_settings::OrganismPoolSize((n * 4).max(16)));
     }
     // Initial-cohort herbivore count from the launcher's "Start
     // Heterotroph Number" field (or `--start-heteros N`). When
@@ -339,6 +363,13 @@ fn run_simulation(
     // resource's `init_resource` registration.
     if let Some(n) = start_heterotrophs {
         app.insert_resource(simulation_settings::StartHeterotrophs(n));
+    }
+    // Initial-cohort photoautotroph count from the launcher's
+    // "Spawn Phototrophic Organisms" field (or `--start-photos N`).
+    // When absent, falls back to the resource's `init_resource`
+    // default = `DEFAULT_START_PHOTOAUTOTROPHS`.
+    if let Some(n) = start_photoautotrophs {
+        app.insert_resource(simulation_settings::StartPhotoautotrophs(n));
     }
 
     // AI-training mode — inserted BEFORE `FrontendPlugin` adds its

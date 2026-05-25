@@ -74,8 +74,8 @@ fn reproduction_system(
     heightmap:      Option<Res<HeightmapSampler>>,
     smoothing:      Res<crate::simulation_settings::Smoothing>,
     map_size:       Res<MapSize>,
-    max_organisms:  Res<crate::simulation_settings::MaxOrganisms>,
-    max_herbivores: Res<crate::simulation_settings::MaxHerbivores>,
+    max_photoautotrophs: Res<crate::simulation_settings::MaxPhotoautotrophs>,
+    max_herbivores:      Res<crate::simulation_settings::MaxHerbivores>,
     mut query:      Query<
         (Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
         With<OrganismRoot>,
@@ -90,39 +90,41 @@ fn reproduction_system(
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
-    // Soft cap (runtime resource). The statistics panel already clamps
-    // commits to `OrganismPoolSize` (brain-pool batch dim chosen at
-    // startup), so we can read it without additional defence here.
-    let cap = max_organisms.0;
-    let current_pop = query.iter().count();
-    if current_pop >= cap { return; }
-    let spawn_budget = cap - current_pop;
-
-    // Herbivore-specific cap: count live herbivores (Heterotroph minus
-    // Carnivore) up-front. The reproduction loop refuses to schedule
-    // a new herbivore birth once the running total (live + pending)
-    // reaches this number — the population is held flat from there
-    // until enough have died for the count to drop again.
-    let max_herb        = max_herbivores.0;
+    // Per-class caps. The photoautotroph cap and the herbivore cap
+    // are INDEPENDENT — each class fills its own budget without
+    // competing for shared slots. The global brain pool size
+    // (`OrganismPoolSize`) still bounds heterotrophs implicitly: an
+    // offspring beyond pool size spawns but doesn't get a brain slot
+    // until one frees up.
+    let photo_cap  = max_photoautotrophs.0;
+    let herb_cap   = max_herbivores.0;
+    let live_photos = query.iter()
+        .filter(|(_, _, _, is_photo, _, _)| *is_photo)
+        .count();
     let live_herbivores = query.iter()
         .filter(|(_, _, _, _, is_hetero, is_carn)| *is_hetero && !*is_carn)
         .count();
+    let mut pending_photo_births:     usize = 0;
     let mut pending_herbivore_births: usize = 0;
 
     let mut pending_births: Vec<PendingBirth> = Vec::new();
     let mut rng = rand::rng();
 
     for (parent_entity, mut organism, transform, is_photo, is_hetero, is_carn) in &mut query {
-        if pending_births.len() >= spawn_budget { break; }
-
         if organism.reproduced { continue; }
 
-        // Herbivore cap: if reproducing this parent would push the
-        // running herbivore total at/above `max_herb`, skip. Carnivores
-        // and photoautotrophs are unaffected.
+        // Per-class budget: skip the parent when reproducing would
+        // push the relevant class's running total at/above its cap.
+        // Carnivores are unbounded — they reproduce freely subject
+        // only to `reproduced` flag and energy threshold.
         let is_herbivore = is_hetero && !is_carn;
+        if is_photo
+            && (live_photos + pending_photo_births) >= photo_cap
+        {
+            continue;
+        }
         if is_herbivore
-            && (live_herbivores + pending_herbivore_births) >= max_herb
+            && (live_herbivores + pending_herbivore_births) >= herb_cap
         {
             continue;
         }
@@ -261,6 +263,7 @@ fn reproduction_system(
         let spawn_pos = Vec3::new(spawn_x, spawn_y, spawn_z);
 
         if is_herbivore { pending_herbivore_births += 1; }
+        if is_photo     { pending_photo_births     += 1; }
 
         pending_births.push(PendingBirth {
             pos:        spawn_pos,

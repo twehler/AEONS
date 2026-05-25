@@ -40,6 +40,7 @@ impl Plugin for ColonyPlugin {
         app.init_resource::<ColonyLoadPath>();
         app.init_resource::<crate::simulation_settings::AutoSpawnHeteros>();
         app.init_resource::<crate::simulation_settings::StartHeterotrophs>();
+        app.init_resource::<crate::simulation_settings::StartPhotoautotrophs>();
         app.init_resource::<crate::simulation_settings::MinHeteroCount>();
         app.init_resource::<crate::simulation_settings::MinHeteroCountEditState>();
         app.init_resource::<AutosaveTimer>();
@@ -904,9 +905,10 @@ fn spawn_colony(
     load_path:       Res<ColonyLoadPath>,
     smoothing:       Res<crate::simulation_settings::Smoothing>,
     map_size:        Res<MapSize>,
-    max_organisms:   Res<crate::simulation_settings::MaxOrganisms>,
-    max_herbivores:  Res<crate::simulation_settings::MaxHerbivores>,
-    start_heteros:   Res<crate::simulation_settings::StartHeterotrophs>,
+    max_photoautotrophs: Res<crate::simulation_settings::MaxPhotoautotrophs>,
+    max_herbivores:      Res<crate::simulation_settings::MaxHerbivores>,
+    start_heteros:       Res<crate::simulation_settings::StartHeterotrophs>,
+    start_photos:        Res<crate::simulation_settings::StartPhotoautotrophs>,
     mut spawned:     Local<bool>,
 ) {
     if *spawned { return; }
@@ -944,21 +946,21 @@ fn spawn_colony(
         }
     }
 
-    // Derive cohort sizes from the launcher-set values (defaulting
-    // to the matching `DEFAULT_*` constants). `saturating_sub` keeps
-    // a pathological `MaxHerbivores > MaxOrganisms` config from
-    // underflowing — the photoautotroph count just becomes zero.
-    // `n_herbivores` reads from `StartHeterotrophs` (the launcher's
-    // "Start Heterotroph Number" field) so the initial cohort can be
-    // smaller than the running cap (`MaxHerbivores`); reproduction
-    // then fills the population up to the cap.
+    // Derive initial cohort sizes from the launcher-set spawn-count
+    // resources (defaulting to the matching `DEFAULT_*` constants).
+    // Both spawn counts are independent of the running-population
+    // caps (`MaxPhotoautotrophs` / `MaxHerbivores`) so the user can
+    // seed a small starter cohort and let reproduction backfill the
+    // population up to each class's cap.
     let n_herbivores      = start_heteros.0;
-    let n_photoautotrophs = max_organisms.0.saturating_sub(max_herbivores.0);
+    let n_photoautotrophs = start_photos.0;
     info!(
         "spawn_colony: target cohort = {} photoautotrophs + {} herbivores \
-         (MaxOrganisms={}, MaxHerbivores={}, StartHeterotrophs={})",
+         (StartPhotoautotrophs={}, StartHeterotrophs={}, \
+          MaxPhotoautotrophs={}, MaxHerbivores={})",
         n_photoautotrophs, n_herbivores,
-        max_organisms.0, max_herbivores.0, start_heteros.0,
+        start_photos.0, start_heteros.0,
+        max_photoautotrophs.0, max_herbivores.0,
     );
 
     for _ in 0..n_photoautotrophs {

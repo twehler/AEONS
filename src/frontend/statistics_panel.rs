@@ -19,7 +19,7 @@ use bevy::render::render_resource::TextureFormat;
 
 use crate::colony::{Photoautotroph, Heterotroph, Organism, OrganismRoot, SaveRequested};
 use crate::frontend::PANEL_BG_COLOR;
-use crate::simulation_settings::{SimulationRunning, TimeSpeed, MaxOrganisms};
+use crate::simulation_settings::{SimulationRunning, TimeSpeed, MaxPhotoautotrophs};
 
 use rand::prelude::*;
 
@@ -75,14 +75,14 @@ const SPEED_INPUT_BG_FOCUSED: Color = Color::srgb(0.32, 0.30, 0.18);
 const SPEED_BUFFER_MAX_LEN:   usize = 8;
 
 /// Max-organisms input field — same widget pattern as the speed input.
-const MAX_ORG_INPUT_WIDTH_PX:  f32   = 88.0;
-const MAX_ORG_INPUT_HEIGHT_PX: f32   = 26.0;
-const MAX_ORG_BG_IDLE:         Color = Color::srgb(0.20, 0.20, 0.22);
-const MAX_ORG_BG_FOCUSED:      Color = Color::srgb(0.32, 0.30, 0.18);
-const MAX_ORG_BUFFER_MAX_LEN:  usize = 8;
+const MAX_PHOTO_INPUT_WIDTH_PX:  f32   = 88.0;
+const MAX_PHOTO_INPUT_HEIGHT_PX: f32   = 26.0;
+const MAX_PHOTO_BG_IDLE:         Color = Color::srgb(0.20, 0.20, 0.22);
+const MAX_PHOTO_BG_FOCUSED:      Color = Color::srgb(0.32, 0.30, 0.18);
+const MAX_PHOTO_BUFFER_MAX_LEN:  usize = 8;
 
 /// Font size for the photo / hetero count texts. Lowered from 20.0 to
-/// make room for the "Max Organisms:" input row above them.
+/// make room for the "Max Phototrophic Organisms:" input row above them.
 const COUNT_FONT_SIZE:         f32 = 14.0;
 
 /// Spacing between the Max-Organisms input row and the counters below.
@@ -197,17 +197,17 @@ pub struct HeteroCountText;
 
 /// Click target for the "Max Organisms" integer-input field.
 #[derive(Component)]
-pub struct MaxOrganismsInput;
+pub struct MaxPhotoautotrophsInput;
 
 /// Marker on the Text child inside the Max-Organisms input box.
 #[derive(Component)]
-pub struct MaxOrganismsText;
+pub struct MaxPhotoautotrophsText;
 
 /// Edit-state for the Max-Organisms input. Same model as
 /// `TimeSpeedEditState` — `focused` is true while the user is actively
 /// typing; `buffer` holds the in-progress digits.
 #[derive(Resource, Default)]
-pub struct MaxOrganismsEditState {
+pub struct MaxPhotoautotrophsEditState {
     pub buffer:  String,
     pub focused: bool,
 }
@@ -238,7 +238,7 @@ pub struct MaxHerbivoresInput;
 pub struct MaxHerbivoresText;
 
 /// Edit-state for the Max-Herbivores input — mirrors
-/// `MaxOrganismsEditState`. `focused` is true while the user is
+/// `MaxPhotoautotrophsEditState`. `focused` is true while the user is
 /// actively typing; `buffer` holds the in-progress digits.
 #[derive(Resource, Default)]
 pub struct MaxHerbivoresEditState {
@@ -247,7 +247,7 @@ pub struct MaxHerbivoresEditState {
 }
 
 /// Notification state for the random-cull toast. Set by
-/// `apply_max_organisms_cull` when the soft cap drops below the current
+/// `apply_max_phototrophs_cull` when the soft cap drops below the current
 /// population; auto-cleared after `CULL_MSG_VISIBLE_SECS` seconds.
 #[derive(Resource, Default)]
 pub struct CullMessage {
@@ -462,7 +462,7 @@ pub fn spawn_panel(
                 ..default()
             })
             .with_children(|right| {
-                // ── "Max Organisms:" row (label + integer input). ──
+                // ── "Max Phototrophic Organisms:" row (label + integer input). ──
                 right
                     .spawn(Node {
                         flex_direction: FlexDirection::Row,
@@ -471,7 +471,7 @@ pub fn spawn_panel(
                     })
                     .with_children(|row| {
                         row.spawn((
-                            Text::new("Max Organisms:"),
+                            Text::new("Max Phototrophic Organisms:"),
                             TextFont { font_size: 14.0, ..default() },
                             TextColor(Color::WHITE),
                             Node { margin: UiRect::right(Val::Px(8.0)), ..default() },
@@ -479,21 +479,21 @@ pub fn spawn_panel(
                         ));
                         row
                             .spawn((
-                                MaxOrganismsInput,
+                                MaxPhotoautotrophsInput,
                                 Button,
                                 Node {
-                                    width:   Val::Px(MAX_ORG_INPUT_WIDTH_PX),
-                                    height:  Val::Px(MAX_ORG_INPUT_HEIGHT_PX),
+                                    width:   Val::Px(MAX_PHOTO_INPUT_WIDTH_PX),
+                                    height:  Val::Px(MAX_PHOTO_INPUT_HEIGHT_PX),
                                     padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
                                     align_items:     AlignItems::Center,
                                     justify_content: JustifyContent::FlexStart,
                                     ..default()
                                 },
-                                BackgroundColor(MAX_ORG_BG_IDLE),
+                                BackgroundColor(MAX_PHOTO_BG_IDLE),
                             ))
                             .with_children(|btn| {
                                 btn.spawn((
-                                    MaxOrganismsText,
+                                    MaxPhotoautotrophsText,
                                     Text::new("0"),
                                     TextFont { font_size: 14.0, ..default() },
                                     TextColor(Color::WHITE),
@@ -640,14 +640,14 @@ pub fn spawn_panel(
                                 MaxHerbivoresInput,
                                 Button,
                                 Node {
-                                    width:   Val::Px(MAX_ORG_INPUT_WIDTH_PX),
-                                    height:  Val::Px(MAX_ORG_INPUT_HEIGHT_PX),
+                                    width:   Val::Px(MAX_PHOTO_INPUT_WIDTH_PX),
+                                    height:  Val::Px(MAX_PHOTO_INPUT_HEIGHT_PX),
                                     padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
                                     align_items:     AlignItems::Center,
                                     justify_content: JustifyContent::FlexStart,
                                     ..default()
                                 },
-                                BackgroundColor(MAX_ORG_BG_IDLE),
+                                BackgroundColor(MAX_PHOTO_BG_IDLE),
                             ))
                             .with_children(|btn| {
                                 btn.spawn((
@@ -1353,7 +1353,7 @@ pub fn apply_time_speed(
 
 /// Click + keyboard router for the Max-Organisms integer-input field.
 /// Mirrors the `handle_time_speed_input` design, but accepts digits only
-/// (no decimal point) and commits a `usize` into `MaxOrganisms`. The
+/// (no decimal point) and commits a `usize` into `MaxPhotoautotrophs`. The
 /// value is *not* clamped to `OrganismPoolSize` — the user is free to
 /// raise the soft cap above the GPU brain-pool batch dim chosen at
 /// startup. Organisms spawned past the pool size will simply not
@@ -1361,12 +1361,12 @@ pub fn apply_time_speed(
 /// them when `pool.free` is empty), which is harmless: those
 /// organisms behave as if their last brain output is still in effect
 /// until they die or are recycled into a freed slot.
-pub fn handle_max_organisms_input(
+pub fn handle_max_phototrophs_input(
     mouse:            Res<ButtonInput<MouseButton>>,
     mut keyboard:     MessageReader<KeyboardInput>,
-    interaction_q:    Query<&Interaction, With<MaxOrganismsInput>>,
-    mut state:        ResMut<MaxOrganismsEditState>,
-    mut max_org:      ResMut<MaxOrganisms>,
+    interaction_q:    Query<&Interaction, With<MaxPhotoautotrophsInput>>,
+    mut state:        ResMut<MaxPhotoautotrophsEditState>,
+    mut max_photo:      ResMut<MaxPhotoautotrophs>,
 ) {
     let click_on_input = mouse.just_pressed(MouseButton::Left)
         && interaction_q.iter().any(|i| matches!(i, Interaction::Pressed));
@@ -1375,11 +1375,11 @@ pub fn handle_max_organisms_input(
     if click_on_input && !state.focused {
         state.focused = true;
         state.buffer.clear();
-        let _ = write!(state.buffer, "{}", max_org.0);
+        let _ = write!(state.buffer, "{}", max_photo.0);
     }
 
     if click_outside && state.focused {
-        commit_max_organisms(&mut state, &mut max_org);
+        commit_max_phototrophs(&mut state, &mut max_photo);
     }
 
     if !state.focused {
@@ -1391,7 +1391,7 @@ pub fn handle_max_organisms_input(
         if !ev.state.is_pressed() { continue; }
         match ev.key_code {
             KeyCode::Enter | KeyCode::NumpadEnter => {
-                commit_max_organisms(&mut state, &mut max_org);
+                commit_max_phototrophs(&mut state, &mut max_photo);
             }
             KeyCode::Escape => {
                 state.focused = false;
@@ -1403,7 +1403,7 @@ pub fn handle_max_organisms_input(
             _ => {
                 if let Some(text) = ev.text.as_ref() {
                     for c in text.chars() {
-                        if state.buffer.len() >= MAX_ORG_BUFFER_MAX_LEN { break; }
+                        if state.buffer.len() >= MAX_PHOTO_BUFFER_MAX_LEN { break; }
                         if c.is_ascii_digit() {
                             state.buffer.push(c);
                         }
@@ -1420,10 +1420,10 @@ pub fn handle_max_organisms_input(
 /// the cap exceeds the pool size, new organisms simply spawn without
 /// brain slots until a slot frees up. Always unfocus + clear the
 /// buffer.
-fn commit_max_organisms(state: &mut MaxOrganismsEditState, max_org: &mut MaxOrganisms) {
+fn commit_max_phototrophs(state: &mut MaxPhotoautotrophsEditState, max_photo: &mut MaxPhotoautotrophs) {
     if let Ok(v) = state.buffer.parse::<usize>() {
-        if max_org.0 != v {
-            max_org.0 = v;
+        if max_photo.0 != v {
+            max_photo.0 = v;
         }
     }
     state.focused = false;
@@ -1431,51 +1431,52 @@ fn commit_max_organisms(state: &mut MaxOrganismsEditState, max_org: &mut MaxOrga
 }
 
 /// Sync the input box's text + background colour with the current
-/// committed `MaxOrganisms` value and edit state.
-pub fn update_max_organisms_text(
-    state:      Res<MaxOrganismsEditState>,
-    max_org:    Res<MaxOrganisms>,
-    mut text_q: Query<&mut Text, With<MaxOrganismsText>>,
-    mut bg_q:   Query<&mut BackgroundColor, With<MaxOrganismsInput>>,
+/// committed `MaxPhotoautotrophs` value and edit state.
+pub fn update_max_phototrophs_text(
+    state:      Res<MaxPhotoautotrophsEditState>,
+    max_photo:    Res<MaxPhotoautotrophs>,
+    mut text_q: Query<&mut Text, With<MaxPhotoautotrophsText>>,
+    mut bg_q:   Query<&mut BackgroundColor, With<MaxPhotoautotrophsInput>>,
 ) {
-    if !state.is_changed() && !max_org.is_changed() { return; }
+    if !state.is_changed() && !max_photo.is_changed() { return; }
 
     let display = if state.focused {
         format!("{}_", state.buffer)
     } else {
-        format!("{}", max_org.0)
+        format!("{}", max_photo.0)
     };
     for mut text in &mut text_q {
         text.0 = display.clone();
     }
 
-    let bg = if state.focused { MAX_ORG_BG_FOCUSED } else { MAX_ORG_BG_IDLE };
+    let bg = if state.focused { MAX_PHOTO_BG_FOCUSED } else { MAX_PHOTO_BG_IDLE };
     for mut b in &mut bg_q {
         if b.0 != bg { *b = BackgroundColor(bg); }
     }
 }
 
 
-// ── Max-Organisms enforcement (random cull) ─────────────────────────────────
+// ── Max-Phototrophs enforcement (random cull of photoautotrophs only) ──────
 
-/// When `MaxOrganisms` changes downward below the current OrganismRoot
-/// count, randomly sample `(count - max)` entities in a single pass and
-/// despawn them. The orange notification text is populated for
-/// `update_cull_message` to surface.
+/// When `MaxPhotoautotrophs` changes downward below the current
+/// photoautotroph count, randomly sample `(count - max)` photo entities
+/// in a single pass and despawn them. Heterotrophs are NOT touched —
+/// they have their own independent cap (`MaxHerbivores`). The orange
+/// notification text is populated for `update_cull_message` to surface.
 ///
 /// Selection: partial Fisher–Yates shuffle on the entity vector — O(n)
 /// memory, O(k) random swaps where k = entities to remove. No per-tick
 /// allocation in steady state because the system early-returns unless
-/// the resource changed *and* the population exceeds the cap.
-pub fn apply_max_organisms_cull(
+/// the resource changed *and* the photo population exceeds the cap.
+pub fn apply_max_phototrophs_cull(
     mut commands:   Commands,
-    max_org:        Res<MaxOrganisms>,
-    organisms:      Query<Entity, With<OrganismRoot>>,
+    max_photo:      Res<MaxPhotoautotrophs>,
+    photos:         Query<Entity, (With<OrganismRoot>, With<Photoautotroph>)>,
     mut message:    ResMut<CullMessage>,
 ) {
-    if !max_org.is_changed() { return; }
-    let cap = max_org.0;
-    let mut roots: Vec<Entity> = organisms.iter().collect();
+    if !max_photo.is_changed() { return; }
+    let cap = max_photo.0;
+    let mut roots: Vec<Entity> = photos.iter().collect();
     if roots.len() <= cap { return; }
 
     let to_remove = roots.len() - cap;
@@ -1595,7 +1596,7 @@ pub fn update_ai_training_checkbox_mark(
 // the same pattern used by the Max-Organisms field. Differs in two
 // places: (a) no upper clamp (the field gates reproduction, not the
 // GPU brain-pool batch dim), and (b) the committed value lands in
-// `MaxHerbivores` instead of `MaxOrganisms`.
+// `MaxHerbivores` instead of `MaxPhotoautotrophs`.
 
 pub fn handle_max_herbivores_input(
     mouse:         Res<ButtonInput<MouseButton>>,
@@ -1639,7 +1640,7 @@ pub fn handle_max_herbivores_input(
             _ => {
                 if let Some(text) = ev.text.as_ref() {
                     for c in text.chars() {
-                        if state.buffer.len() >= MAX_ORG_BUFFER_MAX_LEN { break; }
+                        if state.buffer.len() >= MAX_PHOTO_BUFFER_MAX_LEN { break; }
                         if c.is_ascii_digit() {
                             state.buffer.push(c);
                         }
@@ -1680,7 +1681,7 @@ pub fn update_max_herbivores_text(
         text.0 = display.clone();
     }
 
-    let bg = if state.focused { MAX_ORG_BG_FOCUSED } else { MAX_ORG_BG_IDLE };
+    let bg = if state.focused { MAX_PHOTO_BG_FOCUSED } else { MAX_PHOTO_BG_IDLE };
     for mut b in &mut bg_q {
         if b.0 != bg { *b = BackgroundColor(bg); }
     }

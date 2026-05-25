@@ -12,13 +12,13 @@
 
 use bevy::prelude::*;
 
-/// Default value seeded into both `MaxOrganisms` and `OrganismPoolSize`
-/// when nothing else (launcher / CLI flag) sets them. Picked low so a
-/// fresh launch doesn't allocate huge GPU tensors before the user has
-/// had a chance to choose. The launcher is the canonical way to raise
-/// the value; that value flows through `run_simulation` and becomes
-/// both the brain-pool size *and* the initial reproduction cap.
-pub const DEFAULT_MAX_ORGANISMS: usize = 100;
+/// Default value seeded into `MaxPhotoautotrophs` when nothing else
+/// (launcher / CLI flag) sets it. This is the *running-population
+/// cap* on photoautotrophs only — heterotrophs have their own
+/// independent cap (`MaxHerbivores`). The GPU brain-pool batch dim
+/// (`OrganismPoolSize`) is derived separately from `MaxHerbivores`
+/// at startup, since only heterotrophs use brain slots.
+pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 100;
 
 /// Launcher-side default for the herbivore reproduction cap. The
 /// reproduction system stops scheduling new herbivore births once
@@ -33,6 +33,12 @@ pub const DEFAULT_MAX_HERBIVORES: usize = 5;
 /// population and let reproduction grow it up to the cap.
 pub const DEFAULT_START_HETEROTROPHS: usize = 5;
 
+/// Launcher-side default for the initial photoautotroph cohort size
+/// at `spawn_colony` (when no colony save is loaded). Independent
+/// from `DEFAULT_MAX_PHOTOAUTOTROPHS` so the user can seed a small
+/// starter population and let reproduction grow it up to the cap.
+pub const DEFAULT_START_PHOTOAUTOTROPHS: usize = 100;
+
 
 /// Number of heterotrophs to spawn at `spawn_colony` startup. Set
 /// from the launcher's "Start Heterotroph Number" field (or the
@@ -44,6 +50,18 @@ pub struct StartHeterotrophs(pub usize);
 
 impl Default for StartHeterotrophs {
     fn default() -> Self { Self(DEFAULT_START_HETEROTROPHS) }
+}
+
+/// Number of photoautotrophs to spawn at `spawn_colony` startup. Set
+/// from the launcher's "Spawn Phototrophic Organisms" field (or the
+/// `--start-photos N` argv flag). Distinct from `MaxPhotoautotrophs`,
+/// which caps the running photo population — this resource only
+/// drives the *initial* cohort.
+#[derive(Resource)]
+pub struct StartPhotoautotrophs(pub usize);
+
+impl Default for StartPhotoautotrophs {
+    fn default() -> Self { Self(DEFAULT_START_PHOTOAUTOTROPHS) }
 }
 
 pub const DEFAULT_MAP_X:           f32        = 100.0;
@@ -211,21 +229,23 @@ impl Default for Smoothing {
 
 
 
-/// Runtime-adjustable upper bound on the live OrganismRoot count.
+/// Runtime-adjustable upper bound on the live photoautotroph count.
 ///
-/// Reproduction reads this resource each tick — when set lower than the
-/// current population, `apply_max_organisms_cull` (in
-/// `statistics_panel.rs`) despawns a random subset to meet the new cap
-/// in one step.
+/// Reproduction reads this resource each tick — when the live photo
+/// count is at or above this cap, the reproduction system suppresses
+/// further photo births. When the cap is lowered below the current
+/// photo count, `apply_max_phototrophs_cull` (in
+/// `statistics_panel.rs`) despawns a random subset of photos to
+/// meet the new cap in one step.
 ///
-/// The hard ceiling for this value is `OrganismPoolSize` (the GPU
-/// brain-pool tensor size, fixed at startup). The statistics-panel
-/// commit clamps user input to `[0, OrganismPoolSize]`.
+/// Heterotrophs are NOT bounded by this resource — they have their
+/// own `MaxHerbivores` cap and their own brain-pool sizing via
+/// `OrganismPoolSize`.
 #[derive(Resource)]
-pub struct MaxOrganisms(pub usize);
+pub struct MaxPhotoautotrophs(pub usize);
 
-impl Default for MaxOrganisms {
-    fn default() -> Self { Self(DEFAULT_MAX_ORGANISMS) }
+impl Default for MaxPhotoautotrophs {
+    fn default() -> Self { Self(DEFAULT_MAX_PHOTOAUTOTROPHS) }
 }
 
 
@@ -285,17 +305,19 @@ pub struct MinHeteroCountEditState {
 /// The four `BrainPool*` resources size their GPU tensors against this
 /// value during `FromWorld::from_world`. Because the CubeCL kernel
 /// cache + the burn-cuda tensor allocations are pinned to this shape,
-/// it CANNOT change at runtime — the statistics panel's editable
-/// "Max Organisms" field is clamped to it.
+/// it CANNOT change at runtime. Heterotroph reproduction past this
+/// limit will skip brain-slot assignment for the extras (they exist
+/// as entities but the brain pool can't enrol them).
 ///
-/// Set by `main.rs::run_simulation` from the launcher's input
-/// (`--max-organisms N`). When no flag is provided this falls back to
-/// `DEFAULT_MAX_ORGANISMS`.
+/// Set by `main.rs::run_simulation` from a conservative bound on the
+/// heterotroph population — typically `MaxHerbivores` plus headroom.
+/// Independent from the photo cap (`MaxPhotoautotrophs`) since
+/// photos don't have brain slots.
 #[derive(Resource)]
 pub struct OrganismPoolSize(pub usize);
 
 impl Default for OrganismPoolSize {
-    fn default() -> Self { Self(DEFAULT_MAX_ORGANISMS) }
+    fn default() -> Self { Self(DEFAULT_MAX_PHOTOAUTOTROPHS) }
 }
 
 

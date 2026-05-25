@@ -12,20 +12,22 @@ use std::sync::mpsc;
 use eframe::egui;
 
 use crate::simulation_settings::{
-    DEFAULT_MAX_ORGANISMS, DEFAULT_MAX_HERBIVORES, DEFAULT_START_HETEROTROPHS,
+    DEFAULT_MAX_PHOTOAUTOTROPHS, DEFAULT_MAX_HERBIVORES,
+    DEFAULT_START_HETEROTROPHS, DEFAULT_START_PHOTOAUTOTROPHS,
     DEFAULT_MAP_X, DEFAULT_MAP_Z,
 };
 
-/// Soft practical upper bound for the launcher's "Max Organisms" field.
-/// Higher values still work (the simulation simply allocates a larger
-/// GPU brain pool), but the DragValue would feel runaway at very high
-/// magnitudes. Picked to comfortably exceed any realistic colony size.
-const LAUNCHER_MAX_ORGANISMS_CAP: usize = 100_000;
+/// Soft practical upper bound for the launcher's "Max Phototrophic
+/// Organisms" field (and the other population-cap fields). Higher
+/// values still work, but the DragValue would feel runaway at very
+/// high magnitudes. Picked to comfortably exceed any realistic
+/// colony size.
+const LAUNCHER_POPULATION_CAP: usize = 100_000;
 
 
 // ── Layout constants ─────────────────────────────────────────────────────────
 
-const LAUNCHER_WINDOW_SIZE:    egui::Vec2 = egui::vec2(800.0, 680.0);
+const LAUNCHER_WINDOW_SIZE:    egui::Vec2 = egui::vec2(800.0, 720.0);
 const BANNER_PATH:             &str       = "logos/dna.png";
 const BANNER_POS:              egui::Pos2 = egui::pos2(0.0, 0.0);
 const BANNER_SIZE:             egui::Vec2 = egui::vec2(800.0, 200.0);
@@ -53,7 +55,7 @@ const MAPSIZE_MIN:             f32        = 50.0;
 const MAPSIZE_MAX:             f32        = 8192.0;
 
 // Max-organisms row. Single `DragValue` capped at
-// `LAUNCHER_MAX_ORGANISMS_CAP`. The chosen value is forwarded to the
+// `LAUNCHER_POPULATION_CAP`. The chosen value is forwarded to the
 // child subprocess via `--max-organisms N` argv and sizes both the
 // GPU brain-pool tensors (`OrganismPoolSize`) AND the initial
 // reproduction soft cap (`MaxOrganisms`) at simulation startup.
@@ -65,39 +67,50 @@ const ADJUSTCOL_ROW_TOP:       f32        = 380.0;
 const ADJUSTCOL_POS:           egui::Pos2 = egui::pos2(60.0, ADJUSTCOL_ROW_TOP);
 const ADJUSTCOL_SIZE:          egui::Vec2 = egui::vec2(400.0, 24.0);
 
-const MAXORG_ROW_TOP:          f32        = 415.0;
-const MAXORG_LABEL_POS:        egui::Pos2 = egui::pos2(60.0, MAXORG_ROW_TOP);
-const MAXORG_LABEL_SIZE:       egui::Vec2 = egui::vec2(180.0, 32.0);
-const MAXORG_DRAG_POS:         egui::Pos2 = egui::pos2(245.0, MAXORG_ROW_TOP);
-const MAXORG_FIELD_SIZE:       egui::Vec2 = egui::vec2(110.0, 32.0);
+// Wider label box than the old "Max Organisms:" row because
+// "Max Phototrophic Organisms:" is ~12 characters longer; matches
+// the Start-Heterotroph-Number layout below.
+// Wider label box than the old "Max Organisms:" row because
+// "Max Phototrophic Organisms:" is ~12 characters longer; matches
+// the Start-Heterotroph-Number layout below.
+const MAXPHOTO_ROW_TOP:          f32        = 415.0;
+const MAXPHOTO_LABEL_POS:        egui::Pos2 = egui::pos2(60.0, MAXPHOTO_ROW_TOP);
+const MAXPHOTO_LABEL_SIZE:       egui::Vec2 = egui::vec2(220.0, 32.0);
+const MAXPHOTO_DRAG_POS:         egui::Pos2 = egui::pos2(285.0, MAXPHOTO_ROW_TOP);
+const MAXPHOTO_FIELD_SIZE:       egui::Vec2 = egui::vec2(110.0, 32.0);
 
-// AI-training-mode checkbox — sits between the Max-Organisms row and
-// the action button. The checkbox is the final word on whether the
-// child process boots with training mode active: it initialises from
-// the `--trainingmode` flag (if the launcher itself was invoked with
-// it) but the user can override the initial value by toggling, and
-// the final committed state is forwarded via
-// `LaunchMode::RunSimulation::training_mode`.
-const TRAININGMODE_ROW_TOP:    f32        = 450.0;
+// Spawn-phototrophic-organisms row. Paired directly with the
+// Max-Phototrophic-Organisms cap above so the cap+spawn for photos
+// live together. Drives the initial-cohort photo count at
+// `spawn_colony`; independent from `MaxPhotoautotrophs`, which caps
+// the running population.
+const SPAWNPHOTO_ROW_TOP:        f32        = 450.0;
+const SPAWNPHOTO_LABEL_POS:      egui::Pos2 = egui::pos2(60.0, SPAWNPHOTO_ROW_TOP);
+const SPAWNPHOTO_LABEL_SIZE:     egui::Vec2 = egui::vec2(265.0, 32.0);
+const SPAWNPHOTO_DRAG_POS:       egui::Pos2 = egui::pos2(330.0, SPAWNPHOTO_ROW_TOP);
+const SPAWNPHOTO_FIELD_SIZE:     egui::Vec2 = egui::vec2(110.0, 32.0);
+
+// AI-training-mode checkbox — separates the photo-related fields
+// (above) from the herbivore-related fields (below). Seeded from
+// `--trainingmode` argv on launcher start (see `LauncherApp::new`).
+const TRAININGMODE_ROW_TOP:    f32        = 485.0;
 const TRAININGMODE_POS:        egui::Pos2 = egui::pos2(60.0, TRAININGMODE_ROW_TOP);
 const TRAININGMODE_SIZE:       egui::Vec2 = egui::vec2(400.0, 24.0);
 
 // Max-herbivores row. Same layout pattern as the Max-organisms row,
 // just one slot below the AI-training-mode checkbox. The value seeds
-// the `MaxHerbivores` reproduction cap at simulation startup. Tuned
-// from the launcher so AI-training runs can fix the cohort size before
-// the brain pool is allocated.
-const MAXHERB_ROW_TOP:         f32        = 485.0;
+// the `MaxHerbivores` reproduction cap at simulation startup.
+const MAXHERB_ROW_TOP:         f32        = 520.0;
 const MAXHERB_LABEL_POS:       egui::Pos2 = egui::pos2(60.0, MAXHERB_ROW_TOP);
 const MAXHERB_LABEL_SIZE:      egui::Vec2 = egui::vec2(180.0, 32.0);
 const MAXHERB_DRAG_POS:        egui::Pos2 = egui::pos2(245.0, MAXHERB_ROW_TOP);
 const MAXHERB_FIELD_SIZE:      egui::Vec2 = egui::vec2(110.0, 32.0);
 
-// Start-heterotrophs row. Sits one slot below "Max Herbivores",
-// shares the same label / drag layout. Drives the initial-cohort
-// herbivore count at `spawn_colony`. Independent from
+// Start-heterotrophs row. Paired directly with the Max-Herbivores
+// cap above so the cap+spawn for heteros live together. Drives the
+// initial-cohort herbivore count at `spawn_colony`. Independent from
 // `MaxHerbivores`, which caps the running population.
-const STARTHET_ROW_TOP:        f32        = 520.0;
+const STARTHET_ROW_TOP:        f32        = 555.0;
 const STARTHET_LABEL_POS:      egui::Pos2 = egui::pos2(60.0, STARTHET_ROW_TOP);
 const STARTHET_LABEL_SIZE:     egui::Vec2 = egui::vec2(220.0, 32.0);
 const STARTHET_DRAG_POS:       egui::Pos2 = egui::pos2(285.0, STARTHET_ROW_TOP);
@@ -106,7 +119,7 @@ const STARTHET_FIELD_SIZE:     egui::Vec2 = egui::vec2(110.0, 32.0);
 // Two side-by-side buttons. "START AEONS" on the left, "COLONY EDITOR"
 // on the right — both styled the same so neither feels like a footnote.
 const ACTION_BTN_SIZE:         egui::Vec2 = egui::vec2(330.0, 90.0);
-const ACTION_ROW_TOP:          f32        = 565.0;
+const ACTION_ROW_TOP:          f32        = 600.0;
 const ACTION_BTN_FONT_SIZE:    f32        = 24.0;
 const START_BTN_LABEL:         &str       = "START AEONS";
 const DEFAULT_MAP_PATH:        &str       = "assets/world_superflat.glb";
@@ -130,7 +143,7 @@ pub enum LaunchMode {
         wireframe:      bool,
         map_x:          f32,
         map_z:          f32,
-        max_organisms:  usize,
+        max_phototrophs:  usize,
         /// Reproduction soft cap on herbivores. Forwarded to the
         /// child as `--max-herbivores N`. Seeded from the launcher's
         /// text field — defaults to `DEFAULT_MAX_HERBIVORES`.
@@ -139,6 +152,11 @@ pub enum LaunchMode {
         /// initial cohort in `spawn_colony`; the cap (`MaxHerbivores`)
         /// is independent. Forwarded via `--start-heteros N`.
         start_heterotrophs: usize,
+        /// Number of photoautotrophs spawned at startup. Drives the
+        /// initial cohort in `spawn_colony`; the cap
+        /// (`MaxPhotoautotrophs`) is independent. Forwarded via
+        /// `--start-photos N`.
+        start_photoautotrophs: usize,
         /// Final AI-training-mode state at click-of-START — the
         /// launcher's checkbox is the source of truth. It seeds
         /// from `--trainingmode` if that argv flag was set when the
@@ -188,7 +206,7 @@ struct LauncherApp {
     wireframe:      bool,
     map_x:          f32,
     map_z:          f32,
-    max_organisms:  usize,
+    max_phototrophs:  usize,
     /// Herbivore reproduction soft cap. Editable via the Max
     /// Herbivores text field; forwarded to the child via
     /// `--max-herbivores N`.
@@ -197,6 +215,10 @@ struct LauncherApp {
     /// Start Heterotroph Number text field; forwarded via
     /// `--start-heteros N`.
     start_heterotrophs: usize,
+    /// Initial-cohort photoautotroph count. Editable via the
+    /// Spawn Phototrophic Organisms text field; forwarded via
+    /// `--start-photos N`.
+    start_photoautotrophs: usize,
     /// AI-training-mode checkbox state. Initialised from
     /// `--trainingmode` in argv; mutable while the launcher is open.
     /// Whatever value is held when the user clicks START AEONS is
@@ -226,18 +248,20 @@ impl LauncherApp {
             map_x:          DEFAULT_MAP_X,
             map_z:          DEFAULT_MAP_Z,
             // Default seed: the global "starter" value. The user can
-            // dial it freely up to `LAUNCHER_MAX_ORGANISMS_CAP`; the
+            // dial it freely up to `LAUNCHER_POPULATION_CAP`; the
             // chosen value flows through to the GPU brain-pool size.
-            max_organisms:  DEFAULT_MAX_ORGANISMS,
+            max_phototrophs:  DEFAULT_MAX_PHOTOAUTOTROPHS,
             // Herbivore cap default — mirrors `MaxHerbivores::default()`.
-            // Capped at `LAUNCHER_MAX_ORGANISMS_CAP` from above for
+            // Capped at `LAUNCHER_POPULATION_CAP` from above for
             // simplicity (the herbivore count can never exceed the
             // overall organism cap anyway).
             max_herbivores: DEFAULT_MAX_HERBIVORES,
             // Initial herbivore cohort default. Defaults to the same
             // value as the cap so an out-of-the-box run with default
             // settings still produces a visible starter cohort.
-            start_heterotrophs: DEFAULT_START_HETEROTROPHS,
+            start_heterotrophs:    DEFAULT_START_HETEROTROPHS,
+            // Photo cohort default — matches `DEFAULT_START_PHOTOAUTOTROPHS`.
+            start_photoautotrophs: DEFAULT_START_PHOTOAUTOTROPHS,
             training_mode,
             // Default OFF — if the user pre-fills a colony path,
             // they'll see the spawn widgets greyed out until they
@@ -263,9 +287,10 @@ impl LauncherApp {
             wireframe:      self.wireframe,
             map_x:          self.map_x,
             map_z:          self.map_z,
-            max_organisms:  self.max_organisms.max(1),
+            max_phototrophs:  self.max_phototrophs.max(1),
             max_herbivores: self.max_herbivores,
-            start_heterotrophs: self.start_heterotrophs,
+            start_heterotrophs:    self.start_heterotrophs,
+            start_photoautotrophs: self.start_photoautotrophs,
             training_mode:  self.training_mode,
         };
         let _ = self.tx.send(mode);
@@ -451,19 +476,41 @@ impl eframe::App for LauncherApp {
                     // this soft cap further, but never above what was
                     // allocated here. Ignored by the editor.
                     let maxorg_label_rect = egui::Rect::from_min_size(
-                        MAXORG_LABEL_POS, MAXORG_LABEL_SIZE);
+                        MAXPHOTO_LABEL_POS, MAXPHOTO_LABEL_SIZE);
                     ui.put(
                         maxorg_label_rect,
                         egui::Label::new(
-                            egui::RichText::new("Max Organisms:").size(TEXTFIELD_FONT_SIZE),
+                            egui::RichText::new("Max Phototrophic Organisms:").size(TEXTFIELD_FONT_SIZE),
                         ),
                     );
                     let maxorg_drag_rect = egui::Rect::from_min_size(
-                        MAXORG_DRAG_POS, MAXORG_FIELD_SIZE);
+                        MAXPHOTO_DRAG_POS, MAXPHOTO_FIELD_SIZE);
                     ui.put(
                         maxorg_drag_rect,
-                        egui::DragValue::new(&mut self.max_organisms)
-                            .range(1..=LAUNCHER_MAX_ORGANISMS_CAP)
+                        egui::DragValue::new(&mut self.max_phototrophs)
+                            .range(1..=LAUNCHER_POPULATION_CAP)
+                            .speed(1.0),
+                    );
+
+                    // ── Spawn-phototrophic-organisms row ─────────────
+                    // Initial-cohort photo count, independent from the
+                    // running-population cap. Setting it below
+                    // `MaxPhotoautotrophs` leaves room for reproduction
+                    // to backfill the photo population up to the cap.
+                    let spawnphoto_label_rect = egui::Rect::from_min_size(
+                        SPAWNPHOTO_LABEL_POS, SPAWNPHOTO_LABEL_SIZE);
+                    ui.put(
+                        spawnphoto_label_rect,
+                        egui::Label::new(
+                            egui::RichText::new("Spawn Phototrophic Organisms:").size(TEXTFIELD_FONT_SIZE),
+                        ),
+                    );
+                    let spawnphoto_drag_rect = egui::Rect::from_min_size(
+                        SPAWNPHOTO_DRAG_POS, SPAWNPHOTO_FIELD_SIZE);
+                    ui.put(
+                        spawnphoto_drag_rect,
+                        egui::DragValue::new(&mut self.start_photoautotrophs)
+                            .range(0..=LAUNCHER_POPULATION_CAP)
                             .speed(1.0),
                     );
 
@@ -487,7 +534,7 @@ impl eframe::App for LauncherApp {
                     // runtime so the user can lower or raise it
                     // later, but the initial-cohort sizing is
                     // anchored here. Clamped to
-                    // `[1, LAUNCHER_MAX_ORGANISMS_CAP]` so the
+                    // `[1, LAUNCHER_POPULATION_CAP]` so the
                     // herbivore cap can never exceed the overall
                     // pool size.
                     let maxherb_label_rect = egui::Rect::from_min_size(
@@ -503,7 +550,7 @@ impl eframe::App for LauncherApp {
                     ui.put(
                         maxherb_drag_rect,
                         egui::DragValue::new(&mut self.max_herbivores)
-                            .range(1..=LAUNCHER_MAX_ORGANISMS_CAP)
+                            .range(1..=LAUNCHER_POPULATION_CAP)
                             .speed(1.0),
                     );
 
@@ -526,7 +573,7 @@ impl eframe::App for LauncherApp {
                     ui.put(
                         starthet_drag_rect,
                         egui::DragValue::new(&mut self.start_heterotrophs)
-                            .range(0..=LAUNCHER_MAX_ORGANISMS_CAP)
+                            .range(0..=LAUNCHER_POPULATION_CAP)
                             .speed(1.0),
                     );
                 });

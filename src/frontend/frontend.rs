@@ -143,11 +143,11 @@ impl Plugin for FrontendPlugin {
             .init_resource::<PlayerControlsActive>()
             .init_resource::<Smoothing>()
             .init_resource::<TimeSpeed>()
-            .init_resource::<crate::simulation_settings::MaxOrganisms>()
+            .init_resource::<crate::simulation_settings::MaxPhotoautotrophs>()
             .init_resource::<crate::simulation_settings::OrganismPoolSize>()
             .init_resource::<WindowMode>()
             .init_resource::<statistics_panel::TimeSpeedEditState>()
-            .init_resource::<statistics_panel::MaxOrganismsEditState>()
+            .init_resource::<statistics_panel::MaxPhotoautotrophsEditState>()
             .init_resource::<statistics_panel::MaxHerbivoresEditState>()
             .init_resource::<statistics_panel::CullMessage>()
             .init_resource::<crate::simulation_settings::AiTrainingMode>()
@@ -210,9 +210,9 @@ impl Plugin for FrontendPlugin {
             // a second `add_systems` call to stay under Bevy's tuple size
             // limit for variadic system configs.
             .add_systems(Update, (
-                statistics_panel::handle_max_organisms_input,
-                statistics_panel::update_max_organisms_text,
-                statistics_panel::apply_max_organisms_cull,
+                statistics_panel::handle_max_phototrophs_input,
+                statistics_panel::update_max_phototrophs_text,
+                statistics_panel::apply_max_phototrophs_cull,
                 statistics_panel::update_cull_message,
                 statistics_panel::handle_ai_training_checkbox,
                 statistics_panel::update_ai_training_checkbox_mark,
