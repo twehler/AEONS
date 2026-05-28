@@ -18,6 +18,7 @@
 //                         bilateral axis + body mesh refresh
 //   * save.rs           — .species binary writer (rfd Save-As dialog)
 
+pub mod body_part_panel;
 pub mod bottom_panel;
 pub mod camera;
 pub mod clear_modal;
@@ -25,6 +26,7 @@ pub mod placement;
 pub mod save;
 pub mod session;
 pub mod top_panel;
+pub mod undo;
 
 use bevy::prelude::*;
 
@@ -75,6 +77,7 @@ impl Plugin for SpeciesEditorPlugin {
             .init_resource::<session::SpeciesSession>()
             .init_resource::<placement::PlacementSnap>()
             .init_resource::<camera::StashedSimCameraTransform>()
+            .init_resource::<undo::SpeciesUndo>()
             // Top-panel button + cycler handlers.
             .add_systems(Update, (
                 top_panel::handle_cycler_clicks,
@@ -88,6 +91,14 @@ impl Plugin for SpeciesEditorPlugin {
                 bottom_panel::handle_tile_clicks,
                 bottom_panel::sync_tile_borders,
             ))
+            // Body-part index panel.
+            .add_systems(Update, (
+                body_part_panel::handle_begin_new_body_part,
+                body_part_panel::manage_body_part_list,
+                body_part_panel::handle_body_part_row_clicks,
+                body_part_panel::handle_rename_input,
+                body_part_panel::sync_body_part_rows,
+            ))
             // Camera + placement.
             .add_systems(Update, (
                 camera::snap_camera_on_mode_entry,
@@ -97,6 +108,13 @@ impl Plugin for SpeciesEditorPlugin {
                 placement::update_preview_cell,
                 placement::handle_left_click_place,
             ))
+            // Undo (Ctrl+Z). `track` records prior states; `handle`
+            // restores. `track` is ordered AFTER the mutating systems and
+            // the undo handler so a restore is synced, not re-captured.
+            .add_systems(Update, (
+                undo::handle_species_undo_shortcut,
+                undo::track_species_undo,
+            ).chain())
             // Save dispatcher.
             .add_systems(Update, save::dispatch_save_requests);
     }
@@ -110,5 +128,6 @@ impl Plugin for SpeciesEditorPlugin {
 pub fn spawn_overlay_panels(parent: &mut ChildSpawnerCommands, top_offset_px: f32) {
     top_panel::spawn_top_panel(parent, top_offset_px);
     bottom_panel::spawn_bottom_panel(parent);
+    body_part_panel::spawn_body_part_panel(parent, top_offset_px);
     clear_modal::spawn_clear_new_button(parent);
 }

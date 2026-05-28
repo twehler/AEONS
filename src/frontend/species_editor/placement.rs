@@ -78,39 +78,35 @@ pub fn refresh_species_mesh(
 ) {
     if *mode != WindowMode::SpeciesEditor { return; }
     if !session.is_changed() { return; }
-    if session.ocg.is_empty()  { return; }
+    if session.body_parts.is_empty() { return; }
 
-    // Despawn the old mesh entity if present. The session's mesh is
+    // Despawn the old mesh entities if present. The session's meshes are
     // small and rebuilt entirely (no entity reuse needed).
     for e in &existing { commands.entity(e).despawn(); }
 
-    // Build mesh from the combined OCG (mirrored automatically for
-    // Bilateral via `mesh_ocg()`).
-    let combined = session.mesh_ocg();
-    let mesh = build_mesh_from_ocg(&combined);
-    let mesh_handle = meshes.add(mesh);
-
-    // Pick a base colour matching the metabolism. Mixed-type bodies
-    // still get a single material because the runtime organism mesh
-    // shares one material per body part — the cell colours show
-    // through via per-vertex colour data in the mesh.
-    let base = match session.draft.metabolism {
-        super::session::Metabolism::Photoautotroph => Color::srgb(0.2, 0.8, 0.2),
-        super::session::Metabolism::Heterotroph    => Color::srgb(0.8, 0.2, 0.2),
-    };
+    // One mesh entity per body part. Each part's OCG is mirrored
+    // (Bilateral) via `combined_ocg`. Per-cell colour comes from the
+    // mesh's `ATTRIBUTE_COLOR` attribute (one colour per source cell),
+    // so the material is a single white that lets vertex colours show
+    // through unmultiplied — cells of different types within the same
+    // body part now display their own colours individually.
     let mat_handle = materials.add(StandardMaterial {
-        base_color: base,
+        base_color: Color::WHITE,
         ..default()
     });
-
-    commands.spawn((
-        SpeciesEditorMesh,
-        Mesh3d(mesh_handle),
-        MeshMaterial3d(mat_handle),
-        Transform::from_translation(SPECIES_EDITOR_ORIGIN),
-        RenderLayers::layer(SPECIES_EDITOR_LAYER),
-        bevy::light::NotShadowCaster,
-    ));
+    for part in &session.body_parts {
+        if part.ocg.is_empty() { continue; }
+        let combined = session.combined_ocg(&part.ocg);
+        let mesh_handle = meshes.add(build_mesh_from_ocg(&combined));
+        commands.spawn((
+            SpeciesEditorMesh,
+            Mesh3d(mesh_handle),
+            MeshMaterial3d(mat_handle.clone()),
+            Transform::from_translation(SPECIES_EDITOR_ORIGIN),
+            RenderLayers::layer(SPECIES_EDITOR_LAYER),
+            bevy::light::NotShadowCaster,
+        ));
+    }
 }
 
 
@@ -199,11 +195,24 @@ pub fn update_preview_cell(
     let _ = inv_scale; // viewport-local conversion below uses world_to_viewport
 
     // Candidates: list of LOCAL-frame centres (relative to species editor origin).
+    // Bilateral placement allows the midline (x = 0) and the +X half; the
+    // constraint only rejects −X lattice slots (which belong to the
+    // auto-generated left half). Midline cells bridge the two halves with
+    // real shared faces — without them the halves only meet at points.
     let min_x_constraint = match session.draft.symmetry {
-        Symmetry::Bilateral  => Some(MIN_X_BILATERAL),
+        Symmetry::Bilateral  => Some(0.0),
         Symmetry::NoSymmetry => None,
     };
-    let candidates_local = candidate_centers_for_ocg(&session.ocg, min_x_constraint);
+    // Candidates come from the ACTIVE part's frontier. A freshly-begun
+    // appendage has no cells yet, so its first cell attaches to the BASE
+    // body's frontier instead.
+    let active_empty = session.active_part().map_or(true, |p| p.ocg.is_empty());
+    let source_ocg: Vec<(usize, Vec3, CellType)> = if active_empty {
+        session.base_part().map(|p| p.ocg.clone()).unwrap_or_default()
+    } else {
+        session.active_part().map(|p| p.ocg.clone()).unwrap_or_default()
+    };
+    let candidates_local = candidate_centers_for_ocg(&source_ocg, min_x_constraint);
     if candidates_local.is_empty() {
         snap.snapped_local = None;
         for (e, _, _) in &preview_q { commands.entity(e).despawn(); }
@@ -257,9 +266,11 @@ pub fn update_preview_cell(
         return;
     }
 
-    // No existing preview entity — spawn one. Use a single-cell mesh.
+    // No existing preview entity — spawn one. Use a single-cell mesh
+    // WITHOUT per-vertex colours so the translucent blue material isn't
+    // tinted by the snapped cell type's colour.
     let preview_ocg = vec![(0usize, Vec3::ZERO, session.selected_cell_type.unwrap_or(CellType::NonPhoto))];
-    let mesh        = build_mesh_from_ocg(&preview_ocg);
+    let mesh        = crate::volumetric_growth::build_uncolored_mesh_from_ocg(&preview_ocg);
     let mesh_handle = meshes.add(mesh);
     let mat_handle  = materials.add(StandardMaterial {
         base_color:  PREVIEW_BLUE,
@@ -303,27 +314,28 @@ pub fn handle_left_click_place(
     // click is owned by a button. Skip placement.
     if ui_interactions.iter().any(|i| matches!(i, Interaction::Pressed)) { return; }
 
-    // Bilateral guard: the right-half OCG must stay at x >= MIN_X_BILATERAL.
+    // Bilateral guard: the right-half OCG must stay at x >= 0 (midline
+    // allowed); −X slots belong to the mirrored left half.
     if session.draft.symmetry == Symmetry::Bilateral
-        && target_local.x < MIN_X_BILATERAL - 1e-3
+        && target_local.x < -MIN_X_BILATERAL * 0.5
     {
         return;
     }
 
-    let idx = session.ocg.len();
-    session.ocg.push((idx, target_local, ct));
+    // Place into the ACTIVE body part. Bail if none exists yet (the base
+    // is seeded by "Spawn first Cell" before placement is possible).
+    let active = session.active_body_part;
+    let Some(part) = session.body_parts.get_mut(active) else { return };
+    let idx = part.ocg.len();
+    part.ocg.push((idx, target_local, ct));
+    let part_ocg = part.ocg.clone();
     session.dirty = true;
 
-    // For bilateral, double-check the result by running through
-    // `bilateral_body_part_from_right_ocg` — if the welding fails for
-    // some reason (e.g. seed cell mis-aligned), at least the user
-    // sees the mesh refresh and can decide to start over. The real
-    // validation is geometric: `MIN_X_BILATERAL` keeps the right half
-    // off the YZ plane.
+    // For bilateral, exercise the welding pipeline at edit time as a
+    // sanity check; result discarded (the mesh refresh does the same
+    // work). Geometric validation is `MIN_X_BILATERAL` keeping the
+    // right half off the YZ plane.
     if session.draft.symmetry == Symmetry::Bilateral {
-        // The dummy call exercises the welding pipeline at edit time;
-        // we discard the result — `mesh_ocg()` does the same work for
-        // the actual mesh refresh.
-        let _ = bilateral_body_part_from_right_ocg(&session.ocg);
+        let _ = bilateral_body_part_from_right_ocg(&part_ocg);
     }
 }

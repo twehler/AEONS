@@ -165,18 +165,27 @@ fn load_species_into_session(
         crate::colony_editor::template::Form::Fixed
     };
 
-    // Bilateral species: the .species file stores RIGHT-half only.
-    // Expand to right + mirrored-left + re-indexed sequentially.
-    let ocg = match loaded.symmetry {
-        crate::organism::Symmetry::NoSymmetry => loaded.ocg.clone(),
-        crate::organism::Symmetry::Bilateral  => {
-            let left = crate::body_part::mirror_ocg_x(&loaded.ocg);
-            let mut combined: Vec<(usize, bevy::math::Vec3, crate::cell::CellType)> =
-                loaded.ocg.iter().chain(left.iter()).copied().collect();
-            for (i, entry) in combined.iter_mut().enumerate() { entry.0 = i; }
-            combined
+    // Base body (part 0). Bilateral species store RIGHT-half only, so
+    // expand to right + mirrored-left + re-indexed sequentially. The
+    // raw right-half OCGs of any appendage parts are carried through
+    // verbatim and expanded at spawn time.
+    let expand = |raw: &[(usize, bevy::math::Vec3, crate::cell::CellType)]|
+        -> Vec<(usize, bevy::math::Vec3, crate::cell::CellType)> {
+        match loaded.symmetry {
+            crate::organism::Symmetry::NoSymmetry => raw.to_vec(),
+            crate::organism::Symmetry::Bilateral  => {
+                let left = crate::body_part::mirror_right_to_left(raw);
+                let mut combined: Vec<(usize, bevy::math::Vec3, crate::cell::CellType)> =
+                    raw.iter().chain(left.iter()).copied().collect();
+                for (i, entry) in combined.iter_mut().enumerate() { entry.0 = i; }
+                combined
+            }
         }
     };
+    let base_raw = loaded.body_parts.first().map(|p| p.ocg.clone()).unwrap_or_default();
+    let ocg = expand(&base_raw);
+    let appendages: Vec<Vec<(usize, bevy::math::Vec3, crate::cell::CellType)>> =
+        loaded.body_parts.iter().skip(1).map(|p| p.ocg.clone()).collect();
 
     let display_name = path.file_stem()
         .and_then(|s| s.to_str())
@@ -200,6 +209,7 @@ fn load_species_into_session(
         is_sessile:   loaded.is_sessile,
         is_carnivore,
         ocg,
+        appendages,
         // v3 brain payload, if the file carried one. Spawn paths
         // duplicate this into a per-organism component at
         // placement time.

@@ -338,7 +338,7 @@ fn dialog_start_dir(current: &str) -> std::path::PathBuf {
 }
 
 impl eframe::App for LauncherApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let panel_frame = egui::Frame::default()
             .inner_margin(egui::Margin::ZERO)
             .outer_margin(egui::Margin::ZERO);
@@ -367,10 +367,17 @@ impl eframe::App for LauncherApp {
                 let open_map_rect = egui::Rect::from_min_size(OPEN_MAP_BTN_POS, OPEN_BTN_SIZE);
                 if ui.put(open_map_rect, egui::Button::new("Open…")).clicked() {
                     let start = dialog_start_dir(&self.map_path);
+                    // `set_parent(frame)` ties the rfd dialog to the
+                    // launcher window so KDE Plasma / xdg-desktop-portal
+                    // can stack it above the launcher instead of behind.
+                    // Without a parent handle the portal places the
+                    // picker arbitrarily, which on Wayland tends to be
+                    // *behind* the spawning window.
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("glTF binary (.glb)", &["glb"])
                         .add_filter("All files", &["*"])
                         .set_directory(&start)
+                        .set_parent(frame)
                         .pick_file()
                     {
                         self.map_path = p.to_string_lossy().into_owned();
@@ -392,6 +399,7 @@ impl eframe::App for LauncherApp {
                         .add_filter("AEONS colony (.colony)", &["colony"])
                         .add_filter("All files", &["*"])
                         .set_directory(&start)
+                        .set_parent(frame)
                         .pick_file()
                     {
                         self.colony_path = p.to_string_lossy().into_owned();
@@ -442,31 +450,33 @@ impl eframe::App for LauncherApp {
                 );
 
                 // ── Adjust-colony-dimensions checkbox ───────────────
-                // Always interactive — controls whether the three
-                // spawn-control widgets below stay editable when a
-                // colony file is loaded. When no colony is loaded,
-                // the checkbox is irrelevant (spawn controls are
-                // always editable in that case) so it just acts as a
-                // user-state memo.
-                let adjustcol_rect = egui::Rect::from_min_size(
-                    ADJUSTCOL_POS, ADJUSTCOL_SIZE);
-                ui.put(
-                    adjustcol_rect,
-                    egui::Checkbox::new(
-                        &mut self.adjust_colony_dimensions,
-                        "Adjust colony dimensions",
-                    ),
-                );
+                // Only rendered when a colony file is selected — the
+                // checkbox is meaningless otherwise (it gates the
+                // spawn-control widgets specifically for the
+                // load-a-colony case). Hiding it keeps the launcher
+                // visually quiet during fresh-spawn runs.
+                let colony_loaded = !self.colony_path.trim().is_empty();
+                if colony_loaded {
+                    let adjustcol_rect = egui::Rect::from_min_size(
+                        ADJUSTCOL_POS, ADJUSTCOL_SIZE);
+                    ui.put(
+                        adjustcol_rect,
+                        egui::Checkbox::new(
+                            &mut self.adjust_colony_dimensions,
+                            "Adjust colony dimensions",
+                        ),
+                    );
+                }
 
-                // Editability gate for Max Organisms / AI-training /
-                // Max Herbivores: when a colony is loaded AND the
-                // user hasn't ticked "Adjust colony dimensions",
-                // these are greyed out so the colony loads as
-                // recorded. Otherwise they're editable (no colony,
-                // or user has explicitly opted in to override).
+                // Editability gate for the spawn-control widgets:
+                // greyed out when a colony is loaded AND the user
+                // hasn't ticked "Adjust colony dimensions". Otherwise
+                // editable (no colony, or user has explicitly opted in
+                // to override). Reading `adjust_colony_dimensions`
+                // even when no colony is loaded is safe — its stored
+                // value is just ignored.
                 let spawn_widgets_enabled =
-                    self.colony_path.trim().is_empty()
-                    || self.adjust_colony_dimensions;
+                    !colony_loaded || self.adjust_colony_dimensions;
 
                 ui.add_enabled_ui(spawn_widgets_enabled, |ui| {
                     // ── Max-organisms row ───────────────────────────

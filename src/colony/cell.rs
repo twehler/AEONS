@@ -78,16 +78,39 @@ pub const CELL_COLLISION_RADIUS: f32 = CELL_SPACING * 0.7;
 pub enum CellType {
     Photo,
     NonPhoto,
+    /// Inert debug/placeholder cell. Renders blue (a body part containing
+    /// any Placeholder cell uses the debug-blue material — see
+    /// `OrganismMaterials::handle_for`). Never photosynthesises; counts as
+    /// body mass like `NonPhoto` for upkeep. Used by the species editor to
+    /// sketch out new body parts.
+    Placeholder,
 }
 
 impl CellType {
-    /// Linear-RGB colour painted onto the surface around a cell of this type.
+    /// Linear-RGB colour written into `Mesh::ATTRIBUTE_COLOR` (Bevy treats
+    /// vertex colours as linear). The numeric values are the linear-space
+    /// equivalents of the sRGB display colours we want — i.e. they match
+    /// what the legacy whole-part `Color::srgb(...)` materials produced
+    /// on screen, just delivered per-vertex now. If you change one,
+    /// keep the comment in sync so the intended display colour stays
+    /// obvious.
     #[inline]
     pub fn color(&self) -> [f32; 3] {
         match self {
-            CellType::Photo    => [0.16, 0.85, 0.18], // bright green
-            CellType::NonPhoto => [0.85, 0.20, 0.16], // mild red
+            // sRGB (0.2, 0.8, 0.2)  — bright green
+            CellType::Photo       => [0.0331, 0.6038, 0.0331],
+            // sRGB (0.8, 0.2, 0.2) — mild red
+            CellType::NonPhoto    => [0.6038, 0.0331, 0.0331],
+            // sRGB (0.2, 0.4, 0.95) — debug blue
+            CellType::Placeholder => [0.0331, 0.1329, 0.8902],
         }
+    }
+
+    /// True for cell types that contribute photosynthetic energy. Only
+    /// `Photo` does; `NonPhoto` and `Placeholder` are non-photosynthetic.
+    #[inline]
+    pub fn is_photo(&self) -> bool {
+        matches!(self, CellType::Photo)
     }
 }
 
@@ -282,9 +305,10 @@ impl BodyPart {
     pub fn cell_counts(&self) -> (u32, u32) {
         let mut p = 0; let mut np = 0;
         for c in &self.cells {
+            // Placeholder counts as non-photo body mass for upkeep.
             match c.cell_type {
-                CellType::Photo    => p  += 1,
-                CellType::NonPhoto => np += 1,
+                CellType::Photo                          => p  += 1,
+                CellType::NonPhoto | CellType::Placeholder => np += 1,
             }
         }
         (p, np)

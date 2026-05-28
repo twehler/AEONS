@@ -41,10 +41,17 @@ use super::session::{Classification, Metabolism, SpeciesSession};
 /// v2 introduced the `classification` byte (Herbivore / Carnivore)
 /// after `is_sessile`. v1 files are still accepted by
 /// `load_species` and default to `Classification::Herbivore`.
+/// v4 stores MULTIPLE body parts, each with a UTF-8 name. After the 6
+/// metadata bytes it writes `u32 body_part_count`, then per part:
+/// `u32 name_len`, name bytes, `u32 ocg_count`, then the OCG entries.
+/// The base body is part 0; later parts are appendages. The optional
+/// brain block follows the last part. v1–v3 stored a single OCG; the
+/// loader wraps those as a single "Base Body" part.
+const MAGIC_V4:     &[u8; 8] = b"AEONSS04";
 const MAGIC_V3:     &[u8; 8] = b"AEONSS03";
 const MAGIC_V2:     &[u8; 8] = b"AEONSS02";
 const MAGIC_V1:     &[u8; 8] = b"AEONSS01";
-const MAGIC: &[u8; 8] = MAGIC_V3;
+const MAGIC: &[u8; 8] = MAGIC_V4;
 
 
 pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
@@ -63,9 +70,10 @@ pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
     let bytes = encode_species(&session);
     match std::fs::write(&path, &bytes) {
         Ok(()) => {
+            let cells: usize = session.body_parts.iter().map(|p| p.ocg.len()).sum();
             info!(
-                "species saved to {} — {} cells, {} bytes",
-                path.display(), session.ocg.len(), bytes.len(),
+                "species saved to {} — {} body parts, {} cells, {} bytes",
+                path.display(), session.body_parts.len(), cells, bytes.len(),
             );
             session.dirty = false;
         }
@@ -75,7 +83,8 @@ pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
 
 
 fn encode_species(session: &SpeciesSession) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::with_capacity(64 + session.ocg.len() * 17);
+    let total_cells: usize = session.body_parts.iter().map(|p| p.ocg.len()).sum();
+    let mut buf: Vec<u8> = Vec::with_capacity(64 + total_cells * 17);
     buf.extend_from_slice(MAGIC);
 
     let kind_byte: u8 = match session.draft.metabolism {
@@ -111,26 +120,42 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     buf.push(var_byte);
     buf.push(sessile_byte);
     buf.push(classification_byte);
-    buf.extend_from_slice(&(session.ocg.len() as u32).to_le_bytes());
 
-    for &(idx, pos, ct) in &session.ocg {
+    // v4: multi-part body. Skip empty parts (e.g. an appendage that was
+    // begun but never given a cell). body_part_count, then per part.
+    let parts: Vec<&super::session::EditorBodyPart> =
+        session.body_parts.iter().filter(|p| !p.ocg.is_empty()).collect();
+    buf.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    for part in parts {
+        write_body_part(&mut buf, &part.name, &part.ocg);
+    }
+
+    // Brain block — editor saves write `brain_present = 0`. Weights are
+    // regenerated as fresh random init at spawn. Only the "export
+    // trained" workflow writes a non-zero brain block, via
+    // `encode_species_with_brain`.
+    buf.push(0);
+    buf
+}
+
+/// Write one body part: `u32 name_len`, name bytes, `u32 ocg_count`,
+/// then the OCG entries (`u32 idx`, 3×`f32` pos, `u8` cell_type).
+fn write_body_part(buf: &mut Vec<u8>, name: &str, ocg: &[(usize, Vec3, CellType)]) {
+    let name_bytes = name.as_bytes();
+    buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(name_bytes);
+    buf.extend_from_slice(&(ocg.len() as u32).to_le_bytes());
+    for &(idx, pos, ct) in ocg {
         buf.extend_from_slice(&(idx as u32).to_le_bytes());
         buf.extend_from_slice(&pos.x.to_le_bytes());
         buf.extend_from_slice(&pos.y.to_le_bytes());
         buf.extend_from_slice(&pos.z.to_le_bytes());
-        let ct_byte: u8 = match ct {
-            CellType::Photo    => 0,
-            CellType::NonPhoto => 1,
-        };
-        buf.push(ct_byte);
+        buf.push(match ct {
+            CellType::Photo       => 0,
+            CellType::NonPhoto    => 1,
+            CellType::Placeholder => 2,
+        });
     }
-    // v3 brain block — editor saves write `brain_present = 0`. The
-    // weights are regenerated as fresh random init when the species
-    // is later spawned. Only the "export trained" workflow writes a
-    // non-zero brain block; it bypasses this function and uses
-    // `encode_species_with_brain` instead.
-    buf.push(0);
-    buf
 }
 
 
@@ -183,18 +208,9 @@ pub fn encode_species_with_brain(
     buf.push(var_byte);
     buf.push(sessile_byte);
     buf.push(classification_byte);
-    buf.extend_from_slice(&(ocg.len() as u32).to_le_bytes());
-    for &(idx, pos, ct) in ocg {
-        buf.extend_from_slice(&(idx as u32).to_le_bytes());
-        buf.extend_from_slice(&pos.x.to_le_bytes());
-        buf.extend_from_slice(&pos.y.to_le_bytes());
-        buf.extend_from_slice(&pos.z.to_le_bytes());
-        let ct_byte: u8 = match ct {
-            CellType::Photo    => 0,
-            CellType::NonPhoto => 1,
-        };
-        buf.push(ct_byte);
-    }
+    // v4: a trained export is a single "Base Body" part.
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    write_body_part(&mut buf, "Base Body", ocg);
     buf.push(1);   // brain_present
     crate::intelligence_level_herbivore_1::encode_brain_restore(&mut buf, brain);
     buf
@@ -210,6 +226,14 @@ pub fn load_species(path: &Path) -> std::io::Result<LoadedSpecies> {
 }
 
 
+/// One decoded body part: its name and right-half (Bilateral) / full
+/// (NoSymmetry) OCG, exactly as stored. Index 0 is the base body.
+#[derive(Clone, Debug)]
+pub struct LoadedBodyPart {
+    pub name: String,
+    pub ocg:  Vec<(usize, Vec3, CellType)>,
+}
+
 /// Decoded species record. Mirrors `SpeciesSession`'s payload but with
 /// all enums resolved to their canonical types.
 #[allow(dead_code)]
@@ -221,8 +245,10 @@ pub struct LoadedSpecies {
     pub is_sessile:        bool,
     /// v1 files default this to `Herbivore`; v2 reads it from disk.
     pub classification:    Classification,
-    pub ocg:               Vec<(usize, Vec3, CellType)>,
-    /// `Some` when the file carries trained brain weights (v3 with
+    /// All body parts (index 0 = base body). v1–v3 files yield a single
+    /// "Base Body" part.
+    pub body_parts:        Vec<LoadedBodyPart>,
+    /// `Some` when the file carries trained brain weights (v3/v4 with
     /// `brain_present = 1`). Spawning from such a species attaches
     /// the restore payload to every copy so all spawned instances
     /// boot with the saved weights instead of fresh random init.
@@ -236,11 +262,12 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     fn err(msg: &str) -> Error { Error::new(ErrorKind::InvalidData, msg.to_string()) }
 
     if bytes.len() < 8 + 5 + 4 { return Err(err("species file too short for header")); }
+    let is_v4 = &bytes[..8] == MAGIC_V4;
     let is_v3 = &bytes[..8] == MAGIC_V3;
     let is_v2 = &bytes[..8] == MAGIC_V2;
     let is_v1 = &bytes[..8] == MAGIC_V1;
-    if !is_v3 && !is_v2 && !is_v1 {
-        return Err(err("species magic mismatch (expected AEONSS01, AEONSS02 or AEONSS03)"));
+    if !is_v4 && !is_v3 && !is_v2 && !is_v1 {
+        return Err(err("species magic mismatch (expected AEONSS01..AEONSS04)"));
     }
 
     let mut c = 8usize;
@@ -249,7 +276,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let intel_byte   = bytes[c]; c += 1;
     let var_byte     = bytes[c]; c += 1;
     let sessile_byte = bytes[c]; c += 1;
-    let classification = if is_v2 || is_v3 {
+    let classification = if is_v2 || is_v3 || is_v4 {
         let b = bytes[c]; c += 1;
         match b {
             0 => Classification::Herbivore,
@@ -261,7 +288,6 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
         // old saves load as the more common case.
         Classification::Herbivore
     };
-    let ocg_count = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
 
     let metabolism = match kind_byte {
         0 => Metabolism::Photoautotroph,
@@ -283,32 +309,27 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let has_variable_form = var_byte != 0;
     let is_sessile        = sessile_byte != 0;
 
-    let mut ocg = Vec::with_capacity(ocg_count);
-    for _ in 0..ocg_count {
-        if bytes.len() < c + 4 + 12 + 1 { return Err(err("ocg entry truncated")); }
-        let idx = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
-        let x = f32::from_le_bytes(bytes[c..c+4].try_into().unwrap()); c += 4;
-        let y = f32::from_le_bytes(bytes[c..c+4].try_into().unwrap()); c += 4;
-        let z = f32::from_le_bytes(bytes[c..c+4].try_into().unwrap()); c += 4;
-        let ct_byte = bytes[c]; c += 1;
-        let ct = match ct_byte {
-            0 => CellType::Photo,
-            1 => CellType::NonPhoto,
-            _ => return Err(err("unknown cell_type tag")),
-        };
-        ocg.push((idx, Vec3::new(x, y, z), ct));
-    }
+    // Body parts. v4 stores a count + named parts; v1–v3 store a single
+    // OCG which we wrap as one "Base Body" part.
+    let body_parts: Vec<LoadedBodyPart> = if is_v4 {
+        if bytes.len() < c + 4 { return Err(err("missing body_part_count")); }
+        let count = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            parts.push(read_species_body_part(bytes, &mut c)?);
+        }
+        parts
+    } else {
+        if bytes.len() < c + 4 { return Err(err("missing ocg_count")); }
+        let ocg_count = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
+        let ocg = read_species_ocg(bytes, &mut c, ocg_count)?;
+        vec![LoadedBodyPart { name: "Base Body".to_string(), ocg }]
+    };
 
-    // v3 brain block. Layout:
-    //   u8 brain_present
-    //   if 1 → 12 length-prefixed Vec<f32> + prev_state + prev_action
-    //          + 2× f32 (prev_dopamine, prev_target_distance).
-    // v1/v2 don't carry a brain block; default to None.
-    let brain = if is_v3 {
+    // Brain block (v3 + v4). Layout: u8 brain_present, and if 1 the
+    // shared BrainRestoreHerbivore1 payload. v1/v2 carry none.
+    let brain = if is_v3 || is_v4 {
         if c >= bytes.len() {
-            // Malformed: header promised v3 but file ends before
-            // the brain_present byte. Be conservative and treat as
-            // "no brain" rather than erroring.
             None
         } else {
             let brain_present = bytes[c]; c += 1;
@@ -326,6 +347,41 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
 
     Ok(LoadedSpecies {
         metabolism, symmetry, intelligence, has_variable_form, is_sessile,
-        classification, ocg, brain,
+        classification, body_parts, brain,
     })
+}
+
+/// Read one v4 body part (name + OCG) advancing `c`.
+fn read_species_body_part(bytes: &[u8], c: &mut usize) -> std::io::Result<LoadedBodyPart> {
+    let err = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    if bytes.len() < *c + 4 { return Err(err("body part name length truncated")); }
+    let name_len = u32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()) as usize; *c += 4;
+    if bytes.len() < *c + name_len { return Err(err("body part name truncated")); }
+    let name = String::from_utf8_lossy(&bytes[*c..*c+name_len]).into_owned(); *c += name_len;
+    if bytes.len() < *c + 4 { return Err(err("body part ocg_count truncated")); }
+    let ocg_count = u32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()) as usize; *c += 4;
+    let ocg = read_species_ocg(bytes, c, ocg_count)?;
+    Ok(LoadedBodyPart { name, ocg })
+}
+
+/// Read `count` OCG entries advancing `c`.
+fn read_species_ocg(bytes: &[u8], c: &mut usize, count: usize) -> std::io::Result<Vec<(usize, Vec3, CellType)>> {
+    let err = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let mut ocg = Vec::with_capacity(count);
+    for _ in 0..count {
+        if bytes.len() < *c + 4 + 12 + 1 { return Err(err("ocg entry truncated")); }
+        let idx = u32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()) as usize; *c += 4;
+        let x = f32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()); *c += 4;
+        let y = f32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()); *c += 4;
+        let z = f32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()); *c += 4;
+        let ct_byte = bytes[*c]; *c += 1;
+        let ct = match ct_byte {
+            0 => CellType::Photo,
+            1 => CellType::NonPhoto,
+            2 => CellType::Placeholder,
+            _ => return Err(err("unknown cell_type tag")),
+        };
+        ocg.push((idx, Vec3::new(x, y, z), ct));
+    }
+    Ok(ocg)
 }

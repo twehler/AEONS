@@ -263,8 +263,8 @@ fn grow_new_branch(
     // changed, and predation / energy / physiology read from the cache.
     for cell in &new_part.cells {
         match cell.cell_type {
-            CellType::Photo    => organism.photo_cell_count    += 1,
-            CellType::NonPhoto => organism.non_photo_cell_count += 1,
+            CellType::Photo                            => organism.photo_cell_count    += 1,
+            CellType::NonPhoto | CellType::Placeholder => organism.non_photo_cell_count += 1,
         }
     }
 
@@ -333,8 +333,8 @@ fn extend_root_part(
     physiology::recompute_body_part(&mut organism.body_parts[0]);
 
     match new_cell_type {
-        CellType::Photo    => organism.photo_cell_count    += 1,
-        CellType::NonPhoto => organism.non_photo_cell_count += 1,
+        CellType::Photo                            => organism.photo_cell_count    += 1,
+        CellType::NonPhoto | CellType::Placeholder => organism.non_photo_cell_count += 1,
     }
     // Cached bounding radius needs refreshing — the new cell may extend
     // the envelope. Only one body part has changed; the function still

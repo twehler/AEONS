@@ -100,8 +100,8 @@ pub fn recompute_body_part(bp: &mut BodyPart) {
         let n = count_rd_neighbours(&positions, i);
         cell.neighbour_count = n;
         cell.photo = match cell.cell_type {
-            CellType::Photo    => Some(PhotosyntheticCell::new(n, PHOTO_PRODUCTION_PER_CELL)),
-            CellType::NonPhoto => None,
+            CellType::Photo                            => Some(PhotosyntheticCell::new(n, PHOTO_PRODUCTION_PER_CELL)),
+            CellType::NonPhoto | CellType::Placeholder => None,
         };
     }
 }

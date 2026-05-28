@@ -1,12 +1,15 @@
 // Reproduction.
 //
-// Offspring are exact copies of their parent's body plan — same body parts,
-// same cell types, no mutation. Each newborn is a rhombic-dodecahedron
-// organism (one cell per body part), just like every parent.
+// Each birth clones the parent's body plan and applies one mutation step:
+//   * NoSymmetry: 20% append a new branch body part, else extend the root
+//     part's OCG by one cell.
+//   * Bilateral: 20% (under MAX_BODY_PARTS) append a new appendage on the
+//     base body, else grow the base by one mirrored cell pair.
+// Cell types are inherited from the seed entry, preserving trophic identity.
 //
 // The `reproduced` boolean on `Organism` enforces a species-specific
-// reproduction cap: heterotrophs reproduce at most once, photoautotrophs at
-// most twice.
+// reproduction cap (`reproductions` counter vs. the cap): heterotrophs
+// reproduce at most twice, photoautotrophs at most twice.
 
 use bevy::prelude::*;
 use rand::prelude::*;
@@ -29,7 +32,7 @@ const OFFSPRING_ENERGY_FRACTION: f32 = 0.5;
 /// reproduction candidate.
 const REPRODUCTION_ENERGY_THRESHOLD: f32 = 0.8;
 
-const HETEROTROPH_REPRODUCTION_CAP:    u8 = 1;
+const HETEROTROPH_REPRODUCTION_CAP:    u8 = 2;
 const PHOTOAUTOTROPH_REPRODUCTION_CAP: u8 = 2;
 
 
@@ -200,44 +203,122 @@ fn reproduction_system(
                 }
             }
             Symmetry::Bilateral => {
-                // Bilateral organisms have ONE body part whose OCG
-                // contains both halves (right cells with x > 0 plus
-                // their mirrors). Growth: extract the right half from
-                // the combined OCG, mutate it (constrained to
-                // x ≥ MIN_X_BILATERAL), mirror, and reassemble. The
-                // combined-OCG mesh build then welds the seam and
-                // drops interior faces automatically. No branching
-                // for bilateral organisms.
+                // Bilateral organisms have ONE base body part (index 0)
+                // whose OCG contains both halves (right cells with
+                // x > 0 plus their mirrors). On each birth, either:
+                //   * 20% (when a symmetric pair still fits under
+                //     MAX_BODY_PARTS): grow a NEW MIRRORED PAIR of
+                //     appendages on the base body — one on the +X
+                //     side, its X-mirror on the −X side. Both attach
+                //     to the base body (parent_idx = 0), never to
+                //     another appendage. Pairs keep the body plan
+                //     bilaterally symmetric, like real limbs.
+                //   * otherwise: extend the bilateral base by one
+                //     mirrored cell pair — extract the right half,
+                //     mutate it (constrained to x ≥ MIN_X_BILATERAL),
+                //     mirror, and reassemble. The combined-OCG mesh
+                //     build welds the seam and drops interior faces.
                 let mut parts = organism.body_parts.clone();
                 if parts.is_empty() { continue; }
 
-                // Extract right-half cells with fresh sequential
-                // indices — `mutate_bilateral` expects a contiguous
-                // [0..N) ledger as input.
-                let right_ocg: Vec<(usize, Vec3, CellType)> = parts[0].ocg.iter()
-                    .filter(|(_, p, _)| p.x > 0.0)
-                    .enumerate()
-                    .map(|(i, (_, p, ct))| (i, *p, *ct))
-                    .collect();
-                if right_ocg.is_empty() { continue; }
+                // A pair adds TWO parts, so only branch while two more
+                // still fit under the cap (with MAX_BODY_PARTS = 3 this
+                // means exactly when the organism has only its base).
+                if parts.len() + 2 <= body_part::MAX_BODY_PARTS
+                    && body_part::should_branch(&mut rng)
+                {
+                    let base_ocg = &parts[0].ocg;
+                    if base_ocg.is_empty() { continue; }
 
-                let Some(grown_right) =
-                    crate::mutation::mutate_bilateral(&right_ocg, &mut rng)
-                    else { continue; };
-                let grown_left = body_part::mirror_ocg_x(&grown_right);
+                    // Pick the right-side appendage attachment from the
+                    // base's right half only, so the +X limb and its
+                    // mirror land symmetrically off each flank.
+                    let right_base: Vec<(usize, Vec3, CellType)> = base_ocg.iter()
+                        .filter(|(_, p, _)| p.x > 0.0)
+                        .enumerate()
+                        .map(|(i, (_, p, ct))| (i, *p, *ct))
+                        .collect();
+                    if right_base.is_empty() { continue; }
 
-                // Reassemble both halves into a single OCG with
-                // contiguous indices.
-                let combined: Vec<(usize, Vec3, CellType)> = grown_right.iter()
-                    .chain(grown_left.iter())
-                    .enumerate()
-                    .map(|(i, (_, p, ct))| (i, *p, *ct))
-                    .collect();
-                parts[0].cells = combined.iter()
-                    .map(|(_, p, ct)| Cell::new(*p, *ct))
-                    .collect();
-                parts[0].ocg = combined;
-                parts
+                    let seed_ct = base_ocg[0].2;
+                    let (origin_r, outward_r) =
+                        body_part::pick_attachment(&right_base, &mut rng);
+
+                    // Build + grow (1→2) the right appendage.
+                    let right_attach = Attachment {
+                        parent_idx:   0,
+                        origin_local: origin_r,
+                        rotation:     Quat::IDENTITY,
+                    };
+                    let right_seed = body_part::create_branch_body_part(
+                        seed_ct, right_attach, outward_r,
+                    );
+                    let right_ocg = crate::mutation::mutate_ocg(
+                        &right_seed.ocg, &mut rng,
+                    );
+                    if right_ocg.is_empty() { continue; }
+                    let mut right_part = right_seed;
+                    right_part.cells = right_ocg.iter()
+                        .map(|(_, p, ct)| Cell::new(*p, *ct))
+                        .collect();
+                    right_part.ocg = right_ocg.clone();
+
+                    // Mirror it across the YZ plane to make the left
+                    // appendage: mirror the cell ledger, the attachment
+                    // origin, and the outward seed direction. Each cell
+                    // is still emitted as a canonical outward-faced RD
+                    // by the mesh builder, so the mirrored mesh is not
+                    // inside-out.
+                    let left_ocg = body_part::mirror_ocg_x(&right_ocg);
+                    let origin_l = Vec3::new(-origin_r.x, origin_r.y, origin_r.z);
+                    let outward_l = Vec3::new(-outward_r.x, outward_r.y, outward_r.z);
+                    let left_attach = Attachment {
+                        parent_idx:   0,
+                        origin_local: origin_l,
+                        rotation:     Quat::IDENTITY,
+                    };
+                    let mut left_part = body_part::create_branch_body_part(
+                        seed_ct, left_attach, outward_l,
+                    );
+                    left_part.cells = left_ocg.iter()
+                        .map(|(_, p, ct)| Cell::new(*p, *ct))
+                        .collect();
+                    left_part.ocg = left_ocg;
+
+                    parts.push(right_part);
+                    parts.push(left_part);
+                    parts
+                } else {
+                    // Extract the right half (midline + +X cells) with
+                    // fresh sequential indices — `mutate_bilateral`
+                    // expects a contiguous [0..N) ledger as input. The
+                    // `x > -EPS` filter keeps midline cells (x = 0) while
+                    // dropping the mirrored −X (left) cells.
+                    let right_ocg: Vec<(usize, Vec3, CellType)> = parts[0].ocg.iter()
+                        .filter(|(_, p, _)| p.x > -body_part::BILATERAL_MIDLINE_EPS)
+                        .enumerate()
+                        .map(|(i, (_, p, ct))| (i, *p, *ct))
+                        .collect();
+                    if right_ocg.is_empty() { continue; }
+
+                    let Some(grown_right) =
+                        crate::mutation::mutate_bilateral(&right_ocg, &mut rng)
+                        else { continue; };
+                    let grown_left = body_part::mirror_right_to_left(&grown_right);
+
+                    // Reassemble both halves into a single OCG with
+                    // contiguous indices.
+                    let combined: Vec<(usize, Vec3, CellType)> = grown_right.iter()
+                        .chain(grown_left.iter())
+                        .enumerate()
+                        .map(|(i, (_, p, ct))| (i, *p, *ct))
+                        .collect();
+                    parts[0].cells = combined.iter()
+                        .map(|(_, p, ct)| Cell::new(*p, *ct))
+                        .collect();
+                    parts[0].ocg = combined;
+                    parts
+                }
             }
         };
 

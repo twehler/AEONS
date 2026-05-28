@@ -28,7 +28,7 @@ use crate::simulation_settings::WindowMode;
 
 use super::session::{
     cycle_intelligence, cycle_symmetry, intelligence_label, symmetry_label,
-    Classification, DraftSpecies, Mobility, SpeciesSession,
+    Classification, DraftSpecies, Metabolism, Mobility, SpeciesSession,
 };
 use super::TOP_PANEL_HEIGHT_PX;
 
@@ -175,6 +175,18 @@ fn default_intelligence_for(m: Mobility, c: Classification) -> IntelligenceLevel
     }
 }
 
+/// Canonical default symmetry for a metabolism. Heterotrophs are
+/// bilaterally symmetric (like real animals); photoautotrophs default
+/// to no symmetry (plant-like radial/irregular growth). Applied when
+/// the metabolism cycler is toggled; the user can still re-cycle the
+/// symmetry knob afterwards.
+fn default_symmetry_for(m: Metabolism) -> Symmetry {
+    match m {
+        Metabolism::Heterotroph    => Symmetry::Bilateral,
+        Metabolism::Photoautotroph => Symmetry::NoSymmetry,
+    }
+}
+
 pub fn handle_cycler_clicks(
     mode:             Res<WindowMode>,
     mut interactions: Query<(&Interaction, &Cycler, &mut BackgroundColor), Changed<Interaction>>,
@@ -187,7 +199,15 @@ pub fn handle_cycler_clicks(
         match *interaction {
             Interaction::Pressed => {
                 match cycler.0 {
-                    CyclerKind::Metabolism => session.draft.metabolism = session.draft.metabolism.cycle(),
+                    CyclerKind::Metabolism => {
+                        // Toggle metabolism, then snap symmetry to the
+                        // canonical default for the new metabolism
+                        // (Heterotroph → Bilateral, Photoautotroph →
+                        // NoSymmetry). The user can re-cycle symmetry
+                        // afterwards.
+                        session.draft.metabolism = session.draft.metabolism.cycle();
+                        session.draft.symmetry = default_symmetry_for(session.draft.metabolism);
+                    }
                     CyclerKind::Mobility => {
                         // Toggle, then enforce the Mobility ↔ Intelligence
                         // coupling: sessile species are auto-Level0;
@@ -298,8 +318,12 @@ pub fn handle_spawn_first_cell(
                     Symmetry::NoSymmetry => Vec3::ZERO,
                     Symmetry::Bilateral  => Vec3::new(crate::body_part::MIN_X_BILATERAL, 0.0, 0.0),
                 };
-                session.ocg.clear();
-                session.ocg.push((0usize, pos, starter));
+                // Seed the base body (index 0) with its first cell.
+                session.body_parts = vec![super::session::EditorBodyPart {
+                    name: "Base Body".to_string(),
+                    ocg:  vec![(0usize, pos, starter)],
+                }];
+                session.active_body_part = 0;
                 session.first_cell_spawned = true;
                 session.dirty = true;
                 *bg = BackgroundColor(ACTION_BG_HOVER);
@@ -324,7 +348,7 @@ pub fn handle_create_species(
     if *mode != WindowMode::SpeciesEditor { return; }
 
     for (interaction, mut bg) in &mut interactions {
-        let can_save = !session.ocg.is_empty();
+        let can_save = session.base_part().is_some_and(|p| !p.ocg.is_empty());
         match *interaction {
             Interaction::Pressed if can_save => {
                 let _ = CellType::Photo; // (silence unused-import lint if any)

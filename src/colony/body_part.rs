@@ -26,6 +26,12 @@ use crate::cell::*;
 /// instead of extending the existing one. 0.2 = 20%.
 pub const NEW_BODY_PART_PROBABILITY: f32 = 0.2;
 
+/// Maximum number of body parts an organism may have, INCLUDING the base
+/// body (`body_parts[0]`). Bilateral appendages are added as mirrored
+/// left/right PAIRS, so reproduction only branches while two more parts
+/// still fit. 3 = base body + one symmetric appendage pair.
+pub const MAX_BODY_PARTS: usize = 3;
+
 /// Minimum +X coordinate any cell in the RIGHT body part of a Bilateral
 /// organism may occupy. Equals `2/√3 ≈ 1.1547` — the half-distance between
 /// two axis-aligned RD neighbours, also the long-radius (B-vertex offset)
@@ -161,40 +167,58 @@ pub fn mirror_ocg_x(
         .collect()
 }
 
-/// Build the single bilateral body part from a right-half OCG.
+/// |x| below which a cell is considered to lie ON the bilateral mirror
+/// plane. Lattice x-coordinates are multiples of `MIN_X_BILATERAL`
+/// (≈1.1547), so any sane epsilon well under that cleanly separates a
+/// midline cell (x = 0) from the innermost paramedian column.
+pub const BILATERAL_MIDLINE_EPS: f32 = 1e-3;
+
+/// Build the LEFT half of a bilateral body from a right-half OCG
+/// (cells with `x ≥ 0`), mirroring across the YZ-plane. Cells ON the
+/// mirror plane (`|x| < BILATERAL_MIDLINE_EPS`) are their own mirror
+/// and are SKIPPED here — they live once in the right-half OCG and
+/// must not be duplicated, or the mesh dedup (which drops faces shared
+/// by two coincident cells) would erase them. Indices and cell types
+/// are preserved; callers renumber after concatenating the halves.
+pub fn mirror_right_to_left(
+    right_ocg: &[(usize, Vec3, CellType)],
+) -> Vec<(usize, Vec3, CellType)> {
+    right_ocg.iter()
+        .filter(|(_, p, _)| p.x > BILATERAL_MIDLINE_EPS)
+        .map(|(idx, pos, ct)| (*idx, Vec3::new(-pos.x, pos.y, pos.z), *ct))
+        .collect()
+}
+
+/// Build the single bilateral body part from a right-half OCG
+/// (cells with `x ≥ 0`).
 ///
 /// Returns ONE `BodyPart` whose OCG contains both halves: the input
-/// right-side cells followed by their mirror images across the YZ
-/// plane (`mirror_ocg_x`). `volumetric_growth::build_mesh_from_ocg`
+/// right-side cells followed by the mirror of the strictly-positive-x
+/// ones (`mirror_right_to_left`). `volumetric_growth::build_mesh_from_ocg`
 /// then runs its translate → weld → drop-interior-faces pipeline over
-/// the combined cell list, which automatically:
+/// the combined cell list.
 ///
-///   * **Connects the halves at the seam.** The right seed at
-///     `(+MIN_X_BILATERAL, 0, 0)` and its mirror at
-///     `(-MIN_X_BILATERAL, 0, 0)` are exact +X axis-aligned RD
-///     neighbours, sharing four vertices on their common rhombic face
-///     on the YZ plane. The weld step (HashMap on quantised positions
-///     with `WELD_EPS = 1e-4`) merges those four vertices, fusing the
-///     halves into a single connected mesh. Same applies to every
-///     other right cell whose mirror lands at lattice-adjacency.
-///   * **Drops the now-hidden seam face.** Each shared rhombic face
-///     appears with sorted-vertex multiplicity 2 (one copy from each
-///     cell). The dedup step removes both copies. The outward-facing
-///     triangles from each cell survive with their natural winding.
-///   * **Generates no extra geometry.** The bridge between the halves
-///     is the merged-vertex topology itself — no manual zipper
-///     stitching, no `fill_holes`. Surviving triangles point outward
-///     by construction (each is the outward copy from its unique
-///     source cell).
+/// **How the halves connect.** A right cell and its pure-X mirror are
+/// separated by `(2x, 0, 0)`. In the RD lattice only the 12 FCC slots
+/// (two ±½ components) share a rhombic FACE; the 6 axis slots share
+/// just a vertex. A pure-X displacement has a single non-zero
+/// component, so a cell and its own mirror are NEVER face-adjacent —
+/// they meet at most at a point. The two halves are therefore bridged
+/// by **midline cells** (`x = 0`): such a cell is FCC-face-adjacent to
+/// both a +X cell and that cell's −X mirror (e.g. `(0, t, 0)` neighbours
+/// both `(t, 0, 0)` and `(−t, 0, 0)`), so it welds the halves with real
+/// shared faces. Midline cells are stored once (see
+/// `mirror_right_to_left`); without any midline cells the body still
+/// renders, just with the two halves touching only at points.
 ///
-/// Replaces the previous `bilateral_pair_from_right_ocg` which
-/// returned two separate body parts and produced two coplanar
-/// opposite-winding faces at the seam. With a single body part those
-/// faces cancel during dedup and the mesh is genuinely seamless.
+/// The weld step (HashMap on quantised positions, `WELD_EPS = 1e-4`)
+/// merges coincident vertices and the dedup step drops faces shared by
+/// adjacent cells (multiplicity 2); surviving triangles point outward
+/// by construction. No manual zipper stitching, no `fill_holes`.
 pub fn bilateral_body_part_from_right_ocg(
     right_ocg: &[(usize, Vec3, CellType)],
 ) -> BodyPart {
-    let left_ocg = mirror_ocg_x(right_ocg);
+    let left_ocg = mirror_right_to_left(right_ocg);
 
     // Combined OCG: right cells first, then left mirrors. Indices are
     // re-numbered sequentially so the body part's OCG is a contiguous

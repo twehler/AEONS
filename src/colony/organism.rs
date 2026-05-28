@@ -325,8 +325,8 @@ impl Organism {
         for bp in self.body_parts.iter().filter(|bp| bp.is_alive()) {
             for cell in &bp.cells {
                 match cell.cell_type {
-                    CellType::Photo    => p  += 1,
-                    CellType::NonPhoto => np += 1,
+                    CellType::Photo                            => p  += 1,
+                    CellType::NonPhoto | CellType::Placeholder => np += 1,
                 }
             }
         }

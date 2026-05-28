@@ -311,7 +311,9 @@ pub(super) fn respawn_template(
     }
 
     let ocg = template.build_ocg();
-    let mesh    = meshes.add(build_smoothed_mesh_from_ocg(&ocg));
+    // Use the uncolored mesh so the marker takes its `preview_colour`
+    // material verbatim (no per-cell tinting in the fallback marker).
+    let mesh    = meshes.add(crate::volumetric_growth::build_uncolored_mesh_from_ocg(&ocg));
     let colour  = template.metabolism.preview_colour();
     let material = materials.add(StandardMaterial {
         base_color: colour,
@@ -333,6 +335,31 @@ pub(super) fn respawn_template(
 /// capacity (same convention as `.colony` save records and the
 /// initial colony cohort), so the new organism doesn't immediately
 /// starve.
+/// Build an appendage `BodyPart` from a full OCG (already mirrored if
+/// needed). Attaches to the base body (parent_idx 0) at the origin —
+/// the OCG positions are absolute in the organism's local frame, so the
+/// entity sits at ZERO and the cells render where they were authored.
+/// Colour comes from cell content (Placeholder ⇒ blue via `handle_for`).
+fn appendage_body_part(ocg: Vec<(usize, Vec3, CellType)>) -> crate::cell::BodyPart {
+    let cells = ocg.iter()
+        .map(|(_, p, ct)| crate::cell::Cell::new(*p, *ct))
+        .collect();
+    crate::cell::BodyPart {
+        kind:         crate::cell::BodyPartKind::Limb,
+        local_offset: Vec3::ZERO,
+        cells,
+        ocg,
+        attachment:   Some(crate::body_part::Attachment {
+            parent_idx:   0,
+            origin_local: Vec3::ZERO,
+            rotation:     Quat::IDENTITY,
+        }),
+        consumed:     false,
+        debug_blue:   false,
+        regrowable:   true,
+    }
+}
+
 fn spawn_real_organism(
     template:  &OrganismTemplate,
     commands:  &mut Commands,
@@ -340,17 +367,31 @@ fn spawn_real_organism(
     org_mats:  &OrganismMaterials,
     smoothing: bool,
 ) -> Entity {
-    let ocg        = template.build_ocg();
-    let body_parts = vec![root_body_part_from_ocg(&ocg)];
+    let ocg = template.build_ocg();
+    // Base body (part 0, attachment None). Appendage parts attach to it
+    // (parent_idx 0). For bilateral species each appendage is a mirrored
+    // pair of runtime parts; for NoSymmetry it is one part.
+    let mut body_parts = vec![root_body_part_from_ocg(&ocg)];
+    for app_raw in &template.custom_appendages {
+        match template.symmetry {
+            Symmetry::Bilateral => {
+                body_parts.push(appendage_body_part(app_raw.clone()));
+                body_parts.push(appendage_body_part(
+                    crate::body_part::mirror_right_to_left(app_raw),
+                ));
+            }
+            Symmetry::NoSymmetry => {
+                body_parts.push(appendage_body_part(app_raw.clone()));
+            }
+        }
+    }
     let kind = match template.metabolism {
         crate::colony_editor::template::Metabolism::Photoautotroph => OrganismKind::Photoautotroph,
         crate::colony_editor::template::Metabolism::Heterotroph    => OrganismKind::Heterotroph,
     };
-    // Cell count drives the half-tank initial-energy budget. For
-    // species-loaded templates the OCG can carry up to 30 cells, so
-    // we read its length directly rather than hard-coding 1/2 based
-    // on symmetry.
-    let cell_count = ocg.len() as f32;
+    // Cell count drives the half-tank initial-energy budget — sum across
+    // every body part so multi-part species get a proportionate tank.
+    let cell_count = body_parts.iter().map(|bp| bp.cells.len()).sum::<usize>() as f32;
     let _ = CellType::Photo; // silence unused-import lint without removing the symbol
     let initial_energy = cell_count * MAX_ENERGY_PER_CELL * 0.5;
     let mut rng = rand::rng();
@@ -448,6 +489,7 @@ pub(super) fn spawn_species_template_at(
         position,
         entity:       Entity::PLACEHOLDER,
         custom_ocg:   Some(species.ocg.clone()),
+        custom_appendages: species.appendages.clone(),
         species_name: Some(species.name.clone()),
         is_carnivore: species.is_carnivore,
     };

@@ -284,10 +284,7 @@ fn save_colony_system(
             put_u32(&mut buf, bp.cells.len() as u32);
             for cell in &bp.cells {
                 put_vec3(&mut buf, cell.local_pos);
-                put_u8(&mut buf, match cell.cell_type {
-                    CellType::Photo    => 0,
-                    CellType::NonPhoto => 1,
-                });
+                put_u8(&mut buf, cell_type_byte(cell.cell_type));
                 put_f32(&mut buf, cell.cell_energy);
                 put_u8(&mut buf, cell.neighbour_count);
             }
@@ -296,10 +293,7 @@ fn save_colony_system(
             for (idx, pos, ct) in &bp.ocg {
                 put_u32(&mut buf, *idx as u32);
                 put_vec3(&mut buf, *pos);
-                put_u8(&mut buf, match ct {
-                    CellType::Photo    => 0,
-                    CellType::NonPhoto => 1,
-                });
+                put_u8(&mut buf, cell_type_byte(*ct));
             }
         }
 
@@ -555,7 +549,7 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
                         neighbour_count,
                         crate::energy::PHOTO_PRODUCTION_PER_CELL,
                     )),
-                    CellType::NonPhoto => None,
+                    CellType::NonPhoto | CellType::Placeholder => None,
                 };
                 cells.push(Cell { local_pos, cell_type, cell_energy, neighbour_count, photo });
             }
@@ -872,7 +866,19 @@ fn read_cell_type(buf: &[u8], c: &mut usize) -> std::io::Result<CellType> {
     match read_u8(buf, c)? {
         0 => Ok(CellType::Photo),
         1 => Ok(CellType::NonPhoto),
+        2 => Ok(CellType::Placeholder),
         other => Err(std::io::Error::other(format!("unknown cell-type tag: {other}"))),
+    }
+}
+
+/// Canonical byte tag for a `CellType` in the `.colony` binary format.
+/// Must stay in sync with `read_cell_type`.
+#[inline]
+fn cell_type_byte(ct: CellType) -> u8 {
+    match ct {
+        CellType::Photo       => 0,
+        CellType::NonPhoto    => 1,
+        CellType::Placeholder => 2,
     }
 }
 
@@ -1120,15 +1126,23 @@ pub struct OrganismMaterials {
 
 impl OrganismMaterials {
     pub fn new(materials: &mut Assets<StandardMaterial>) -> Self {
+        // The trophic material is now WHITE so the mesh's per-vertex
+        // colours (assigned per cell by `build_mesh_from_ocg`) come
+        // through unmultiplied — every cell shows its own colour
+        // regardless of the body part's overall trophic kind. The
+        // `photo` and `hetero` handles share one underlying material.
+        let body = materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            ..default()
+        });
         Self {
-            photo:      materials.add(StandardMaterial {
-                base_color: Color::srgb(0.2, 0.8, 0.2),
-                ..default()
-            }),
-            hetero:     materials.add(StandardMaterial {
-                base_color: Color::srgb(0.8, 0.2, 0.2),
-                ..default()
-            }),
+            photo:      body.clone(),
+            hetero:     body,
+            // `debug_blue` is kept as a full-part override for
+            // procedural reproduction appendages (which seed from a
+            // non-Placeholder cell and would otherwise look identical
+            // to the base body). Set on the BodyPart's `debug_blue`
+            // flag at creation time.
             debug_blue: materials.add(StandardMaterial {
                 base_color: Color::srgb(0.2, 0.4, 0.95),
                 ..default()
@@ -1137,15 +1151,16 @@ impl OrganismMaterials {
     }
 
     /// Pick the material handle for one body part, given the trophic kind of
-    /// its owning organism.
-    pub fn handle_for(&self, kind: OrganismKind, bp: &BodyPart) -> Handle<StandardMaterial> {
+    /// its owning organism. Per-cell colouring lives on the mesh itself
+    /// (`Mesh::ATTRIBUTE_COLOR`), so this only needs to choose between the
+    /// shared white body material and the debug-blue full-part override.
+    pub fn handle_for(&self, _kind: OrganismKind, bp: &BodyPart) -> Handle<StandardMaterial> {
         if bp.debug_blue {
             self.debug_blue.clone()
         } else {
-            match kind {
-                OrganismKind::Photoautotroph => self.photo.clone(),
-                OrganismKind::Heterotroph    => self.hetero.clone(),
-            }
+            // Same handle as `self.hetero`; `kind` is unused now that
+            // colour comes from per-vertex data.
+            self.photo.clone()
         }
     }
 }

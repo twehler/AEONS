@@ -149,6 +149,11 @@ pub struct OrganismTemplate {
     /// returns this verbatim — the default 1- or 2-cell shape from
     /// the cycler-driven path is bypassed.
     pub custom_ocg:    Option<Vec<(usize, Vec3, CellType)>>,
+    /// Appendage parts from a multi-part `.species` file, each as its
+    /// RAW stored OCG (right-half for bilateral, full for NoSymmetry).
+    /// Empty for cycler-derived or single-part templates. Expanded to
+    /// runtime body parts (attached to the base) at spawn time.
+    pub custom_appendages: Vec<Vec<(usize, Vec3, CellType)>>,
     /// Display name from the species file (filename stem). `None`
     /// for cycler-derived templates; falls back to "Hetero/Photo #N"
     /// formatting in `display_name`.

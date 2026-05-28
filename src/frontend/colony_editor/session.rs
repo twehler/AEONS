@@ -40,11 +40,17 @@ pub struct LoadedSpecies {
     /// Drives the `Carnivore` marker component at spawn time, which
     /// IL2 / IL3 brains read to filter their prey type.
     pub is_carnivore:      bool,
-    /// Full OCG ready for `root_body_part_from_ocg`. For bilateral
+    /// Base-body OCG ready for `root_body_part_from_ocg`. For bilateral
     /// species this has been pre-expanded to right + mirrored-left
     /// at load time so downstream code (placement, save) doesn't
     /// need to know the difference.
     pub ocg:               Vec<(usize, Vec3, CellType)>,
+    /// Appendage parts (index ≥ 1 in the species), each as its RAW
+    /// stored OCG (right-half for bilateral, full for NoSymmetry).
+    /// Expanded to runtime body parts at spawn (bilateral → mirrored
+    /// pair attached to the base; NoSymmetry → one attached part).
+    /// Empty for single-part / legacy species.
+    pub appendages:        Vec<Vec<(usize, Vec3, CellType)>>,
     /// `Some` when this species was loaded from a `.species` v3 file
     /// that carried trained brain weights. Every organism spawned
     /// from this species gets a copy of the payload attached as a

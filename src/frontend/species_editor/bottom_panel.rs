@@ -37,15 +37,17 @@ const TILE_BORDER_HOVER:    Color = Color::srgb(0.65, 0.65, 0.65);
 /// returns linear RGB. A 1:1 sync would double-correct.
 fn ui_color_for(ct: CellType) -> Color {
     match ct {
-        CellType::Photo    => Color::srgb(0.2, 0.8, 0.2),
-        CellType::NonPhoto => Color::srgb(0.8, 0.2, 0.2),
+        CellType::Photo       => Color::srgb(0.2, 0.8, 0.2),
+        CellType::NonPhoto    => Color::srgb(0.8, 0.2, 0.2),
+        CellType::Placeholder => Color::srgb(0.2, 0.45, 0.95),
     }
 }
 
 fn label_for(ct: CellType) -> &'static str {
     match ct {
-        CellType::Photo    => "Photo",
-        CellType::NonPhoto => "NonPhoto",
+        CellType::Photo       => "Photo",
+        CellType::NonPhoto    => "NonPhoto",
+        CellType::Placeholder => "Placeholder",
     }
 }
 
@@ -83,7 +85,7 @@ pub fn spawn_bottom_panel(parent: &mut ChildSpawnerCommands) {
             BackgroundColor(PANEL_BG_COLOR),
         ))
         .with_children(|panel| {
-            for ct in [CellType::Photo, CellType::NonPhoto] {
+            for ct in [CellType::Photo, CellType::NonPhoto, CellType::Placeholder] {
                 tile(panel, ct);
             }
         });

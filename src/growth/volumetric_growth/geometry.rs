@@ -44,20 +44,42 @@ pub fn best_matching(cell: &[Vec3], face: &[Vec3]) -> [usize; 3] {
 
 /// Flat-shaded, non-indexed triangle-list mesh.
 pub fn build_flat_mesh(verts: &[Vec3], tris: &[[u32; 3]]) -> Mesh {
+    build_flat_mesh_colored(verts, tris, None)
+}
+
+/// Same as `build_flat_mesh` but additionally writes per-vertex colours
+/// to `Mesh::ATTRIBUTE_COLOR`. `tri_colors[i]` is the linear-RGBA colour
+/// applied to all three vertices of `tris[i]` — flat-shaded, so each
+/// triangle takes its source cell's colour cleanly with no blending at
+/// inter-cell boundaries. Pass `None` to skip the colour attribute (the
+/// `StandardMaterial`'s `base_color` then drives the appearance, as
+/// before).
+pub fn build_flat_mesh_colored(
+    verts: &[Vec3],
+    tris: &[[u32; 3]],
+    tri_colors: Option<&[[f32; 4]]>,
+) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    for &[a, b, c] in tris {
+    let mut normals:   Vec<[f32; 3]> = Vec::new();
+    let mut colors:    Vec<[f32; 4]> = Vec::new();
+    let with_colors = tri_colors.is_some();
+    for (i, &[a, b, c]) in tris.iter().enumerate() {
         let av = verts[a as usize];
         let bv = verts[b as usize];
         let cv = verts[c as usize];
         let n = (bv - av).cross(cv - av).normalize_or_zero().to_array();
+        let col = tri_colors.and_then(|cs| cs.get(i)).copied();
         for p in [av, bv, cv] {
             positions.push(p.to_array());
             normals.push(n);
+            if let Some(c) = col { colors.push(c); }
         }
     }
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    if with_colors {
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    }
     mesh
 }

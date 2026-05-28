@@ -106,9 +106,9 @@ fn weld_key(p: Vec3) -> (i64, i64, i64) {
 /// (shared rhombic faces between adjacent cells) cancel and are dropped.
 /// Surviving triangles already have outward winding because each is the
 /// outward copy from its unique source cell.
-fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>, Vec<u32>) {
     if centers.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
 
     let local_verts: Vec<Vec3> = match GROWTH_MODE {
@@ -130,8 +130,12 @@ fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>) {
     let mut verts: Vec<Vec3> = Vec::new();
     let mut vmap: HashMap<(i64, i64, i64), u32> = HashMap::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
+    // Parallel to `tris`: which cell (index into `centers`) emitted each
+    // triangle. Survives the dedup so callers can colour kept triangles
+    // by their source cell's `CellType`.
+    let mut tri_src: Vec<u32> = Vec::new();
 
-    for &c in centers {
+    for (cell_idx, &c) in centers.iter().enumerate() {
         let mut local_to_global: Vec<u32> = Vec::with_capacity(local_verts.len());
         for &v in &local_verts {
             let p = c + v;
@@ -143,12 +147,13 @@ fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>) {
             });
             local_to_global.push(idx);
         }
-        for &[a, b, c] in &local_tris {
+        for &[a, b, c2] in &local_tris {
             tris.push([
                 local_to_global[a as usize],
                 local_to_global[b as usize],
-                local_to_global[c as usize],
+                local_to_global[c2 as usize],
             ]);
+            tri_src.push(cell_idx as u32);
         }
     }
 
@@ -161,16 +166,19 @@ fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>) {
         k.sort_unstable();
         *bucket.entry(k).or_insert(0) += 1;
     }
-    tris.retain(|&t| {
-        if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
-            return false;
-        }
+    let mut kept_tris: Vec<[u32; 3]> = Vec::with_capacity(tris.len());
+    let mut kept_src:  Vec<u32>      = Vec::with_capacity(tris.len());
+    for (i, &t) in tris.iter().enumerate() {
+        if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] { continue; }
         let mut k = t;
         k.sort_unstable();
-        bucket[&k] == 1
-    });
+        if bucket[&k] == 1 {
+            kept_tris.push(t);
+            kept_src.push(tri_src[i]);
+        }
+    }
 
-    (verts, tris)
+    (verts, kept_tris, kept_src)
 }
 
 // ── OCG pathway ───────────────────────────────────────────────────────────────
@@ -193,7 +201,21 @@ pub fn build_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
         return build_flat_mesh(&[], &[]);
     }
     let centers: Vec<Vec3> = ocg.iter().map(|(_, p, _)| *p).collect();
-    let (verts, tris) = rebuild_mesh(&centers);
+    let (verts, tris, tri_src) = rebuild_mesh(&centers);
+    let tri_colors = ocg_tri_colors(ocg, &tri_src);
+    geometry::build_flat_mesh_colored(&verts, &tris, Some(&tri_colors))
+}
+
+/// Same as `build_mesh_from_ocg` but WITHOUT per-vertex colours. The
+/// resulting mesh is rendered solely by its `StandardMaterial::base_color`
+/// — used for the species-editor preview cell (a translucent blue
+/// indicator that should NOT inherit the snapped cell type's colour).
+pub fn build_uncolored_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
+    if ocg.is_empty() {
+        return build_flat_mesh(&[], &[]);
+    }
+    let centers: Vec<Vec3> = ocg.iter().map(|(_, p, _)| *p).collect();
+    let (verts, tris, _tri_src) = rebuild_mesh(&centers);
     build_flat_mesh(&verts, &tris)
 }
 
@@ -209,12 +231,28 @@ pub fn build_smoothed_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
         return build_flat_mesh(&[], &[]);
     }
     let centers: Vec<Vec3> = ocg.iter().map(|(_, p, _)| *p).collect();
-    let (mut verts, tris) = rebuild_mesh(&centers);
+    let (mut verts, tris, tri_src) = rebuild_mesh(&centers);
     smooth_vertices::smooth_vertices(
         &mut verts, &tris,
         ADULT_SMOOTH_LAMBDA, ADULT_SMOOTH_ITERATIONS,
     );
-    build_flat_mesh(&verts, &tris)
+    // Smoothing only moves positions; the per-tri source-cell mapping
+    // (and therefore the colours) is unaffected.
+    let tri_colors = ocg_tri_colors(ocg, &tri_src);
+    geometry::build_flat_mesh_colored(&verts, &tris, Some(&tri_colors))
+}
+
+/// Map each surviving triangle to its source cell's linear-RGBA colour
+/// (alpha = 1). `tri_src[i]` is the cell-index that emitted the i-th
+/// surviving triangle.
+fn ocg_tri_colors(
+    ocg:     &[(usize, Vec3, CellType)],
+    tri_src: &[u32],
+) -> Vec<[f32; 4]> {
+    tri_src.iter().map(|&i| {
+        let [r, g, b] = ocg[i as usize].2.color();
+        [r, g, b, 1.0]
+    }).collect()
 }
 
 /// Grow one additional cell from the frontier of the OCG's final state.
@@ -238,7 +276,7 @@ pub fn grow_ocg_one_step(
     // unused) still needs the cached `triangles` slab — keep the rebuild
     // there.
     if matches!(GROWTH_MODE, GrowthMode::Tetrahedron) {
-        let (v, t) = rebuild_mesh(&state.centers);
+        let (v, t, _) = rebuild_mesh(&state.centers);
         state.vertices = v;
         state.triangles = t;
     }
@@ -277,7 +315,7 @@ pub fn candidate_centers_for_ocg(
         update_lattice_bookkeeping(&mut state, *center);
     }
     if matches!(GROWTH_MODE, GrowthMode::Tetrahedron) {
-        let (v, t) = rebuild_mesh(&state.centers);
+        let (v, t, _) = rebuild_mesh(&state.centers);
         state.vertices = v;
         state.triangles = t;
     }
@@ -313,7 +351,7 @@ pub fn grow_ocg_one_step_constrained(
     }
     // Same Dodec-mode rebuild_mesh skip as in grow_ocg_one_step.
     if matches!(GROWTH_MODE, GrowthMode::Tetrahedron) {
-        let (v, t) = rebuild_mesh(&state.centers);
+        let (v, t, _) = rebuild_mesh(&state.centers);
         state.vertices = v;
         state.triangles = t;
     }
@@ -398,7 +436,7 @@ impl VolumetricState {
         let mut s = Self::empty();
         s.centers.push(Vec3::ZERO);
         update_lattice_bookkeeping(&mut s, Vec3::ZERO);
-        let (v, t) = rebuild_mesh(&s.centers);
+        let (v, t, _) = rebuild_mesh(&s.centers);
         s.vertices = v;
         s.triangles = t;
         s.mesh_dirty = false;
@@ -617,7 +655,7 @@ fn grow_one_step(
     }
 
     if state.mesh_dirty {
-        let (v, t) = rebuild_mesh(&state.centers);
+        let (v, t, _) = rebuild_mesh(&state.centers);
         state.vertices = v;
         state.triangles = t;
         state.mesh_dirty = false;

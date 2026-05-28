@@ -58,8 +58,8 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
     let mut non_photo_cells: i32 = 0;
     for (_, _, ct) in &ocg_for_counts {
         match ct {
-            CellType::Photo    => photo_cells     += 1,
-            CellType::NonPhoto => non_photo_cells += 1,
+            CellType::Photo                            => photo_cells     += 1,
+            CellType::NonPhoto | CellType::Placeholder => non_photo_cells += 1,
         }
     }
     let cells = photo_cells + non_photo_cells;
@@ -121,8 +121,9 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
     for (_, pos, ct) in &ocg {
         put_vec3(buf, *pos);
         put_u8 (buf, match ct {
-            CellType::Photo    => 0,
-            CellType::NonPhoto => 1,
+            CellType::Photo       => 0,
+            CellType::NonPhoto    => 1,
+            CellType::Placeholder => 2,
         });
         put_f32(buf, 1.0);       // cell_energy — DEFAULT_CELL_ENERGY
         put_u8 (buf, 0);         // neighbour_count — recomputed at load
@@ -134,8 +135,9 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
         put_u32(buf, *idx as u32);
         put_vec3(buf, *pos);
         put_u8 (buf, match ct {
-            CellType::Photo    => 0,
-            CellType::NonPhoto => 1,
+            CellType::Photo       => 0,
+            CellType::NonPhoto    => 1,
+            CellType::Placeholder => 2,
         });
     }
 
