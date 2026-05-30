@@ -142,6 +142,31 @@ impl Mobility {
     pub fn is_sessile(self) -> bool { matches!(self, Mobility::Sessile) }
 }
 
+/// Movement paradigm. Maps directly to `Organism::sliding_movement`:
+///   * `Sliding`     → brain writes velocity, root translates kinematically.
+///   * `LimbMovement` → Avian physics per body part; PPO brain outputs
+///                      PD target joint angles. Limbs push the body via
+///                      friction at the ground.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeciesMovement { Sliding, LimbMovement }
+
+impl SpeciesMovement {
+    pub fn cycle(self) -> Self {
+        match self {
+            SpeciesMovement::Sliding      => SpeciesMovement::LimbMovement,
+            SpeciesMovement::LimbMovement => SpeciesMovement::Sliding,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            SpeciesMovement::Sliding      => "Sliding",
+            SpeciesMovement::LimbMovement => "Limb-Movement",
+        }
+    }
+    /// Inverse of `Organism::sliding_movement`'s naming.
+    pub fn is_sliding(self) -> bool { matches!(self, SpeciesMovement::Sliding) }
+}
+
 // Wrappers around the shared enums to keep cycle-label helpers local.
 pub fn cycle_intelligence(level: IntelligenceLevel) -> IntelligenceLevel {
     match level {
@@ -184,6 +209,7 @@ pub struct DraftSpecies {
     pub form:           Form,
     pub mobility:       Mobility,
     pub classification: Classification,
+    pub movement:       SpeciesMovement,
 }
 
 impl Default for DraftSpecies {
@@ -198,6 +224,10 @@ impl Default for DraftSpecies {
             form:           Form::Fixed,
             mobility:       Mobility::Mobile,
             classification: Classification::Herbivore,
+            // Default to Sliding so new species inherit current
+            // behaviour. The toggle is the user's deliberate opt-in
+            // to physics + PPO locomotion.
+            movement:       SpeciesMovement::Sliding,
         }
     }
 }
@@ -220,6 +250,12 @@ pub struct EditorBodyPart {
     /// Right-half (Bilateral) or full (NoSymmetry) OCG, editor-local
     /// coords, sequential indices 0..N.
     pub ocg: Vec<(usize, Vec3, CellType)>,
+    /// `true` when the user marked this body part as a "Limb" in the
+    /// body-part index panel. Limbs spawn with `BodyPartKind::Limb` and
+    /// visually rotate around their FIRST cell (the attachment seed)
+    /// in the running simulation. The base body (index 0) is never a
+    /// limb. Persisted to the `.species` file (v05+).
+    pub is_limb: bool,
 }
 
 

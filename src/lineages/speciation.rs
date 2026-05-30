@@ -28,8 +28,8 @@
 
 use bevy::prelude::*;
 
-use crate::intelligence_level_2::{BrainPoolL2, BrainSlotL2};
-use crate::intelligence_level_3::{BrainPoolL3, BrainSlotL3};
+use crate::intelligence_level_2_sliding::{BrainPoolL2, BrainSlotL2};
+use crate::intelligence_level_3_sliding::{BrainPoolL3, BrainSlotL3};
 use crate::lineages::dna::{
     distance, empty_dna, write_l1_hetero_genes, write_phenotype_dims, DNA_DIM,
 };

@@ -281,7 +281,7 @@ pub fn grow_ocg_one_step(
         state.triangles = t;
     }
 
-    let candidates = collect_candidates(&state);
+    let candidates = collect_candidates(&state, true);
     if candidates.is_empty() {
         return ocg.to_vec();
     }
@@ -319,7 +319,9 @@ pub fn candidate_centers_for_ocg(
         state.vertices = v;
         state.triangles = t;
     }
-    let raw = collect_candidates(&state);
+    // Editor authoring path: `respect_upward = false` so the user can
+    // place cells freely in 3D, including below the root.
+    let raw = collect_candidates(&state, false);
     match min_x {
         Some(v) => {
             let threshold = v - 1e-3;
@@ -357,7 +359,7 @@ pub fn grow_ocg_one_step_constrained(
     }
 
     let threshold = min_x - 1e-3;
-    let candidates: Vec<_> = collect_candidates(&state)
+    let candidates: Vec<_> = collect_candidates(&state, true)
         .into_iter()
         .filter(|c| c.center.x >= threshold)
         .collect();
@@ -486,14 +488,24 @@ fn face_normal(tri: &[u32; 3], verts: &[Vec3]) -> Vec3 {
 
 // ── Candidate generation ──────────────────────────────────────────────────────
 
-fn collect_candidates(state: &VolumetricState) -> Vec<CandidateInfo> {
+/// Generate the set of legal next-cell positions for `state`.
+///
+/// `respect_upward` controls whether the `GROW_ONLY_UPWARDS` flag is
+/// honoured:
+///   * `true`  — used by the procedural growth pipeline (continuous
+///     growth + reproduction-time mutation). Keeps plant-like organisms
+///     growing skyward instead of burrowing into the heightfield.
+///   * `false` — used by the Species Editor's authoring tool, where
+///     the user explicitly wants free 3D placement around the existing
+///     cells (no axis restriction).
+fn collect_candidates(state: &VolumetricState, respect_upward: bool) -> Vec<CandidateInfo> {
     match GROWTH_MODE {
-        GrowthMode::Dodecahedron => collect_candidates_dodec(state),
-        GrowthMode::Tetrahedron => collect_candidates_tetra(state),
+        GrowthMode::Dodecahedron => collect_candidates_dodec(state, respect_upward),
+        GrowthMode::Tetrahedron  => collect_candidates_tetra(state, respect_upward),
     }
 }
 
-fn collect_candidates_dodec(state: &VolumetricState) -> Vec<CandidateInfo> {
+fn collect_candidates_dodec(state: &VolumetricState, respect_upward: bool) -> Vec<CandidateInfo> {
     let scale = dodecahedron::center_scale(EDGE_LEN);
     state
         .frontier_pos
@@ -504,7 +516,10 @@ fn collect_candidates_dodec(state: &VolumetricState) -> Vec<CandidateInfo> {
                 .iter()
                 .map(|&dir| center - dir * scale)
                 .find(|p| state.occupied.contains(&lattice_key(*p)))?;
-            if growth_controls::GROW_ONLY_UPWARDS && center.y < parent_center.y {
+            if respect_upward
+                && growth_controls::GROW_ONLY_UPWARDS
+                && center.y < parent_center.y
+            {
                 return None;
             }
             Some(CandidateInfo {
@@ -517,7 +532,7 @@ fn collect_candidates_dodec(state: &VolumetricState) -> Vec<CandidateInfo> {
         .collect()
 }
 
-fn collect_candidates_tetra(state: &VolumetricState) -> Vec<CandidateInfo> {
+fn collect_candidates_tetra(state: &VolumetricState, respect_upward: bool) -> Vec<CandidateInfo> {
     if state.vertices.is_empty() || state.triangles.is_empty() {
         return Vec::new();
     }
@@ -532,7 +547,10 @@ fn collect_candidates_tetra(state: &VolumetricState) -> Vec<CandidateInfo> {
             if tetra_is_blocked(center, &state.tetra_occupied) {
                 return None;
             }
-            if growth_controls::GROW_ONLY_UPWARDS && center.y < centroid.y {
+            if respect_upward
+                && growth_controls::GROW_ONLY_UPWARDS
+                && center.y < centroid.y
+            {
                 return None;
             }
             Some(CandidateInfo {
@@ -571,6 +589,8 @@ fn spawn_volumetric_mesh(
             intelligence_level:   crate::organism::IntelligenceLevel::Level1,
             is_sessile:           false,
             has_variable_form:    false,
+            sliding_movement:     true,
+        limb_targets:         [0.0; 6],
             adult:                false,
             photo_cell_count:     1,
             non_photo_cell_count: 0,
@@ -617,7 +637,7 @@ fn grow_one_step(
         return;
     }
 
-    let candidates = collect_candidates(&state);
+    let candidates = collect_candidates(&state, true);
     if candidates.is_empty() {
         state.done = true;
         info!(

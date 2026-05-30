@@ -26,12 +26,12 @@ use std::path::Path;
 use crate::cell::CellType;
 use crate::colony::{IntelligenceLevel, Symmetry};
 
-use super::session::{Classification, Metabolism, SpeciesSession};
+use super::session::{Classification, Metabolism, SpeciesMovement, SpeciesSession};
 
 /// v3 appends an optional brain block immediately after the OCG
 /// entries: one byte `brain_present`, and if 1 the same payload
 /// `colony.rs` writes for `AEONS004` colony files (the shared
-/// helpers in `intelligence_level_herbivore_1::{encode,decode}_brain_restore`).
+/// helpers in `intelligence_level_herbivore_1_sliding::{encode,decode}_brain_restore`).
 /// The species editor itself always writes `brain_present = 0`
 /// (random init is regenerated at spawn time, not baked into the
 /// file); the "export trained organism as a species" workflow in
@@ -41,17 +41,29 @@ use super::session::{Classification, Metabolism, SpeciesSession};
 /// v2 introduced the `classification` byte (Herbivore / Carnivore)
 /// after `is_sessile`. v1 files are still accepted by
 /// `load_species` and default to `Classification::Herbivore`.
+/// v5 adds a per-part `u8 is_limb` byte AFTER the name (and before the
+/// OCG count). Limb-flagged appendages spawn as `BodyPartKind::Limb`
+/// and visually rotate around their first cell in the running sim.
+/// Everything else matches v4.
+///
 /// v4 stores MULTIPLE body parts, each with a UTF-8 name. After the 6
 /// metadata bytes it writes `u32 body_part_count`, then per part:
 /// `u32 name_len`, name bytes, `u32 ocg_count`, then the OCG entries.
 /// The base body is part 0; later parts are appendages. The optional
 /// brain block follows the last part. v1–v3 stored a single OCG; the
 /// loader wraps those as a single "Base Body" part.
+/// v6 appends a single `u8 sliding` byte at the end of the metadata
+/// header (after `classification`, before `body_part_count`). 1 =
+/// sliding (legacy), 0 = limb-based. Pre-v6 files default this flag
+/// to `true` on load (matches the simulation default before the
+/// physics + PPO pipeline existed).
+const MAGIC_V6:     &[u8; 8] = b"AEONSS06";
+const MAGIC_V5:     &[u8; 8] = b"AEONSS05";
 const MAGIC_V4:     &[u8; 8] = b"AEONSS04";
 const MAGIC_V3:     &[u8; 8] = b"AEONSS03";
 const MAGIC_V2:     &[u8; 8] = b"AEONSS02";
 const MAGIC_V1:     &[u8; 8] = b"AEONSS01";
-const MAGIC: &[u8; 8] = MAGIC_V4;
+const MAGIC: &[u8; 8] = MAGIC_V6;
 
 
 pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
@@ -120,14 +132,17 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     buf.push(var_byte);
     buf.push(sessile_byte);
     buf.push(classification_byte);
+    // v6: movement paradigm byte (1 = sliding, 0 = limb-based).
+    let sliding_byte: u8 = if session.draft.movement.is_sliding() { 1 } else { 0 };
+    buf.push(sliding_byte);
 
-    // v4: multi-part body. Skip empty parts (e.g. an appendage that was
-    // begun but never given a cell). body_part_count, then per part.
+    // v5: multi-part body with per-part `is_limb` flag. Skip empty parts
+    // (e.g. an appendage that was begun but never given a cell).
     let parts: Vec<&super::session::EditorBodyPart> =
         session.body_parts.iter().filter(|p| !p.ocg.is_empty()).collect();
     buf.extend_from_slice(&(parts.len() as u32).to_le_bytes());
     for part in parts {
-        write_body_part(&mut buf, &part.name, &part.ocg);
+        write_body_part(&mut buf, &part.name, part.is_limb, &part.ocg);
     }
 
     // Brain block — editor saves write `brain_present = 0`. Weights are
@@ -138,12 +153,14 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     buf
 }
 
-/// Write one body part: `u32 name_len`, name bytes, `u32 ocg_count`,
-/// then the OCG entries (`u32 idx`, 3×`f32` pos, `u8` cell_type).
-fn write_body_part(buf: &mut Vec<u8>, name: &str, ocg: &[(usize, Vec3, CellType)]) {
+/// Write one v5 body part: `u32 name_len`, name bytes, `u8 is_limb`,
+/// `u32 ocg_count`, then the OCG entries (`u32 idx`, 3×`f32` pos, `u8`
+/// cell_type).
+fn write_body_part(buf: &mut Vec<u8>, name: &str, is_limb: bool, ocg: &[(usize, Vec3, CellType)]) {
     let name_bytes = name.as_bytes();
     buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(name_bytes);
+    buf.push(if is_limb { 1 } else { 0 });
     buf.extend_from_slice(&(ocg.len() as u32).to_le_bytes());
     for &(idx, pos, ct) in ocg {
         buf.extend_from_slice(&(idx as u32).to_le_bytes());
@@ -177,7 +194,7 @@ pub fn encode_species_with_brain(
     is_sessile:        bool,
     classification:    Classification,
     ocg:               &[(usize, Vec3, CellType)],
-    brain:             &crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1,
+    brain:             &crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1,
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(64 + ocg.len() * 17 + 32 * 1024);
     buf.extend_from_slice(MAGIC);
@@ -208,11 +225,14 @@ pub fn encode_species_with_brain(
     buf.push(var_byte);
     buf.push(sessile_byte);
     buf.push(classification_byte);
-    // v4: a trained export is a single "Base Body" part.
+    // v6: trained exports come from the sliding herbivore_1 brain, so
+    // sliding = true.
+    buf.push(1);
+    // v5: a trained export is a single "Base Body" part (never a limb).
     buf.extend_from_slice(&1u32.to_le_bytes());
-    write_body_part(&mut buf, "Base Body", ocg);
+    write_body_part(&mut buf, "Base Body", false, ocg);
     buf.push(1);   // brain_present
-    crate::intelligence_level_herbivore_1::encode_brain_restore(&mut buf, brain);
+    crate::intelligence_level_herbivore_1_sliding::encode_brain_restore(&mut buf, brain);
     buf
 }
 
@@ -231,6 +251,9 @@ pub fn load_species(path: &Path) -> std::io::Result<LoadedSpecies> {
 #[derive(Clone, Debug)]
 pub struct LoadedBodyPart {
     pub name: String,
+    /// `true` when the part is flagged as a limb (animated at runtime).
+    /// v1–v4 files default this to `false` on load.
+    pub is_limb: bool,
     pub ocg:  Vec<(usize, Vec3, CellType)>,
 }
 
@@ -245,6 +268,10 @@ pub struct LoadedSpecies {
     pub is_sessile:        bool,
     /// v1 files default this to `Herbivore`; v2 reads it from disk.
     pub classification:    Classification,
+    /// Movement paradigm. v1–v5 files default to `Sliding`; v6+ reads
+    /// the byte. Mapped directly to `Organism::sliding_movement` at
+    /// spawn (`Sliding → true`).
+    pub movement:          SpeciesMovement,
     /// All body parts (index 0 = base body). v1–v3 files yield a single
     /// "Base Body" part.
     pub body_parts:        Vec<LoadedBodyPart>,
@@ -252,7 +279,7 @@ pub struct LoadedSpecies {
     /// `brain_present = 1`). Spawning from such a species attaches
     /// the restore payload to every copy so all spawned instances
     /// boot with the saved weights instead of fresh random init.
-    pub brain: Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>,
+    pub brain: Option<crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1>,
 }
 
 
@@ -262,12 +289,14 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     fn err(msg: &str) -> Error { Error::new(ErrorKind::InvalidData, msg.to_string()) }
 
     if bytes.len() < 8 + 5 + 4 { return Err(err("species file too short for header")); }
+    let is_v6 = &bytes[..8] == MAGIC_V6;
+    let is_v5 = &bytes[..8] == MAGIC_V5;
     let is_v4 = &bytes[..8] == MAGIC_V4;
     let is_v3 = &bytes[..8] == MAGIC_V3;
     let is_v2 = &bytes[..8] == MAGIC_V2;
     let is_v1 = &bytes[..8] == MAGIC_V1;
-    if !is_v4 && !is_v3 && !is_v2 && !is_v1 {
-        return Err(err("species magic mismatch (expected AEONSS01..AEONSS04)"));
+    if !is_v6 && !is_v5 && !is_v4 && !is_v3 && !is_v2 && !is_v1 {
+        return Err(err("species magic mismatch (expected AEONSS01..AEONSS06)"));
     }
 
     let mut c = 8usize;
@@ -276,7 +305,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let intel_byte   = bytes[c]; c += 1;
     let var_byte     = bytes[c]; c += 1;
     let sessile_byte = bytes[c]; c += 1;
-    let classification = if is_v2 || is_v3 || is_v4 {
+    let classification = if is_v2 || is_v3 || is_v4 || is_v5 || is_v6 {
         let b = bytes[c]; c += 1;
         match b {
             0 => Classification::Herbivore,
@@ -287,6 +316,19 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
         // v1 didn't store a classification — default to Herbivore so
         // old saves load as the more common case.
         Classification::Herbivore
+    };
+    // v6 introduced the movement-paradigm byte right after
+    // classification. Older versions default to Sliding (legacy
+    // behaviour, before physics + PPO existed).
+    let movement = if is_v6 {
+        let b = bytes[c]; c += 1;
+        match b {
+            0 => SpeciesMovement::LimbMovement,
+            1 => SpeciesMovement::Sliding,
+            _ => return Err(err("unknown movement tag")),
+        }
+    } else {
+        SpeciesMovement::Sliding
     };
 
     let metabolism = match kind_byte {
@@ -309,32 +351,32 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let has_variable_form = var_byte != 0;
     let is_sessile        = sessile_byte != 0;
 
-    // Body parts. v4 stores a count + named parts; v1–v3 store a single
+    // Body parts. v4/v5/v6 store a count + named parts; v1–v3 store a single
     // OCG which we wrap as one "Base Body" part.
-    let body_parts: Vec<LoadedBodyPart> = if is_v4 {
+    let body_parts: Vec<LoadedBodyPart> = if is_v4 || is_v5 || is_v6 {
         if bytes.len() < c + 4 { return Err(err("missing body_part_count")); }
         let count = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
         let mut parts = Vec::with_capacity(count);
         for _ in 0..count {
-            parts.push(read_species_body_part(bytes, &mut c)?);
+            parts.push(read_species_body_part(bytes, &mut c, is_v5 || is_v6)?);
         }
         parts
     } else {
         if bytes.len() < c + 4 { return Err(err("missing ocg_count")); }
         let ocg_count = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
         let ocg = read_species_ocg(bytes, &mut c, ocg_count)?;
-        vec![LoadedBodyPart { name: "Base Body".to_string(), ocg }]
+        vec![LoadedBodyPart { name: "Base Body".to_string(), is_limb: false, ocg }]
     };
 
-    // Brain block (v3 + v4). Layout: u8 brain_present, and if 1 the
-    // shared BrainRestoreHerbivore1 payload. v1/v2 carry none.
-    let brain = if is_v3 || is_v4 {
+    // Brain block (v3+). Layout: u8 brain_present, and if 1 the shared
+    // BrainRestoreHerbivore1 payload. v1/v2 carry none.
+    let brain = if is_v3 || is_v4 || is_v5 || is_v6 {
         if c >= bytes.len() {
             None
         } else {
             let brain_present = bytes[c]; c += 1;
             if brain_present == 1 {
-                Some(crate::intelligence_level_herbivore_1::decode_brain_restore(
+                Some(crate::intelligence_level_herbivore_1_sliding::decode_brain_restore(
                     bytes, &mut c,
                 )?)
             } else {
@@ -347,21 +389,28 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
 
     Ok(LoadedSpecies {
         metabolism, symmetry, intelligence, has_variable_form, is_sessile,
-        classification, body_parts, brain,
+        classification, movement, body_parts, brain,
     })
 }
 
-/// Read one v4 body part (name + OCG) advancing `c`.
-fn read_species_body_part(bytes: &[u8], c: &mut usize) -> std::io::Result<LoadedBodyPart> {
+/// Read one v4/v5 body part (name [+ is_limb if v5] + OCG), advancing `c`.
+fn read_species_body_part(bytes: &[u8], c: &mut usize, is_v5: bool) -> std::io::Result<LoadedBodyPart> {
     let err = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
     if bytes.len() < *c + 4 { return Err(err("body part name length truncated")); }
     let name_len = u32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()) as usize; *c += 4;
     if bytes.len() < *c + name_len { return Err(err("body part name truncated")); }
     let name = String::from_utf8_lossy(&bytes[*c..*c+name_len]).into_owned(); *c += name_len;
+    let is_limb = if is_v5 {
+        if bytes.len() < *c + 1 { return Err(err("body part is_limb truncated")); }
+        let b = bytes[*c]; *c += 1;
+        b != 0
+    } else {
+        false
+    };
     if bytes.len() < *c + 4 { return Err(err("body part ocg_count truncated")); }
     let ocg_count = u32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()) as usize; *c += 4;
     let ocg = read_species_ocg(bytes, c, ocg_count)?;
-    Ok(LoadedBodyPart { name, ocg })
+    Ok(LoadedBodyPart { name, is_limb, ocg })
 }
 
 /// Read `count` OCG entries advancing `c`.

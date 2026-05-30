@@ -233,6 +233,10 @@ fn spawn_krishi(
         // Krishi roams freely (mobile predator); no plant-like form.
         is_sessile:           false,
         has_variable_form:    false,
+        // Krishi keeps legacy sliding movement — it has a hand-built
+        // static body and no limbs to drive locomotion through.
+        sliding_movement:     true,
+        limb_targets:         [0.0; 6],
         // Krishi has a hand-built footprint and never grows — adult
         // from spawn. (No mesh smoothing is run because Krishi's body
         // part is `regrowable: false`, so spawn_organism skips mesh

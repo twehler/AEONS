@@ -1,7 +1,9 @@
 // Continuous per-organism time-series logger.
 //
 // Every `LOG_INTERVAL_SECS` virtual seconds the system writes one
-// CSV row per Level1 herbivore to `logs/time_series_<timestamp>.csv`.
+// CSV row per Level1 herbivore to `datasets/time_series_<timestamp>.csv`
+// (alongside the milestone snapshots, so the analysis suite can pick
+// it up — see `data-analysis/time_series.R`).
 // The file is opened lazily on the first log tick and stays open
 // for the lifetime of the process. Lets us trace per-individual
 // learning trajectories (mu_angle, value_v, mean_reward_64 over
@@ -18,7 +20,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 
 use crate::colony::{Carnivore, Heterotroph, Organism, OrganismRoot};
-use crate::intelligence_level_herbivore_1::{
+use crate::intelligence_level_herbivore_1_sliding::{
     BrainPoolHerbivore1, BrainSlotHerbivore1,
 };
 
@@ -62,7 +64,7 @@ pub fn tick_time_series_logger(
     if !logger.init_attempted {
         logger.init_attempted = true;
         let path = PathBuf::from(format!(
-            "logs/time_series_{}.csv",
+            "datasets/time_series_{}.csv",
             chrono::Local::now().format("%d-%m-%Y-%H-%M-%S"),
         ));
         if let Some(parent) = path.parent() {
@@ -71,6 +73,10 @@ pub fn tick_time_series_logger(
                 return;
             }
         }
+        // NB: timestamped filename, so it is NOT touched by
+        // `dataset_export::rotate_existing_datasets` (which only
+        // matches the `simulation_dataset_*` prefix) — each run keeps
+        // its own trace file in `datasets/`.
         match File::create(&path) {
             Ok(f) => {
                 let mut w = BufWriter::new(f);

@@ -184,8 +184,10 @@ fn load_species_into_session(
     };
     let base_raw = loaded.body_parts.first().map(|p| p.ocg.clone()).unwrap_or_default();
     let ocg = expand(&base_raw);
-    let appendages: Vec<Vec<(usize, bevy::math::Vec3, crate::cell::CellType)>> =
-        loaded.body_parts.iter().skip(1).map(|p| p.ocg.clone()).collect();
+    let appendages: Vec<(Vec<(usize, bevy::math::Vec3, crate::cell::CellType)>, bool)> =
+        loaded.body_parts.iter().skip(1)
+            .map(|p| (p.ocg.clone(), p.is_limb))
+            .collect();
 
     let display_name = path.file_stem()
         .and_then(|s| s.to_str())
@@ -195,6 +197,10 @@ fn load_species_into_session(
     let is_carnivore = matches!(
         loaded.classification,
         crate::species_editor::session::Classification::Carnivore,
+    );
+    let sliding_movement = matches!(
+        loaded.movement,
+        crate::species_editor::session::SpeciesMovement::Sliding,
     );
 
     session.next_species_id += 1;
@@ -208,6 +214,7 @@ fn load_species_into_session(
         form,
         is_sessile:   loaded.is_sessile,
         is_carnivore,
+        sliding_movement,
         ocg,
         appendages,
         // v3 brain payload, if the file carried one. Spawn paths

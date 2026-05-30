@@ -38,6 +38,12 @@ const BEGIN_BG:        Color = Color::srgb(0.20, 0.45, 0.70);
 const BEGIN_BG_HOVER:  Color = Color::srgb(0.30, 0.55, 0.80);
 const BEGIN_BG_DISABLED: Color = Color::srgb(0.18, 0.18, 0.18);
 
+const LIMB_TOGGLE_WIDTH_PX: f32 = 52.0;
+const LIMB_BG_OFF:       Color = Color::srgb(0.22, 0.22, 0.22);
+const LIMB_BG_OFF_HOVER: Color = Color::srgb(0.32, 0.32, 0.32);
+const LIMB_BG_ON:        Color = Color::srgb(0.30, 0.55, 0.30);
+const LIMB_BG_ON_HOVER:  Color = Color::srgb(0.40, 0.65, 0.40);
+
 
 // ── Markers ──────────────────────────────────────────────────────────────────
 
@@ -52,10 +58,22 @@ pub struct BodyPartList;
 pub struct BeginNewBodyPartButton;
 
 /// One row in the index, carrying the body-part index it represents.
+/// The row itself is a layout Node — not a Button. Its two children
+/// (a select button and a limb toggle) carry the interactions.
 #[derive(Component, Clone, Copy)]
 pub struct BodyPartRow(pub usize);
 
-/// Text child of a row, so the label-sync system finds it directly.
+/// Click target for selecting / renaming a body part (the name area
+/// of the row). One per row.
+#[derive(Component, Clone, Copy)]
+pub struct BodyPartSelectButton(pub usize);
+
+/// Click target for the per-row "Limb" toggle (right side of the
+/// row). Hidden for the base body (index 0). One per appendage row.
+#[derive(Component, Clone, Copy)]
+pub struct BodyPartLimbToggle(pub usize);
+
+/// Text child of a select button, so the label-sync system finds it directly.
 #[derive(Component, Clone, Copy)]
 pub struct BodyPartRowLabel(pub usize);
 
@@ -146,6 +164,7 @@ pub fn handle_begin_new_body_part(
                 session.body_parts.push(EditorBodyPart {
                     name: format!("Body Part {n}"),
                     ocg:  Vec::new(),
+                    is_limb: false,
                 });
                 session.active_body_part = n;
                 session.renaming_body_part = None;
@@ -184,25 +203,64 @@ pub fn manage_body_part_list(
         for (i, part) in session.body_parts.iter().enumerate() {
             list.spawn((
                 BodyPartRow(i),
-                Button,
                 Node {
                     width:  Val::Percent(100.0),
                     height: Val::Px(ROW_HEIGHT_PX),
-                    align_items:     AlignItems::Center,
-                    justify_content: JustifyContent::FlexStart,
-                    padding: UiRect::horizontal(Val::Px(8.0)),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Stretch,
+                    column_gap: Val::Px(4.0),
                     ..default()
                 },
-                BackgroundColor(ROW_BG_IDLE),
             ))
             .with_children(|row| {
+                // Name select button — clicking it selects this part
+                // as the active placement target (and starts rename
+                // on a second click).
                 row.spawn((
-                    BodyPartRowLabel(i),
-                    Text::new(part.name.clone()),
-                    TextFont { font_size: 13.0, ..default() },
-                    TextColor(Color::WHITE),
-                    Pickable::IGNORE,
-                ));
+                    BodyPartSelectButton(i),
+                    Button,
+                    Node {
+                        flex_grow: 1.0,
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::FlexStart,
+                        padding: UiRect::horizontal(Val::Px(8.0)),
+                        ..default()
+                    },
+                    BackgroundColor(ROW_BG_IDLE),
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        BodyPartRowLabel(i),
+                        Text::new(part.name.clone()),
+                        TextFont { font_size: 13.0, ..default() },
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
+                });
+
+                // Limb toggle — appendages only; the base body cannot
+                // be a limb.
+                if i != 0 {
+                    row.spawn((
+                        BodyPartLimbToggle(i),
+                        Button,
+                        Node {
+                            width:  Val::Px(LIMB_TOGGLE_WIDTH_PX),
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        },
+                        BackgroundColor(if part.is_limb { LIMB_BG_ON } else { LIMB_BG_OFF }),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new("Limb"),
+                            TextFont { font_size: 11.0, ..default() },
+                            TextColor(Color::WHITE),
+                            Pickable::IGNORE,
+                        ));
+                    });
+                }
             });
         }
     });
@@ -213,14 +271,14 @@ pub fn manage_body_part_list(
 
 pub fn handle_body_part_row_clicks(
     mode:             Res<WindowMode>,
-    mut interactions: Query<(&Interaction, &BodyPartRow), Changed<Interaction>>,
+    mut interactions: Query<(&Interaction, &BodyPartSelectButton), Changed<Interaction>>,
     mut session:      ResMut<SpeciesSession>,
 ) {
     if *mode != WindowMode::SpeciesEditor { return; }
 
-    for (interaction, row) in &mut interactions {
+    for (interaction, sel) in &mut interactions {
         if !matches!(*interaction, Interaction::Pressed) { continue; }
-        let i = row.0;
+        let i = sel.0;
         if i >= session.body_parts.len() { continue; }
 
         if session.active_body_part == i && session.renaming_body_part != Some(i) {
@@ -231,6 +289,28 @@ pub fn handle_body_part_row_clicks(
             // Select this part as the active placement target.
             session.active_body_part = i;
             session.renaming_body_part = None;
+        }
+    }
+}
+
+
+// ── Limb toggle ───────────────────────────────────────────────────────────────
+
+pub fn handle_limb_toggle(
+    mode:             Res<WindowMode>,
+    mut interactions: Query<(&Interaction, &BodyPartLimbToggle), Changed<Interaction>>,
+    mut session:      ResMut<SpeciesSession>,
+) {
+    if *mode != WindowMode::SpeciesEditor { return; }
+
+    for (interaction, t) in &mut interactions {
+        if !matches!(*interaction, Interaction::Pressed) { continue; }
+        let i = t.0;
+        // Base body is never a limb.
+        if i == 0 { continue; }
+        if let Some(part) = session.body_parts.get_mut(i) {
+            part.is_limb = !part.is_limb;
+            session.dirty = true;
         }
     }
 }
@@ -290,10 +370,12 @@ pub fn handle_rename_input(
 // ── Row label + highlight sync ─────────────────────────────────────────────────
 
 pub fn sync_body_part_rows(
-    session:    Res<SpeciesSession>,
-    mut rows:   Query<(&BodyPartRow, &Interaction, &mut BackgroundColor)>,
-    mut labels: Query<(&BodyPartRowLabel, &mut Text)>,
+    session:     Res<SpeciesSession>,
+    mut labels:  Query<(&BodyPartRowLabel, &mut Text)>,
+    mut selects: Query<(&BodyPartSelectButton, &Interaction, &mut BackgroundColor), Without<BodyPartLimbToggle>>,
+    mut toggles: Query<(&BodyPartLimbToggle, &Interaction, &mut BackgroundColor), Without<BodyPartSelectButton>>,
 ) {
+    // Labels (renaming overlays show the live buffer with a cursor).
     for (label, mut text) in &mut labels {
         let i = label.0;
         let Some(part) = session.body_parts.get(i) else { continue };
@@ -305,8 +387,9 @@ pub fn sync_body_part_rows(
         if text.0 != new { text.0 = new; }
     }
 
-    for (row, interaction, mut bg) in &mut rows {
-        let i = row.0;
+    // Select-button background: rename > active > hover > idle.
+    for (sel, interaction, mut bg) in &mut selects {
+        let i = sel.0;
         let target = if session.renaming_body_part == Some(i) {
             ROW_BG_RENAME
         } else if session.active_body_part == i {
@@ -315,6 +398,20 @@ pub fn sync_body_part_rows(
             ROW_BG_HOVER
         } else {
             ROW_BG_IDLE
+        };
+        *bg = BackgroundColor(target);
+    }
+
+    // Limb-toggle background reflects `is_limb`, with a hover variant.
+    for (t, interaction, mut bg) in &mut toggles {
+        let i = t.0;
+        let Some(part) = session.body_parts.get(i) else { continue };
+        let hovered = matches!(*interaction, Interaction::Hovered | Interaction::Pressed);
+        let target = match (part.is_limb, hovered) {
+            (true,  false) => LIMB_BG_ON,
+            (true,  true)  => LIMB_BG_ON_HOVER,
+            (false, false) => LIMB_BG_OFF,
+            (false, true)  => LIMB_BG_OFF_HOVER,
         };
         *bg = BackgroundColor(target);
     }

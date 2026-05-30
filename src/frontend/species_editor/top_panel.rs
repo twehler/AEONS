@@ -28,7 +28,7 @@ use crate::simulation_settings::WindowMode;
 
 use super::session::{
     cycle_intelligence, cycle_symmetry, intelligence_label, symmetry_label,
-    Classification, DraftSpecies, Metabolism, Mobility, SpeciesSession,
+    Classification, DraftSpecies, Metabolism, Mobility, SpeciesMovement, SpeciesSession,
 };
 use super::TOP_PANEL_HEIGHT_PX;
 
@@ -50,7 +50,7 @@ const ACTION_BG_DISABLED:  Color = Color::srgb(0.18, 0.18, 0.18);
 pub struct SpeciesTopPanel;
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
-pub enum CyclerKind { Metabolism, Mobility, Classification, Intelligence, Symmetry, Form }
+pub enum CyclerKind { Metabolism, Mobility, Classification, Intelligence, Symmetry, Form, Movement }
 
 #[derive(Component, Clone, Copy)]
 pub struct Cycler(pub CyclerKind);
@@ -97,6 +97,7 @@ pub fn spawn_top_panel(parent: &mut ChildSpawnerCommands, top_offset_px: f32) {
             cycler_button(bar, CyclerKind::Intelligence,   intelligence_label(draft.intelligence));
             cycler_button(bar, CyclerKind::Symmetry,       symmetry_label(draft.symmetry));
             cycler_button(bar, CyclerKind::Form,           draft.form.label());
+            cycler_button(bar, CyclerKind::Movement,       draft.movement.label());
 
             // Action buttons — wider than cyclers.
             action_button::<SpawnFirstCellButton>(bar, "Spawn first Cell", ACTION_BG_PRIMARY);
@@ -217,6 +218,16 @@ pub fn handle_cycler_clicks(
                         session.draft.intelligence = default_intelligence_for(
                             session.draft.mobility, session.draft.classification,
                         );
+                        // Sessile organisms must be on the sliding path
+                        // (Kinematic root, immovable to physics). Snap
+                        // the movement cycler when entering Sessile so
+                        // the user doesn't inadvertently leave a stale
+                        // LimbMovement selection — `spawn_organism`
+                        // would coerce it anyway but the UI should
+                        // reflect what will actually happen.
+                        if session.draft.mobility == Mobility::Sessile {
+                            session.draft.movement = SpeciesMovement::Sliding;
+                        }
                     }
                     CyclerKind::Classification => {
                         // Toggle classification, then re-apply the
@@ -250,6 +261,13 @@ pub fn handle_cycler_clicks(
                     }
                     CyclerKind::Symmetry => session.draft.symmetry = cycle_symmetry(session.draft.symmetry),
                     CyclerKind::Form     => session.draft.form     = session.draft.form.cycle(),
+                    CyclerKind::Movement => {
+                        // Sessile species are locked to Sliding (their
+                        // root is a physics-immovable Kinematic body).
+                        // Match the Intelligence cycler's pattern.
+                        if session.draft.mobility == Mobility::Sessile { continue; }
+                        session.draft.movement = session.draft.movement.cycle();
+                    }
                 }
                 *bg = BackgroundColor(CYCLER_BG_HOVER);
             }
@@ -274,6 +292,7 @@ pub fn sync_cycler_labels(
             CyclerKind::Intelligence   => intelligence_label(session.draft.intelligence).to_string(),
             CyclerKind::Symmetry       => symmetry_label(session.draft.symmetry).to_string(),
             CyclerKind::Form           => session.draft.form.label().to_string(),
+            CyclerKind::Movement       => session.draft.movement.label().to_string(),
         };
         if text.0 != new { text.0 = new; }
     }
@@ -282,19 +301,22 @@ pub fn sync_cycler_labels(
 /// Visually grey-out cyclers based on lock state:
 ///   * After first cell spawned → ALL cyclers locked (body plan
 ///     committed).
-///   * While sessile (Mobility = Sessile) → Intelligence cycler locked
-///     (Level0 only).
+///   * While sessile (Mobility = Sessile) → Intelligence cycler AND
+///     Movement cycler locked (Level0 + Sliding only).
 /// Other cyclers stay active in the active state.
 pub fn sync_cycler_lock_state(
     session:     Res<SpeciesSession>,
     mut cyclers: Query<(&Cycler, &mut BackgroundColor)>,
 ) {
     if !session.is_changed() { return; }
-    let all_locked = session.first_cell_spawned;
-    let intel_locked_by_sessility = session.draft.mobility == Mobility::Sessile;
+    let all_locked      = session.first_cell_spawned;
+    let locked_by_sessile = session.draft.mobility == Mobility::Sessile;
     for (cycler, mut bg) in &mut cyclers {
         let locked = all_locked
-            || (cycler.0 == CyclerKind::Intelligence && intel_locked_by_sessility);
+            || (locked_by_sessile && matches!(
+                cycler.0,
+                CyclerKind::Intelligence | CyclerKind::Movement,
+            ));
         *bg = BackgroundColor(if locked { CYCLER_BG_LOCKED } else { CYCLER_BG_ACTIVE });
     }
 }
@@ -322,6 +344,7 @@ pub fn handle_spawn_first_cell(
                 session.body_parts = vec![super::session::EditorBodyPart {
                     name: "Base Body".to_string(),
                     ocg:  vec![(0usize, pos, starter)],
+                    is_limb: false,
                 }];
                 session.active_body_part = 0;
                 session.first_cell_spawned = true;

@@ -35,4 +35,5 @@ run brain_weights.R     results_brain_weights.txt
 run training_curves.R   results_training_curves.txt
 run limb_brains.R       results_limb_brains.txt
 run correlations.R      results_correlations.txt
+run time_series.R       results_time_series.txt
 echo "Done."

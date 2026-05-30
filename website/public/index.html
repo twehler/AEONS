@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AEONS — Accelerated Evolution, Open-Naturalistic Simulator</title>
+  <meta
+    name="description"
+    content="AEONS is a research project simulating the evolution of biological form and behaviour, blending Darwinian natural selection with Lamarckian neural adaptation."
+  />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,900&family=Space+Grotesk:wght@300;400;500;700&family=JetBrains+Mono:wght@400;600&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- Generative background canvas (drifting cells / organisms) -->
+  <canvas id="bg-canvas" aria-hidden="true"></canvas>
+
+  <!-- Reading progress bar -->
+  <div id="progress" aria-hidden="true"></div>
+
+  <!-- ───────────────────────── NAV ───────────────────────── -->
+  <header class="nav" id="nav">
+    <a class="brand" href="#top">
+      <span class="brand-mark" aria-hidden="true">
+        <span></span><span></span><span></span>
+      </span>
+      <span class="brand-text">AEONS</span>
+    </a>
+    <nav class="nav-links">
+      <a href="#about">Premise</a>
+      <a href="#modes">Two Modes</a>
+      <a href="#life">Life</a>
+      <a href="#world">World</a>
+      <a href="#tech" class="nav-cta">Engine</a>
+    </nav>
+  </header>
+
+  <!-- ───────────────────────── HERO ───────────────────────── -->
+  <main id="top">
+    <section class="hero" id="hero">
+      <div class="hero-inner">
+        <p class="eyebrow reveal">A living research instrument</p>
+        <h1 class="hero-title reveal">
+          Watch <span class="grad">evolution</span> happen<br />
+          in <span class="grad alt">real&nbsp;time</span>.
+        </h1>
+        <p class="hero-lead reveal">
+          <strong>AEONS</strong> — the <em>Accelerated Evolution, Open-Naturalistic
+          Simulator</em> — grows multicellular organisms from simple geometric cells
+          and lets them eat, move, photosynthesise and reproduce across a
+          hand-crafted world. Form and behaviour emerge over generations, driven by
+          two rival theories of evolution.
+        </p>
+        <div class="hero-actions reveal">
+          <a href="#about" class="btn btn-primary">Enter the simulation</a>
+          <a href="#modes" class="btn btn-ghost">Darwin or Lamarck? →</a>
+        </div>
+        <div class="hero-meta reveal">
+          <span><b>Darwin</b> &amp; <b>Lamarck</b> modes</span>
+          <span class="dot"></span>
+          <span>GPU-trained brains</span>
+          <span class="dot"></span>
+          <span>Written in Rust</span>
+        </div>
+      </div>
+      <div class="scroll-hint" aria-hidden="true">
+        <span>scroll</span>
+        <div class="mouse"><div class="wheel"></div></div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── ABOUT ───────────────────────── -->
+    <section class="section" id="about">
+      <div class="section-head reveal">
+        <span class="kicker">01 — The premise</span>
+        <h2>A laboratory for the origin of form &amp; behaviour.</h2>
+      </div>
+      <div class="prose reveal">
+        <p>
+          AEONS is a research project built to simulate the evolution of
+          <span class="hl">biological form</span> and
+          <span class="hl">behaviour</span>, grounded in the two great theories of
+          evolution — those of <b>Charles Darwin</b> and
+          <b>Jean-Baptiste de Lamarck</b>.
+        </p>
+        <p>
+          It focuses on <b>multicellularity</b> — the emergence of shape from many
+          simple cells — and on how organisms behave toward their environment as the
+          generations pass. The ambition is a complex world with realistic
+          parameters, where scientifically proven concepts about evolution can be
+          studied as they unfold, live.
+        </p>
+      </div>
+
+      <div class="stat-grid">
+        <div class="stat reveal" data-count="2" data-suffix="">
+          <span class="stat-num">0</span>
+          <span class="stat-label">theories of evolution, side by side</span>
+        </div>
+        <div class="stat reveal" data-count="2" data-suffix="">
+          <span class="stat-num">0</span>
+          <span class="stat-label">cell types — Photo &amp; Non-Photo</span>
+        </div>
+        <div class="stat reveal" data-count="100" data-suffix="%">
+          <span class="stat-num">0</span>
+          <span class="stat-label">emergent — nothing is scripted</span>
+        </div>
+        <div class="stat reveal" data-count="1" data-suffix="">
+          <span class="stat-num">0</span>
+          <span class="stat-label">brain per organism, trained on the GPU</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── MODES ───────────────────────── -->
+    <section class="section section-modes" id="modes">
+      <div class="section-head reveal">
+        <span class="kicker">02 — Two engines of change</span>
+        <h2>Darwin &amp; Lamarck, as a switch you can flip.</h2>
+        <p class="section-sub">
+          Two evolution modes drive everything you observe. Toggle between them to
+          feel the difference.
+        </p>
+      </div>
+
+      <div class="mode-toggle reveal" role="tablist" aria-label="Evolution mode">
+        <button class="mode-btn is-active" data-mode="darwin" role="tab" aria-selected="true">
+          Darwin Mode
+        </button>
+        <span class="mode-slider" aria-hidden="true"></span>
+        <button class="mode-btn" data-mode="lamarck" role="tab" aria-selected="false">
+          Lamarck Mode
+        </button>
+      </div>
+
+      <div class="mode-stage reveal">
+        <article class="mode-card" data-mode-panel="darwin">
+          <h3>Natural selection, and nothing else.</h3>
+          <p>
+            In <b>Darwin Mode</b>, blind variation and differential survival are the
+            <em>only</em> driving factors for everything that can be observed.
+            Mutations arrive at random; the world decides who reproduces. No
+            organism knows what it is becoming.
+          </p>
+          <ul class="mode-points">
+            <li>Random mutation of the genome</li>
+            <li>Survival of the fittest body plans</li>
+            <li>Behaviour shaped purely by who lives to reproduce</li>
+          </ul>
+        </article>
+        <article class="mode-card" data-mode-panel="lamarck" hidden>
+          <h3>Neural networks that steer their own genes.</h3>
+          <p>
+            In <b>Lamarck Mode</b>, small neural networks decide how to slowly edit an
+            organism's genetic information so that survival is best secured. Acquired
+            advantage feeds back into heredity — evolution with a sense of direction.
+          </p>
+          <ul class="mode-points">
+            <li>Per-organism brains propose genetic edits</li>
+            <li>Adaptation accumulates within and across lifetimes</li>
+            <li>Goal-seeking change, not blind chance</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── LIFE ───────────────────────── -->
+    <section class="section" id="life">
+      <div class="section-head reveal">
+        <span class="kicker">03 — The life forms</span>
+        <h2>Bodies built from cells. Minds built from math.</h2>
+        <p class="section-sub">
+          Every life form is assembled from <b>cells</b> — simple geometric shapes —
+          and piloted by a small, isolated machine-learning brain.
+        </p>
+      </div>
+
+      <div class="card-grid">
+        <article class="feature-card reveal">
+          <div class="card-glyph" data-glyph="cell"></div>
+          <h3>Geometric cells</h3>
+          <p>
+            Two kinds of cell — light-harvesting <span class="tag tag-photo">Photo</span>
+            and structural <span class="tag tag-nonphoto">Non-Photo</span> — snap
+            together on a crystalline lattice to compose every body part.
+          </p>
+        </article>
+        <article class="feature-card reveal">
+          <div class="card-glyph" data-glyph="organism"></div>
+          <h3>Emergent multicellularity</h3>
+          <p>
+            From single seed cells, organisms grow body parts, branch into limbs, and
+            settle into symmetries. Shape is never hand-drawn — it is grown.
+          </p>
+        </article>
+        <article class="feature-card reveal">
+          <div class="card-glyph" data-glyph="brain"></div>
+          <h3>Isolated brains</h3>
+          <p>
+            Behaviour rests on small, independent ML algorithms — one brain per
+            organism — that learn to chase food, flee, and reproduce. Their learning,
+            too, is dictated by the active evolution mode.
+          </p>
+        </article>
+        <article class="feature-card reveal">
+          <div class="card-glyph" data-glyph="dna"></div>
+          <h3>Heritable genomes</h3>
+          <p>
+            A compact genome encodes body plan and behaviour. Offspring inherit it —
+            mutated by chance in Darwin Mode, edited with intent in Lamarck Mode.
+          </p>
+        </article>
+      </div>
+
+      <figure class="figure reveal">
+        <div class="figure-frame">
+          <span class="placeholder-label">Screenshot — organisms grazing in the world</span>
+        </div>
+        <figcaption>A future colony, mid-simulation. (placeholder)</figcaption>
+      </figure>
+    </section>
+
+    <!-- ───────────────────────── WORLD ───────────────────────── -->
+    <section class="section section-world" id="world">
+      <div class="world-split">
+        <div class="world-text reveal">
+          <span class="kicker">04 — The world</span>
+          <h2>A terrain authored by hand, ruled by physics.</h2>
+          <p>
+            To guarantee maximum control over the environment, the terrain is
+            constructed from two hand-crafted images:
+          </p>
+          <div class="map-rows">
+            <div class="map-row">
+              <span class="map-chip heightmap">Heightmap</span>
+              <p>defines the shape of the land — valleys, ridges, the climb of every slope.</p>
+            </div>
+            <div class="map-row">
+              <span class="map-chip materialmap">Material map</span>
+              <p>paints what each patch of ground <em>is</em> — and how it behaves.</p>
+            </div>
+          </div>
+          <p>
+            The aim is a complex world with realistic parameters, in which proven
+            mechanisms of evolution can be studied in real time.
+          </p>
+        </div>
+        <div class="world-visual reveal">
+          <div class="map-stack">
+            <div class="map-layer map-height" aria-hidden="true"></div>
+            <div class="map-layer map-material" aria-hidden="true"></div>
+            <span class="placeholder-label">Heightmap × Material map (placeholder)</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── TECH ───────────────────────── -->
+    <section class="section" id="tech">
+      <div class="section-head reveal">
+        <span class="kicker">05 — Built to run for aeons</span>
+        <h2>Engineered for the long run.</h2>
+        <p class="section-sub">
+          To run the simulation for a very long time without crashing, AEONS is built
+          on a deliberately robust stack.
+        </p>
+      </div>
+      <div class="tech-grid">
+        <article class="tech-card reveal">
+          <span class="tech-tag">language</span>
+          <h3>Rust</h3>
+          <p>Memory-safe and fast — the foundation that keeps the simulation stable across endless generations.</p>
+        </article>
+        <article class="tech-card reveal">
+          <span class="tech-tag">engine</span>
+          <h3>Bevy</h3>
+          <p>A modern, data-driven game engine providing efficient rendering and an ECS world for thousands of organisms.</p>
+        </article>
+        <article class="tech-card reveal">
+          <span class="tech-tag">learning</span>
+          <h3>Burn</h3>
+          <p>Drives the organisms' neural networks directly on the GPU, so brains learn while the world keeps turning.</p>
+        </article>
+      </div>
+
+      <div class="roadmap reveal">
+        <h3 class="roadmap-title">Where it goes next</h3>
+        <p class="roadmap-note">
+          If the project succeeds, a larger version will extend the simulation to the
+          <span class="hl">evolution of biochemical aspects</span> — chemistry as a
+          new dimension of natural selection.
+        </p>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── CTA / FOOTER ───────────────────────── -->
+    <section class="closing reveal" id="closing">
+      <div class="closing-inner">
+        <img class="closing-logo" src="/assets/dna.png" alt="AEONS DNA logo" />
+        <h2>Evolution, accelerated.</h2>
+        <p>
+          AEONS is an open research instrument for the patient study of life's oldest
+          process — running on your own machine, for as long as you let it.
+        </p>
+        <a href="#top" class="btn btn-primary">Back to the top ↑</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-row">
+      <span class="brand-text small">AEONS</span>
+      <span class="footer-tag">Accelerated Evolution, Open-Naturalistic Simulator</span>
+    </div>
+    <p class="footer-fine">
+      A research project on the evolution of form and behaviour · Darwin &amp; Lamarck ·
+      Rust · Bevy · Burn
+    </p>
+  </footer>
+
+  <script src="/main.js"></script>
+</body>
+</html>

@@ -62,8 +62,22 @@ impl Default for AutoExportSchedule {
         // previous run's artefacts to `#1` at startup.
         Self {
             pending: vec![
+                // Baseline snapshot. Fires at virtual t=15 s instead
+                // of 0 because the world load + `spawn_colony` are
+                // gated on the async glb load (`HeightmapSampler`)
+                // and don't finish until ~7 seconds of virtual time
+                // — at virtual t=0 the colony hasn't been spawned yet
+                // and the snapshot CSV would come out empty. 15 s is
+                // comfortably after spawn + first brain enrolment but
+                // before any meaningful PPO update has fired, so the
+                // analysis scripts get a clean "initial" reference.
+                (     15.0, "simulation_dataset_0_SECONDS"),
+                (     60.0, "simulation_dataset_1_MINUTE"),
+                (    180.0, "simulation_dataset_3_MINUTES"),
                 (    300.0, "simulation_dataset_5_MINUTES"),
+                (    420.0, "simulation_dataset_7_MINUTES"),
                 (    600.0, "simulation_dataset_10_MINUTES"),
+                (   1200.0, "simulation_dataset_20_MINUTES"),
                 (   1800.0, "simulation_dataset_30_MINUTES"),
                 (   3600.0, "simulation_dataset_60_MINUTES"),
                 (  10800.0, "simulation_dataset_3_HOURS"),
@@ -199,8 +213,22 @@ pub fn export_dataset_system(
         ),
         With<OrganismRoot>,
     >,
+    // Per body-part Avian state + last-applied-torque, used to build a
+    // per-organism telemetry map for the limb-pool CSV writer below.
+    // Joined to the organism root via `ChildOf::parent()` (every limb
+    // body part is a child of the `OrganismRoot`).
+    limb_bp_q: Query<(
+        &bevy::prelude::ChildOf,
+        &crate::cell::BodyPartIndex,
+        &avian3d::prelude::LinearVelocity,
+        &avian3d::prelude::AngularVelocity,
+        &crate::avian_setup::LastAppliedTorque,
+    )>,
     virtual_time: Res<Time<Virtual>>,
-    pool:         NonSend<crate::intelligence_level_herbivore_1::BrainPoolHerbivore1>,
+    pool:         NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
+    pool_limb_h:  NonSend<crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
+    pool_limb_l2: NonSend<crate::intelligence_level_2_limb::BrainPoolL2Limb>,
+    pool_limb_l3: NonSend<crate::intelligence_level_3_limb::BrainPoolL3Limb>,
 ) {
     let Some(path) = req.0.take() else { return };
 
@@ -273,6 +301,200 @@ pub fn export_dataset_system(
         }
         Err(e) => error!("brain-probe: failed to create {}: {}", probe_path.display(), e),
     }
+
+    // ── Per-pool limb-brain side-cars. One CSV per limb pool
+    // listing every organism currently enrolled in it, with current
+    // state + the limb-brain's per-organism log_std stats. Filenames:
+    // `<stem>_limb_<level>.csv`. Snapshots are cheap (one GPU→CPU
+    // sync per tensor); writes are no-ops when the pool is empty.
+    let snap_h  = pool_limb_h.0.snapshot();
+    let snap_l2 = pool_limb_l2.0.snapshot();
+    let snap_l3 = pool_limb_l3.0.snapshot();
+
+    // ── Build per-organism Avian telemetry map ────────────────────
+    // For each organism root, gather:
+    //   * BASE body's (LinearVelocity, AngularVelocity) — idx 0
+    //   * max |torque| across all body parts — diagnostic for whether
+    //     the PD controller is producing anything at all.
+    // Stored in a HashMap keyed by the OrganismRoot entity.
+    let mut limb_telemetry: std::collections::HashMap<Entity, LimbBodyTelemetry> =
+        std::collections::HashMap::new();
+    for (child_of, idx, lin_vel, ang_vel, torque) in &limb_bp_q {
+        let root = child_of.parent();
+        let entry = limb_telemetry.entry(root).or_default();
+        let t_norm = torque.0.length();
+        if t_norm > entry.max_torque_norm { entry.max_torque_norm = t_norm; }
+        if idx.0 == 0 {
+            entry.base_lin_vel = lin_vel.0;
+            entry.base_ang_vel = ang_vel.0;
+            entry.base_seen = true;
+        }
+    }
+
+    write_limb_pool_csv(
+        &path, "limb_herbivore_1", &snap_h, &query, &limb_telemetry,
+        virtual_time.elapsed_secs(),
+    );
+    write_limb_pool_csv(
+        &path, "limb_l2", &snap_l2, &query, &limb_telemetry,
+        virtual_time.elapsed_secs(),
+    );
+    write_limb_pool_csv(
+        &path, "limb_l3", &snap_l3, &query, &limb_telemetry,
+        virtual_time.elapsed_secs(),
+    );
+
+    // ── Side-car: limb-pool training-stats CSVs. One per limb pool
+    // that has any logged training history. Filename:
+    // `<stem>_limb_<pool>_training_stats.csv`. The schema mirrors the
+    // sliding pool's training_stats CSV exactly, so the same R reader
+    // can ingest both.
+    write_limb_training_stats(&path, "limb_herbivore_1", pool_limb_h.0.training_history());
+    write_limb_training_stats(&path, "limb_l2",          pool_limb_l2.0.training_history());
+    write_limb_training_stats(&path, "limb_l3",          pool_limb_l3.0.training_history());
+}
+
+/// Per-organism Avian telemetry assembled in `export_dataset_system`
+/// and threaded into `write_limb_pool_csv`. Defaults are all-zero so
+/// organisms whose body parts aren't yet in Avian's query
+/// (e.g., between PreUpdate spawn and FixedPostUpdate physics step)
+/// still get a sensible row.
+#[derive(Default, Clone, Copy)]
+struct LimbBodyTelemetry {
+    base_lin_vel:    Vec3,
+    base_ang_vel:    Vec3,
+    max_torque_norm: f32,
+    /// True iff the base body part appeared in the query at all.
+    /// False usually means the organism is sliding (no Avian dynamic
+    /// bodies) — in which case the velocity columns will be 0 but
+    /// torque_norm is also 0, which is correct.
+    base_seen:       bool,
+}
+
+/// Write a single limb-pool's training-step history to a side-car
+/// CSV. Filename: `<stem>_<pool>_training_stats.csv`. Silent no-op
+/// when the history is empty (no PPO update has fired yet).
+fn write_limb_training_stats(
+    main_path:  &std::path::Path,
+    pool_label: &str,
+    history:    &std::collections::VecDeque<crate::limb_ppo::LimbTrainingStep>,
+) {
+    if history.is_empty() { return; }
+    let stem = main_path.file_stem().and_then(|s| s.to_str()).unwrap_or("dataset");
+    let out_path = main_path.with_file_name(format!("{stem}_{pool_label}_training_stats.csv"));
+    let file = match File::create(&out_path) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("{pool_label}: failed to create {}: {}", out_path.display(), e);
+            return;
+        }
+    };
+    let mut w = BufWriter::new(file);
+    let _ = writeln!(
+        &mut w,
+        "step;virtual_time_secs;n_active;actor_loss;critic_loss;entropy;\
+         total_loss;mean_return;return_var;supervised_loss"
+    );
+    for s in history.iter() {
+        let _ = writeln!(
+            &mut w,
+            "{};{:.3};{};{:.6};{:.6};{:.6};{:.6};{:.6};{:.6};{:.6}",
+            s.step, s.virtual_time_secs, s.n_active,
+            s.actor_loss, s.critic_loss, s.entropy,
+            s.total_loss, s.mean_return, s.return_var,
+            s.supervised_loss,
+        );
+    }
+    let _ = w.flush();
+    info!("limb-pool training stats written to {}", out_path.display());
+}
+
+/// Write a single limb-pool snapshot to its own `<stem>_<pool>.csv`
+/// side-car. One row per organism currently enrolled in the pool,
+/// with state from the `Organism` component + per-dim `log_std` from
+/// the saved actor weights. Silent no-op if the pool is empty.
+fn write_limb_pool_csv(
+    main_path:    &std::path::Path,
+    pool_label:   &str,
+    snap:         &crate::limb_ppo::LimbPoolSnapshot,
+    query:        &Query<
+        (
+            Entity, &Organism, &Transform,
+            Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>,
+            Option<&LineageRecord>,
+        ),
+        With<OrganismRoot>,
+    >,
+    telemetry: &std::collections::HashMap<Entity, LimbBodyTelemetry>,
+    t_virtual: f32,
+) {
+    if snap.map.is_empty() { return; }
+
+    let stem = main_path.file_stem().and_then(|s| s.to_str()).unwrap_or("dataset");
+    let out_path = main_path.with_file_name(format!("{stem}_{pool_label}.csv"));
+    let file = match File::create(&out_path) {
+        Ok(f)  => f,
+        Err(e) => {
+            error!("{pool_label}: failed to create {}: {}", out_path.display(), e);
+            return;
+        }
+    };
+    let mut w = BufWriter::new(file);
+
+    // Header. Tier 0 instrumentation adds the BASE body's linear and
+    // angular velocity (so we can see whether Avian's integrator is
+    // doing anything at all) plus the max torque magnitude commanded
+    // by the PD controller across all body parts this tick.
+    let _ = writeln!(
+        &mut w,
+        "entity;t_virtual;slot;x;y;z;energy;energy_norm;predations;reproductions;\
+         is_carnivore;intelligence_level;\
+         limb_target_0;limb_target_1;limb_target_2;limb_target_3;limb_target_4;limb_target_5;\
+         log_std_0;log_std_1;log_std_2;log_std_3;log_std_4;log_std_5;\
+         base_lin_vel_x;base_lin_vel_y;base_lin_vel_z;\
+         base_ang_vel_x;base_ang_vel_y;base_ang_vel_z;\
+         base_speed_xz;max_torque_norm"
+    );
+
+    // For each organism enrolled in this pool, write a row.
+    for (e, org, transform, _is_photo, _is_hetero, is_carn, _lineage) in query.iter() {
+        let Some(&slot) = snap.map.get(&e) else { continue };
+        let s = slot as usize;
+
+        // Per-dim log_std from the snapshot's flat [N * OUT] buffer.
+        let ls_base = s * crate::limb_ppo::OUT;
+        let log_std = &snap.actor_log_std[ls_base..ls_base + crate::limb_ppo::OUT];
+
+        let max_e = (org.grown_cell_count() as f32) * crate::energy::MAX_ENERGY_PER_CELL;
+        let energy_norm = if max_e > 0.0 { (org.energy / max_e).clamp(0.0, 1.0) } else { 0.0 };
+
+        let tel = telemetry.get(&e).copied().unwrap_or_default();
+        let base_speed_xz = (tel.base_lin_vel.x * tel.base_lin_vel.x
+                             + tel.base_lin_vel.z * tel.base_lin_vel.z).sqrt();
+
+        let _ = writeln!(
+            &mut w,
+            "{};{};{};{};{};{};{};{};{};{};{};{};\
+             {};{};{};{};{};{};\
+             {};{};{};{};{};{};\
+             {};{};{};{};{};{};{};{}",
+            e.index(), t_virtual, slot,
+            transform.translation.x, transform.translation.y, transform.translation.z,
+            org.energy, energy_norm,
+            org.predations, org.reproductions,
+            bool01(is_carn),
+            intelligence_label(org.intelligence_level),
+            org.limb_targets[0], org.limb_targets[1], org.limb_targets[2],
+            org.limb_targets[3], org.limb_targets[4], org.limb_targets[5],
+            log_std[0], log_std[1], log_std[2], log_std[3], log_std[4], log_std[5],
+            tel.base_lin_vel.x, tel.base_lin_vel.y, tel.base_lin_vel.z,
+            tel.base_ang_vel.x, tel.base_ang_vel.y, tel.base_ang_vel.z,
+            base_speed_xz, tel.max_torque_norm,
+        );
+    }
+
+    let _ = w.flush();
+    info!("limb-pool dataset written to {}", out_path.display());
 }
 
 
@@ -309,7 +531,7 @@ fn write_brain_probe_csv<W: Write>(
         ),
         With<OrganismRoot>,
     >,
-    pool:  &crate::intelligence_level_herbivore_1::BrainPoolHerbivore1,
+    pool:  &crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1,
 ) -> std::io::Result<()> {
     use rand::seq::SliceRandom;
 
@@ -387,7 +609,7 @@ fn write_brain_probe_csv<W: Write>(
 /// train_step in the pool's history ring).
 fn write_training_stats_csv<W: Write>(
     out:     &mut W,
-    history: &std::collections::VecDeque<crate::intelligence_level_herbivore_1::TrainingStep>,
+    history: &std::collections::VecDeque<crate::intelligence_level_herbivore_1_sliding::TrainingStep>,
 ) -> std::io::Result<()> {
     out.write_all(
         b"step;virtual_time_secs;n_active;actor_loss;critic_loss;entropy;\
@@ -460,8 +682,8 @@ fn write_csv<W: Write>(
         With<OrganismRoot>,
     >,
     now_secs:  f32,
-    pool:      &crate::intelligence_level_herbivore_1::BrainPoolHerbivore1,
-    telemetry: &[crate::intelligence_level_herbivore_1::BrainTelemetry],
+    pool:      &crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1,
+    telemetry: &[crate::intelligence_level_herbivore_1_sliding::BrainTelemetry],
 ) -> std::io::Result<()> {
     // ── Header ────────────────────────────────────────────────
     let mut header = String::new();
@@ -556,7 +778,7 @@ fn write_row<W: Write>(
     lineage:    Option<&LineageRecord>,
     child_count: u32,
     now_secs:   f32,
-    telem:      Option<&crate::intelligence_level_herbivore_1::BrainTelemetry>,
+    telem:      Option<&crate::intelligence_level_herbivore_1_sliding::BrainTelemetry>,
 ) -> std::io::Result<()> {
     let pos = transform.translation;
 

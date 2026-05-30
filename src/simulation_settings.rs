@@ -18,26 +18,26 @@ use bevy::prelude::*;
 /// independent cap (`MaxHerbivores`). The GPU brain-pool batch dim
 /// (`OrganismPoolSize`) is derived separately from `MaxHerbivores`
 /// at startup, since only heterotrophs use brain slots.
-pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 100;
+pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 800;
 
 /// Launcher-side default for the herbivore reproduction cap. The
 /// reproduction system stops scheduling new herbivore births once
 /// this number is reached. Kept small by default so a fresh launch
 /// stays manageable; the launcher text field lifts it for AI-training
 /// runs.
-pub const DEFAULT_MAX_HERBIVORES: usize = 5;
+pub const DEFAULT_MAX_HERBIVORES: usize = 100;
 
 /// Launcher-side default for the initial herbivore cohort size at
 /// `spawn_colony` (when no colony save is loaded). Independent from
 /// `DEFAULT_MAX_HERBIVORES` so the user can seed a small starter
 /// population and let reproduction grow it up to the cap.
-pub const DEFAULT_START_HETEROTROPHS: usize = 5;
+pub const DEFAULT_START_HETEROTROPHS: usize = 100;
 
 /// Launcher-side default for the initial photoautotroph cohort size
 /// at `spawn_colony` (when no colony save is loaded). Independent
 /// from `DEFAULT_MAX_PHOTOAUTOTROPHS` so the user can seed a small
 /// starter population and let reproduction grow it up to the cap.
-pub const DEFAULT_START_PHOTOAUTOTROPHS: usize = 100;
+pub const DEFAULT_START_PHOTOAUTOTROPHS: usize = 800;
 
 
 /// Number of heterotrophs to spawn at `spawn_colony` startup. Set
@@ -64,8 +64,8 @@ impl Default for StartPhotoautotrophs {
     fn default() -> Self { Self(DEFAULT_START_PHOTOAUTOTROPHS) }
 }
 
-pub const DEFAULT_MAP_X:           f32        = 100.0;
-pub const DEFAULT_MAP_Z:           f32        = 100.0;
+pub const DEFAULT_MAP_X:           f32        = 1000.0;
+pub const DEFAULT_MAP_Z:           f32        = 1000.0;
 
 
 /// AI-training mode toggle for the heterotroph movement-RL

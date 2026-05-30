@@ -177,6 +177,11 @@ fn apply_movement(
         // world-bounds clamping run in their own systems and continue to
         // apply, so a sessile cell still settles onto the heightmap.
         if organism.is_sessile { continue; }
+        // Limb-based organisms get their pose from Avian's dynamic
+        // bodies — overwriting their root transform here would fight
+        // the physics engine. Their motion happens in Avian's solver
+        // and the PD-torque application step.
+        if !organism.sliding_movement { continue; }
 
         // Yaw the organism so its local +Z axis (defined as "front" by
         // the body-plan convention) points along the XZ projection of

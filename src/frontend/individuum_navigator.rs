@@ -1029,11 +1029,11 @@ fn handle_export_buttons(
 /// the .species v3 payload, and writes it to disk.
 fn dispatch_export_species_requests(
     mut request: ResMut<ExportSpeciesRequested>,
-    pool:        NonSend<crate::intelligence_level_herbivore_1::BrainPoolHerbivore1>,
+    pool:        NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
     query:       Query<
         (
             &Organism,
-            &crate::intelligence_level_herbivore_1::BrainSlotHerbivore1,
+            &crate::intelligence_level_herbivore_1_sliding::BrainSlotHerbivore1,
             Has<crate::colony::Photoautotroph>,
             Has<Heterotroph>,
             Has<crate::colony::Carnivore>,

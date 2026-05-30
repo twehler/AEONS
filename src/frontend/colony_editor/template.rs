@@ -149,11 +149,13 @@ pub struct OrganismTemplate {
     /// returns this verbatim — the default 1- or 2-cell shape from
     /// the cycler-driven path is bypassed.
     pub custom_ocg:    Option<Vec<(usize, Vec3, CellType)>>,
-    /// Appendage parts from a multi-part `.species` file, each as its
-    /// RAW stored OCG (right-half for bilateral, full for NoSymmetry).
-    /// Empty for cycler-derived or single-part templates. Expanded to
-    /// runtime body parts (attached to the base) at spawn time.
-    pub custom_appendages: Vec<Vec<(usize, Vec3, CellType)>>,
+    /// Appendage parts from a multi-part `.species` file, each as
+    /// `(OCG, is_limb)`. The OCG is the raw stored shape (right-half
+    /// for bilateral, full for NoSymmetry); `is_limb = true` makes the
+    /// runtime spawn rebase the part to a first-cell pivot and tag it
+    /// as `BodyPartKind::Limb` so it animates. Empty for
+    /// cycler-derived or single-part templates.
+    pub custom_appendages: Vec<(Vec<(usize, Vec3, CellType)>, bool)>,
     /// Display name from the species file (filename stem). `None`
     /// for cycler-derived templates; falls back to "Hetero/Photo #N"
     /// formatting in `display_name`.
@@ -165,6 +167,21 @@ pub struct OrganismTemplate {
     /// so IL2 / IL3 brains hunt other heterotrophs instead of
     /// photoautotrophs.
     pub is_carnivore:  bool,
+    /// Maps to `Organism::sliding_movement`. `true` = legacy sliding,
+    /// `false` = limb-based physics + PPO. Sourced from the species
+    /// editor's movement cycler via `LoadedSpecies::sliding_movement`.
+    /// Defaults to `true` for cycler-derived templates (the standalone
+    /// "Create Organism" path in the colony editor — these stay on the
+    /// sliding path until the user explicitly imports a limb species).
+    pub sliding_movement: bool,
+    /// Maps to `Organism::is_sessile`, taken verbatim from the
+    /// species-editor Mobility cycler. The simulation enforces the
+    /// invariant `has_variable_form ⇒ is_sessile` independently in
+    /// `spawn_organism`, so a `Variable + Mobile` species would still
+    /// be coerced to sessile at spawn — but the inverse pairing
+    /// (`Fixed + Sessile`) is a legitimate user choice that only this
+    /// field can carry through to the runtime.
+    pub is_sessile: bool,
 }
 
 impl OrganismTemplate {
@@ -190,11 +207,14 @@ impl OrganismTemplate {
         self.form.is_variable()
     }
 
-    /// Sessile is conceptually paired with variable-form in this
-    /// simulation: all variable-form organisms are sessile, and the
-    /// editor doesn't expose sessile as an independent toggle.
+    /// Sessile flag, honouring the species editor's Mobility cycler.
+    /// `is_sessile` and `has_variable_form` are independent in the
+    /// species file: a user can author a fixed-form sessile organism
+    /// (a stone-like creature with a fixed body plan). The OR with
+    /// `has_variable_form` preserves the simulation invariant
+    /// `Variable ⇒ Sessile` for safety.
     pub fn is_sessile(&self) -> bool {
-        self.form.is_variable()
+        self.is_sessile || self.form.is_variable()
     }
 
     /// Build the per-body-part OCG for the save format. If

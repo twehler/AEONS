@@ -40,24 +40,30 @@ pub struct LoadedSpecies {
     /// Drives the `Carnivore` marker component at spawn time, which
     /// IL2 / IL3 brains read to filter their prey type.
     pub is_carnivore:      bool,
+    /// Maps to `Organism::sliding_movement` at spawn. `true` = legacy
+    /// sliding, `false` = limb-based physics + PPO. Sourced from the
+    /// species editor's "Sliding / Limb-Movement" cycler.
+    pub sliding_movement:  bool,
     /// Base-body OCG ready for `root_body_part_from_ocg`. For bilateral
     /// species this has been pre-expanded to right + mirrored-left
     /// at load time so downstream code (placement, save) doesn't
     /// need to know the difference.
     pub ocg:               Vec<(usize, Vec3, CellType)>,
-    /// Appendage parts (index ≥ 1 in the species), each as its RAW
-    /// stored OCG (right-half for bilateral, full for NoSymmetry).
-    /// Expanded to runtime body parts at spawn (bilateral → mirrored
-    /// pair attached to the base; NoSymmetry → one attached part).
-    /// Empty for single-part / legacy species.
-    pub appendages:        Vec<Vec<(usize, Vec3, CellType)>>,
+    /// Appendage parts (index ≥ 1 in the species), each as `(OCG,
+    /// is_limb)`: the raw stored OCG (right-half for bilateral, full
+    /// for NoSymmetry) and the limb flag (limbs spawn with
+    /// `BodyPartKind::Limb` and animate at runtime). Expanded to
+    /// runtime body parts at spawn (bilateral → mirrored pair
+    /// attached to the base; NoSymmetry → one attached part). Empty
+    /// for single-part / legacy species.
+    pub appendages:        Vec<(Vec<(usize, Vec3, CellType)>, bool)>,
     /// `Some` when this species was loaded from a `.species` v3 file
     /// that carried trained brain weights. Every organism spawned
     /// from this species gets a copy of the payload attached as a
     /// `BrainRestoreHerbivore1` component, which the herbivore pool's
     /// `assign_brains_herbivore_1` consumes to seed the slot. `None`
     /// for fresh species-editor saves and legacy v1/v2 files.
-    pub brain: Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>,
+    pub brain: Option<crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1>,
 }
 
 

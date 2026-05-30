@@ -41,9 +41,18 @@ const OPEN_BTN_SIZE:           egui::Vec2 = egui::vec2(90.0, 32.0);
 const OPEN_MAP_BTN_POS:        egui::Pos2 = egui::pos2(650.0, 230.0);
 const OPEN_COLONY_BTN_POS:     egui::Pos2 = egui::pos2(650.0, 295.0);
 
-// Map-size row, sits between the colony textfield and the action
+// AI-training-mode checkbox. Sits directly beneath the colony file
+// path field and is NOT part of the colony-dimension gate — it stays
+// editable even when a colony is loaded (training mode is orthogonal
+// to spawn-count overrides). Seeded from `--trainingmode` argv on
+// launcher start (see `LauncherApp::new`).
+const TRAININGMODE_ROW_TOP:    f32        = 332.0;
+const TRAININGMODE_POS:        egui::Pos2 = egui::pos2(60.0, TRAININGMODE_ROW_TOP);
+const TRAININGMODE_SIZE:       egui::Vec2 = egui::vec2(400.0, 24.0);
+
+// Map-size row, sits between the AI-training checkbox and the action
 // buttons. Two `DragValue` widgets (X / Z) plus a heading label.
-const MAPSIZE_ROW_TOP:         f32        = 345.0;
+const MAPSIZE_ROW_TOP:         f32        = 372.0;
 const MAPSIZE_LABEL_POS:       egui::Pos2 = egui::pos2(60.0, MAPSIZE_ROW_TOP);
 const MAPSIZE_LABEL_SIZE:      egui::Vec2 = egui::vec2(130.0, 32.0);
 const MAPSIZE_X_LABEL_POS:     egui::Pos2 = egui::pos2(200.0, MAPSIZE_ROW_TOP);
@@ -63,7 +72,7 @@ const MAPSIZE_MAX:             f32        = 8192.0;
 // downstream spawn-control widgets (Max Organisms, AI-training mode,
 // Max Herbivores) when a colony file is loaded. The user-facing
 // contract is documented on the field in `LauncherApp`.
-const ADJUSTCOL_ROW_TOP:       f32        = 380.0;
+const ADJUSTCOL_ROW_TOP:       f32        = 407.0;
 const ADJUSTCOL_POS:           egui::Pos2 = egui::pos2(60.0, ADJUSTCOL_ROW_TOP);
 const ADJUSTCOL_SIZE:          egui::Vec2 = egui::vec2(400.0, 24.0);
 
@@ -73,7 +82,7 @@ const ADJUSTCOL_SIZE:          egui::Vec2 = egui::vec2(400.0, 24.0);
 // Wider label box than the old "Max Organisms:" row because
 // "Max Phototrophic Organisms:" is ~12 characters longer; matches
 // the Start-Heterotroph-Number layout below.
-const MAXPHOTO_ROW_TOP:          f32        = 415.0;
+const MAXPHOTO_ROW_TOP:          f32        = 442.0;
 const MAXPHOTO_LABEL_POS:        egui::Pos2 = egui::pos2(60.0, MAXPHOTO_ROW_TOP);
 const MAXPHOTO_LABEL_SIZE:       egui::Vec2 = egui::vec2(220.0, 32.0);
 const MAXPHOTO_DRAG_POS:         egui::Pos2 = egui::pos2(285.0, MAXPHOTO_ROW_TOP);
@@ -84,23 +93,16 @@ const MAXPHOTO_FIELD_SIZE:       egui::Vec2 = egui::vec2(110.0, 32.0);
 // live together. Drives the initial-cohort photo count at
 // `spawn_colony`; independent from `MaxPhotoautotrophs`, which caps
 // the running population.
-const SPAWNPHOTO_ROW_TOP:        f32        = 450.0;
+const SPAWNPHOTO_ROW_TOP:        f32        = 477.0;
 const SPAWNPHOTO_LABEL_POS:      egui::Pos2 = egui::pos2(60.0, SPAWNPHOTO_ROW_TOP);
 const SPAWNPHOTO_LABEL_SIZE:     egui::Vec2 = egui::vec2(265.0, 32.0);
 const SPAWNPHOTO_DRAG_POS:       egui::Pos2 = egui::pos2(330.0, SPAWNPHOTO_ROW_TOP);
 const SPAWNPHOTO_FIELD_SIZE:     egui::Vec2 = egui::vec2(110.0, 32.0);
 
-// AI-training-mode checkbox — separates the photo-related fields
-// (above) from the herbivore-related fields (below). Seeded from
-// `--trainingmode` argv on launcher start (see `LauncherApp::new`).
-const TRAININGMODE_ROW_TOP:    f32        = 485.0;
-const TRAININGMODE_POS:        egui::Pos2 = egui::pos2(60.0, TRAININGMODE_ROW_TOP);
-const TRAININGMODE_SIZE:       egui::Vec2 = egui::vec2(400.0, 24.0);
-
-// Max-herbivores row. Same layout pattern as the Max-organisms row,
-// just one slot below the AI-training-mode checkbox. The value seeds
-// the `MaxHerbivores` reproduction cap at simulation startup.
-const MAXHERB_ROW_TOP:         f32        = 520.0;
+// Max-herbivores row. Same layout pattern as the Max-organisms row.
+// The value seeds the `MaxHerbivores` reproduction cap at simulation
+// startup.
+const MAXHERB_ROW_TOP:         f32        = 512.0;
 const MAXHERB_LABEL_POS:       egui::Pos2 = egui::pos2(60.0, MAXHERB_ROW_TOP);
 const MAXHERB_LABEL_SIZE:      egui::Vec2 = egui::vec2(180.0, 32.0);
 const MAXHERB_DRAG_POS:        egui::Pos2 = egui::pos2(245.0, MAXHERB_ROW_TOP);
@@ -110,7 +112,7 @@ const MAXHERB_FIELD_SIZE:      egui::Vec2 = egui::vec2(110.0, 32.0);
 // cap above so the cap+spawn for heteros live together. Drives the
 // initial-cohort herbivore count at `spawn_colony`. Independent from
 // `MaxHerbivores`, which caps the running population.
-const STARTHET_ROW_TOP:        f32        = 555.0;
+const STARTHET_ROW_TOP:        f32        = 547.0;
 const STARTHET_LABEL_POS:      egui::Pos2 = egui::pos2(60.0, STARTHET_ROW_TOP);
 const STARTHET_LABEL_SIZE:     egui::Vec2 = egui::vec2(220.0, 32.0);
 const STARTHET_DRAG_POS:       egui::Pos2 = egui::pos2(285.0, STARTHET_ROW_TOP);
@@ -406,6 +408,21 @@ impl eframe::App for LauncherApp {
                     }
                 }
 
+                // ── AI-training-mode checkbox ───────────────────────
+                // Placed directly beneath the colony field and OUTSIDE
+                // the colony-dimension gate below, so it stays editable
+                // whether or not a colony is loaded (training mode is
+                // orthogonal to spawn-count overrides). Seeded from
+                // `--trainingmode` argv on launcher start; whatever the
+                // user leaves it on at click-of-START is what's
+                // forwarded (last-touched-wins vs the argv flag).
+                let training_rect = egui::Rect::from_min_size(
+                    TRAININGMODE_POS, TRAININGMODE_SIZE);
+                ui.put(
+                    training_rect,
+                    egui::Checkbox::new(&mut self.training_mode, "AI-training mode"),
+                );
+
                 // ── Map-size row ────────────────────────────────────
                 // Two DragValue widgets that bind to the X and Z
                 // dimensions the loaded world is normalised to. The
@@ -522,20 +539,6 @@ impl eframe::App for LauncherApp {
                         egui::DragValue::new(&mut self.start_photoautotrophs)
                             .range(0..=LAUNCHER_POPULATION_CAP)
                             .speed(1.0),
-                    );
-
-                    // ── AI-training-mode checkbox ───────────────────
-                    // Seeded from `--trainingmode` argv on launcher
-                    // start (see `LauncherApp::new`). Whatever the
-                    // user leaves it on when clicking START is what's
-                    // forwarded — so the launcher checkbox overrides
-                    // the argv flag and they "compete" via
-                    // last-touched-wins.
-                    let training_rect = egui::Rect::from_min_size(
-                        TRAININGMODE_POS, TRAININGMODE_SIZE);
-                    ui.put(
-                        training_rect,
-                        egui::Checkbox::new(&mut self.training_mode, "AI-training mode"),
                     );
 
                     // ── Max-herbivores row ──────────────────────────

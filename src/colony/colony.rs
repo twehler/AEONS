@@ -25,6 +25,89 @@ pub use crate::organism::*;
 /// keeps every "how many of X spawn at startup" knob in one place.
 pub const INITIAL_KRISHI: u32 = 1;
 
+/// Angular damping for the BASE body of a limb-based organism. High,
+/// because the base has no PD actuator of its own — joint-constraint
+/// reaction torques from the limbs would otherwise integrate unbounded
+/// and spin the body up.
+const BASE_ANGULAR_DAMPING: f32 = 3.0;
+
+/// Angular damping for LIMB bodies. Much lower than the base so the
+/// PD controller can produce dynamic swings — the policy can't lift
+/// the legs off the ground if every torque it commands gets drained
+/// to friction within a frame.
+const LIMB_ANGULAR_DAMPING: f32 = 1.0;
+
+/// Linear damping for every limb-based body part (base + limbs).
+/// Light — enough to bleed drift between actuator pulses, not enough
+/// to lock the organism in place.
+const LIMB_LINEAR_DAMPING:  f32 = 0.2;
+
+/// Material density used when deriving each limb-based body part's
+/// mass from its compound collider. Density × volume → mass; lower
+/// density → lower mass → lower normal force at ground contacts →
+/// less friction force resisting limb rotation. Set to 0.2 (down
+/// from the natural 1.0) because at full density a 25-cell organism
+/// sitting on the heightfield was friction-pinned at every ground
+/// contact, dwarfing the brain's PD torques.
+const LIMB_BODY_DENSITY: f32 = 0.2;
+
+/// Friction coefficient applied to every limb-based body part.
+///
+/// Locomotion needs GRIP, not slip: to "press a foot down and back to
+/// drive the body forward" the planted foot must not slide. An earlier
+/// pass set this to 0.05 with a `Min` combine rule to stop limbs
+/// sticking — but that starved the organism of traction (feet slid,
+/// body never propelled), and a test run confirmed near-zero motion.
+/// Raised to 1.0 with an `Average` combine rule, so a limb↔terrain
+/// (default μ = 0.5) contact resolves to μ = 0.75 — firm grip when
+/// planted. This does NOT prevent lifting: a foot lifted off the
+/// ground has zero normal force and therefore zero friction
+/// regardless of μ, so the lift→reposition→plant→press gait cycle
+/// works (the swing phase is frictionless for free).
+const LIMB_FRICTION_COEFFICIENT: f32 = 1.0;
+
+
+/// Compute the (parent_anchor, limb_anchor) pair for a limb's
+/// `SphericalJoint`, placing the pivot at the FACE MIDPOINT between
+/// the parent cell adjacent to the attachment and the limb's first
+/// cell. With the limb rebased so its first cell sits at the limb's
+/// local origin, this gives:
+///
+///   * `anchor1` = `(parent_cell_pos + pivot) / 2`
+///       — point on the parent body, on the parent-cell ↔ limb-first-
+///       cell shared rhombic face.
+///   * `anchor2` = `(parent_cell_pos − pivot) / 2`
+///       — same point expressed in the limb's local frame; the limb's
+///       first cell sits at `(0, 0, 0)` and the anchor lies between
+///       the limb origin and the (offset) direction of the parent
+///       cell.
+///
+/// The two anchors coincide in world space so the cells sit on
+/// opposite sides of the joint — like a shoulder joint at the body
+/// surface rather than a rotation around the limb's own centroid.
+///
+/// "Parent cell adjacent to the attachment" is the parent cell
+/// closest to `pivot`; by construction of the species-editor's
+/// candidate-driven placement, that's exactly one RD lattice step
+/// away. Falls back to `Vec3::ZERO` when the parent body has no
+/// cells (defensive — should never happen for a valid attachment).
+fn limb_joint_anchors(
+    parent_cells: &[Cell],
+    pivot:        Vec3,
+) -> (Vec3, Vec3) {
+    let parent_cell_pos = parent_cells.iter()
+        .map(|c| c.local_pos)
+        .min_by(|a, b| {
+            a.distance_squared(pivot)
+                .partial_cmp(&b.distance_squared(pivot))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(Vec3::ZERO);
+    let anchor1 = (parent_cell_pos + pivot) * 0.5;
+    let anchor2 = (parent_cell_pos - pivot) * 0.5;
+    (anchor1, anchor2)
+}
+
 
 pub struct ColonyPlugin;
 
@@ -55,6 +138,7 @@ impl Plugin for ColonyPlugin {
         });
         app.init_resource::<crate::time_series_log::TimeSeriesLogger>();
         app.add_systems(Update, spawn_colony.run_if(resource_exists::<HeightmapSampler>));
+        app.add_systems(Update, animate_limbs);
         app.add_systems(Update, save_colony_system);
         app.add_systems(Update, autosave_system);
         app.add_systems(Update, auto_spawn_heteros);
@@ -178,7 +262,9 @@ pub struct ColonyLoadPath(pub Option<String>);
 /// can still read v003 organism structure (positions, body parts,
 /// energy) but drops the v003 brain block — the saved weights are
 /// for a different architecture and aren't restorable.
-const SAVE_MAGIC:             &[u8;8] = b"AEONS005";
+const SAVE_MAGIC:             &[u8;8] = b"AEONS007";
+const SAVE_MAGIC_LEGACY_V006: &[u8;8] = b"AEONS006";
+const SAVE_MAGIC_LEGACY_V005: &[u8;8] = b"AEONS005";
 const SAVE_MAGIC_LEGACY_V004: &[u8;8] = b"AEONS004";
 const SAVE_MAGIC_LEGACY_V003: &[u8;8] = b"AEONS003";
 const SAVE_MAGIC_LEGACY_V002: &[u8;8] = b"AEONS002";
@@ -214,12 +300,24 @@ fn save_colony_system(
     // are kept registered as `NonSendResource` for legacy reasons
     // but are not consulted during save — their slots have no
     // routable organisms.
-    pool: NonSend<crate::intelligence_level_herbivore_1::BrainPoolHerbivore1>,
+    pool: NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
+    // v007 addition — limb-based brain pools. One snapshot per pool,
+    // taken once before iterating organisms (each does a small batch
+    // of GPU→CPU syncs). Each organism with a `BrainSlotX_Limb`
+    // contributes one limb-brain block to its record.
+    pool_limb_h:  NonSend<crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
+    pool_limb_l2: NonSend<crate::intelligence_level_2_limb::BrainPoolL2Limb>,
+    pool_limb_l3: NonSend<crate::intelligence_level_3_limb::BrainPoolL3Limb>,
 ) {
     let Some(target_path) = save_requested.0.take() else { return };
 
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     buf.extend_from_slice(SAVE_MAGIC);
+
+    // v007: one limb-pool snapshot per pool, reused across all organisms.
+    let snap_h  = pool_limb_h.0.snapshot();
+    let snap_l2 = pool_limb_l2.0.snapshot();
+    let snap_l3 = pool_limb_l3.0.snapshot();
 
     // Two-pass to write the count up front. iter() over Query is cheap.
     let count = organisms.iter()
@@ -250,6 +348,8 @@ fn save_colony_system(
         });
         put_u8(&mut buf, org.is_sessile as u8);
         put_u8(&mut buf, org.has_variable_form as u8);
+        // v006 addition — movement paradigm.
+        put_u8(&mut buf, org.sliding_movement as u8);
         // v002 addition — saved so loaded organisms keep their
         // assigned intelligence level instead of being re-rolled.
         put_u8(&mut buf, match org.intelligence_level {
@@ -318,8 +418,38 @@ fn save_colony_system(
             Some(b) => {
                 put_u8(&mut buf, 1);
                 // Format shared with .species v3 — see
-                // `intelligence_level_herbivore_1::encode_brain_restore`.
-                crate::intelligence_level_herbivore_1::encode_brain_restore(&mut buf, &b);
+                // `intelligence_level_herbivore_1_sliding::encode_brain_restore`.
+                crate::intelligence_level_herbivore_1_sliding::encode_brain_restore(&mut buf, &b);
+            }
+        }
+
+        // ── v007 limb-brain block. ────────────────────────────────────
+        // For limb-based heterotrophs, find which limb pool this
+        // organism is enrolled in (by intelligence_level + carnivore
+        // marker), extract its weights, write a kind tag + payload.
+        // Non-limb organisms write a single zero byte.
+        //
+        // Kind tags: 0 = none, 1 = herbivore_1_limb, 2 = l2_limb,
+        // 3 = l3_limb. Older readers (≤ v006) stop before this byte
+        // and never see it.
+        let limb_brain = if !org.sliding_movement && is_hetero {
+            match org.intelligence_level {
+                IntelligenceLevel::Level1 if !is_carn =>
+                    snap_h.extract(entity).map(|b| (1u8, b)),
+                IntelligenceLevel::Level2 =>
+                    snap_l2.extract(entity).map(|b| (2u8, b)),
+                IntelligenceLevel::Level3 =>
+                    snap_l3.extract(entity).map(|b| (3u8, b)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match limb_brain {
+            None => put_u8(&mut buf, 0),
+            Some((kind, b)) => {
+                put_u8(&mut buf, kind);
+                crate::limb_ppo::encode_brain_restore_limb(&mut buf, &b);
             }
         }
         let _ = is_carn;   // referenced only above; silence unused
@@ -413,13 +543,17 @@ struct LoadedRecord {
     rotation:  Quat,
     kind:      OrganismKind,
     organism:  Organism,
-    /// Saved brain weights + REINFORCE state. `None` for Level 0
-    /// organisms (no pool to restore into) and for v001/v002 saves
-    /// (which predate brain serialisation). When `Some`,
-    /// `spawn_loaded_organism` attaches a `BrainRestore` component
-    /// and the pool's `assign_brains_*` will install the weights
-    /// next PreUpdate.
-    brain:     Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>,
+    /// Saved sliding-pool herbivore_1 brain weights + REINFORCE state.
+    /// `None` for Level 0 organisms, for v001/v002 saves (predate
+    /// brain serialisation), and for any organism that isn't enrolled
+    /// in the sliding herbivore_1 pool.
+    brain:     Option<crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1>,
+    /// Saved limb-pool brain payload (v007+). `None` for sliding
+    /// organisms, organisms without a limb pool, or older save
+    /// formats. `spawn_loaded_organism` attaches a `BrainRestoreLimb`
+    /// component which the matching limb pool's `assign_brains_*`
+    /// system consumes next PreUpdate.
+    brain_limb: Option<crate::limb_ppo::BrainRestoreLimb>,
 }
 
 
@@ -437,18 +571,26 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         return Err(std::io::Error::other("file too short — missing magic"));
     }
     let magic = &bytes[..SAVE_MAGIC.len()];
-    let format_v005 = magic == SAVE_MAGIC;
+    let format_v007 = magic == SAVE_MAGIC;
+    let format_v006 = magic == SAVE_MAGIC_LEGACY_V006;
+    let format_v005 = magic == SAVE_MAGIC_LEGACY_V005;
     let format_v004 = magic == SAVE_MAGIC_LEGACY_V004;
     let format_v003 = magic == SAVE_MAGIC_LEGACY_V003;
     let format_v002 = magic == SAVE_MAGIC_LEGACY_V002;
     let format_v001 = magic == SAVE_MAGIC_LEGACY_V001;
-    if !format_v005 && !format_v004 && !format_v003 && !format_v002 && !format_v001 {
+    if !format_v007 && !format_v006 && !format_v005 && !format_v004 && !format_v003 && !format_v002 && !format_v001 {
         return Err(std::io::Error::other(
             "magic mismatch — not an AEONS colony save (or unsupported version)",
         ));
     }
     // v002+ all share the intelligence_level byte after has_variable_form.
-    let has_intelligence_byte = format_v005 || format_v004 || format_v003 || format_v002;
+    let has_intelligence_byte = format_v007 || format_v006 || format_v005 || format_v004 || format_v003 || format_v002;
+    // v006+ adds the sliding_movement byte after has_variable_form / before
+    // intelligence_level. Older saves all default to `true`.
+    let has_sliding_byte = format_v007 || format_v006;
+    // v007+ appends a limb-brain block (kind byte + optional payload)
+    // after the existing sliding-brain block per organism.
+    let has_limb_brain_section = format_v007;
     c += SAVE_MAGIC.len();
 
     let count = read_u32(&bytes, &mut c)?;
@@ -485,6 +627,17 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         };
         let is_sessile        = read_u8(&bytes, &mut c)? != 0;
         let has_variable_form = read_u8(&bytes, &mut c)? != 0;
+        // v006 inserted the sliding_movement byte here. Pre-v006 files
+        // pre-date physics-based movement; default to `true`.
+        let mut sliding_movement = if has_sliding_byte {
+            read_u8(&bytes, &mut c)? != 0
+        } else {
+            true
+        };
+        // Same invariant `spawn_organism` enforces: sessile ⇒ sliding.
+        // Catches older `.colony` files that pre-date the editor's UI
+        // grey-out and saved a sessile+limb organism by mistake.
+        if is_sessile { sliding_movement = true; }
 
         // v002+ saves the intelligence level explicitly; v001 didn't,
         // so we synthesise it via the same deterministic rule that
@@ -589,13 +742,16 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         //            drop the data — the loaded organism comes
         //            up with fresh-init weights.
         //   * v001/v002 — no brain section at all.
-        let brain: Option<crate::intelligence_level_herbivore_1::BrainRestoreHerbivore1>
-            = if format_v005 {
-                // New format: shared `BrainRestore` (4-tensor MLP) +
-                // the herbivore_1 8-byte magic prefix.
+        let brain: Option<crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1>
+            = if format_v005 || format_v006 || format_v007 {
+                // v005+: shared `BrainRestore` (4-tensor MLP) +
+                // the herbivore_1 8-byte magic prefix. (Earlier the
+                // gate was `format_v005` only — v006 saves left the
+                // brain block unconsumed, mis-aligning every record
+                // that followed.)
                 let brain_present = read_u8(&bytes, &mut c)?;
                 if brain_present == 1 {
-                    Some(crate::intelligence_level_herbivore_1::decode_brain_restore(
+                    Some(crate::intelligence_level_herbivore_1_sliding::decode_brain_restore(
                         &bytes, &mut c,
                     )?)
                 } else {
@@ -636,6 +792,26 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
                 None
             };
 
+        // v007 limb-brain block. Kind tag 0..3 (0=none, 1=herbivore_1_limb,
+        // 2=l2_limb, 3=l3_limb). When non-zero we deserialise the
+        // `BrainRestoreLimb` payload — `spawn_loaded_organism` then
+        // attaches it as a component for the matching limb pool's
+        // `assign_brains_*_limb` to consume.
+        let brain_limb: Option<crate::limb_ppo::BrainRestoreLimb> = if has_limb_brain_section {
+            let kind = read_u8(&bytes, &mut c)?;
+            if kind == 0 {
+                None
+            } else if kind > 3 {
+                return Err(std::io::Error::other(
+                    format!("unknown limb-brain kind tag: {kind}"),
+                ));
+            } else {
+                Some(crate::limb_ppo::decode_brain_restore_limb(&bytes, &mut c)?)
+            }
+        } else {
+            None
+        };
+
         // `adult` is not in the save format; it's derivable from
         // (`has_variable_form`, total grown cell count): non-variable
         // form organisms are always adult, variable-form become adult
@@ -650,6 +826,8 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
             intelligence_level,
             is_sessile,
             has_variable_form,
+            sliding_movement,
+            limb_targets: [0.0; 6],
             adult,
             photo_cell_count,
             non_photo_cell_count,
@@ -695,7 +873,7 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         };
         organism.recompute_bounding_radius();
 
-        out.push(LoadedRecord { pos, rotation, kind, organism, brain });
+        out.push(LoadedRecord { pos, rotation, kind, organism, brain, brain_limb });
     }
 
     Ok(out)
@@ -717,7 +895,7 @@ fn spawn_loaded_organism(
     materials: &OrganismMaterials,
     rng:       &mut impl rand::Rng,
 ) -> Entity {
-    let LoadedRecord { pos, rotation, kind, organism, brain } = record;
+    let LoadedRecord { pos, rotation, kind, organism, brain, brain_limb } = record;
     if organism.body_parts.is_empty() {
         // Defensive — skip organisms with no body parts (should never
         // happen on a valid save).
@@ -725,10 +903,12 @@ fn spawn_loaded_organism(
     }
 
     let body_parts_snapshot = organism.body_parts.clone();
-    // Capture intelligence level + adult flag before `organism` is
-    // moved into the spawn bundle.
+    // Capture intelligence level + adult flag + movement paradigm
+    // before `organism` is moved into the spawn bundle. The Avian
+    // physics block below needs `sliding_movement`.
     let intelligence_level = organism.intelligence_level;
     let adult              = organism.adult;
+    let sliding_movement   = organism.sliding_movement;
     let direction_interval = 1.0 + rng.random::<f32>() * 9.0;
 
     let mut root_cmd = commands.spawn((
@@ -757,6 +937,14 @@ fn spawn_loaded_organism(
         if !matches!(intelligence_level, IntelligenceLevel::Level0) {
             root_cmd.insert(b);
         }
+    }
+    // v007 limb-brain payload: attached as a component so the matching
+    // limb pool's `assign_brains_*_limb` writes the weights into the
+    // freshly-allocated row. Routing is implicit — each pool's assign
+    // filter (`intelligence_level + !sliding_movement`) picks exactly
+    // one consumer.
+    if let Some(b) = brain_limb {
+        root_cmd.insert(b);
     }
     let root = root_cmd.id();
 
@@ -815,6 +1003,156 @@ fn spawn_loaded_organism(
         commands.entity(root).add_child(child);
 
         bp_entities.push(child);
+    }
+
+    // ── Avian3d physics + LimbAnimation (same code path as
+    //   `spawn_organism`). Without this, loaded limb-based organisms
+    //   would have body-part entities but no rigid bodies, no joints,
+    //   no contact flags, no animation — the brain runs but the PD
+    //   torque step has nothing to torque, so the organism freezes
+    //   at its saved pose and looks "limbless / unmoving" compared
+    //   to its fresh-spawned counterpart. Sliding organisms also
+    //   need their kinematic compound collider so other physics
+    //   bodies can collide with them.
+    if sliding_movement {
+        // Single compound on the root.
+        let mut shapes: Vec<(avian3d::prelude::Position, avian3d::prelude::Rotation, avian3d::prelude::Collider)> = Vec::new();
+        for bp in &body_parts_snapshot {
+            if !bp.is_alive() { continue; }
+            let part_offset = bp.attachment.as_ref()
+                .map_or(Vec3::ZERO, |a| a.origin_local);
+            for cell in &bp.cells {
+                let pos = part_offset + cell.local_pos;
+                shapes.push((
+                    avian3d::prelude::Position(pos),
+                    avian3d::prelude::Rotation::default(),
+                    avian3d::prelude::Collider::sphere(
+                        crate::cell::CELL_COLLISION_RADIUS,
+                    ),
+                ));
+            }
+        }
+        if !shapes.is_empty() {
+            commands.entity(root).insert((
+                avian3d::prelude::RigidBody::Kinematic,
+                avian3d::prelude::Collider::compound(shapes),
+            ));
+        }
+        // LimbAnimation on procedural-style limb body parts (kind =
+        // Limb). Mirrors the in-loop insertion in spawn_organism.
+        for (idx, bp) in body_parts_snapshot.iter().enumerate() {
+            if !bp.is_alive() { continue; }
+            if !matches!(bp.kind, crate::cell::BodyPartKind::Limb) { continue; }
+            use rand::RngExt;
+            let mirror = bp.attachment.as_ref()
+                .is_some_and(|a| a.origin_local.x < 0.0);
+            let two_pi = std::f32::consts::TAU;
+            let la = LimbAnimation {
+                freqs:  [
+                    rng.random_range(1.5..5.0),
+                    rng.random_range(1.5..5.0),
+                    rng.random_range(1.5..5.0),
+                ],
+                phases: [
+                    rng.random::<f32>() * two_pi,
+                    rng.random::<f32>() * two_pi,
+                    rng.random::<f32>() * two_pi,
+                ],
+                amps:   [
+                    rng.random_range(0.3..0.7),
+                    rng.random_range(0.3..0.7),
+                    rng.random_range(0.3..0.7),
+                ],
+                mirror,
+            };
+            commands.entity(bp_entities[idx]).insert(la);
+        }
+    } else {
+        // Limb-based: per-part Dynamic + joints + contact flags.
+        for (idx, bp) in body_parts_snapshot.iter().enumerate() {
+            if !bp.is_alive() { continue; }
+            let mut shapes: Vec<(avian3d::prelude::Position, avian3d::prelude::Rotation, avian3d::prelude::Collider)> = Vec::new();
+            for cell in &bp.cells {
+                shapes.push((
+                    avian3d::prelude::Position(cell.local_pos),
+                    avian3d::prelude::Rotation::default(),
+                    avian3d::prelude::Collider::sphere(
+                        crate::cell::CELL_COLLISION_RADIUS,
+                    ),
+                ));
+            }
+            if !shapes.is_empty() {
+                let ang_damping = if idx == 0 { BASE_ANGULAR_DAMPING } else { LIMB_ANGULAR_DAMPING };
+                // Build the compound collider once so we can both
+                // attach it to the body AND derive mass properties
+                // from its shape (see comment below).
+                let collider = avian3d::prelude::Collider::compound(shapes);
+                commands.entity(bp_entities[idx]).insert((
+                    avian3d::prelude::RigidBody::Dynamic,
+                    collider.clone(),
+                    // Avian's auto-mass-compute pipeline silently fails
+                    // to populate `ComputedMass` / `ComputedAngularInertia`
+                    // for these compound colliders. Defaults of those
+                    // types store INVERSE values that init to zero
+                    // (representing infinite mass/inertia), so every
+                    // `Forces::apply_force` / `apply_torque` call
+                    // computes `acceleration = inverse_mass * force = 0`
+                    // and the body never moves. Explicitly deriving the
+                    // mass properties from the compound's shape ×
+                    // `LIMB_BODY_DENSITY` bypasses the broken auto-
+                    // compute path. Diagnosed May 2026 via the
+                    // constant-torque experiment in `avian_setup`.
+                    avian3d::prelude::MassPropertiesBundle::from_shape(&collider, LIMB_BODY_DENSITY),
+                    // Grip friction (see `LIMB_FRICTION_COEFFICIENT`):
+                    // `Average` combine with the terrain's default 0.5
+                    // gives a contact μ = 0.75 so planted feet propel
+                    // the body instead of sliding.
+                    avian3d::prelude::Friction::new(LIMB_FRICTION_COEFFICIENT)
+                        .with_combine_rule(avian3d::prelude::CoefficientCombine::Average),
+                    avian3d::prelude::CollisionEventsEnabled,
+                    crate::avian_setup::LimbContact::default(),
+                    // Base body gets heavy damping to absorb joint-
+                    // reaction torques; limbs get lighter damping so
+                    // the PD controller can produce dynamic swings.
+                    avian3d::prelude::AngularDamping(ang_damping),
+                    avian3d::prelude::LinearDamping(LIMB_LINEAR_DAMPING),
+                    // Avian's default sleep plugin freezes low-velocity
+                    // bodies, and the brain's `Forces::apply_torque`
+                    // writes don't wake them — every limb organism
+                    // settled, slept, and never moved again. Marker
+                    // keeps these bodies permanently integrated so the
+                    // PD controller's torques actually take effect.
+                    avian3d::prelude::SleepingDisabled,
+                    // Telemetry: the PD controller writes the last
+                    // commanded torque here every frame; the dataset
+                    // exporter reads it to log torque_norm per organism.
+                    crate::avian_setup::LastAppliedTorque::default(),
+                ));
+            }
+        }
+        // Spherical joints — one per appendage. The pivot is placed on
+        // the FACE between the parent cell adjacent to the attachment
+        // and the limb's first cell (see `limb_joint_anchors`), so the
+        // limb rotates like an anatomical shoulder joint rather than
+        // around its own centroid. Compliance is set to a tiny non-
+        // zero value (`LIMB_JOINT_COMPLIANCE`) — strictly-rigid joints
+        // (compliance = 0) are numerically fragile under the high PD
+        // torques the brain commands, and a microscopic give lets the
+        // solver converge cleanly.
+        for (idx, bp) in body_parts_snapshot.iter().enumerate() {
+            if !bp.is_alive() { continue; }
+            let Some(attach) = bp.attachment.as_ref() else { continue; };
+            let parent_e = bp_entities[attach.parent_idx];
+            let child_e  = bp_entities[idx];
+            let parent_cells = &body_parts_snapshot[attach.parent_idx].cells;
+            let (anchor1, anchor2) = limb_joint_anchors(parent_cells, attach.origin_local);
+            commands.spawn(
+                avian3d::prelude::SphericalJoint::new(parent_e, child_e)
+                    .with_local_anchor1(anchor1)
+                    .with_local_anchor2(anchor2)
+                    .with_point_compliance(crate::avian_setup::LIMB_JOINT_COMPLIANCE),
+            );
+        }
     }
 
     root
@@ -1034,6 +1372,9 @@ fn spawn_colony(
             intel,
             smoothing.0,
             max_e * 0.5,
+            // Initial cohort: sliding (legacy) movement until a species
+            // with `sliding_movement = false` is imported / spawned.
+            true,
             &mut commands,
             &mut meshes,
             &materials,
@@ -1082,6 +1423,7 @@ fn spawn_colony(
             intel,
             smoothing.0,
             max_e * 0.5,
+            true,   // sliding_movement — initial cohort uses legacy sliding
             &mut commands,
             &mut meshes,
             &materials,
@@ -1166,6 +1508,40 @@ impl OrganismMaterials {
 }
 
 
+/// Per-limb erratic-rotation parameters. Attached at spawn to every
+/// body-part entity whose `BodyPart::kind == BodyPartKind::Limb`. Each
+/// axis (X / Y / Z) oscillates independently with its own random
+/// frequency, phase and amplitude — incommensurate frequencies make the
+/// compound rotation read as chaotic rather than periodic. `mirror`
+/// inverts all three angles so the left half of a bilateral limb pair
+/// swings opposite to its right twin.
+#[derive(Component, Clone, Debug)]
+pub struct LimbAnimation {
+    pub freqs:  [f32; 3],
+    pub phases: [f32; 3],
+    pub amps:   [f32; 3],
+    pub mirror: bool,
+}
+
+/// Apply the per-limb erratic rotation each frame. Runs in `Update`;
+/// `TransformSystems::Propagate` (PostUpdate) picks it up the same
+/// frame. Reads the default `Time` (virtual clock), so animation freezes
+/// in lock-step with the rest of the simulation when paused.
+pub fn animate_limbs(
+    time:  Res<Time>,
+    mut q: Query<(&LimbAnimation, &mut Transform)>,
+) {
+    let t = time.elapsed_secs();
+    for (la, mut tr) in &mut q {
+        let sign = if la.mirror { -1.0 } else { 1.0 };
+        let x = sign * la.amps[0] * (t * la.freqs[0] + la.phases[0]).sin();
+        let y = sign * la.amps[1] * (t * la.freqs[1] + la.phases[1]).sin();
+        let z = sign * la.amps[2] * (t * la.freqs[2] + la.phases[2]).sin();
+        tr.rotation = Quat::from_euler(EulerRot::XYZ, x, y, z);
+    }
+}
+
+
 /// Construct + register an organism from a list of body parts at world
 /// position `pos`. Each body part owns its own OCG; the mesh for each
 /// regrowable part is built by replaying the part's OCG through
@@ -1188,6 +1564,11 @@ pub fn spawn_organism(
     intelligence_level: IntelligenceLevel,
     smoothing:          bool,
     initial_energy:     f32,
+    // Movement paradigm — see `Organism::sliding_movement`. Pass `true`
+    // for legacy / sliding organisms (current behaviour); `false` to
+    // spawn the organism into Avian's physics world for limb-based
+    // locomotion. Defaults to `true` at every current call site.
+    sliding_movement:   bool,
     commands:           &mut Commands,
     meshes:             &mut ResMut<Assets<Mesh>>,
     materials:          &OrganismMaterials,
@@ -1198,6 +1579,13 @@ pub fn spawn_organism(
     // up here so downstream systems can trust the fields.
     let symmetry  = if has_variable_form { Symmetry::NoSymmetry } else { symmetry };
     let is_sessile = is_sessile || has_variable_form;
+    // Sessile organisms MUST be on the sliding-movement path: their root
+    // is a `RigidBody::Kinematic` (immovable to physics; `apply_movement`
+    // skips it). Spawning a sessile organism into the limb-based Dynamic
+    // body path would let gravity, joint reactions, and collisions push
+    // it around — which presents to the player as a "sliding" sessile
+    // organism, the exact thing the sessile flag is supposed to prevent.
+    let sliding_movement = sliding_movement || is_sessile;
     if body_parts.is_empty() {
         // Defensive — callers should always provide at least the root part.
         // Returning a bogus entity would silently corrupt downstream queries.
@@ -1232,6 +1620,8 @@ pub fn spawn_organism(
         intelligence_level,
         is_sessile,
         has_variable_form,
+        sliding_movement,
+        limb_targets: [0.0; 6],
         adult,
         photo_cell_count:     0,
         non_photo_cell_count: 0,
@@ -1350,6 +1740,43 @@ pub fn spawn_organism(
         }
         let child = child_cmd.id();
 
+        // Limb animation: kind=Limb body parts get the `LimbAnimation`
+        // marker with randomized per-axis oscillator parameters. Mirror
+        // twins (entity origin on the −X side) get the inverted-sign
+        // animation so the pair swings opposite, like a real animal's
+        // limbs. The actual rotation update lives in `animate_limbs`.
+        //
+        // Limb-based organisms drive their joints via the physics
+        // engine (Phase 4 hooks brain PD targets into Avian), so the
+        // kinematic rotation marker is only inserted for sliding
+        // organisms — physics-driven limbs would fight the animation.
+        if sliding_movement
+            && matches!(bp.kind, crate::cell::BodyPartKind::Limb) {
+            use rand::RngExt;
+            let mirror = bp.attachment.as_ref()
+                .is_some_and(|a| a.origin_local.x < 0.0);
+            let two_pi = std::f32::consts::TAU;
+            let la = LimbAnimation {
+                freqs:  [
+                    rng.random_range(1.5..5.0),
+                    rng.random_range(1.5..5.0),
+                    rng.random_range(1.5..5.0),
+                ],
+                phases: [
+                    rng.random::<f32>() * two_pi,
+                    rng.random::<f32>() * two_pi,
+                    rng.random::<f32>() * two_pi,
+                ],
+                amps:   [
+                    rng.random_range(0.3..0.7),
+                    rng.random_range(0.3..0.7),
+                    rng.random_range(0.3..0.7),
+                ],
+                mirror,
+            };
+            commands.entity(child).insert(la);
+        }
+
         // Parent EVERY body-part entity directly under the OrganismRoot
         // — branches included. Earlier this nested branches under their
         // parent body-part entity for "rotation-around-pivot via
@@ -1370,6 +1797,129 @@ pub fn spawn_organism(
         commands.entity(root).add_child(child);
 
         bp_entities.push(child);
+    }
+
+    // ── Avian3d physics components ─────────────────────────────────────
+    //
+    // Sliding organisms (current behaviour for everything):
+    //   * `RigidBody::Kinematic` on the OrganismRoot — its transform is
+    //     written by `apply_movement`; Avian's kinematic sync follows.
+    //   * One compound collider on the root built from every cell
+    //     across every body part, with cell positions offset by the
+    //     body part's attachment origin (so the collider matches the
+    //     world positions the rest of the codebase already uses).
+    //
+    // Limb-based organisms (none until Phase 5's species-editor toggle):
+    //   * Each body part entity gets `RigidBody::Dynamic` + its own
+    //     compound collider built from THAT part's cells.
+    //   * For each appendage (`attachment.is_some()`) we spawn a
+    //     `SphericalJoint` entity connecting the parent body-part
+    //     entity to the appendage entity, anchored at
+    //     `attachment.origin_local` on the parent and `Vec3::ZERO` on
+    //     the child (limb body parts are rebased so their local origin
+    //     sits at the first-cell pivot).
+    if sliding_movement {
+        let mut shapes: Vec<(avian3d::prelude::Position, avian3d::prelude::Rotation, avian3d::prelude::Collider)> = Vec::new();
+        for bp in &body_parts {
+            if !bp.is_alive() { continue; }
+            let part_offset = bp.attachment.as_ref()
+                .map_or(Vec3::ZERO, |a| a.origin_local);
+            for cell in &bp.cells {
+                let pos = part_offset + cell.local_pos;
+                shapes.push((
+                    avian3d::prelude::Position(pos),
+                    avian3d::prelude::Rotation::default(),
+                    avian3d::prelude::Collider::sphere(
+                        crate::cell::CELL_COLLISION_RADIUS,
+                    ),
+                ));
+            }
+        }
+        if !shapes.is_empty() {
+            commands.entity(root).insert((
+                avian3d::prelude::RigidBody::Kinematic,
+                avian3d::prelude::Collider::compound(shapes),
+            ));
+        }
+    } else {
+        // Limb-based: per-part dynamic bodies.
+        for (idx, bp) in body_parts.iter().enumerate() {
+            if !bp.is_alive() { continue; }
+            let mut shapes: Vec<(avian3d::prelude::Position, avian3d::prelude::Rotation, avian3d::prelude::Collider)> = Vec::new();
+            for cell in &bp.cells {
+                shapes.push((
+                    avian3d::prelude::Position(cell.local_pos),
+                    avian3d::prelude::Rotation::default(),
+                    avian3d::prelude::Collider::sphere(
+                        crate::cell::CELL_COLLISION_RADIUS,
+                    ),
+                ));
+            }
+            if !shapes.is_empty() {
+                let ang_damping = if idx == 0 { BASE_ANGULAR_DAMPING } else { LIMB_ANGULAR_DAMPING };
+                // See parallel spawn_organism path: explicit mass
+                // properties because Avian's auto-compute leaves
+                // `ComputedAngularInertia` at its INFINITY default
+                // (inverse = 0) for our compound colliders.
+                let collider = avian3d::prelude::Collider::compound(shapes);
+                commands.entity(bp_entities[idx]).insert((
+                    avian3d::prelude::RigidBody::Dynamic,
+                    collider.clone(),
+                    // Density lowered from 1.0 so total organism mass
+                    // stays light enough that ground-contact friction
+                    // can be overcome by the brain's PD torques. See
+                    // `LIMB_BODY_DENSITY` for rationale.
+                    avian3d::prelude::MassPropertiesBundle::from_shape(&collider, LIMB_BODY_DENSITY),
+                    // Grip friction (see `LIMB_FRICTION_COEFFICIENT`):
+                    // `Average` combine with the terrain's default 0.5
+                    // gives a contact μ = 0.75 so planted feet propel
+                    // the body instead of sliding.
+                    avian3d::prelude::Friction::new(LIMB_FRICTION_COEFFICIENT)
+                        .with_combine_rule(avian3d::prelude::CoefficientCombine::Average),
+                    // Per-entity event toggle so Avian's narrow phase
+                    // emits `CollisionStart` / `CollisionEnd` messages
+                    // for this body part — consumed by
+                    // `update_limb_contacts` to populate `LimbContact`.
+                    avian3d::prelude::CollisionEventsEnabled,
+                    crate::avian_setup::LimbContact::default(),
+                    // Base body gets heavy damping to absorb joint-
+                    // reaction torques; limbs get lighter damping so
+                    // the PD controller can produce dynamic swings.
+                    avian3d::prelude::AngularDamping(ang_damping),
+                    avian3d::prelude::LinearDamping(LIMB_LINEAR_DAMPING),
+                    // Avian's default sleep plugin freezes low-velocity
+                    // bodies, and the brain's `Forces::apply_torque`
+                    // writes don't wake them — every limb organism
+                    // settled, slept, and never moved again. Marker
+                    // keeps these bodies permanently integrated so the
+                    // PD controller's torques actually take effect.
+                    avian3d::prelude::SleepingDisabled,
+                    // Telemetry: the PD controller writes the last
+                    // commanded torque here every frame; the dataset
+                    // exporter reads it to log torque_norm per organism.
+                    crate::avian_setup::LastAppliedTorque::default(),
+                ));
+            }
+        }
+        // Joints — one spherical joint per appendage. Skips the base
+        // body, which has no attachment. See `limb_joint_anchors` for
+        // pivot-placement details (joint sits on the cell-to-cell
+        // face) and `LIMB_JOINT_COMPLIANCE` for the small non-zero
+        // compliance that keeps the XPBD solver well-conditioned.
+        for (idx, bp) in body_parts.iter().enumerate() {
+            if !bp.is_alive() { continue; }
+            let Some(attach) = bp.attachment.as_ref() else { continue; };
+            let parent_e = bp_entities[attach.parent_idx];
+            let child_e  = bp_entities[idx];
+            let parent_cells = &body_parts[attach.parent_idx].cells;
+            let (anchor1, anchor2) = limb_joint_anchors(parent_cells, attach.origin_local);
+            commands.spawn(
+                avian3d::prelude::SphericalJoint::new(parent_e, child_e)
+                    .with_local_anchor1(anchor1)
+                    .with_local_anchor2(anchor2)
+                    .with_point_compliance(crate::avian_setup::LIMB_JOINT_COMPLIANCE),
+            );
+        }
     }
 
     root
@@ -1456,6 +2006,7 @@ pub fn auto_spawn_heteros(
             intel,
             smoothing.0,
             max_e * 0.5,
+            true,  // sliding_movement — auto-spawned heteros use legacy sliding
             &mut commands,
             &mut meshes,
             &org_mats,

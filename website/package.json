@@ -1,0 +1,10 @@
+{
+  "name": "aeons-website",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Public-facing website for the AEONS evolution simulator",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}

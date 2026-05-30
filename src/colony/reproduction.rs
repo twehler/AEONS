@@ -356,6 +356,7 @@ fn reproduction_system(
             symmetry:           organism.symmetry,
             has_variable_form:  organism.has_variable_form,
             is_sessile:         organism.is_sessile,
+            sliding_movement:   organism.sliding_movement,
             intelligence_level: organism.intelligence_level,
             // Captured here so the brain pool can copy parent → child
             // weights when `assign_brains_*` runs next PreUpdate.
@@ -403,6 +404,7 @@ fn reproduction_system(
             birth.intelligence_level,
             smoothing.0,
             birth.energy,
+            birth.sliding_movement,
             &mut commands,
             &mut meshes,
             organism_materials,
@@ -474,6 +476,9 @@ struct PendingBirth {
     symmetry:           Symmetry,
     has_variable_form:  bool,
     is_sessile:         bool,
+    // Inherited verbatim from the parent — offspring keep their
+    // parent's movement paradigm (sliding vs limb-based).
+    sliding_movement:   bool,
     /// Inherited verbatim from the parent — see the doc on
     /// `IntelligenceLevel`. Initial spawn rolls this; reproduction
     /// passes it through.

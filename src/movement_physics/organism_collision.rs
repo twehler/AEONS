@@ -116,6 +116,14 @@ struct OrganismSnapshot {
     /// pushed back → re-approach" dance.
     is_photo:       bool,
     is_carnivore:   bool,
+    /// `false` for limb-based organisms. This custom collision system
+    /// computes cell world positions as `root_transform × local`,
+    /// which is only valid for sliding organisms (single Kinematic
+    /// root). Limb organisms have independent Dynamic body-part bodies
+    /// whose true world positions come from Avian, so any pair
+    /// involving a limb organism is skipped here and handled by
+    /// `avian_setup::emit_limb_contact_events` instead.
+    sliding_movement: bool,
     body_parts:     Vec<BodyPartSnapshot>,
 }
 
@@ -166,6 +174,7 @@ fn snapshot(
         root_world_pos: transform.translation,
         is_photo,
         is_carnivore,
+        sliding_movement: organism.sliding_movement,
         body_parts,
     }
 }
@@ -223,6 +232,18 @@ pub fn apply_organism_collision(
             for &idx_b in bucket {
                 if idx_b <= idx_a { continue; }
                 let snap_b = &snapshots[idx_b];
+
+                // Skip any pair involving a limb-based organism. Their
+                // true body-part world positions live in Avian, not in
+                // `root_transform × local`, so this system would test
+                // collisions against stale geometry. `avian_setup::
+                // emit_limb_contact_events` handles every limb-involved
+                // contact via Avian's narrow phase instead — routing it
+                // through the same `OrganismContactEvent` that predation
+                // already consumes. (Sliding↔sliding pairs stay here.)
+                if !snap_a.sliding_movement || !snap_b.sliding_movement {
+                    continue;
+                }
 
                 // Broad phase: skip pairs whose roots are far apart.
                 let dx = snap_a.root_world_pos - snap_b.root_world_pos;

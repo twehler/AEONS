@@ -335,23 +335,52 @@ pub(super) fn respawn_template(
 /// capacity (same convention as `.colony` save records and the
 /// initial colony cohort), so the new organism doesn't immediately
 /// starve.
-/// Build an appendage `BodyPart` from a full OCG (already mirrored if
-/// needed). Attaches to the base body (parent_idx 0) at the origin —
-/// the OCG positions are absolute in the organism's local frame, so the
-/// entity sits at ZERO and the cells render where they were authored.
-/// Colour comes from cell content (Placeholder ⇒ blue via `handle_for`).
+/// Build a STATIC appendage `BodyPart` from a full OCG (already mirrored
+/// if needed). The entity sits at the organism's local origin and cells
+/// render at their authored absolute positions — no per-frame rotation.
+/// Use `limb_body_part` instead when the appendage is flagged as a Limb.
 fn appendage_body_part(ocg: Vec<(usize, Vec3, CellType)>) -> crate::cell::BodyPart {
     let cells = ocg.iter()
         .map(|(_, p, ct)| crate::cell::Cell::new(*p, *ct))
         .collect();
     crate::cell::BodyPart {
-        kind:         crate::cell::BodyPartKind::Limb,
+        kind:         crate::cell::BodyPartKind::Organ,
         local_offset: Vec3::ZERO,
         cells,
         ocg,
         attachment:   Some(crate::body_part::Attachment {
             parent_idx:   0,
             origin_local: Vec3::ZERO,
+            rotation:     Quat::IDENTITY,
+        }),
+        consumed:     false,
+        debug_blue:   false,
+        regrowable:   true,
+    }
+}
+
+/// Build a LIMB `BodyPart` from a full OCG: the entity is positioned at
+/// the first cell of the appendage and the cells are rebased relative
+/// to that point. Rotating the entity then rotates the limb around the
+/// first cell (the attachment seed), exactly as the species-editor
+/// "Limb" toggle promises. Tagged `BodyPartKind::Limb` so
+/// `spawn_organism` attaches the `LimbAnimation` marker.
+fn limb_body_part(ocg: Vec<(usize, Vec3, CellType)>) -> crate::cell::BodyPart {
+    let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
+    let shifted_ocg: Vec<(usize, Vec3, CellType)> = ocg.iter()
+        .map(|(i, p, ct)| (*i, *p - pivot, *ct))
+        .collect();
+    let cells = shifted_ocg.iter()
+        .map(|(_, p, ct)| crate::cell::Cell::new(*p, *ct))
+        .collect();
+    crate::cell::BodyPart {
+        kind:         crate::cell::BodyPartKind::Limb,
+        local_offset: Vec3::ZERO,
+        cells,
+        ocg:          shifted_ocg,
+        attachment:   Some(crate::body_part::Attachment {
+            parent_idx:   0,
+            origin_local: pivot,
             rotation:     Quat::IDENTITY,
         }),
         consumed:     false,
@@ -372,16 +401,17 @@ fn spawn_real_organism(
     // (parent_idx 0). For bilateral species each appendage is a mirrored
     // pair of runtime parts; for NoSymmetry it is one part.
     let mut body_parts = vec![root_body_part_from_ocg(&ocg)];
-    for app_raw in &template.custom_appendages {
+    for (app_raw, is_limb) in &template.custom_appendages {
+        let make = |o: Vec<(usize, Vec3, CellType)>| -> crate::cell::BodyPart {
+            if *is_limb { limb_body_part(o) } else { appendage_body_part(o) }
+        };
         match template.symmetry {
             Symmetry::Bilateral => {
-                body_parts.push(appendage_body_part(app_raw.clone()));
-                body_parts.push(appendage_body_part(
-                    crate::body_part::mirror_right_to_left(app_raw),
-                ));
+                body_parts.push(make(app_raw.clone()));
+                body_parts.push(make(crate::body_part::mirror_right_to_left(app_raw)));
             }
             Symmetry::NoSymmetry => {
-                body_parts.push(appendage_body_part(app_raw.clone()));
+                body_parts.push(make(app_raw.clone()));
             }
         }
     }
@@ -405,6 +435,12 @@ fn spawn_real_organism(
         template.intelligence,
         smoothing,
         initial_energy,
+        // Movement paradigm from the species-editor toggle, threaded
+        // through `OrganismTemplate::sliding_movement`. Legacy /
+        // cycler-derived templates set this to `true` (sliding);
+        // limb-based species set it to `false`, routing the spawn
+        // into the Avian dynamic-body path in `spawn_organism`.
+        template.sliding_movement,
         commands,
         meshes,
         org_mats,
@@ -492,6 +528,8 @@ pub(super) fn spawn_species_template_at(
         custom_appendages: species.appendages.clone(),
         species_name: Some(species.name.clone()),
         is_carnivore: species.is_carnivore,
+        sliding_movement: species.sliding_movement,
+        is_sessile:   species.is_sessile,
     };
     let entity = respawn_template(&template, commands, meshes, materials, org_materials, smoothing);
 

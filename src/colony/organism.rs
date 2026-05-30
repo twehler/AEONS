@@ -93,8 +93,8 @@ impl IntelligenceLevel {
             }
             OrganismKind::Heterotroph => {
                 // Levels 2 and 3 are placeholder-only after the L1
-                // rewrite (see `intelligence_level_2.rs` /
-                // `intelligence_level_3.rs`). All mobile heterotroph
+                // rewrite (see `intelligence_level_2_sliding.rs` /
+                // `intelligence_level_3_sliding.rs`). All mobile heterotroph
                 // initial-spawn rolls collapse to Level 1 so no
                 // brain-less organism is ever produced. Save files
                 // that record explicit Level2 / Level3 values still
@@ -142,6 +142,31 @@ pub struct Organism {
     /// at initial colony spawn (80% chance for photoautotrophs); after
     /// that the trait is hereditary.
     pub has_variable_form: bool,
+    /// Movement paradigm.
+    ///
+    ///   * `true`  (default) → "sliding": the brain writes
+    ///     `movement_speed` / `movement_direction` directly and
+    ///     `apply_movement` translates the organism root by those
+    ///     each tick. This is the current behaviour of every system
+    ///     prior to limb-based locomotion.
+    ///   * `false`           → "limb-based": the organism is a
+    ///     rigid-body chain in Avian's physics world. Brains output
+    ///     PD target joint angles per spherical limb joint; movement
+    ///     emerges from friction between the limbs and the terrain.
+    ///
+    /// Set at spawn (defaults `true` for legacy colonies, initial
+    /// cohort, reproduction, and any pre-format-bump `.species` /
+    /// `.colony` files). The species editor's "Sliding / Limb-Movement"
+    /// cycler is the user-facing knob. Inherited verbatim by offspring.
+    pub sliding_movement: bool,
+    /// Latest PD target joint angles the limb-based brain commanded
+    /// (radians). Layout: `[limb0_x, limb0_y, limb0_z, limb1_x, limb1_y,
+    /// limb1_z]` — two spherical (3-DOF) limbs maximum, matching
+    /// `limb_ppo::OUT`. The `apply_limb_pd_torques` system reads these
+    /// each physics tick and converts them to angular impulses on the
+    /// limbs' spherical joints. Ignored entirely for sliding organisms
+    /// (`sliding_movement == true`); never read or written there.
+    pub limb_targets: [f32; 6],
     /// `true` once the organism has finished growing — i.e. its meshes
     /// have been smoothed via `volumetric_growth::smooth_vertices`. For
     /// non-variable-form organisms this is `true` from spawn (they don't

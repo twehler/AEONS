@@ -1,0 +1,91 @@
+===============================================================
+ AEONS WEBSITE — HOW TO USE
+===============================================================
+
+A small, public-facing presentation site for the AEONS evolution
+simulator. It runs on a tiny built-in Node.js server — no install
+step, no dependencies.
+
+---------------------------------------------------------------
+ REQUIREMENTS
+---------------------------------------------------------------
+
+  - Node.js (v18 or newer)
+    Check with:   node --version
+
+---------------------------------------------------------------
+ 1. START THE SERVER
+---------------------------------------------------------------
+
+Open a terminal, then:
+
+    cd /home/twehler/AEONS/website
+    node server.js
+
+You should see:
+
+      AEONS website running
+      →  http://localhost:4173
+
+Leave this terminal window open — the server runs as long as it
+stays open.
+
+Want a different port? Set PORT before the command:
+
+    PORT=8080 node server.js
+
+(You can also use:  npm start  — it does the same thing.)
+
+---------------------------------------------------------------
+ 2. OPEN THE WEBSITE
+---------------------------------------------------------------
+
+In your web browser, go to:
+
+    http://localhost:4173
+
+(or whatever port you chose in step 1).
+
+That's it — scroll through the page and flip the
+Darwin/Lamarck switch.
+
+---------------------------------------------------------------
+ 3. STOP THE SERVER
+---------------------------------------------------------------
+
+Go back to the terminal where the server is running and press:
+
+    Ctrl + C
+
+The server shuts down immediately. Closing the terminal window
+also stops it.
+
+If you started it in the background and lost the terminal, find
+and stop it with:
+
+    pkill -f "node server.js"
+
+  (or, more precisely, find the process id first:)
+
+    lsof -i :4173        # shows the PID using the port
+    kill <PID>
+
+---------------------------------------------------------------
+ TROUBLESHOOTING
+---------------------------------------------------------------
+
+  "EADDRINUSE" / port already in use
+      Another program (maybe an old server) is using the port.
+      Stop it (see section 3), or start on a different port:
+          PORT=8080 node server.js
+
+  "command not found: node"
+      Node.js isn't installed or isn't on your PATH.
+      Install it from https://nodejs.org and try again.
+
+  Page won't load in the browser
+      - Make sure the server terminal still shows it's running.
+      - Check the address matches the port (default 4173).
+      - Make sure you typed http:// (not https://).
+
+===============================================================

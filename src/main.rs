@@ -20,17 +20,20 @@
 #[path = "behaviour/world_model.rs"]                mod world_model;
 #[path = "behaviour/rl_helpers.rs"]                 mod rl_helpers;
 #[path = "behaviour/intelligence_level_0.rs"]       mod intelligence_level_0;
-#[path = "behaviour/intelligence_level_1_photo.rs"] mod intelligence_level_1_photo;
-#[path = "behaviour/intelligence_level_1_hetero.rs"] mod intelligence_level_1_hetero;
-#[path = "behaviour/intelligence_level_2.rs"]       mod intelligence_level_2;
-#[path = "behaviour/intelligence_level_3.rs"]       mod intelligence_level_3;
-#[path = "behaviour/intelligence_level_herbivore_1.rs"] mod intelligence_level_herbivore_1;
+#[path = "behaviour/sliding_movement/intelligence_level_2_sliding.rs"]       mod intelligence_level_2_sliding;
+#[path = "behaviour/sliding_movement/intelligence_level_3_sliding.rs"]       mod intelligence_level_3_sliding;
+#[path = "behaviour/sliding_movement/intelligence_level_herbivore_1_sliding.rs"] mod intelligence_level_herbivore_1_sliding;
+#[path = "behaviour/limb_based_movement/limb_ppo.rs"]                                mod limb_ppo;
+#[path = "behaviour/limb_based_movement/intelligence_level_herbivore_1_limb.rs"]     mod intelligence_level_herbivore_1_limb;
+#[path = "behaviour/limb_based_movement/intelligence_level_2_limb.rs"]               mod intelligence_level_2_limb;
+#[path = "behaviour/limb_based_movement/intelligence_level_3_limb.rs"]               mod intelligence_level_3_limb;
 #[path = "behaviour/predation.rs"]                  mod predation;
 #[path = "behaviour/photosynthesis.rs"]             mod photosynthesis;
 #[path = "behaviour/sensory.rs"]                    mod sensory;
 
 #[path = "movement_physics/movement.rs"]           mod movement;
 #[path = "movement_physics/organism_collision.rs"] mod organism_collision;
+#[path = "movement_physics/avian_setup.rs"]        mod avian_setup;
 
 #[path = "physiology/physiology.rs"]   mod physiology;
 
@@ -388,6 +391,7 @@ fn run_simulation(
             }.into(),
             ..default()
         }))
+        .add_plugins(avian_setup::AvianSetupPlugin)
         .add_plugins(world_geometry::WorldPlugin{
             // std::path::Path doesn't have to_string() implemented because
             // input could be anything; use .to_string_lossy().into_owned()
