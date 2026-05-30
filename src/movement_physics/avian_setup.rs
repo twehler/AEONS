@@ -35,15 +35,18 @@ use crate::world_geometry::{HeightmapSampler, HEIGHTMAP_CELL_SIZE};
 
 pub struct AvianSetupPlugin;
 
-/// XPBD solver substeps per physics step. Avian default is 6; we raise
-/// it because our limb-based organisms have strong PD torques (KP=12,
-/// max ~19 N·m) on multi-cell compound bodies connected by rigid
-/// `SphericalJoint`s, and 6 substeps was not enough to keep the joint
-/// constraint convergent — limbs visibly drifted away from their
-/// attachment point during fast brain commands. 16 substeps gives the
-/// position-projection more chances to correct drift before it
-/// accumulates.
-const LIMB_SOLVER_SUBSTEPS: u32 = 16;
+/// XPBD solver substeps per physics step. Avian default is 6. This was
+/// briefly raised to 16 to keep the rigid `SphericalJoint`s convergent
+/// under high PD torque, but substeps multiply the ENTIRE solver cost
+/// linearly and dominated the frame time once dozens of limb organisms
+/// (each = several dynamic bodies + joints + contacts) were alive.
+/// Lowered to 8 now that joint stability comes from the small joint
+/// compliance (`LIMB_JOINT_COMPLIANCE`), proper mass properties, and
+/// the damping splits rather than from brute-force substepping — 8 is
+/// half the cost of 16 while still well above the default. If joints
+/// visibly drift again under fast commands, nudge back up to 10–12
+/// before reaching for 16.
+const LIMB_SOLVER_SUBSTEPS: u32 = 8;
 
 /// Very small "compliance" (inverse stiffness) on every limb
 /// `SphericalJoint`. `0.0` is the XPBD default and means "infinitely

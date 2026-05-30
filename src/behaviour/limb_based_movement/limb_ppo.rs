@@ -631,66 +631,63 @@ impl BrainPoolLimb {
         }
         let s = slot as usize;
         let device = &self.device;
-        // Helper: build a [1, ...] tensor from a Vec<f32> with the
-        // expected shape, then slice-assign into the full batched
-        // Param tensor's row `s`. Burn's `slice_assign` lets us write
-        // a sub-range without going through `assign_value` ceremony.
+        // Write each saved tensor into row `s` of the batched Param via
+        // `Param::map(|t| t.slice_assign(...))`. We must use `map` and
+        // NOT `Param::from_tensor(val().slice_assign(...))`: on the
+        // `Autodiff` backend the result of `slice_assign` is a NON-LEAF
+        // tensor (it's the output of an op), and `Param::from_tensor`
+        // requires a leaf — feeding it a non-leaf panics with
+        // "Can't convert a non leaf tensor into a tracked tensor"
+        // (the load-time crash this fixes). `Param::map` rebuilds the
+        // parameter as a proper trainable leaf. Mirrors the working
+        // pattern in the sliding pools' `restore_slot`.
 
-        // Actor weights
+        // Actor weights.
         let t = Tensor::<MyBackend, 3>::from_data(
             TensorData::new(r.actor_w1.clone(), [1, IN, HIDDEN]), device,
         );
-        let w = self.actor.w1.val().slice_assign([s..s + 1, 0..IN, 0..HIDDEN], t);
-        self.actor.w1 = Param::from_tensor(w);
+        self.actor.w1 = self.actor.w1.clone().map(|x| x.slice_assign([s..s + 1, 0..IN, 0..HIDDEN], t));
 
         let t = Tensor::<MyBackend, 2>::from_data(
             TensorData::new(r.actor_b1.clone(), [1, HIDDEN]), device,
         );
-        let b = self.actor.b1.val().slice_assign([s..s + 1, 0..HIDDEN], t);
-        self.actor.b1 = Param::from_tensor(b);
+        self.actor.b1 = self.actor.b1.clone().map(|x| x.slice_assign([s..s + 1, 0..HIDDEN], t));
 
         let t = Tensor::<MyBackend, 3>::from_data(
             TensorData::new(r.actor_w2.clone(), [1, HIDDEN, OUT]), device,
         );
-        let w = self.actor.w2.val().slice_assign([s..s + 1, 0..HIDDEN, 0..OUT], t);
-        self.actor.w2 = Param::from_tensor(w);
+        self.actor.w2 = self.actor.w2.clone().map(|x| x.slice_assign([s..s + 1, 0..HIDDEN, 0..OUT], t));
 
         let t = Tensor::<MyBackend, 2>::from_data(
             TensorData::new(r.actor_b2.clone(), [1, OUT]), device,
         );
-        let b = self.actor.b2.val().slice_assign([s..s + 1, 0..OUT], t);
-        self.actor.b2 = Param::from_tensor(b);
+        self.actor.b2 = self.actor.b2.clone().map(|x| x.slice_assign([s..s + 1, 0..OUT], t));
 
         let t = Tensor::<MyBackend, 2>::from_data(
             TensorData::new(r.actor_log_std.clone(), [1, OUT]), device,
         );
-        let ls = self.actor.log_std.val().slice_assign([s..s + 1, 0..OUT], t);
-        self.actor.log_std = Param::from_tensor(ls);
+        self.actor.log_std = self.actor.log_std.clone().map(|x| x.slice_assign([s..s + 1, 0..OUT], t));
 
-        // Critic weights
+        // Critic weights.
         let t = Tensor::<MyBackend, 3>::from_data(
             TensorData::new(r.critic_w1.clone(), [1, IN, HIDDEN]), device,
         );
-        let w = self.critic.w1.val().slice_assign([s..s + 1, 0..IN, 0..HIDDEN], t);
-        self.critic.w1 = Param::from_tensor(w);
+        self.critic.w1 = self.critic.w1.clone().map(|x| x.slice_assign([s..s + 1, 0..IN, 0..HIDDEN], t));
 
         let t = Tensor::<MyBackend, 2>::from_data(
             TensorData::new(r.critic_b1.clone(), [1, HIDDEN]), device,
         );
-        let b = self.critic.b1.val().slice_assign([s..s + 1, 0..HIDDEN], t);
-        self.critic.b1 = Param::from_tensor(b);
+        self.critic.b1 = self.critic.b1.clone().map(|x| x.slice_assign([s..s + 1, 0..HIDDEN], t));
 
         let t = Tensor::<MyBackend, 3>::from_data(
             TensorData::new(r.critic_w2.clone(), [1, HIDDEN, 1]), device,
         );
-        let w = self.critic.w2.val().slice_assign([s..s + 1, 0..HIDDEN, 0..1], t);
-        self.critic.w2 = Param::from_tensor(w);
+        self.critic.w2 = self.critic.w2.clone().map(|x| x.slice_assign([s..s + 1, 0..HIDDEN, 0..1], t));
 
         let t = Tensor::<MyBackend, 2>::from_data(
             TensorData::new(r.critic_b2.clone(), [1, 1]), device,
         );
-        let b = self.critic.b2.val().slice_assign([s..s + 1, 0..1], t);
-        self.critic.b2 = Param::from_tensor(b);
+        self.critic.b2 = self.critic.b2.clone().map(|x| x.slice_assign([s..s + 1, 0..1], t));
     }
 }
 

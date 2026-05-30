@@ -67,6 +67,38 @@ const LIMB_BODY_DENSITY: f32 = 0.2;
 const LIMB_FRICTION_COEFFICIENT: f32 = 1.0;
 
 
+/// Build a SINGLE convex-hull collider for a limb-based body part from
+/// its cell cloud, replacing the old `Collider::compound` of one sphere
+/// per cell. Collider count drives Avian's narrow-phase cost (every
+/// shape-pair is tested), so collapsing ~5 spheres per part into one
+/// hull cuts the per-organism collider count ~5× and the pair count
+/// quadratically — the dominant lever for limb-organism physics
+/// performance.
+///
+/// Each cell contributes its six axis-extreme points (`center ± r` on
+/// X/Y/Z). Hulling those instead of bare centers (a) keeps the hull at
+/// roughly the true cell extent so body parts don't sink into the
+/// terrain by a cell radius, and (b) guarantees a non-degenerate 3D
+/// point set even for a 1-cell part (six points → an octahedron), so
+/// `convex_hull` never returns `None` in practice — the sphere fallback
+/// is purely defensive.
+fn limb_part_collider(cells: &[Cell]) -> Option<avian3d::prelude::Collider> {
+    if cells.is_empty() { return None; }
+    let r = crate::cell::CELL_COLLISION_RADIUS;
+    let mut pts: Vec<Vec3> = Vec::with_capacity(cells.len() * 6);
+    for c in cells {
+        let p = c.local_pos;
+        pts.push(p + Vec3::X * r); pts.push(p - Vec3::X * r);
+        pts.push(p + Vec3::Y * r); pts.push(p - Vec3::Y * r);
+        pts.push(p + Vec3::Z * r); pts.push(p - Vec3::Z * r);
+    }
+    Some(
+        avian3d::prelude::Collider::convex_hull(pts)
+            .unwrap_or_else(|| avian3d::prelude::Collider::sphere(r)),
+    )
+}
+
+
 /// Compute the (parent_anchor, limb_anchor) pair for a limb's
 /// `SphericalJoint`, placing the pivot at the FACE MIDPOINT between
 /// the parent cell adjacent to the attachment and the limb's first
@@ -295,16 +327,16 @@ fn save_colony_system(
          Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
         With<OrganismRoot>,
     >,
-    // The herbivore_1 pool is the only one that contributes a brain
-    // block in v004. The L1-photo / L1-hetero / L2 / L3 pool stubs
-    // are kept registered as `NonSendResource` for legacy reasons
-    // but are not consulted during save — their slots have no
-    // routable organisms.
-    pool: NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
-    // v007 addition — limb-based brain pools. One snapshot per pool,
-    // taken once before iterating organisms (each does a small batch
-    // of GPU→CPU syncs). Each organism with a `BrainSlotX_Limb`
-    // contributes one limb-brain block to its record.
+    // All three SLIDING brain pools. A colony save is a full image of
+    // the simulation, so every brain's current weights are persisted:
+    // a sliding organism's `BrainRestore` is pulled from whichever pool
+    // its `intelligence_level` routes it to (herbivore_1 / L2 / L3).
+    pool:    NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
+    pool_l2: NonSend<crate::intelligence_level_2_sliding::BrainPoolL2>,
+    pool_l3: NonSend<crate::intelligence_level_3_sliding::BrainPoolL3>,
+    // Limb-based brain pools. One snapshot per pool, taken once before
+    // iterating organisms (each does a small batch of GPU→CPU syncs).
+    // Each limb organism contributes one limb-brain block to its record.
     pool_limb_h:  NonSend<crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
     pool_limb_l2: NonSend<crate::intelligence_level_2_limb::BrainPoolL2Limb>,
     pool_limb_l3: NonSend<crate::intelligence_level_3_limb::BrainPoolL3Limb>,
@@ -314,7 +346,11 @@ fn save_colony_system(
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     buf.extend_from_slice(SAVE_MAGIC);
 
-    // v007: one limb-pool snapshot per pool, reused across all organisms.
+    // One snapshot per pool (sliding + limb), reused across all
+    // organisms — a single GPU→CPU transfer each, not one per organism.
+    let snap_sl_h  = pool.snapshot();
+    let snap_sl_l2 = pool_l2.snapshot();
+    let snap_sl_l3 = pool_l3.snapshot();
     let snap_h  = pool_limb_h.0.snapshot();
     let snap_l2 = pool_limb_l2.0.snapshot();
     let snap_l3 = pool_limb_l3.0.snapshot();
@@ -397,28 +433,36 @@ fn save_colony_system(
             }
         }
 
-        // ── v004 brain section ───────────────────────────────────
-        // Only `Level1 + Heterotroph + !Carnivore` organisms have a
-        // brain in the new pool. Everyone else (photoautotrophs,
-        // carnivores, Krishi, etc.) emits `brain_present = 0`. The
-        // 12 weight tensors + REINFORCE state are pulled per-slot
-        // from the GPU. The loader's hard-error policy means saved
-        // tensor lengths must match the current architecture
-        // exactly (see HEADER_VERSION + restore_slot checks).
-        let is_l1_herbivore = matches!(org.intelligence_level, IntelligenceLevel::Level1)
-                              && is_hetero
-                              && !is_carn;
-        let brain_data = if is_l1_herbivore {
-            pool.map.get(&entity).map(|&slot| pool.extract_slot(slot))
+        // ── Sliding-brain section ─────────────────────────────────
+        // `present byte + shared BrainRestore payload`. For a SLIDING
+        // heterotroph we pull its weights from whichever sliding pool
+        // its `intelligence_level` routes it to:
+        //   * Level1 + !Carnivore → herbivore_1
+        //   * Level2              → L2
+        //   * Level3              → L3
+        // The `BrainRestore` payload is self-describing (length-prefixed
+        // tensors), and on load the matching pool's `assign_brains_*`
+        // restores it — selected by the same `intelligence_level`, which
+        // is also serialised — so no pool tag is needed in the file.
+        // Limb organisms (and photoautotrophs / Krishi) emit 0 here and
+        // carry their weights in the limb-brain block below instead.
+        let sliding_brain = if org.sliding_movement && is_hetero {
+            match org.intelligence_level {
+                IntelligenceLevel::Level1 if !is_carn => snap_sl_h.extract(entity),
+                IntelligenceLevel::Level2             => snap_sl_l2.extract(entity),
+                IntelligenceLevel::Level3             => snap_sl_l3.extract(entity),
+                _ => None,
+            }
         } else {
             None
         };
-        match brain_data {
+        match sliding_brain {
             None => put_u8(&mut buf, 0),
             Some(b) => {
                 put_u8(&mut buf, 1);
-                // Format shared with .species v3 — see
-                // `intelligence_level_herbivore_1_sliding::encode_brain_restore`.
+                // Shared `BrainRestore` encoding used by all three
+                // sliding pools (they differ only in HIDDEN, which the
+                // length-prefixed payload captures).
                 crate::intelligence_level_herbivore_1_sliding::encode_brain_restore(&mut buf, &b);
             }
         }
@@ -1071,22 +1115,11 @@ fn spawn_loaded_organism(
         // Limb-based: per-part Dynamic + joints + contact flags.
         for (idx, bp) in body_parts_snapshot.iter().enumerate() {
             if !bp.is_alive() { continue; }
-            let mut shapes: Vec<(avian3d::prelude::Position, avian3d::prelude::Rotation, avian3d::prelude::Collider)> = Vec::new();
-            for cell in &bp.cells {
-                shapes.push((
-                    avian3d::prelude::Position(cell.local_pos),
-                    avian3d::prelude::Rotation::default(),
-                    avian3d::prelude::Collider::sphere(
-                        crate::cell::CELL_COLLISION_RADIUS,
-                    ),
-                ));
-            }
-            if !shapes.is_empty() {
+            // Single convex-hull collider per body part (see
+            // `limb_part_collider`) instead of a compound of one sphere
+            // per cell — far cheaper for Avian's narrow phase.
+            if let Some(collider) = limb_part_collider(&bp.cells) {
                 let ang_damping = if idx == 0 { BASE_ANGULAR_DAMPING } else { LIMB_ANGULAR_DAMPING };
-                // Build the compound collider once so we can both
-                // attach it to the body AND derive mass properties
-                // from its shape (see comment below).
-                let collider = avian3d::prelude::Collider::compound(shapes);
                 commands.entity(bp_entities[idx]).insert((
                     avian3d::prelude::RigidBody::Dynamic,
                     collider.clone(),
@@ -1142,16 +1175,35 @@ fn spawn_loaded_organism(
         for (idx, bp) in body_parts_snapshot.iter().enumerate() {
             if !bp.is_alive() { continue; }
             let Some(attach) = bp.attachment.as_ref() else { continue; };
-            let parent_e = bp_entities[attach.parent_idx];
+            // Defensive: a stale / out-of-range `parent_idx` (possible
+            // after sim-time predation soft-deletes + branch growth, or
+            // a hand-edited save) would otherwise panic on the indexing
+            // below. Skip the joint instead — the limb stays a free
+            // dynamic body rather than crashing the spawn.
+            let pidx = attach.parent_idx;
+            if pidx >= body_parts_snapshot.len() || !body_parts_snapshot[pidx].is_alive() {
+                warn!("limb joint skipped: parent_idx {pidx} out of range or consumed");
+                continue;
+            }
+            let parent_e = bp_entities[pidx];
             let child_e  = bp_entities[idx];
-            let parent_cells = &body_parts_snapshot[attach.parent_idx].cells;
+            let parent_cells = &body_parts_snapshot[pidx].cells;
             let (anchor1, anchor2) = limb_joint_anchors(parent_cells, attach.origin_local);
-            commands.spawn(
+            commands.spawn((
                 avian3d::prelude::SphericalJoint::new(parent_e, child_e)
                     .with_local_anchor1(anchor1)
                     .with_local_anchor2(anchor2)
                     .with_point_compliance(crate::avian_setup::LIMB_JOINT_COMPLIANCE),
-            );
+                // Disable collision between this limb and its direct
+                // attachment parent: they overlap at the joint and would
+                // otherwise generate persistent contacts every substep —
+                // wasted narrow-phase work AND a solver fight (the joint
+                // pulls them together while the contact pushes them
+                // apart). Collision with NON-adjacent body parts of the
+                // same organism is unaffected, so intra-body interactions
+                // are preserved.
+                avian3d::prelude::JointCollisionDisabled,
+            ));
         }
     }
 
@@ -1845,23 +1897,10 @@ pub fn spawn_organism(
         // Limb-based: per-part dynamic bodies.
         for (idx, bp) in body_parts.iter().enumerate() {
             if !bp.is_alive() { continue; }
-            let mut shapes: Vec<(avian3d::prelude::Position, avian3d::prelude::Rotation, avian3d::prelude::Collider)> = Vec::new();
-            for cell in &bp.cells {
-                shapes.push((
-                    avian3d::prelude::Position(cell.local_pos),
-                    avian3d::prelude::Rotation::default(),
-                    avian3d::prelude::Collider::sphere(
-                        crate::cell::CELL_COLLISION_RADIUS,
-                    ),
-                ));
-            }
-            if !shapes.is_empty() {
+            // Single convex-hull collider per body part (see
+            // `limb_part_collider`) — matches the spawn_organism path.
+            if let Some(collider) = limb_part_collider(&bp.cells) {
                 let ang_damping = if idx == 0 { BASE_ANGULAR_DAMPING } else { LIMB_ANGULAR_DAMPING };
-                // See parallel spawn_organism path: explicit mass
-                // properties because Avian's auto-compute leaves
-                // `ComputedAngularInertia` at its INFINITY default
-                // (inverse = 0) for our compound colliders.
-                let collider = avian3d::prelude::Collider::compound(shapes);
                 commands.entity(bp_entities[idx]).insert((
                     avian3d::prelude::RigidBody::Dynamic,
                     collider.clone(),
@@ -1909,16 +1948,30 @@ pub fn spawn_organism(
         for (idx, bp) in body_parts.iter().enumerate() {
             if !bp.is_alive() { continue; }
             let Some(attach) = bp.attachment.as_ref() else { continue; };
-            let parent_e = bp_entities[attach.parent_idx];
+            // Defensive bounds/aliveness guard — see the parallel
+            // `spawn_organism` joint loop. A loaded colony that has been
+            // through sim time (predation, growth, reproduction) can
+            // carry a stale `parent_idx`; without this guard the index
+            // below panics, which is the load-time crash this fixes.
+            let pidx = attach.parent_idx;
+            if pidx >= body_parts.len() || !body_parts[pidx].is_alive() {
+                warn!("limb joint skipped on load: parent_idx {pidx} out of range or consumed");
+                continue;
+            }
+            let parent_e = bp_entities[pidx];
             let child_e  = bp_entities[idx];
-            let parent_cells = &body_parts[attach.parent_idx].cells;
+            let parent_cells = &body_parts[pidx].cells;
             let (anchor1, anchor2) = limb_joint_anchors(parent_cells, attach.origin_local);
-            commands.spawn(
+            commands.spawn((
                 avian3d::prelude::SphericalJoint::new(parent_e, child_e)
                     .with_local_anchor1(anchor1)
                     .with_local_anchor2(anchor2)
                     .with_point_compliance(crate::avian_setup::LIMB_JOINT_COMPLIANCE),
-            );
+                // See spawn_organism: suppress the persistent self-contact
+                // between a limb and its joint-adjacent parent. Non-adjacent
+                // intra-body collisions are preserved.
+                avian3d::prelude::JointCollisionDisabled,
+            ));
         }
     }
 
