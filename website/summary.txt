@@ -1,7 +1,0 @@
-AEONS (short for "accelerated evolution-, open-naturalistic simulator) is a research project to simulate the evolution of biological form and behaviour, based on the two theories of evolution from Charles Darwin and Jean Baptiste de Lamarck. It focuses on multicellularity and the thus emerging forms as well as the behaviour of the organisms to the outside environment over the generations. There will be two evolution modes. In "Darwin Mode" natural selection is the only driving factor for everything that can be observed. In "Lamarck Mode", Neural Networks will decide how to slowly edit the genetic information of an organism so that survival is best secured.
-
-The life forms consist of "cells", which are simple geometric forms. If this project is successful, a bigger version will be constructed to also include the evolution of biochemical aspects. The behaviour of the simulated organisms will rely on small, isolated Machine Learning algorithms, representing brains, which is also being dictated by the two evolution modes.
-
-To ensure maximum control over the environment, the terrain is constructed from two hand-crafted images: A heightmap and a material-map. The goal is to create a complex world with realistic parameters, in which scienficially proven concepts and mechanisms about evolution can be studied in realtime.
-
-To make sure the simulation can be run for a very long time without crashing, it is being written in Rust, with the help of the Bevy Game Engine for efficiency and the Burn crate for machine learning algorithms on the GPU.
