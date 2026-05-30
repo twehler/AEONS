@@ -27,10 +27,14 @@ script_dir   <- resolve_script_dir()
 datasets_dir <- normalizePath(file.path(script_dir, "..", "datasets"), mustWork = FALSE)
 output_path  <- file.path(script_dir, "results_brain_weights.txt")
 
-MILESTONES <- c("5_MINUTES","10_MINUTES","30_MINUTES","60_MINUTES",
+MILESTONES <- c("0_SECONDS",
+                "1_MINUTE","3_MINUTES","5_MINUTES","7_MINUTES",
+                "10_MINUTES","20_MINUTES","30_MINUTES","60_MINUTES",
                 "3_HOURS","6_HOURS","12_HOURS","24_HOURS",
                 "48_HOURS","96_HOURS","156_HOURS")
-MILESTONE_SECS <- c(300, 600, 1800, 3600,
+MILESTONE_SECS <- c(0,
+                    60, 180, 300, 420,
+                    600, 1200, 1800, 3600,
                     10800, 21600, 43200, 86400,
                     172800, 345600, 561600)
 

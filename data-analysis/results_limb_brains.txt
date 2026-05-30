@@ -1,0 +1,40 @@
+
+==============================================================================
+ Limb-Brain Diagnostics
+==============================================================================
+Generated: 2026-05-29 23:46:35 CEST
+Datasets dir: /home/twehler/AEONS/datasets
+Records found: 1
+
+------------------------------------------------------------------------------
+ 5_MINUTES — limb_herbivore_1 (3 organisms)
+------------------------------------------------------------------------------
+  Population: 3 enrolled
+  Mean energy_norm:    0.0000
+  Mean predations:     0.0000
+  Mean reproductions:  0.0000
+  log_std per action dim (mean / sd):
+    dim 0: mean=-0.0063 sd=0.0124  (sigma ≈ 0.9938)
+    dim 1: mean=0.0077 sd=0.0036  (sigma ≈ 1.0077)
+    dim 2: mean=-0.0017 sd=0.0125  (sigma ≈ 0.9983)
+    dim 3: mean=-0.0057 sd=0.0109  (sigma ≈ 0.9944)
+    dim 4: mean=-0.0066 sd=0.0134  (sigma ≈ 0.9935)
+    dim 5: mean=0.0032 sd=0.0062  (sigma ≈ 1.0032)
+  limb_target magnitude per dim (mean abs):
+    dim 0: 0.8577
+    dim 1: 0.9152
+    dim 2: 0.6345
+    dim 3: 0.7577
+    dim 4: 0.6788
+    dim 5: 0.8626
+
+==============================================================================
+ Cross-Milestone Trends
+==============================================================================
+
+[limb_herbivore_1] Exploration σ + reward proxies by milestone:
+  milestone           secs     N    mean_sigma    mean_energy   mean_predations
+  ----------------  -------   ---  ------------  ------------  ----------------
+  5_MINUTES             300     3        0.9985        0.0000              0.00
+
+Done.

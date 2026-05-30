@@ -32,8 +32,13 @@ output_path  <- file.path(script_dir, "results_general.txt")
 # Milestones declared in the order they fire in the simulation. The
 # script silently skips any that aren't present.
 MILESTONES <- list(
+  list(label = "0_SECONDS",  secs =     0),
+  list(label = "1_MINUTE",   secs =    60),
+  list(label = "3_MINUTES",  secs =   180),
   list(label = "5_MINUTES",  secs =   300),
+  list(label = "7_MINUTES",  secs =   420),
   list(label = "10_MINUTES", secs =   600),
+  list(label = "20_MINUTES", secs =  1200),
   list(label = "30_MINUTES", secs =  1800),
   list(label = "60_MINUTES", secs =  3600),
   list(label = "3_HOURS",    secs = 10800),

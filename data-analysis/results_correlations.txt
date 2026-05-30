@@ -1,0 +1,16 @@
+
+==============================================================================
+ AEONS Limb-Brain Correlation Diagnostics
+==============================================================================
+Generated: 2026-05-29 23:46:35 CEST
+Milestones loaded: 5_MINUTES
+Organisms per milestone: 3
+
+------------------------------------------------------------------------------
+ Q1. Position drift between milestone snapshots
+------------------------------------------------------------------------------
+Per-organism XZ displacement between adjacent milestones.
+Δ = |pos_xz(t_b) − pos_xz(t_a)| in world units.
+
+  entity   from→to                    Δt_s     Δx          Δz          |Δ_xz|
+  ------   -----------------------    ------   ---------   ---------   --------

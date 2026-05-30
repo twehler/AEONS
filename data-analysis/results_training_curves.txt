@@ -1,71 +1,35 @@
 AEONS — Training Curves Report
-Generated at 2026-05-23 14:09:11
-Milestones found: 3 (5_MINUTES, 10_MINUTES, 30_MINUTES)
+Generated at 2026-05-29 23:46:34
+Milestones found: 1 (5_MINUTES)
 Reference constants: VALUE_COEF=0.50, ENTROPY_COEF=0.000, BOOTSTRAP_STEPS=200
 
 ══════════════════════════════════════════════════════════════════════════════
  1) PER-MILESTONE SUMMARIES
 ══════════════════════════════════════════════════════════════════════════════
 
-── 5_MINUTES  (virtual t = 300 s, 117 steps logged) ──────────────────────
-    virtual_time range: 4.95 s → 297.76 s   step range: 1 → 117
-    actor_loss           n=117    mean=-4.35557    sd=1.33621     min=-13.12587   max=-1.99229   
-    critic_loss          n=117    mean=452.33979   sd=482.50590   min=218.09268   max=5427.25537 
-    entropy              n=117    mean=-0.32310    sd=0.00092     min=-0.32494    max=-0.32151   
-    total_loss           n=117    mean=222.19793   sd=240.29565   min=107.48309   max=2701.12744 
-    mean_return          n=117    mean=22.03984    sd=6.60159     min=10.24670    max=65.29601   
-    return_var           n=117    mean=6226.86816  sd=6823.45297  min=3131.43384  max=76764.10938
-    supervised_loss      n=117    mean=0.38361     sd=0.09210     min=0.24013     max=0.64917    
-    n_active             n=117    mean=201.00000   sd=0.00000     min=201.00000   max=201.00000  
-
-── 10_MINUTES  (virtual t = 600 s, 242 steps logged) ─────────────────────
-    virtual_time range: 4.95 s → 599.25 s   step range: 1 → 242
-    actor_loss           n=242    mean=-5.22881    sd=1.45986     min=-13.12587   max=-1.99229   
-    critic_loss          n=242    mean=452.97632   sd=340.12022   min=218.09268   max=5427.25537 
-    entropy              n=242    mean=-0.32610    sd=0.00356     min=-0.33418    max=-0.32151   
-    total_loss           n=242    mean=221.48577   sd=169.33197   min=107.48309   max=2701.12744 
-    mean_return          n=242    mean=26.17023    sd=7.06807     min=10.24670    max=65.29601   
-    return_var           n=242    mean=6045.16433  sd=4802.19236  min=3131.43384  max=76764.10938
-    supervised_loss      n=242    mean=0.22642     sd=0.17471     min=0.00000     max=0.64917    
-    n_active             n=242    mean=201.00000   sd=0.00000     min=201.00000   max=201.00000  
-
-── 30_MINUTES  (virtual t = 1800 s, 542 steps logged) ────────────────────
-    virtual_time range: 4.95 s → 1791.44 s   step range: 1 → 542
-    actor_loss           n=542    mean=-6.88252    sd=2.91655     min=-14.01562   max=0.52007    
-    critic_loss          n=542    mean=462.91056   sd=257.01810   min=69.37281    max=5427.25537 
-    entropy              n=542    mean=-0.36000    sd=0.04155     min=-0.44169    max=-0.32151   
-    total_loss           n=542    mean=224.67385   sd=127.13247   min=34.79225    max=2701.12744 
-    mean_return          n=542    mean=37.81306    sd=13.08174    min=10.24670    max=68.43964   
-    return_var           n=542    mean=5922.15055  sd=3485.55179  min=1299.97888  max=76764.10938
-    supervised_loss      n=542    mean=0.10110     sd=0.16215     min=0.00000     max=0.64917    
-    n_active             n=542    mean=201.00000   sd=0.00000     min=201.00000   max=201.00000  
+── 5_MINUTES  (virtual t = 300 s, 1 steps logged) ────────────────────────
+    virtual_time range: 5.86 s → 5.86 s   step range: 1 → 1
+    actor_loss           n=1      mean=57.76910    sd=NA          min=57.76910    max=57.76910   
+    critic_loss          n=1      mean=0.00000     sd=NA          min=0.00000     max=0.00000    
+    entropy              n=1      mean=0.00000     sd=NA          min=0.00000     max=0.00000    
+    total_loss           n=1      mean=57.76910    sd=NA          min=57.76910    max=57.76910   
+    mean_return          n=1      mean=31.09722    sd=NA          min=31.09722    max=31.09722   
+    return_var           n=1      mean=927.45673   sd=NA          min=927.45673   max=927.45673  
+    supervised_loss      n=1      mean=0.00000     sd=NA          min=0.00000     max=0.00000    
+    n_active             n=1      mean=5.00000     sd=NA          min=5.00000     max=5.00000    
 
 ══════════════════════════════════════════════════════════════════════════════
  2) TREND TESTS (linear regression on step)
 ══════════════════════════════════════════════════════════════════════════════
 
   milestone     metric                   slope             p       R²       n
-  5_MINUTES     actor_loss           -0.007282         0.046     0.034     117
-  5_MINUTES     critic_loss             -1.678         0.205     0.014     117
-  5_MINUTES     entropy              -2.68e-05      5.91e-99     0.980     117
-  5_MINUTES     total_loss             -0.8488         0.198     0.014     117
-  5_MINUTES     mean_return            0.03109        0.0854     0.026     117
-  5_MINUTES     return_var              -25.46         0.174     0.016     117
-  5_MINUTES     supervised_loss      -0.002592      2.23e-62     0.911     117
-  10_MINUTES    actor_loss            -0.01279      2.19e-26     0.376     242
-  10_MINUTES    critic_loss            -0.2012         0.521     0.002     242
-  10_MINUTES    entropy             -4.932e-05     3.86e-148     0.939     242
-  10_MINUTES    total_loss             -0.1159         0.458     0.002     242
-  10_MINUTES    mean_return            0.06009       1.4e-24     0.354     242
-  10_MINUTES    return_var              -5.692         0.198     0.007     242
-  10_MINUTES    supervised_loss      -0.002467     2.89e-198     0.977     242
-  30_MINUTES    actor_loss           -0.006685      6.31e-18     0.129     542
-  30_MINUTES    critic_loss            -0.1402        0.0468     0.007     542
-  30_MINUTES    entropy             -0.0002453     3.24e-228     0.855     542
-  30_MINUTES    total_loss            -0.07765         0.026     0.009     542
-  30_MINUTES    mean_return             0.0682     6.94e-131     0.667     542
-  30_MINUTES    return_var              -2.789       0.00348     0.016     542
-  30_MINUTES    supervised_loss      -0.000839     1.86e-127     0.657     542
+  5_MINUTES     actor_loss                  NA            NA        NA       1
+  5_MINUTES     critic_loss                 NA            NA        NA       1
+  5_MINUTES     entropy                     NA            NA        NA       1
+  5_MINUTES     total_loss                  NA            NA        NA       1
+  5_MINUTES     mean_return                 NA            NA        NA       1
+  5_MINUTES     return_var                  NA            NA        NA       1
+  5_MINUTES     supervised_loss             NA            NA        NA       1
 
 Interpretation:
   * Negative slope + small p on actor_loss / critic_loss / total_loss
@@ -83,28 +47,28 @@ Interpretation:
  3) LOSS DECOMPOSITION
 ══════════════════════════════════════════════════════════════════════════════
 
-Decomposition computed on 30_MINUTES (the latest milestone).
+Decomposition computed on 5_MINUTES (the latest milestone).
 Components:
   actor_contrib    = actor_loss
   critic_contrib   = 0.50 * critic_loss
   entropy_contrib  = -0.000 * entropy
   supervised_contr = supervised_loss (already scaled by bootstrap_weight in Rust)
 
-  Reconstruction residual mean         -7.657e-07
-  Reconstruction residual max|.|       0.0001735
+  Reconstruction residual mean             0
+  Reconstruction residual max|.|           0
 
 Mean contribution to total_loss (absolute share):
-  actor_contrib                        mean=-6.88252       share= 2.9%
-  critic_contrib                       mean=231.45528      share=97.1%
+  actor_contrib                        mean=57.76910       share=100.0%
+  critic_contrib                       mean=0.00000        share= 0.0%
   entropy_contrib                      mean=0.00000        share= 0.0%
-  sup_contrib                          mean=0.10110        share= 0.0%
+  sup_contrib                          mean=0.00000        share= 0.0%
 
 Trend slope per channel (slope per step):
   channel                    slope             p       R²       n
-  actor_contrib          -0.006685      6.31e-18     0.129     542
-  critic_contrib          -0.07012        0.0468     0.007     542
-  entropy_contrib                0            NA        NA     542
-  sup_contrib            -0.000839     1.86e-127     0.657     542
+  actor_contrib                 NA            NA        NA       1
+  critic_contrib                NA            NA        NA       1
+  entropy_contrib               NA            NA        NA       1
+  sup_contrib                   NA            NA        NA       1
 
 ══════════════════════════════════════════════════════════════════════════════
  4) CRITIC SANITY CHECK
@@ -114,9 +78,7 @@ or because the targets (returns) are themselves shrinking?
 Spearman ρ(critic_loss, return_var) ≈ 1 → critic just tracks the
 targets; no real prediction skill. Lower ρ → critic is independent.
 
-  5_MINUTES     ρ(critic_loss, return_var) = +0.991   ρ(critic_loss, |mean_return|) = +0.723
-  10_MINUTES    ρ(critic_loss, return_var) = +0.974   ρ(critic_loss, |mean_return|) = +0.693
-  30_MINUTES    ρ(critic_loss, return_var) = +0.961   ρ(critic_loss, |mean_return|) = +0.498
+  5_MINUTES     ρ(critic_loss, return_var) = NA   ρ(critic_loss, |mean_return|) = NA
 
 ══════════════════════════════════════════════════════════════════════════════
  5) SUPERVISED BOOTSTRAP DECAY
@@ -127,24 +89,10 @@ AFTER that scaling, so it should drop to zero by step %d.
 
  200
 ── 5_MINUTES ─────────────────────────────────────────────────────────────
-  steps < 100   — mean sup_loss      0.4059
-  steps 100..200 — mean sup_loss     0.2607
+  steps < 100   — mean sup_loss      0.0000
+  steps 100..200 — mean sup_loss     NA
   steps > 200    — mean sup_loss     NA
   steps > 200    — max  sup_loss     NA
-
-── 10_MINUTES ────────────────────────────────────────────────────────────
-  steps < 100   — mean sup_loss      0.4059
-  steps 100..200 — mean sup_loss     0.1446
-  steps > 200    — mean sup_loss     0.000000
-  steps > 200    — max  sup_loss     0.000000
-  ✓ supervised channel cleanly zeroed out post-bootstrap.
-
-── 30_MINUTES ────────────────────────────────────────────────────────────
-  steps < 100   — mean sup_loss      0.4059
-  steps 100..200 — mean sup_loss     0.1446
-  steps > 200    — mean sup_loss     0.000000
-  steps > 200    — max  sup_loss     0.000000
-  ✓ supervised channel cleanly zeroed out post-bootstrap.
 
 ══════════════════════════════════════════════════════════════════════════════
  6) CHANGE-POINT DETECTION (binary CUSUM)
@@ -153,23 +101,11 @@ Best single breakpoint for each metric within each milestone.
 Useful to spot when learning starts (or stops).
 
 
-── 5_MINUTES — 117 steps ─────────────────────────────────────────────────
-  mean_return                          break at step 92 (Δ post-pre = +4.8421)
-  actor_loss                           break at step 92 (Δ post-pre = -1.0433)
-  critic_loss                          break at step 20 (Δ post-pre = -305.6004)
-  total_loss                           break at step 20 (Δ post-pre = -152.2509)
-
-── 10_MINUTES — 242 steps ────────────────────────────────────────────────
-  mean_return                          break at step 137 (Δ post-pre = +8.4384)
-  actor_loss                           break at step 137 (Δ post-pre = -1.7759)
-  critic_loss                          break at step 20 (Δ post-pre = -275.4924)
-  total_loss                           break at step 20 (Δ post-pre = -138.3730)
-
-── 30_MINUTES — 542 steps ────────────────────────────────────────────────
-  mean_return                          break at step 260 (Δ post-pre = +21.3093)
-  actor_loss                           break at step 522 (Δ post-pre = +6.6356)
-  critic_loss                          break at step 522 (Δ post-pre = -385.5220)
-  total_loss                           break at step 522 (Δ post-pre = -186.2304)
+── 5_MINUTES — 1 steps ───────────────────────────────────────────────────
+  mean_return                          (too few steps)
+  actor_loss                           (too few steps)
+  critic_loss                          (too few steps)
+  total_loss                           (too few steps)
 
 ══════════════════════════════════════════════════════════════════════════════
  7) ENDPOINT COMPARISON ACROSS MILESTONES
@@ -178,16 +114,4 @@ Last-50-step rolling mean of each metric, per milestone.
 Compare adjacent rows to see how training has progressed.
 
   milestone         actor_loss     critic_loss         entropy      total_loss     mean_return      return_var  supervised_loss
-  5_MINUTES           -4.77969       438.02259        -0.32398       214.53312        23.95916      5949.76394         0.30151
-  10_MINUTES          -6.40448       442.80111        -0.33178       214.99818        31.67991      5637.03529         0.00211
-  30_MINUTES          -2.77934       241.27688        -0.43938       117.85910        41.69555      3611.50629         0.00000
-
-══════════════════════════════════════════════════════════════════════════════
- 8) SYNTHESIS
-══════════════════════════════════════════════════════════════════════════════
-  PASS  Total loss trending down                      slope=-0.0776, p=0.026
-  PASS  Mean return rising                            slope=0.0682, p=6.94e-131
-  FAIL  Critic decoupled from return_var (ρ < 0.95)  ρ=0.961
-  PASS  Supervised bootstrap zeroed post-decay        post-step-200 mean = 0.00000
-
-=== END ===
+  5_MINUTES   

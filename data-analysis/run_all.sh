@@ -33,4 +33,6 @@ echo "Running AEONS data-analysis suite..."
 run general.R           results_general.txt
 run brain_weights.R     results_brain_weights.txt
 run training_curves.R   results_training_curves.txt
+run limb_brains.R       results_limb_brains.txt
+run correlations.R      results_correlations.txt
 echo "Done."
