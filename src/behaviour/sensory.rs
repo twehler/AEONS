@@ -30,11 +30,7 @@ use crate::colony::{Carnivore, Heterotroph, Organism};
 use crate::world_model::{OrganismType, WorldModelGrid};
 
 
-/// Radius (world units) within which the sensory algorithm looks
-/// for a target photo. Anything beyond this is treated as "no
-/// target", and `Organism::target_distance` saturates at this
-/// value so the input observation stays bounded.
-pub const SENSORY_RADIUS: f32 = 50.0;
+pub use crate::simulation_settings::SENSORY_RADIUS;
 
 
 /// For every herbivore (Heterotroph, non-Carnivore), find the

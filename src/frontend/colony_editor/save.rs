@@ -20,14 +20,19 @@ use crate::colony_editor::template::{Metabolism, OrganismTemplate};
 use crate::energy::MAX_ENERGY_PER_CELL;
 
 
-const SAVE_MAGIC: &[u8; 8] = b"AEONS007";
+const SAVE_MAGIC: &[u8; 8] = b"AEONS008";
 
 
-/// Write every organism in `templates` to `path` in the v007 .colony
+/// Write every organism in `templates` to `path` in the v008 .colony
 /// format. The file is overwritten on each call.
 pub fn write_colony(path: &str, templates: &[OrganismTemplate]) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     buf.extend_from_slice(SAVE_MAGIC);
+    // v008 time notation (hours, minutes, seconds). An editor-authored
+    // colony has no elapsed virtual time, so it resumes at t=0.
+    put_u32(&mut buf, 0);
+    put_u32(&mut buf, 0);
+    put_u32(&mut buf, 0);
     put_u32(&mut buf, templates.len() as u32);
 
     for tpl in templates {

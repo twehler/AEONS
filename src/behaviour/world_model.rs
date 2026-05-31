@@ -21,9 +21,7 @@ use std::collections::HashMap;
 use crate::colony::{Heterotroph, Organism, Photoautotroph};
 
 
-/// Radius (world units) within which neighbour organisms are considered
-/// part of the heterotroph's world model.
-pub const WORLD_MODEL_RADIUS: f32 = 60.0;
+pub use crate::simulation_settings::WORLD_MODEL_RADIUS;
 
 /// Number of nearest neighbours encoded into the world model. Padded
 /// with zeros when fewer than `K` organisms are within radius.
@@ -36,11 +34,7 @@ pub const WORLD_MODEL_K: usize = 4;
 pub const WORLD_MODEL_NEIGHBOUR_DIMS: usize = 6;
 pub const WORLD_MODEL_DIMS:           usize = WORLD_MODEL_K * WORLD_MODEL_NEIGHBOUR_DIMS;
 
-/// Velocity normalisation factor. Roughly the expected top speed in
-/// world-units / second — matches the active hetero pools'
-/// `MAX_SPEED`. A neighbour cruising at MAX_SPEED registers as `±1`
-/// on the corresponding velocity dim.
-pub const VELOCITY_NORM_SCALE: f32 = 20.0;
+pub use crate::simulation_settings::VELOCITY_NORM_SCALE;
 
 
 #[derive(Clone, Copy, PartialEq, Eq)]

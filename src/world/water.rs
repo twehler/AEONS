@@ -5,8 +5,7 @@ use crate::world_geometry::{HeightmapSampler, HEIGHTMAP_CELL_SIZE};
 use bevy::light::NotShadowCaster;
 
 const WATER_COLOR: Color = Color::srgba(0.1, 0.3, 0.8, 0.35);
-const BUOYANCY_STRENGTH:    f32 = 12.0;
-const TRUE_WATER_DRAG_COEF: f32 = 0.05;
+use crate::simulation_settings::{BUOYANCY_STRENGTH, TRUE_WATER_DRAG_COEF};
 
 #[derive(Component)]
 pub struct WaterPlane;

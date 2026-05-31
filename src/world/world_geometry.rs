@@ -69,15 +69,7 @@ impl Default for MapSize {
 }
 
 
-/// Edge safety zone (world units). No organism may move closer to
-/// any of the four XZ map borders than this distance, and no spawn
-/// position is ever generated inside the band — together those two
-/// rules keep organisms strictly inside `[MARGIN, MapSize - MARGIN]²`
-/// on the XZ plane. The clamp is enforced by
-/// `movement::apply_world_bounds`; the spawn rule by every
-/// `rng.random_range(..)` call that produces an XZ coordinate
-/// (initial cohort, reproduction, auto-spawn).
-pub const WORLD_SAFETY_MARGIN: f32 = 15.0;
+pub use crate::simulation_settings::WORLD_SAFETY_MARGIN;
 
 
 // ── Plugin ──────────────────────────────────────────────────────────────────

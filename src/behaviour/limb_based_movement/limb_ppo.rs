@@ -61,53 +61,31 @@ use crate::rl_helpers::{MyBackend, gaussian_noise};
 ///   * `obs[1..25]`     — world-model neighbours              (24)
 ///   * `obs[25..37]`    — joint angles (sin/cos × 3 axes × 2) (12)
 ///   * `obs[37..43]`    — joint angular velocities (3 × 2)    (6)
-///   * `obs[43..52]`    — base body pose+velocity (3+3+3)     (9)
-///   * `obs[52..55]`    — per-limb contact (base + 2 limbs)   (3)
-///   * `obs[55..61]`    — prev_action recurrence              (6)
-///   * `obs[61..64]`    — nearest-prey bearing (body-local
+///   * `obs[43..55]`    — base orientation (sin/cos × 3 axes)
+///                        + angular vel (3) + linear vel (3)  (12)
+///   * `obs[55..58]`    — base up-vector `base_rot · +Y`       (3)
+///   * `obs[58..61]`    — per-limb contact (base + 2 limbs)   (3)
+///   * `obs[61..67]`    — prev_action recurrence              (6)
+///   * `obs[67..70]`    — nearest-prey bearing (body-local
 ///                        dir_x, dir_z, dist_norm)            (3)
 ///
-/// The bearing block closes the observation/reward gap: the reward
-/// (`K_HEADING`, `K_PROGRESS`) is computed against `nearest_prey`,
-/// which scans for the closest photoautotroph regardless of how many
-/// other neighbours are nearer — so it can target prey the K-nearest
-/// world-model block (`obs[1..25]`) doesn't even contain. Feeding the
-/// same bearing as a dedicated, distilled input lets the brain
-/// *observe* exactly what it's *graded on*.
-pub const IN:     usize = 64;
+/// Base orientation is encoded as `(sin, cos)` pairs of the Euler-XYZ
+/// angles (not raw angles) so the ±π wrap is continuous, matching the
+/// joint-angle encoding. The **up-vector** (`base_rot · +Y`) is the
+/// singularity-free tilt/fall signal: upright → `(0, 1, 0)`, on its
+/// side → `y ≈ 0`, upside-down → `y ≈ −1`. Its `.y` is exactly the
+/// `uprightness` term the reward grades on (`K_UP`), so the brain now
+/// *observes* the quantity it's *judged on* — letting it sense and
+/// recover from stumbles. The nearest-prey bearing block likewise
+/// closes the observation/reward gap for `K_HEADING` / `K_PROGRESS`.
+pub const IN:     usize = 70;
 pub const HIDDEN: usize = 128;
 pub const OUT:    usize = 6;
 
-/// Per-organism rollout length. "Short rollout" per the design choice;
-/// each agent fills its own buffer independently — when a buffer is
-/// full, that agent runs its own PPO update against its own data.
-pub const ROLLOUT_LEN: usize = 64;
-
-/// PPO update epochs per filled rollout.
-pub const PPO_EPOCHS: usize = 4;
-
-/// PPO clip range (ε).
-pub const CLIP_EPS: f32 = 0.2;
-
-/// Discount factor for value bootstrapping.
-pub const GAMMA: f32 = 0.99;
-
-/// GAE smoothing factor.
-pub const LAMBDA: f32 = 0.95;
-
-/// Adam learning rate.
-pub const LR: f64 = 3e-4;
-
-/// Coefficient on the value (critic) loss term.
-pub const VALUE_LOSS_COEF: f32 = 0.5;
-
-/// Coefficient on the entropy bonus term.
-pub const ENTROPY_COEF: f32 = 0.03;
-
-/// Initial `log_std` for the diagonal-Gaussian policy. exp(-0.5) ≈ 0.61
-/// — a moderately wide initial distribution for exploration that the
-/// gradient will tighten once a reward signal emerges.
-pub const LOG_STD_INIT: f32 = 0.0;
+pub use crate::simulation_settings::{
+    ROLLOUT_LEN, PPO_EPOCHS, CLIP_EPS, GAMMA, LAMBDA, LR,
+    VALUE_LOSS_COEF, ENTROPY_COEF, LOG_STD_INIT,
+};
 
 // ── Reward shaping ──
 //
@@ -115,12 +93,17 @@ pub const LOG_STD_INIT: f32 = 0.0;
 // plus dense locomotion-intrinsic terms designed to AVOID the freeze
 // local optimum that the first reward draft fell into:
 //
-//   1. Speed magnitude — `|lin_vel_xz|`. Rewards motion in any direction.
-//      Earlier we projected onto the heading and only credited forward
-//      progress; with random initial actions, expected forward velocity
-//      was ~0, so the brain rarely saw the signal. Magnitude fires on
-//      any motion, even sideways or backwards — discovering that joint
-//      patterns produce motion has to come before discovering direction.
+//   1. Forward velocity — `lin_vel_xz · heading_xz` (signed projection
+//      onto the body's facing direction). The bootstrap version of this
+//      term rewarded speed MAGNITUDE (`|lin_vel_xz|`, any direction) to
+//      get organisms moving at all when forward velocity was ~0 under
+//      random actions. That worked — but once they moved, magnitude
+//      rewarded spinning/circling just as much as directed travel, and
+//      the policy converged to a spin-drift local optimum. Projecting
+//      onto the heading pays only for travel in the facing direction:
+//      pure spin nets ~0, backward drift is mildly penalised. Combined
+//      with `K_HEADING` (turn to face prey) this composes into directed
+//      pursuit — face the target, then move forward.
 //   2. Uprightness GATED on motion — `(rot · +Y).y * min(1, speed / IDLE_THRESH)`.
 //      Bare uprightness was paying the freeze policy a constant alive
 //      bonus. Gating it on motion means standing still upright scores 0;
@@ -132,48 +115,10 @@ pub const LOG_STD_INIT: f32 = 0.0;
 // Action smoothness (`K_SMOOTH`) was removed: it's the right tool to
 // clean up jitter once a gait exists, but during bootstrap it directly
 // rewards constant outputs, which is exactly the freeze policy.
-pub const K_EAT:      f32 = 4.0;
-pub const K_REPRO:    f32 = 5.0;
-pub const K_SPEED:    f32 = 0.1;
-pub const K_UP:       f32 = 0.02;
-pub const K_IDLE:     f32 = 0.05;
-/// Reward per world-unit of XZ distance closed to the nearest
-/// photoautotroph since the last brain tick. Gives a dense
-/// directional signal: any motion that nets closer-to-food is paid
-/// even before the brain has discovered locomotion. Mirrors the
-/// `K_PROGRESS` term in the sliding pools.
-pub const K_PROGRESS: f32 = 0.5;
-/// Reward per unit of improvement in heading-alignment toward the
-/// nearest photoautotroph, tick-over-tick. `alignment ∈ [-1, 1]` is
-/// `dot(body_heading_xz, prey_dir_xz)`; the reward is the RECTIFIED
-/// delta `max(0, alignment_now − alignment_prev)`, so only turning
-/// TOWARD the target is paid (turning away costs nothing — same
-/// rectified philosophy as `K_PROGRESS`). This is the limb pool's
-/// learned analogue of the sliding pool's hard-coded "rotate to face
-/// travel direction": the brain must discover which limb motions
-/// rotate the base toward prey, and gets dense credit for doing so
-/// even before net translation begins. Rewarding the ACT of turning
-/// (not static facing) avoids the alive-bonus trap.
-pub const K_HEADING: f32 = 0.3;
-/// Reward per limb-contact TRANSITION (a foot lifting off or planting
-/// down) since the last tick, summed over the two limb pairs. A
-/// walking gait cycles feet on and off the ground; rewarding the
-/// transition gives a dense gradient toward *stepping* rather than
-/// either static contact (foot dragging) or static lift (foot waving
-/// in the air). Only the two LIMB contact flags are counted — the
-/// BASE contact flag is excluded (the base touching the ground is
-/// the body dragging, which we don't want to reward). Kept modest so
-/// it can't be farmed by high-frequency contact jitter — the speed /
-/// progress terms still dominate genuine locomotion. (A `feet
-/// air-time` shaping, as in legged_gym, is the natural refinement if
-/// jitter-farming shows up.)
-pub const K_STEP: f32 = 0.1;
-
-/// Speed (world-units/sec) at which the uprightness reward fully
-/// activates and the idle penalty bottoms out. Below this the brain
-/// is treated as "not really moving" and the alive-bonus is dimmed
-/// proportionally.
-pub const IDLE_THRESH: f32 = 0.5;
+pub use crate::simulation_settings::{
+    K_EAT, K_REPRO, K_FWD, K_UP, K_IDLE, K_PROGRESS, K_HEADING, K_STEP,
+    IDLE_THRESH,
+};
 
 
 // ── Networks ──────────────────────────────────────────────────────────────────
@@ -321,9 +266,17 @@ pub struct LimbObsInputs {
     /// Per-limb angular velocity in the parent's local frame. Three
     /// scalars per limb (×2 limbs).
     pub joint_angvel:   [f32; 6],
-    /// Base body's orientation Euler XYZ (3) + angular velocity (3) +
-    /// linear velocity (3). Read from Avian.
-    pub base_pose_vel:  [f32; 9],
+    /// Base body's orientation as `(sin, cos)` pairs of Euler-XYZ (6)
+    /// + angular velocity (3) + linear velocity (3). Sin/cos rather
+    /// than raw angles so the ±π wrap is continuous (matching
+    /// `joint_sincos`). Layout: `[sin rx, cos rx, sin ry, cos ry,
+    /// sin rz, cos rz, ωx, ωy, ωz, vx, vy, vz]`.
+    pub base_pose_vel:  [f32; 12],
+    /// Base up-vector in WORLD frame (`base_rot · +Y`). The
+    /// singularity-free tilt/fall signal: `(0,1,0)` upright, `y≈0` on
+    /// its side, `y≈−1` upside-down. `.y` equals the reward's
+    /// `uprightness` term.
+    pub base_up:        [f32; 3],
     /// Contact flags for [base, limb0, limb1]. `1.0` while touching,
     /// `0.0` otherwise.
     pub limb_contact:   [f32; 3],
@@ -374,11 +327,12 @@ pub fn build_observation(
     obs[1..25].copy_from_slice(&physics.world_model);
     obs[25..37].copy_from_slice(&physics.joint_sincos);
     obs[37..43].copy_from_slice(&physics.joint_angvel);
-    obs[43..52].copy_from_slice(&physics.base_pose_vel);
-    obs[52..55].copy_from_slice(&physics.limb_contact);
-    obs[55..61].copy_from_slice(prev_action);
+    obs[43..55].copy_from_slice(&physics.base_pose_vel);   // 6 sincos + 3 angvel + 3 linvel
+    obs[55..58].copy_from_slice(&physics.base_up);          // up-vector
+    obs[58..61].copy_from_slice(&physics.limb_contact);
+    obs[61..67].copy_from_slice(prev_action);
 
-    // Nearest-prey bearing in BODY-LOCAL frame (obs[61..64]):
+    // Nearest-prey bearing in BODY-LOCAL frame (obs[67..70]):
     // (dir_x, dir_z, dist_norm). The stored direction is world-frame;
     // rotate it through the base body's inverse yaw so it lands in the
     // same frame as the body-local world-model block. A real bearing
@@ -392,14 +346,14 @@ pub fn build_observation(
             let (sin_h, cos_h) = if len > 1e-6 { (fwd.x / len, fwd.z / len) } else { (0.0, 1.0) };
             // Inverse-yaw rotation, identical convention to
             // `world_model::encode_neighbours_body_local`.
-            obs[61] = dir_world.x * cos_h - dir_world.y * sin_h;
-            obs[62] = dir_world.x * sin_h + dir_world.y * cos_h;
-            obs[63] = (dist / crate::world_model::WORLD_MODEL_RADIUS).clamp(0.0, 1.0);
+            obs[67] = dir_world.x * cos_h - dir_world.y * sin_h;
+            obs[68] = dir_world.x * sin_h + dir_world.y * cos_h;
+            obs[69] = (dist / crate::world_model::WORLD_MODEL_RADIUS).clamp(0.0, 1.0);
         }
         _ => {
-            obs[61] = 0.0;
-            obs[62] = 0.0;
-            obs[63] = 1.0;
+            obs[67] = 0.0;
+            obs[68] = 0.0;
+            obs[69] = 1.0;
         }
     }
     obs
@@ -449,15 +403,22 @@ pub fn gather_limb_obs_inputs(
         let root = child_of.parent();
         let (rx, ry, rz) = rot.0.to_euler(bevy::math::EulerRot::XYZ);
         let entry = out.entry(root).or_default();
-        entry.base_pose_vel[0] = rx;
-        entry.base_pose_vel[1] = ry;
-        entry.base_pose_vel[2] = rz;
-        entry.base_pose_vel[3] = ang_vel.0.x;
-        entry.base_pose_vel[4] = ang_vel.0.y;
-        entry.base_pose_vel[5] = ang_vel.0.z;
-        entry.base_pose_vel[6] = lin_vel.0.x;
-        entry.base_pose_vel[7] = lin_vel.0.y;
-        entry.base_pose_vel[8] = lin_vel.0.z;
+        // Orientation as sin/cos pairs (continuous across the ±π wrap).
+        entry.base_pose_vel[0]  = rx.sin();
+        entry.base_pose_vel[1]  = rx.cos();
+        entry.base_pose_vel[2]  = ry.sin();
+        entry.base_pose_vel[3]  = ry.cos();
+        entry.base_pose_vel[4]  = rz.sin();
+        entry.base_pose_vel[5]  = rz.cos();
+        entry.base_pose_vel[6]  = ang_vel.0.x;
+        entry.base_pose_vel[7]  = ang_vel.0.y;
+        entry.base_pose_vel[8]  = ang_vel.0.z;
+        entry.base_pose_vel[9]  = lin_vel.0.x;
+        entry.base_pose_vel[10] = lin_vel.0.y;
+        entry.base_pose_vel[11] = lin_vel.0.z;
+        // Up-vector: where the body's +Y points in world frame.
+        let up = rot.0 * Vec3::Y;
+        entry.base_up = [up.x, up.y, up.z];
         entry.limb_contact[0] = if contact.is_some_and(|c| c.in_contact) { 1.0 } else { 0.0 };
         entry.base_rot     = rot.0;
         entry.base_lin_vel = lin_vel.0;
@@ -1083,10 +1044,19 @@ impl BrainPoolLimb {
             let phys = obs_inputs.get(&e).unwrap_or(&default_phys);
             let lin_xz = Vec2::new(phys.base_lin_vel.x, phys.base_lin_vel.z);
             let speed  = lin_xz.length();
+            // Forward velocity: signed projection of XZ velocity onto the
+            // body's facing direction (`base_rot · +Z`). Rewards directed
+            // travel, not undirected spin (which nets ~0 here). See the
+            // `K_FWD` note above.
+            let fwd = phys.base_rot * Vec3::Z;
+            let heading_xz = Vec2::new(fwd.x, fwd.z).normalize_or_zero();
+            let forward_speed = lin_xz.dot(heading_xz);
             // Motion gate ∈ [0, 1]: 0 when stationary, 1 once speed ≥
             // IDLE_THRESH. Used to suppress the uprightness alive-bonus
             // when the brain isn't actually moving and to scale the
-            // idle penalty inversely.
+            // idle penalty inversely. Uses speed MAGNITUDE (not forward
+            // velocity) — "is it moving at all" is the right gate for
+            // the liveness terms, independent of direction.
             let motion_gate = (speed / IDLE_THRESH).clamp(0.0, 1.0);
             // Uprightness: world-Y component of the body's local +Y axis.
             let uprightness = (phys.base_rot * Vec3::Y).y;
@@ -1131,7 +1101,7 @@ impl BrainPoolLimb {
                             + (phys.limb_contact[2] - prev_lc[2]).abs();
             self.prev_limb_contact[su] = phys.limb_contact;
 
-            let dense_reward = K_SPEED    * speed
+            let dense_reward = K_FWD      * forward_speed
                              + K_UP       * uprightness * motion_gate
                              - K_IDLE     * (1.0 - motion_gate)
                              + K_PROGRESS * progress

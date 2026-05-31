@@ -23,17 +23,11 @@ use crate::world_geometry::{HeightmapSampler, MapSize};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const REPRODUCTION_CHECK_INTERVAL: f32 = 2.0;
-
-/// Energy split between parent and offspring at reproduction (50/50).
-const OFFSPRING_ENERGY_FRACTION: f32 = 0.5;
-
-/// Threshold (fraction of `max_energy`) above which an organism becomes a
-/// reproduction candidate.
-const REPRODUCTION_ENERGY_THRESHOLD: f32 = 0.8;
-
-const HETEROTROPH_REPRODUCTION_CAP:    u8 = 2;
-const PHOTOAUTOTROPH_REPRODUCTION_CAP: u8 = 2;
+use crate::simulation_settings::{
+    REPRODUCTION_CHECK_INTERVAL, OFFSPRING_ENERGY_FRACTION,
+    REPRODUCTION_ENERGY_THRESHOLD, HETEROTROPH_REPRODUCTION_CAP,
+    PHOTOAUTOTROPH_REPRODUCTION_CAP,
+};
 
 
 // ── Timer resource ───────────────────────────────────────────────────────────

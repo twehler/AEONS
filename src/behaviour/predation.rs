@@ -22,9 +22,7 @@ use crate::colony::*;
 use crate::organism_collision::OrganismContactEvent;
 
 
-/// Fraction of the prey body part's energy share that becomes predator
-/// energy. The "lost" 20% models metabolic inefficiency in digestion.
-const ENERGY_TRANSFER_RATE: f32 = 0.8;
+use crate::simulation_settings::ENERGY_TRANSFER_RATE;
 
 
 pub struct PredationPlugin;

@@ -12,32 +12,19 @@
 
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
-use std::time::Duration;
+use std::collections::HashMap;
 
 use crate::colony::{Organism, OrganismRoot};
 use crate::world_geometry::HeightmapSampler;
 
 
-/// Direction *toward* the sun, as a unit vector.
-///
-/// Mirrors the directional light orientation in `main.rs`:
-/// `Quat::from_euler(EulerRot::XYZ, -π/4, π/4, 0)` applied to Bevy's default
-/// directional light forward (`-Z`) yields a light pointing roughly
-/// `(-0.5, -√2/2, -0.5)`. The opposite of that — the direction *toward* the
-/// light source — is the unit vector below.
-pub const SUN_DIRECTION: Vec3 = Vec3::new(0.5, std::f32::consts::FRAC_1_SQRT_2, 0.5);
+pub use crate::simulation_settings::SUN_DIRECTION;
 
-const SHADOW_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+use crate::simulation_settings::SHADOW_CHECK_INTERVAL;
 
-/// Step length of the shadow raymarch in world units. Chosen to match the
-/// heightmap cell size (1.0) so each step samples a fresh terrain cell.
-const RAY_STEP_SIZE: f32 = 1.0;
+use crate::simulation_settings::RAY_STEP_SIZE;
 
-/// Maximum number of steps before declaring the ray escaped to the sky.
-/// With sun y-component √2/2 ≈ 0.707 and step size 1.0, 300 steps lift
-/// the ray ~210 units above its origin — comfortably above any plausible
-/// terrain peak in normalised worlds.
-const MAX_RAY_STEPS: usize = 300;
+use crate::simulation_settings::MAX_RAY_STEPS;
 
 
 pub struct PhotosynthesisPlugin;
@@ -58,13 +45,34 @@ impl Plugin for PhotosynthesisPlugin {
 /// photoautotrophs in `intelligence_level_1.rs`.
 fn update_sunlight(
     heightmap: Res<HeightmapSampler>,
-    mut query: Query<(&mut Organism, &Transform), With<OrganismRoot>>,
+    mut query: Query<(Entity, &mut Organism, &Transform), With<OrganismRoot>>,
+    // Trunk-part (`BodyPartIndex(0)`) world transforms, keyed by their
+    // parent OrganismRoot. For LIMB-based organisms the root transform
+    // is frozen at spawn — only the per-part `RigidBody::Dynamic`
+    // children move — so the ray-march must originate from the trunk
+    // part's true world position, otherwise a walking phototroph's
+    // sun-occlusion would be evaluated at its birthplace forever. For
+    // sliding organisms the trunk sits at identity-local under a moving
+    // root, so its world position equals the root's and this is a no-op.
+    base_part_q: Query<(&ChildOf, &crate::cell::BodyPartIndex, &GlobalTransform)>,
 ) {
     let sun      = SUN_DIRECTION.normalize();
     let escape_y = heightmap.max_height + 5.0;
 
-    for (mut organism, transform) in query.iter_mut() {
-        organism.in_sunlight = is_lit(transform.translation, &heightmap, sun, escape_y);
+    // Map each OrganismRoot to its trunk part's world position.
+    let mut base_pos: HashMap<Entity, Vec3> = HashMap::new();
+    for (parent, idx, gx) in &base_part_q {
+        if idx.0 == 0 {
+            base_pos.insert(parent.parent(), gx.translation());
+        }
+    }
+
+    for (entity, mut organism, transform) in query.iter_mut() {
+        // Prefer the trunk part's world position; fall back to the root
+        // transform if (briefly) no trunk part is registered.
+        let origin = base_pos.get(&entity).copied()
+            .unwrap_or(transform.translation);
+        organism.in_sunlight = is_lit(origin, &heightmap, sun, escape_y);
     }
 }
 

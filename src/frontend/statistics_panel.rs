@@ -152,6 +152,12 @@ pub struct FpsText { timer: Timer }
 #[derive(Component)]
 pub struct CellCountText { timer: Timer }
 
+/// Marker on the camera-coordinate text directly beneath the FPS counter.
+/// No timer: its update system is driven purely by `Changed<Transform>` on
+/// the `FlyCam`, so it does zero work on frames where the camera is idle.
+#[derive(Component)]
+pub struct CameraCoordsText;
+
 /// Marker on the simulation-clock text that sits between the vertical
 /// separator and the population graph. Reads `Time<Virtual>` so it
 /// pauses automatically with the simulation. The internal timer just
@@ -348,6 +354,15 @@ pub fn spawn_panel(
                     TextFont { font_size: 20.0, ..default() },
                     TextColor(Color::WHITE),
                     FpsText { timer: Timer::from_seconds(0.1, TimerMode::Repeating) },
+                ));
+                left.spawn((
+                    // Camera position, directly beneath the FPS counter.
+                    // Refreshed only when the FlyCam transform changes
+                    // (`update_camera_coords_text`) — idle frames cost nothing.
+                    Text::new("Cam: -, -, -"),
+                    TextFont { font_size: 14.0, ..default() },
+                    TextColor(Color::srgb(0.7, 0.7, 0.7)),
+                    CameraCoordsText,
                 ));
                 left.spawn((
                     Text::new("Cells: 0"),
@@ -780,6 +795,27 @@ pub fn update_fps_text(
                 }
             }
         }
+    }
+}
+
+
+/// Refresh the camera-coordinate readout beneath the FPS counter.
+///
+/// Driven entirely by Bevy change detection: the `Changed<Transform>` filter
+/// makes the camera query yield a row ONLY on frames where the `FlyCam`
+/// transform actually moved (plus once at spawn, when it counts as added). On
+/// every idle frame the query is empty and the system returns immediately
+/// after a per-archetype change-tick check — effectively zero cost. The text
+/// buffer is cleared-and-rewritten in place, so a refresh allocates nothing.
+pub fn update_camera_coords_text(
+    camera: Query<&Transform, (With<crate::player_plugin::FlyCam>, Changed<Transform>)>,
+    mut query: Query<&mut Text, With<CameraCoordsText>>,
+) {
+    let Ok(cam_xf) = camera.single() else { return };
+    let t = cam_xf.translation;
+    for mut text in &mut query {
+        text.0.clear();
+        let _ = write!(text.0, "Cam: {:.0}, {:.0}, {:.0}", t.x, t.y, t.z);
     }
 }
 

@@ -21,50 +21,22 @@ pub use crate::organism::*;
 // CAP lets the user seed a small starter cohort and let reproduction
 // fill the room up to the cap. See `spawn_colony`.
 
-/// Initial Krishi cohort size. `pub` so `krishi.rs` reads it directly —
-/// keeps every "how many of X spawn at startup" knob in one place.
-pub const INITIAL_KRISHI: u32 = 1;
+pub use crate::simulation_settings::INITIAL_KRISHI;
 
-/// Angular damping for the BASE body of a limb-based organism. High,
-/// because the base has no PD actuator of its own — joint-constraint
-/// reaction torques from the limbs would otherwise integrate unbounded
-/// and spin the body up.
-const BASE_ANGULAR_DAMPING: f32 = 3.0;
+use crate::simulation_settings::{
+    SPAWN_CRAWLER_PATH, SPAWN_CRAWLER_COUNT,
+    SPAWN_STRIDER_PATH, SPAWN_STRIDER_COUNT,
+    SPAWN_ALGAE_PATH, SPAWN_ALGAE_COUNT,
+};
 
-/// Angular damping for LIMB bodies. Much lower than the base so the
-/// PD controller can produce dynamic swings — the policy can't lift
-/// the legs off the ground if every torque it commands gets drained
-/// to friction within a frame.
-const LIMB_ANGULAR_DAMPING: f32 = 1.0;
+use crate::simulation_settings::BASE_ANGULAR_DAMPING;
 
-/// Linear damping for every limb-based body part (base + limbs).
-/// Light — enough to bleed drift between actuator pulses, not enough
-/// to lock the organism in place.
-const LIMB_LINEAR_DAMPING:  f32 = 0.2;
+use crate::simulation_settings::LIMB_ANGULAR_DAMPING;
 
-/// Material density used when deriving each limb-based body part's
-/// mass from its compound collider. Density × volume → mass; lower
-/// density → lower mass → lower normal force at ground contacts →
-/// less friction force resisting limb rotation. Set to 0.2 (down
-/// from the natural 1.0) because at full density a 25-cell organism
-/// sitting on the heightfield was friction-pinned at every ground
-/// contact, dwarfing the brain's PD torques.
-const LIMB_BODY_DENSITY: f32 = 0.2;
+use crate::simulation_settings::LIMB_LINEAR_DAMPING;
 
-/// Friction coefficient applied to every limb-based body part.
-///
-/// Locomotion needs GRIP, not slip: to "press a foot down and back to
-/// drive the body forward" the planted foot must not slide. An earlier
-/// pass set this to 0.05 with a `Min` combine rule to stop limbs
-/// sticking — but that starved the organism of traction (feet slid,
-/// body never propelled), and a test run confirmed near-zero motion.
-/// Raised to 1.0 with an `Average` combine rule, so a limb↔terrain
-/// (default μ = 0.5) contact resolves to μ = 0.75 — firm grip when
-/// planted. This does NOT prevent lifting: a foot lifted off the
-/// ground has zero normal force and therefore zero friction
-/// regardless of μ, so the lift→reposition→plant→press gait cycle
-/// works (the swing phase is frictionless for free).
-const LIMB_FRICTION_COEFFICIENT: f32 = 1.0;
+use crate::simulation_settings::LIMB_BODY_DENSITY;
+
 
 
 /// Build a SINGLE convex-hull collider for a limb-based body part from
@@ -294,13 +266,41 @@ pub struct ColonyLoadPath(pub Option<String>);
 /// can still read v003 organism structure (positions, body parts,
 /// energy) but drops the v003 brain block — the saved weights are
 /// for a different architecture and aren't restorable.
-const SAVE_MAGIC:             &[u8;8] = b"AEONS007";
+const SAVE_MAGIC:             &[u8;8] = b"AEONS008";
+const SAVE_MAGIC_LEGACY_V007: &[u8;8] = b"AEONS007";
 const SAVE_MAGIC_LEGACY_V006: &[u8;8] = b"AEONS006";
 const SAVE_MAGIC_LEGACY_V005: &[u8;8] = b"AEONS005";
 const SAVE_MAGIC_LEGACY_V004: &[u8;8] = b"AEONS004";
 const SAVE_MAGIC_LEGACY_V003: &[u8;8] = b"AEONS003";
 const SAVE_MAGIC_LEGACY_V002: &[u8;8] = b"AEONS002";
 const SAVE_MAGIC_LEGACY_V001: &[u8;8] = b"AEONS001";
+
+/// Elapsed virtual time written into the v008 colony file as a handful
+/// of cheap integers (the "time notation"), right after the magic.
+/// On load the simulation's virtual clock is advanced to this point so
+/// a resumed colony continues from the exact virtual time it was saved
+/// at. No separate time-tracking machinery — the clock itself carries
+/// absolute time, so every virtual-time consumer (sim timer, auto-
+/// export milestones, logs) resumes for free.
+#[derive(Clone, Copy, Default)]
+struct TimeNotation {
+    hours:   u32,
+    minutes: u32,
+    seconds: u32,
+}
+
+impl TimeNotation {
+    fn from_secs(total: u32) -> Self {
+        Self {
+            hours:   total / 3600,
+            minutes: (total % 3600) / 60,
+            seconds: total % 60,
+        }
+    }
+    fn total_secs(&self) -> u32 {
+        self.hours * 3600 + self.minutes * 60 + self.seconds
+    }
+}
 
 /// One-shot resource: when set to `Some(path)`, `save_colony_system`
 /// writes the current world to that path on the next Update tick and
@@ -322,6 +322,9 @@ pub struct SaveRequested(pub Option<std::path::PathBuf>);
 
 fn save_colony_system(
     mut save_requested: ResMut<SaveRequested>,
+    // Source of the v008 time-notation — the current virtual elapsed
+    // time, written so a reload resumes the clock at this exact point.
+    virtual_time: Res<Time<Virtual>>,
     organisms: Query<
         (Entity, &Transform, &Organism,
          Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
@@ -345,6 +348,15 @@ fn save_colony_system(
 
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     buf.extend_from_slice(SAVE_MAGIC);
+
+    // v008 time notation — current virtual elapsed time as cheap
+    // integers, immediately after the magic. The clock already carries
+    // absolute time (it's set on load), so this round-trips across
+    // save → load → save chains without any separate bookkeeping.
+    let notation = TimeNotation::from_secs(virtual_time.elapsed_secs() as u32);
+    put_u32(&mut buf, notation.hours);
+    put_u32(&mut buf, notation.minutes);
+    put_u32(&mut buf, notation.seconds);
 
     // One snapshot per pool (sliding + limb), reused across all
     // organisms — a single GPU→CPU transfer each, not one per organism.
@@ -601,7 +613,7 @@ struct LoadedRecord {
 }
 
 
-fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
+fn load_colony_from_file(path: &str) -> std::io::Result<(TimeNotation, Vec<LoadedRecord>)> {
     let bytes = std::fs::read(path)?;
     let mut c = 0usize;
 
@@ -615,27 +627,43 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         return Err(std::io::Error::other("file too short — missing magic"));
     }
     let magic = &bytes[..SAVE_MAGIC.len()];
-    let format_v007 = magic == SAVE_MAGIC;
+    let format_v008 = magic == SAVE_MAGIC;
+    let format_v007 = magic == SAVE_MAGIC_LEGACY_V007;
     let format_v006 = magic == SAVE_MAGIC_LEGACY_V006;
     let format_v005 = magic == SAVE_MAGIC_LEGACY_V005;
     let format_v004 = magic == SAVE_MAGIC_LEGACY_V004;
     let format_v003 = magic == SAVE_MAGIC_LEGACY_V003;
     let format_v002 = magic == SAVE_MAGIC_LEGACY_V002;
     let format_v001 = magic == SAVE_MAGIC_LEGACY_V001;
-    if !format_v007 && !format_v006 && !format_v005 && !format_v004 && !format_v003 && !format_v002 && !format_v001 {
+    if !format_v008 && !format_v007 && !format_v006 && !format_v005 && !format_v004 && !format_v003 && !format_v002 && !format_v001 {
         return Err(std::io::Error::other(
             "magic mismatch — not an AEONS colony save (or unsupported version)",
         ));
     }
+    // v008 has the same per-organism record layout as v007 (it only
+    // adds the time notation after the magic), so every v007 feature
+    // flag also holds for v008.
+    let format_v007_layout = format_v008 || format_v007;
     // v002+ all share the intelligence_level byte after has_variable_form.
-    let has_intelligence_byte = format_v007 || format_v006 || format_v005 || format_v004 || format_v003 || format_v002;
+    let has_intelligence_byte = format_v007_layout || format_v006 || format_v005 || format_v004 || format_v003 || format_v002;
     // v006+ adds the sliding_movement byte after has_variable_form / before
     // intelligence_level. Older saves all default to `true`.
-    let has_sliding_byte = format_v007 || format_v006;
+    let has_sliding_byte = format_v007_layout || format_v006;
     // v007+ appends a limb-brain block (kind byte + optional payload)
     // after the existing sliding-brain block per organism.
-    let has_limb_brain_section = format_v007;
+    let has_limb_brain_section = format_v007_layout;
     c += SAVE_MAGIC.len();
+
+    // v008 time notation (hours, minutes, seconds) immediately after the
+    // magic. Older formats have no notation → resume at t=0.
+    let notation = if format_v008 {
+        let hours   = read_u32(&bytes, &mut c)?;
+        let minutes = read_u32(&bytes, &mut c)?;
+        let seconds = read_u32(&bytes, &mut c)?;
+        TimeNotation { hours, minutes, seconds }
+    } else {
+        TimeNotation::default()
+    };
 
     let count = read_u32(&bytes, &mut c)?;
     let mut out: Vec<LoadedRecord> = Vec::with_capacity(count as usize);
@@ -787,7 +815,7 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         //            up with fresh-init weights.
         //   * v001/v002 — no brain section at all.
         let brain: Option<crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1>
-            = if format_v005 || format_v006 || format_v007 {
+            = if format_v005 || format_v006 || format_v007_layout {
                 // v005+: shared `BrainRestore` (4-tensor MLP) +
                 // the herbivore_1 8-byte magic prefix. (Earlier the
                 // gate was `format_v005` only — v006 saves left the
@@ -920,7 +948,7 @@ fn load_colony_from_file(path: &str) -> std::io::Result<Vec<LoadedRecord>> {
         out.push(LoadedRecord { pos, rotation, kind, organism, brain, brain_limb });
     }
 
-    Ok(out)
+    Ok((notation, out))
 }
 
 
@@ -1140,7 +1168,7 @@ fn spawn_loaded_organism(
                     // `Average` combine with the terrain's default 0.5
                     // gives a contact μ = 0.75 so planted feet propel
                     // the body instead of sliding.
-                    avian3d::prelude::Friction::new(LIMB_FRICTION_COEFFICIENT)
+                    avian3d::prelude::Friction::new(crate::simulation_settings::LIMB_FRICTION_COEFFICIENT)
                         .with_combine_rule(avian3d::prelude::CoefficientCombine::Average),
                     avian3d::prelude::CollisionEventsEnabled,
                     crate::avian_setup::LimbContact::default(),
@@ -1301,10 +1329,10 @@ fn spawn_colony(
     load_path:       Res<ColonyLoadPath>,
     smoothing:       Res<crate::simulation_settings::Smoothing>,
     map_size:        Res<MapSize>,
-    max_photoautotrophs: Res<crate::simulation_settings::MaxPhotoautotrophs>,
-    max_herbivores:      Res<crate::simulation_settings::MaxHerbivores>,
-    start_heteros:       Res<crate::simulation_settings::StartHeterotrophs>,
-    start_photos:        Res<crate::simulation_settings::StartPhotoautotrophs>,
+    // NOTE: the launcher start-count / cap resources no longer drive
+    // the fresh cohort (it spawns fixed `.species` counts), but
+    // `--max-herbivores` still sizes the GPU brain pools in `main.rs`.
+    mut virtual_time:    ResMut<Time<Virtual>>,
     mut spawned:     Local<bool>,
 ) {
     if *spawned { return; }
@@ -1328,12 +1356,25 @@ fn spawn_colony(
     // so the run still produces something visible.
     if let Some(path) = &load_path.0 {
         match load_colony_from_file(path) {
-            Ok(records) => {
+            Ok((notation, records)) => {
                 let n = records.len();
                 for record in records {
                     spawn_loaded_organism(record, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
                 }
-                info!("loaded colony from {} — {} organisms restored", path, n);
+                // Resume the virtual clock at the saved point. Two
+                // `advance_by` calls: the first bumps `elapsed` to the
+                // target; the second (ZERO) resets THIS frame's `delta`
+                // back to 0, so no delta-integrating system (physics
+                // accumulator, movement) sees the jump as a single
+                // giant timestep. Bevy's normal per-frame update resumes
+                // from the new elapsed next frame.
+                let total = notation.total_secs();
+                if total > 0 {
+                    virtual_time.advance_by(std::time::Duration::from_secs(total as u64));
+                    virtual_time.advance_by(std::time::Duration::ZERO);
+                }
+                info!("loaded colony from {} — {} organisms restored, virtual time resumed at {}h{}m{}s",
+                      path, n, notation.hours, notation.minutes, notation.seconds);
                 return;
             }
             Err(e) => {
@@ -1342,146 +1383,154 @@ fn spawn_colony(
         }
     }
 
-    // Derive initial cohort sizes from the launcher-set spawn-count
-    // resources (defaulting to the matching `DEFAULT_*` constants).
-    // Both spawn counts are independent of the running-population
-    // caps (`MaxPhotoautotrophs` / `MaxHerbivores`) so the user can
-    // seed a small starter cohort and let reproduction backfill the
-    // population up to each class's cap.
-    let n_herbivores      = start_heteros.0;
-    let n_photoautotrophs = start_photos.0;
-    info!(
-        "spawn_colony: target cohort = {} photoautotrophs + {} herbivores \
-         (StartPhotoautotrophs={}, StartHeterotrophs={}, \
-          MaxPhotoautotrophs={}, MaxHerbivores={})",
-        n_photoautotrophs, n_herbivores,
-        start_photos.0, start_heteros.0,
-        max_photoautotrophs.0, max_herbivores.0,
+    // Fresh-start cohort: seed the world from authored `.species`
+    // files instead of procedurally-generated starter organisms. Each
+    // file is loaded once and spawned `count` times at random
+    // positions. Counts and paths are fixed (see the `SPAWN_*`
+    // constants); the launcher's start-count fields no longer drive
+    // the fresh cohort, though `--max-herbivores` still sizes the GPU
+    // brain pools in `main.rs`.
+    spawn_species_cohort(SPAWN_ALGAE_PATH,   SPAWN_ALGAE_COUNT,   &heightmap, &map_size, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
+    spawn_species_cohort(SPAWN_CRAWLER_PATH, SPAWN_CRAWLER_COUNT, &heightmap, &map_size, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
+    spawn_species_cohort(SPAWN_STRIDER_PATH, SPAWN_STRIDER_COUNT, &heightmap, &map_size, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
+}
+
+
+/// Build a STATIC appendage `BodyPart` from a full OCG (cells render at
+/// their authored positions; no per-frame rotation). Mirrors
+/// `colony_editor::placement::appendage_body_part`.
+fn appendage_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>) -> BodyPart {
+    let cells = ocg.iter().map(|(_, p, ct)| Cell::new(*p, *ct)).collect();
+    BodyPart {
+        kind:         BodyPartKind::Organ,
+        local_offset: Vec3::ZERO,
+        cells,
+        ocg,
+        attachment:   Some(crate::body_part::Attachment {
+            parent_idx: 0, origin_local: Vec3::ZERO, rotation: Quat::IDENTITY,
+        }),
+        consumed:   false,
+        debug_blue: false,
+        regrowable: true,
+    }
+}
+
+/// Build a LIMB `BodyPart` from a full OCG: cells are rebased so the
+/// first cell sits at the limb's local origin and the attachment pivot
+/// is that first cell, so the limb rotates around its base. Mirrors
+/// `colony_editor::placement::limb_body_part`.
+fn limb_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>) -> BodyPart {
+    let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
+    let shifted: Vec<(usize, Vec3, CellType)> =
+        ocg.iter().map(|(i, p, ct)| (*i, *p - pivot, *ct)).collect();
+    let cells = shifted.iter().map(|(_, p, ct)| Cell::new(*p, *ct)).collect();
+    BodyPart {
+        kind:         BodyPartKind::Limb,
+        local_offset: Vec3::ZERO,
+        cells,
+        ocg:          shifted,
+        attachment:   Some(crate::body_part::Attachment {
+            parent_idx: 0, origin_local: pivot, rotation: Quat::IDENTITY,
+        }),
+        consumed:   false,
+        debug_blue: false,
+        regrowable: true,
+    }
+}
+
+/// Load a `.species` file and spawn `count` instances at random
+/// positions across the world. Used by `spawn_colony`'s fresh-start
+/// path. Body-part assembly (root + appendages, bilateral mirroring,
+/// limb-pivot rebasing) mirrors
+/// `colony_editor::placement::spawn_real_organism`, so a species spawns
+/// identically whether placed in the editor or seeded here. Each spawn
+/// gets an `ImportedSpeciesOrigin` (filename stem) so it founds its own
+/// lineage in the speciation registry. Errors (missing/bad file) are
+/// logged and the cohort is skipped.
+#[allow(clippy::too_many_arguments)]
+fn spawn_species_cohort(
+    path:      &str,
+    count:     usize,
+    heightmap: &HeightmapSampler,
+    map_size:  &MapSize,
+    smoothing: bool,
+    commands:  &mut Commands,
+    meshes:    &mut ResMut<Assets<Mesh>>,
+    materials: &OrganismMaterials,
+    rng:       &mut impl rand::Rng,
+) {
+    let species = match crate::species_editor::save::load_species(std::path::Path::new(path)) {
+        Ok(s)  => s,
+        Err(e) => { error!("spawn_colony: failed to load species {path}: {e}"); return; }
+    };
+    if species.body_parts.is_empty() {
+        error!("spawn_colony: species {path} has no body parts — skipped");
+        return;
+    }
+    let name = std::path::Path::new(path).file_stem()
+        .and_then(|s| s.to_str()).unwrap_or("species").to_string();
+    let kind = match species.metabolism {
+        crate::species_editor::session::Metabolism::Photoautotroph => OrganismKind::Photoautotroph,
+        crate::species_editor::session::Metabolism::Heterotroph    => OrganismKind::Heterotroph,
+    };
+    let is_carnivore = matches!(
+        species.classification,
+        crate::species_editor::session::Classification::Carnivore
     );
+    let sliding = species.movement.is_sliding();
+    let margin  = crate::world_geometry::WORLD_SAFETY_MARGIN;
 
-    for _ in 0..n_photoautotrophs {
-        // Spawn strictly inside the WORLD_SAFETY_MARGIN inset so the
-        // organism is born inside the same XZ band that
-        // `apply_world_bounds` keeps it within at runtime.
-        let x = rng.random_range(
-            crate::world_geometry::WORLD_SAFETY_MARGIN
-                ..(map_size.x - crate::world_geometry::WORLD_SAFETY_MARGIN),
-        );
-        let z = rng.random_range(
-            crate::world_geometry::WORLD_SAFETY_MARGIN
-                ..(map_size.z - crate::world_geometry::WORLD_SAFETY_MARGIN),
-        );
+    for _ in 0..count {
+        // Body-part list rebuilt per spawn (spawn_organism consumes it):
+        // root from part 0; each later part is an appendage (bilateral
+        // → mirrored pair, NoSymmetry → single).
+        let mut body_parts = vec![root_body_part_from_ocg(&species.body_parts[0].ocg)];
+        for lbp in &species.body_parts[1..] {
+            let make = |o: Vec<(usize, Vec3, CellType)>| -> BodyPart {
+                if lbp.is_limb { limb_body_part_from_ocg(o) } else { appendage_body_part_from_ocg(o) }
+            };
+            match species.symmetry {
+                Symmetry::Bilateral => {
+                    body_parts.push(make(lbp.ocg.clone()));
+                    body_parts.push(make(crate::body_part::mirror_right_to_left(&lbp.ocg)));
+                }
+                Symmetry::NoSymmetry => body_parts.push(make(lbp.ocg.clone())),
+            }
+        }
+        let cell_count = body_parts.iter().map(|bp| bp.cells.len()).sum::<usize>() as f32;
+        let initial_energy = cell_count * crate::energy::MAX_ENERGY_PER_CELL * 0.5;
+
+        let x = rng.random_range(margin..(map_size.x - margin));
+        let z = rng.random_range(margin..(map_size.z - margin));
         let y = heightmap.height_at(x, z) + 1.0;
 
-        // 80% of photoautotrophs are variable-form: NoSymmetry,
-        // sessile, plant-like. The remaining 20% are Bilateral and
-        // mobile (animal-like).
-        let has_variable_form = rng.random::<f32>() < 0.8;
-        let (symmetry, body_parts, max_e) = if has_variable_form {
-            // Single root cell, asymmetric growth, branching enabled.
-            let ocg = vec![(0usize, Vec3::ZERO, CellType::Photo)];
-            let parts = vec![root_body_part_from_ocg(&ocg)];
-            let max_e = (ocg.len() as f32) * crate::energy::MAX_ENERGY_PER_CELL;
-            (Symmetry::NoSymmetry, parts, max_e)
-        } else {
-            // Bilateral seed: cells at (±MIN_X_BILATERAL, 0, 0) — exact
-            // +X axis-aligned RD neighbours sharing a rhombic face on
-            // the YZ-plane. Both go into a SINGLE body part whose OCG
-            // contains both halves; `build_mesh_from_ocg`'s weld+dedup
-            // fuses them at the seam (see `bilateral_body_part_from_right_ocg`).
-            let right_seed = vec![(
-                0usize,
-                Vec3::new(crate::body_part::MIN_X_BILATERAL, 0.0, 0.0),
-                CellType::Photo,
-            )];
-            let parts = vec![
-                crate::body_part::bilateral_body_part_from_right_ocg(&right_seed)
-            ];
-            let max_e = 2.0 * crate::energy::MAX_ENERGY_PER_CELL;
-            (Symmetry::Bilateral, parts, max_e)
-        };
-
-        // Initial cohort intelligence level — rolled once per organism.
-        // For photoautotrophs the 80%-Level0 target falls out of the
-        // sessile branch (sessile == has_variable_form for photos), so
-        // mobile photos always go to Level1. Inherited verbatim by
-        // offspring after this point.
-        let intel = IntelligenceLevel::for_initial_spawn(
-            OrganismKind::Photoautotroph,
-            has_variable_form,
-            &mut rng,
-        );
-        spawn_organism(
+        let entity = spawn_organism(
             Vec3::new(x, y, z),
             body_parts,
-            OrganismKind::Photoautotroph,
-            symmetry,
-            has_variable_form,
-            // is_sessile is forced true inside spawn_organism whenever
-            // has_variable_form is true; we pass false here to keep the
-            // signal explicit.
-            false,
-            intel,
-            smoothing.0,
-            max_e * 0.5,
-            // Initial cohort: sliding (legacy) movement until a species
-            // with `sliding_movement = false` is imported / spawned.
-            true,
-            &mut commands,
-            &mut meshes,
-            &materials,
-            &mut rng,
+            kind,
+            species.symmetry,
+            species.has_variable_form,
+            species.is_sessile,
+            species.intelligence,
+            smoothing,
+            initial_energy,
+            sliding,
+            commands,
+            meshes,
+            materials,
+            rng,
         );
+        if is_carnivore {
+            commands.entity(entity).try_insert(Carnivore);
+        }
+        commands.entity(entity).try_insert(
+            crate::lineages::species::ImportedSpeciesOrigin { name: name.clone() },
+        );
+        if let Some(b) = &species.brain {
+            commands.entity(entity).try_insert(b.clone());
+        }
     }
-
-    for _ in 0..n_herbivores {
-        // Spawn strictly inside the WORLD_SAFETY_MARGIN inset so the
-        // organism is born inside the same XZ band that
-        // `apply_world_bounds` keeps it within at runtime.
-        let x = rng.random_range(
-            crate::world_geometry::WORLD_SAFETY_MARGIN
-                ..(map_size.x - crate::world_geometry::WORLD_SAFETY_MARGIN),
-        );
-        let z = rng.random_range(
-            crate::world_geometry::WORLD_SAFETY_MARGIN
-                ..(map_size.z - crate::world_geometry::WORLD_SAFETY_MARGIN),
-        );
-        let y = heightmap.height_at(x, z) + 1.0;
-        // Single bilateral body part — see comment for the
-        // photoautotroph cohort above.
-        let right_seed = vec![(
-            0usize,
-            Vec3::new(crate::body_part::MIN_X_BILATERAL, 0.0, 0.0),
-            CellType::NonPhoto,
-        )];
-        let body_parts = vec![
-            crate::body_part::bilateral_body_part_from_right_ocg(&right_seed)
-        ];
-        let max_e = 2.0 * crate::energy::MAX_ENERGY_PER_CELL;
-        // Heterotroph intelligence: 50/40/10 across L1/L2/L3 — see
-        // `IntelligenceLevel::for_initial_spawn`.
-        let intel = IntelligenceLevel::for_initial_spawn(
-            OrganismKind::Heterotroph,
-            false,
-            &mut rng,
-        );
-        spawn_organism(
-            Vec3::new(x, y, z),
-            body_parts,
-            OrganismKind::Heterotroph,
-            Symmetry::Bilateral,
-            false,  // has_variable_form — heterotrophs are always mobile
-            false,  // is_sessile
-            intel,
-            smoothing.0,
-            max_e * 0.5,
-            true,   // sliding_movement — initial cohort uses legacy sliding
-            &mut commands,
-            &mut meshes,
-            &materials,
-            &mut rng,
-        );
-    }
+    info!("spawn_colony: spawned {count} × {name} from {path}");
 }
 
 
@@ -1913,7 +1962,7 @@ pub fn spawn_organism(
                     // `Average` combine with the terrain's default 0.5
                     // gives a contact μ = 0.75 so planted feet propel
                     // the body instead of sliding.
-                    avian3d::prelude::Friction::new(LIMB_FRICTION_COEFFICIENT)
+                    avian3d::prelude::Friction::new(crate::simulation_settings::LIMB_FRICTION_COEFFICIENT)
                         .with_combine_rule(avian3d::prelude::CoefficientCombine::Average),
                     // Per-entity event toggle so Avian's narrow phase
                     // emits `CollisionStart` / `CollisionEnd` messages

@@ -28,16 +28,7 @@ use crate::energy::PHOTO_PRODUCTION_PER_CELL;
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/// How often the physiology tick runs. 0.5 s matches the energy tick so
-/// per-cell and per-organism updates stay roughly in phase, simplifying
-/// reasoning about which lags which.
-const PHYSIOLOGY_TICK_INTERVAL: f32 = 0.5;
-
-/// Hard ceiling on per-cell energy. Cells never exceed this regardless of
-/// how much they would otherwise gain in one tick — keeps the value
-/// comparable across cell types and prevents overflow into pathological
-/// regimes that future rules would have to special-case.
-pub const MAX_CELL_ENERGY: f32 = 1.0;
+use crate::simulation_settings::PHYSIOLOGY_TICK_INTERVAL;
 
 /// Distance² window for two cells (in the same body part's local frame) to
 /// count as RD lattice neighbours. Axis-aligned RD adjacency lands at

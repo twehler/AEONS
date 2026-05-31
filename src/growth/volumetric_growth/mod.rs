@@ -80,8 +80,7 @@ pub enum GrowthMode {
 pub const GROWTH_MODE: GrowthMode = GrowthMode::Dodecahedron;
 const EDGE_LEN: f32 = 1.0;
 const MIN_CENTER_DIST: f32 = 0.5;
-/// Sandbox and OCG growth stops after this many cells are appended to the seed.
-pub const MAX_CELLS: usize = 60;
+pub use crate::simulation_settings::MAX_CELLS;
 
 /// Vertex-weld tolerance. RD's smallest inter-vertex distance is 1.0; expected
 /// float drift across ≤60 translations is ~60·ε_f32 ≈ 8e-6, so 1e-4 is safe.

@@ -42,7 +42,6 @@
 
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
-use std::time::Duration;
 
 use crate::intelligence_level_herbivore_1_sliding::{
     BrainPoolHerbivore1, assign_brains_herbivore_1, free_brains_herbivore_1,
@@ -89,29 +88,10 @@ use crate::world_model::{WorldModelGrid, rebuild_world_model_grid};
 ///
 /// `on_timer` ticks with `Time<Virtual>::delta()`, so brains
 /// naturally pause when the simulation is paused.
-// `PHOTO_BRAIN_TICK_INTERVAL` was retired with the L1-photo brain;
-// kept here only as a documentation breadcrumb until the photo
-// pool is removed entirely:
-#[allow(dead_code)]
-const PHOTO_BRAIN_TICK_INTERVAL:  Duration = Duration::from_millis(33);
+#[allow(unused_imports)]
+use crate::simulation_settings::PHOTO_BRAIN_TICK_INTERVAL;
 
-/// Heterotroph brain tick rate (≈ 6.7 Hz).
-///
-/// Slower than the photo brain because the heterotroph's reward
-/// signal is sparse: photos gain energy continuously from sunlight
-/// (per-tick signal), but heterotrophs lose a tiny amount per
-/// energy-plugin tick (0.5 s) and only receive a positive jump on
-/// the rare predation event. At 30 Hz the σ-noise on actions
-/// dominated displacement and rewards averaged to ~0 per tick — the
-/// brain saw mostly noise. Slowing to ~150 ms gives:
-///   * less visible direction jitter (one fresh action sample per
-///     ~150 ms instead of ~33 ms),
-///   * larger per-tick energy deltas (about 1/3 of an energy-plugin
-///     tick fits inside one brain tick), and
-///   * the reward shaper in `intelligence_level_1_hetero.rs` —
-///     progress + facing — gets a meaningful per-tick state delta
-///     to base its signal on.
-const HETERO_BRAIN_TICK_INTERVAL: Duration = Duration::from_millis(150);
+use crate::simulation_settings::HETERO_BRAIN_TICK_INTERVAL;
 
 
 pub struct BehaviourPlugin;
@@ -156,15 +136,26 @@ impl Plugin for BehaviourPlugin {
         app.add_systems(PreUpdate, (assign_brains_l2_limb,          free_brains_l2_limb)         .chain());
         app.add_systems(PreUpdate, (assign_brains_l3_limb,          free_brains_l3_limb)         .chain());
 
-        // ── Update: hetero pools at ~6.7 Hz. ────────────────────────
-        // Shared world-model rebuild then each of the three hetero
-        // pools' apply systems. The chain ordering ensures the grid
-        // is fresh before any apply reads it. The three apply systems
-        // are independent (each touches its own pool's NonSend
-        // resource) but we run them in series for determinism and to
-        // share the same brain-tick cadence.
+        // ── FixedUpdate: hetero pools at ~6.7 Hz of VIRTUAL time. ───
+        // The brain decision/learning cadence runs in `FixedUpdate`
+        // (NOT `Update`) so it's driven by virtual time, not the render
+        // frame rate. In `Update`, a system runs at most once per real
+        // frame, so at high `TimeSpeed` the brain under-ticked (it
+        // "should" fire every 150 ms of virtual time but couldn't fire
+        // more than once per frame). `FixedUpdate` runs as many times
+        // per real frame as needed to consume the accumulated virtual
+        // time, so the brain fires every `HETERO_BRAIN_TICK_INTERVAL`
+        // of VIRTUAL time regardless of frame rate or `TimeSpeed` —
+        // making fast-forwarded learning equivalent to real-time
+        // learning (just more wall-clock-cheap), as long as the
+        // hardware keeps up. `on_timer` here ticks on `Time<Fixed>`
+        // (the active clock inside `FixedUpdate`), i.e. fixed-step
+        // virtual deltas.
+        //
+        // Shared world-model rebuild → sensory → each pool's apply.
+        // The chain keeps the grid fresh before any apply reads it.
         app.add_systems(
-            Update,
+            FixedUpdate,
             (
                 rebuild_world_model_grid,
                 // Sensory layer — must run AFTER the world-model
@@ -175,9 +166,9 @@ impl Plugin for BehaviourPlugin {
                 apply_intelligence_level_herbivore_1,
                 apply_intelligence_level_2,
                 apply_intelligence_level_3,
-                // Limb-based apply systems (stubs until Phase 4). Run
-                // in the same chained block so they share the brain-tick
-                // cadence and observe the same world-model snapshot.
+                // Limb-based apply systems. Run in the same chained
+                // block so they share the brain-tick cadence and
+                // observe the same world-model snapshot.
                 apply_intelligence_level_herbivore_1_limb,
                 apply_intelligence_level_2_limb,
                 apply_intelligence_level_3_limb,

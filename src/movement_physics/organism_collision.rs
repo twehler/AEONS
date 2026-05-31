@@ -35,23 +35,7 @@ pub struct OrganismContactEvent {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Broad phase: organism root positions must be closer than this for any
-/// further checks to run. Set generously — it's only a cheap distance test.
-const ORGANISM_BROAD_RADIUS: f32 = 10.0;
-
-/// Tick interval — running the full pipeline every frame is wasteful at
-/// 1100-organism scale, and contacts emerge cleanly at 10 Hz.
-const COLLISION_TICK: f32 = 0.1;
-
-/// Maximum positional separation applied to any single organism per
-/// collision tick (XZ plane, world units). Caps the integrated push
-/// so deeply-overlapping organisms — e.g. a 30-cell vs 30-cell pair
-/// can generate up to 900 narrow-phase contacts in one tick — don't
-/// snap apart by an absurd amount. At 10 Hz this allows a maximum
-/// separation speed of 5 world units / second, fast enough to
-/// resolve any plausible penetration within ~1 s yet slow enough
-/// that the eye reads it as a firm push rather than a teleport.
-const MAX_SEPARATION_PER_TICK: f32 = 0.5;
+use crate::simulation_settings::{ORGANISM_BROAD_RADIUS, COLLISION_TICK};
 
 
 // ── Timer resource ───────────────────────────────────────────────────────────

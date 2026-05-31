@@ -46,15 +46,9 @@ pub struct AvianSetupPlugin;
 /// half the cost of 16 while still well above the default. If joints
 /// visibly drift again under fast commands, nudge back up to 10–12
 /// before reaching for 16.
-const LIMB_SOLVER_SUBSTEPS: u32 = 8;
+use crate::simulation_settings::LIMB_SOLVER_SUBSTEPS;
 
-/// Very small "compliance" (inverse stiffness) on every limb
-/// `SphericalJoint`. `0.0` is the XPBD default and means "infinitely
-/// stiff", which in finite precision can produce worse numerical
-/// stability than a microscopic give. `1e-6` is invisible to the eye
-/// (joint drift bounded to sub-µm under typical impulses) but lets
-/// the solver converge gracefully under high-torque transients.
-pub const LIMB_JOINT_COMPLIANCE: f32 = 1e-6;
+pub use crate::simulation_settings::LIMB_JOINT_COMPLIANCE;
 
 impl Plugin for AvianSetupPlugin {
     fn build(&self, app: &mut App) {
@@ -71,9 +65,18 @@ impl Plugin for AvianSetupPlugin {
         );
         // PD-style torque application for limb-based organisms — reads
         // the brain's `Organism::limb_targets` and applies torques to
-        // the dynamic body-part rigid bodies. Runs in `Update` so
-        // Avian's PostUpdate solver sees the fresh torques.
-        app.add_systems(Update, apply_limb_pd_torques);
+        // the dynamic body-part rigid bodies. Runs in `FixedUpdate`,
+        // NOT `Update`: Avian steps the physics in `FixedPostUpdate`,
+        // which runs once per `FixedMain` iteration (N times per real
+        // frame, scaling with `TimeSpeed`). Avian clears applied forces
+        // after each step, so a torque applied once per real frame in
+        // `Update` only actuated ~1/N of the physics steps at high
+        // speed — the limbs coasted the rest. Running here re-applies
+        // the brain's target torque on EVERY physics step, so control
+        // authority is invariant to `TimeSpeed` / frame rate.
+        // `FixedUpdate` runs before `FixedPostUpdate` within each
+        // iteration, so the torque is in place when the step solves.
+        app.add_systems(FixedUpdate, apply_limb_pd_torques);
         // Per-entity collision flags for limb-based body parts. Reads
         // `CollisionStart` / `CollisionEnd` messages emitted by Avian's
         // narrow phase.
@@ -321,24 +324,11 @@ fn spawn_terrain_collider(
 /// up — a concrete reason locomotion never emerged. `KP = 40` gives
 /// ≈ 84 N·m of stance authority, comfortably above a density-0.2
 /// organism's weight.
-const KP_TORQUE: f32 = 40.0;
+use crate::simulation_settings::KP_TORQUE;
 
-/// Velocity gain — torque-per-(rad/s). Scaled up with `KP` (ratio
-/// ≈ KP/10, the legged_gym convention) so the stiffer spring stays
-/// damped rather than oscillating/overshooting.
-const KD_TORQUE: f32 = 4.0;
+use crate::simulation_settings::KD_TORQUE;
 
-/// Maximum joint angle the brain can command on each Euler axis. The
-/// brain emits `limb_targets ∈ [-1, 1]` (tanh-clamped + sample-clamped
-/// in `limb_ppo`); multiplying by this constant maps it onto a usable
-/// ±60° swing range.
-// Raised from π/2 → 2π/3 (120°) so the brain can command a wider
-// swing range. Going to a full π would put us past the gimbal-lock
-// singularity of Euler-XYZ extraction (at ±π/2 on the second axis),
-// which would make the PD spring direction flip in the wrong way.
-// 2π/3 stays comfortably below that while still giving the brain
-// 33 % more range than before.
-const MAX_JOINT_ANGLE: f32 = 2.0 * std::f32::consts::FRAC_PI_3;
+use crate::simulation_settings::MAX_JOINT_ANGLE;
 
 /// Read `Organism::limb_targets` on each limb-based organism and apply
 /// PD-on-angle torques to its dynamic limb rigid bodies. The base body

@@ -29,26 +29,9 @@ use crate::physiology;
 use crate::volumetric_growth::{build_mesh_from_ocg, MAX_CELLS};
 
 
-/// Effective growth cadence per organism. Each variable-form organism
-/// receives one growth tick every `CONTINUOUS_GROWTH_INTERVAL` seconds.
-/// 1.0 s gives a noticeable "growing" silhouette over ~30 seconds for
-/// a fresh seed reaching the 30-cell cap.
-const CONTINUOUS_GROWTH_INTERVAL: f32 = 1.0;
-
-/// Number of phase slices the per-second growth workload is sliced into.
-/// At 30, the system fires every `1/30` s ≈ 33 ms and each tick
-/// processes only the organisms whose entity-index modulo 30 matches
-/// the rotating phase counter — roughly 1/30th of the variable-form
-/// population per tick. Total work per second is unchanged; the
-/// per-tick allocator + Bevy command-buffer spike that was visible
-/// every second goes away. Aligned with the 30 Hz brain tick so both
-/// throttled subsystems share the same timing rhythm.
-const GROWTH_PHASE_PERIOD: u32 = 30;
-
-/// Wall-clock interval between phase steps. `CONTINUOUS_GROWTH_INTERVAL
-/// / GROWTH_PHASE_PERIOD` so the per-organism cadence is preserved.
-const GROWTH_PHASE_STEP_SECS: f32 =
-    CONTINUOUS_GROWTH_INTERVAL / GROWTH_PHASE_PERIOD as f32;
+use crate::simulation_settings::{
+    GROWTH_PHASE_PERIOD, GROWTH_PHASE_STEP_SECS,
+};
 
 
 // ── Resources ────────────────────────────────────────────────────────────────

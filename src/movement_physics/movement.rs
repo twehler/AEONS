@@ -16,11 +16,11 @@ use crate::colony::*;
 use crate::organism_collision;
 use crate::world_geometry::{HeightmapSampler, MapSize, WorldMesh, WORLD_SAFETY_MARGIN};
 
-const MIN_DIRECTION_INTERVAL: f32 = 1.0;
-const MAX_DIRECTION_INTERVAL: f32 = 10.0;
+use crate::simulation_settings::{MIN_DIRECTION_INTERVAL, MAX_DIRECTION_INTERVAL};
 
-const GRAVITY:          f32 = 9.8;
-const MAX_CLIMB_HEIGHT: f32 = 4.0;
+use crate::simulation_settings::{GRAVITY, MAX_CLIMB_HEIGHT};
+
+use crate::simulation_settings::ORGANISM_DESPAWN_Y;
 
 
 /// Re-roll cadence for photoautotroph wander direction. Each spawn rolls its
@@ -64,6 +64,10 @@ impl Plugin for MovementPlugin {
         app.add_systems(PostUpdate, (
             apply_floor_collision.run_if(resource_exists::<HeightmapSampler>),
             apply_world_bounds.run_if(resource_exists::<HeightmapSampler>),
+            // Runs after Propagate so trunk-part GlobalTransforms reflect this
+            // frame's positions. Ungated: it's a pure Y test with no world
+            // dependency, and the query is empty until organisms exist.
+            despawn_fallen_organisms,
         ).chain().after(TransformSystems::Propagate));
 
         app.add_systems(Last, organism_collision::apply_organism_collision);
@@ -339,5 +343,63 @@ fn apply_world_bounds(
     for mut transform in &mut query {
         transform.translation.x = transform.translation.x.clamp(min_x, max_x);
         transform.translation.z = transform.translation.z.clamp(min_z, max_z);
+    }
+}
+
+
+// ── Kill-floor ─────────────────────────────────────────────────────────────────
+
+/// Despawn any organism that has fallen below `ORGANISM_DESPAWN_Y`. An
+/// organism that slips off the map edge or through a mesh gap falls forever
+/// under gravity, wasting brain + physics cycles on an entity that can never
+/// recover.
+///
+/// Position source is Avian's **`Position`** component (authoritative
+/// world-space physics position), NOT `GlobalTransform`. On some worlds the
+/// organisms' `GlobalTransform` is unreliable (observed reading a large
+/// constant Y offset from the true position while Avian `Position` stayed
+/// correct), which previously made this system despawn the entire healthy
+/// colony. `Position` is the physics truth that the rest of the simulation
+/// already trusts, so we key off it directly.
+///
+/// Two cases, because the rigid body lives in a different place per movement
+/// mode:
+///   * Sliding / sessile organisms have a `RigidBody` (kinematic) on the
+///     `OrganismRoot`, so the root itself carries a `Position`.
+///   * Limb organisms have no root rigid body — each body part is its own
+///     `RigidBody::Dynamic` — so the root has no `Position`; we read the trunk
+///     part's (`BodyPartIndex(0)`) `Position` instead.
+///
+/// Despawning the root cascades to its body-part children and removes the
+/// `Heterotroph` / `BrainSlot*` components, so the brain-pool free-lists and
+/// auto-spawn logic reclaim the slot exactly as they do on starvation death.
+fn despawn_fallen_organisms(
+    mut commands: Commands,
+    roots:       Query<(Entity, Option<&avian3d::prelude::Position>), With<OrganismRoot>>,
+    // Only limb body parts carry an Avian `Position` (sliding/sessile parts
+    // are plain transform children), so requiring `&Position` here naturally
+    // restricts the map to limb organisms — exactly the roots that lack their
+    // own `Position` above.
+    limb_trunks: Query<(&ChildOf, &BodyPartIndex, &avian3d::prelude::Position)>,
+) {
+    use std::collections::HashMap;
+    let mut trunk_y: HashMap<Entity, f32> = HashMap::new();
+    for (child_of, idx, pos) in &limb_trunks {
+        if idx.0 == 0 {
+            trunk_y.insert(child_of.parent(), pos.y);
+        }
+    }
+
+    for (root, root_pos) in &roots {
+        let y = match root_pos {
+            Some(p) => p.y,                          // sliding / sessile: root rigid body
+            None => match trunk_y.get(&root) {       // limb: read the trunk part
+                Some(&y) => y,
+                None     => continue,                // not yet physics-initialised
+            },
+        };
+        if y < ORGANISM_DESPAWN_Y {
+            commands.entity(root).despawn();
+        }
     }
 }

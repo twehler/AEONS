@@ -3,26 +3,15 @@ use crate::colony::*;
 use crate::environment::WATER_LEVEL;
 use crate::krishi::Krishi;
 
-const ENERGY_TICK_INTERVAL: f32 = 0.5;
-pub const MAX_ENERGY_PER_CELL: f32 = 10.0;
+use crate::simulation_settings::ENERGY_TICK_INTERVAL;
+pub use crate::simulation_settings::MAX_ENERGY_PER_CELL;
 
-/// Per-tick energy a fully-surrounded (18 RD neighbours) photo cell
-/// produces. Read by `physiology.rs::PhotosyntheticCell::new` to derive
-/// the per-cell `energy_production` cache; the photosynthesis tick itself
-/// runs in `physiology.rs`, not here.
-pub const PHOTO_PRODUCTION_PER_CELL:  f32 = 4.0;
-const NON_PHOTO_CONSUMPTION_PER_CELL: f32 = 0.01;
+pub use crate::simulation_settings::PHOTO_PRODUCTION_PER_CELL;
+use crate::simulation_settings::NON_PHOTO_CONSUMPTION_PER_CELL;
 
-// Movement-cost coefficients tuned so a max-speed (20) sprint is heavily
-// punitive on heavy organisms but doesn't immediately kill them.
-const K_GROUND_FRICTION: f32 = 0.003;
-const K_FLUID_DRAG:      f32 = 0.03;
+use crate::simulation_settings::{K_GROUND_FRICTION, K_FLUID_DRAG};
 
-/// Energy cost per metre of elevation gained — the gravitational-PE
-/// analogue. Charged on every climb step accumulated since the last energy
-/// tick and reset afterwards. Krishi is filtered out of the energy system
-/// entirely, so its accumulated debt is never drained (never spent).
-pub const ELEVATION_ENERGY_PER_UNIT: f32 = 0.5;
+pub use crate::simulation_settings::ELEVATION_ENERGY_PER_UNIT;
 
 /// Maximum energy storage = grown cell count × per-cell capacity.
 pub fn get_max_energy(organism: &Organism) -> f32 {
@@ -64,7 +53,7 @@ impl Plugin for EnergyPlugin {
 // when hungry. A sated organism (hunger ≈ 0.23 at full energy)
 // depletes ~0.077/s; a starving one (hunger = 1) depletes 0.33/s.
 
-const DOPAMINE_DEPLETION_INTERVAL: f32 = 1.0;
+use crate::simulation_settings::DOPAMINE_DEPLETION_INTERVAL;
 
 #[derive(Resource)]
 pub struct DopamineDepletionTimer { pub timer: Timer }

@@ -33,6 +33,7 @@ use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::MouseWheel;
 use bevy::ui::{ComputedNode, UiGlobalTransform};
 use bevy::window::PrimaryWindow;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use crate::colony::{Heterotroph, IntelligenceLevel, Organism, OrganismRoot};
@@ -129,7 +130,7 @@ pub struct NavigatorPanel;
 /// Marker on the vertical drag-handle between viewport and navigator
 /// panel.
 #[derive(Component)]
-struct VerticalDivider;
+pub struct VerticalDivider;
 
 /// Marker on the scrollable list container inside the navigator panel.
 #[derive(Component)]
@@ -564,6 +565,15 @@ fn update_label_positions(
     cameras:     Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     viewport_q:  Query<&ComputedNode, With<ViewportImage>>,
     organism_q:  Query<&GlobalTransform, With<OrganismRoot>>,
+    // Base-body-part transforms, keyed by their parent OrganismRoot.
+    // For LIMB-based organisms the root entity's transform is frozen at
+    // the spawn position — only the per-part `RigidBody::Dynamic`
+    // children actually move (Avian writes their world pose). The trunk
+    // part (`BodyPartIndex(0)`) is the organism's true location, so the
+    // label tracks it. For sliding organisms the trunk part sits at
+    // identity-local under a root that `apply_movement` moves, so its
+    // `GlobalTransform` equals the root's — correct on both paths.
+    base_part_q: Query<(&ChildOf, &crate::cell::BodyPartIndex, &GlobalTransform)>,
     mut labels:  Query<(&IndividualLabel, &ComputedNode, &mut Node, &mut Visibility)>,
 ) {
     // Hide all labels when the user is in any mode other than the
@@ -600,13 +610,31 @@ fn update_label_positions(
     let inv_scale         = viewport_node.inverse_scale_factor;
     let viewport_size     = viewport_node.size();
 
+    // Map each OrganismRoot to its trunk part's (`BodyPartIndex(0)`)
+    // world position. This is the moving anchor for limb organisms; for
+    // sliding organisms it coincides with the root.
+    let mut base_pos: HashMap<Entity, Vec3> = HashMap::new();
+    for (parent, idx, gx) in &base_part_q {
+        if idx.0 == 0 {
+            base_pos.insert(parent.parent(), gx.translation());
+        }
+    }
+
     for (label, label_node, mut node, mut vis) in &mut labels {
-        let Ok(target_xf) = organism_q.get(label.target) else {
-            *vis = Visibility::Hidden;
-            continue;
+        // Prefer the trunk part's world position; fall back to the root
+        // transform if (briefly) no base part is registered.
+        let anchor = match base_pos.get(&label.target) {
+            Some(p) => *p,
+            None => match organism_q.get(label.target) {
+                Ok(xf) => xf.translation(),
+                Err(_) => {
+                    *vis = Visibility::Hidden;
+                    continue;
+                }
+            },
         };
 
-        let world_pos = target_xf.translation() + Vec3::new(0.0, LABEL_WORLD_LIFT, 0.0);
+        let world_pos = anchor + Vec3::new(0.0, LABEL_WORLD_LIFT, 0.0);
         let Ok(vp) = camera.world_to_viewport(cam_xf, world_pos) else {
             *vis = Visibility::Hidden;
             continue;

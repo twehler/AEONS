@@ -36,7 +36,7 @@ use crate::individuum_navigator::{
     self, IndividuumNavigatorPlugin, NavigatorPanel,
 };
 use crate::simulation_settings::{
-    PlayerControlsActive, SimulationRunning, Smoothing, TimeSpeed, WindowMode,
+    CinematicMode, PlayerControlsActive, SimulationRunning, Smoothing, TimeSpeed, WindowMode,
 };
 use crate::colony_editor::{self, EditorOverlayPlugin, EditorOverlayPanel};
 
@@ -137,6 +137,7 @@ impl Plugin for FrontendPlugin {
     fn build(&self, app: &mut App) {
         app
             .init_resource::<ViewportSettings>()
+            .init_resource::<crate::simulation_settings::CinematicMode>()
             .init_resource::<OrganismCounts>()
             .init_resource::<DividerDragState>()
             .init_resource::<SimulationRunning>()
@@ -190,6 +191,8 @@ impl Plugin for FrontendPlugin {
                 bind_main_camera_to_viewport,
                 resize_render_target,
                 toggle_advanced_viewport,
+                toggle_cinematic_mode,
+                apply_cinematic_chrome,
                 statistics_panel::update_fps_text,
                 statistics_panel::update_cell_count_text,
                 statistics_panel::update_sim_timer_text,
@@ -210,6 +213,7 @@ impl Plugin for FrontendPlugin {
             // a second `add_systems` call to stay under Bevy's tuple size
             // limit for variadic system configs.
             .add_systems(Update, (
+                statistics_panel::update_camera_coords_text,
                 statistics_panel::handle_max_phototrophs_input,
                 statistics_panel::update_max_phototrophs_text,
                 statistics_panel::apply_max_phototrophs_cull,
@@ -613,6 +617,46 @@ pub fn toggle_advanced_viewport(
     }
 }
 
+/// F1 toggles cinematic mode — but only in `WindowMode::Simulation`
+/// (the other modes have their own full-screen panels). Also clears
+/// cinematic if the window mode is somehow no longer Simulation, so the
+/// flag never lingers across a mode switch. Writing `cinematic.0` marks
+/// the resource changed, which re-runs `apply_mode_transition`
+/// (sim-panel visibility) and `apply_cinematic_chrome` (top bar +
+/// vertical divider).
+pub fn toggle_cinematic_mode(
+    keys:          Res<ButtonInput<KeyCode>>,
+    window_mode:   Res<WindowMode>,
+    mut cinematic: ResMut<CinematicMode>,
+) {
+    if *window_mode == WindowMode::Simulation {
+        if keys.just_pressed(KeyCode::F1) {
+            cinematic.0 = !cinematic.0;
+        }
+    } else if cinematic.0 {
+        // Safety net: cinematic only makes sense in Simulation mode.
+        cinematic.0 = false;
+    }
+}
+
+/// Hide / show the UI chrome that `apply_mode_transition` does NOT own
+/// (the top mode bar and the viewport↔navigator vertical divider) in
+/// lock-step with cinematic mode. Kept separate so we don't have to
+/// thread these two node types through `apply_mode_transition`'s
+/// disjoint-`&mut Node` query set. Runs only on a cinematic-mode change.
+pub fn apply_cinematic_chrome(
+    cinematic:   Res<CinematicMode>,
+    mut top_bar: Query<&mut Node, (With<TopModeBar>,
+                                   Without<crate::individuum_navigator::VerticalDivider>)>,
+    mut vdiv:    Query<&mut Node, (With<crate::individuum_navigator::VerticalDivider>,
+                                   Without<TopModeBar>)>,
+) {
+    if !cinematic.is_changed() { return; }
+    let display = if cinematic.0 { Display::None } else { Display::Flex };
+    for mut n in &mut top_bar { n.display = display; }
+    for mut n in &mut vdiv    { n.display = display; }
+}
+
 pub fn draw_orientation_gizmos(
     // Only queries entities explicitly tagged with `ShowGizmo` — terrain
     // chunks, UI, lights etc. are never included. The
@@ -742,6 +786,7 @@ fn handle_mode_switch_buttons(
 ///     visually distinct.
 fn apply_mode_transition(
     window_mode:        Res<WindowMode>,
+    cinematic:          Res<CinematicMode>,
     mut sim_running:    ResMut<SimulationRunning>,
     mut player_active:  ResMut<PlayerControlsActive>,
     mut virtual_time:   ResMut<Time<Virtual>>,
@@ -809,15 +854,20 @@ fn apply_mode_transition(
                                           Without<ModeSwitchButton>)>,
     mut buttons_q:      Query<(&ModeSwitchButton, &mut BackgroundColor)>,
 ) {
-    if !window_mode.is_changed() { return; }
+    // Runs on a window-mode change OR a cinematic-mode toggle — both
+    // affect which simulation panels are visible.
+    let mode_changed = window_mode.is_changed();
+    if !mode_changed && !cinematic.is_changed() { return; }
 
     // Per-mode visibility table. Simulation mode shows the stats /
     // navigator stack; EditColony shows the editor overlays;
     // Lineages shows only the tree-of-life panel (sim viewport
     // stays hidden because the panel covers the whole content
-    // area).
+    // area). Cinematic mode hides the Simulation-mode panels so the
+    // viewport fills the window (the flex-grow layout expands it for
+    // free; `resize_render_target` then matches the GPU texture).
     let mode = *window_mode;
-    let sim_visible      = mode == WindowMode::Simulation;
+    let sim_visible      = mode == WindowMode::Simulation && !cinematic.0;
     let editor_visible   = mode == WindowMode::EditColony;
     let lineages_visible = mode == WindowMode::Lineages;
     let species_visible  = mode == WindowMode::SpeciesEditor;
@@ -839,10 +889,10 @@ fn apply_mode_transition(
         *bg = BackgroundColor(if is_active { MODE_BUTTON_ACTIVE } else { MODE_BUTTON_INACTIVE });
     }
 
-    // Modes other than Simulation pause the simulation on entry. The
-    // user can resume manually via the statistics-panel button after
-    // returning to Simulation mode.
-    if editor_visible || lineages_visible || species_visible {
+    // Modes other than Simulation pause the simulation on entry. Gated
+    // on an actual mode change so a cinematic-mode toggle (which also
+    // re-runs this system) never pauses the sim.
+    if mode_changed && (editor_visible || lineages_visible || species_visible) {
         sim_running.0 = false;
         virtual_time.pause();
         player_active.0 = false;
