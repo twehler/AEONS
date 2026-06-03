@@ -9,9 +9,10 @@
 //     follows the mouse, snapping to the nearest valid lattice
 //     position from `volumetric_growth::candidate_centers_for_ocg`.
 //     Left-click commits the cell, extends the OCG, mesh rebuilds.
-//   * The yellow bilateral axis: a tall thin yellow cylinder along
-//     local Y at x = 0 in editor-local space (= world `SPECIES_EDITOR_ORIGIN`).
-//     Visible only when `session.draft.symmetry == Bilateral`.
+//   * The yellow bilateral axes: two tall thin yellow cylinders through the
+//     editor-local origin (= world `SPECIES_EDITOR_ORIGIN`) — one along local Y
+//     and one along local X (the bilateral mirror-normal). Visible only when
+//     `session.draft.symmetry == Bilateral`.
 //
 // All editor-spawned entities are tagged with `SpeciesEditorEntity`
 // so they can be cleared on mode exit if needed. Currently we keep
@@ -29,6 +30,7 @@ use crate::simulation_settings::WindowMode;
 use crate::volumetric_growth::{build_mesh_from_ocg, candidate_centers_for_ocg};
 
 use super::session::SpeciesSession;
+use super::mesh_import::MeshImport;
 use super::{SPECIES_EDITOR_ORIGIN, SPECIES_EDITOR_LAYER};
 use crate::frontend::ViewportImage;
 
@@ -78,11 +80,13 @@ pub fn refresh_species_mesh(
 ) {
     if *mode != WindowMode::SpeciesEditor { return; }
     if !session.is_changed() { return; }
-    if session.body_parts.is_empty() { return; }
 
     // Despawn the old mesh entities if present. The session's meshes are
-    // small and rebuilt entirely (no entity reuse needed).
+    // small and rebuilt entirely (no entity reuse needed). Done before the
+    // empty-check so deleting all cells (e.g. on `.glb` import) clears the
+    // rendered body instead of leaving it stranded.
     for e in &existing { commands.entity(e).despawn(); }
+    if session.body_parts.is_empty() { return; }
 
     // One mesh entity per body part. Each part's OCG is mirrored
     // (Bilateral) via `combined_ocg`. Per-cell colour comes from the
@@ -115,19 +119,22 @@ pub fn refresh_species_mesh(
 pub fn refresh_bilateral_axis(
     mode:          Res<WindowMode>,
     session:       Res<SpeciesSession>,
+    mesh_import:   Res<MeshImport>,
     mut commands:  Commands,
     mut meshes:    ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     existing:      Query<Entity, With<SpeciesBilateralAxis>>,
 ) {
-    if !mode.is_changed() && !session.is_changed() { return; }
+    if !mode.is_changed() && !session.is_changed() && !mesh_import.is_changed() { return; }
 
     let want_axis = *mode == WindowMode::SpeciesEditor
-                 && session.draft.symmetry == Symmetry::Bilateral;
+                 && session.draft.symmetry == Symmetry::Bilateral
+                 && !mesh_import.active();
 
     for e in &existing { commands.entity(e).despawn(); }
     if !want_axis { return; }
 
+    // One cylinder mesh + one yellow material, shared by both axis bars.
     let mesh = meshes.add(Cylinder::new(BILATERAL_AXIS_RADIUS, BILATERAL_AXIS_HEIGHT).mesh());
     let mat  = materials.add(StandardMaterial {
         base_color:        BILATERAL_AXIS_COLOR,
@@ -135,13 +142,25 @@ pub fn refresh_bilateral_axis(
         unlit:             true,
         ..default()
     });
+    // Y-axis bar: cylinder default axis is Y → already upright. At x = 0.
+    commands.spawn((
+        SpeciesBilateralAxis,
+        Mesh3d(mesh.clone()),
+        MeshMaterial3d(mat.clone()),
+        Transform::from_translation(SPECIES_EDITOR_ORIGIN),
+        RenderLayers::layer(SPECIES_EDITOR_LAYER),
+        bevy::light::NotShadowCaster,
+    ));
+    // X-axis bar: same yellow cylinder, rotated 90° about Z so its long
+    // axis lies along X (the bilateral mirror-normal / left-right axis).
+    // Shares the `SpeciesBilateralAxis` marker, so it's refreshed/despawned
+    // together with the Y bar.
     commands.spawn((
         SpeciesBilateralAxis,
         Mesh3d(mesh),
         MeshMaterial3d(mat),
-        // Local origin at x = 0; cylinder default axis is Y → already
-        // upright. Translate to species-editor world origin.
-        Transform::from_translation(SPECIES_EDITOR_ORIGIN),
+        Transform::from_translation(SPECIES_EDITOR_ORIGIN)
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
         RenderLayers::layer(SPECIES_EDITOR_LAYER),
         bevy::light::NotShadowCaster,
     ));
@@ -159,6 +178,7 @@ pub fn refresh_bilateral_axis(
 pub fn update_preview_cell(
     mode:           Res<WindowMode>,
     session:        Res<SpeciesSession>,
+    mesh_import:    Res<MeshImport>,
     mut snap:       ResMut<PlacementSnap>,
     mut commands:   Commands,
     mut meshes:     ResMut<Assets<Mesh>>,
@@ -170,7 +190,9 @@ pub fn update_preview_cell(
 ) {
     let inactive = *mode != WindowMode::SpeciesEditor
                 || session.selected_cell_type.is_none()
-                || !session.first_cell_spawned;
+                || !session.first_cell_spawned
+                || session.deletion_mode // deletion mode owns the cursor
+                || mesh_import.active();  // imported mesh suspends cell placement
 
     if inactive {
         snap.snapped_local = None;
@@ -203,20 +225,40 @@ pub fn update_preview_cell(
         Symmetry::Bilateral  => Some(0.0),
         Symmetry::NoSymmetry => None,
     };
-    // Candidates come from the ACTIVE part's frontier. A freshly-begun
-    // appendage has no cells yet, so its first cell attaches to the BASE
-    // body's frontier instead.
+    // Candidates come from the ACTIVE part's frontier once it has cells.
+    // A freshly-begun part (no cells yet) can attach its first cell to the
+    // frontier of ANY existing body part — the union of all parts' cells.
+    // Whichever part that first cell ends up touching becomes its parent
+    // (decided by contact in `handle_left_click_place`), so a limb can
+    // stick to the main body or to another limb, the user's free choice.
+    let active = session.active_body_part;
     let active_empty = session.active_part().map_or(true, |p| p.ocg.is_empty());
     let source_ocg: Vec<(usize, Vec3, CellType)> = if active_empty {
-        session.base_part().map(|p| p.ocg.clone()).unwrap_or_default()
+        let mut all: Vec<(usize, Vec3, CellType)> = Vec::new();
+        for (pi, p) in session.body_parts.iter().enumerate() {
+            if pi == active { continue; }
+            for &(_, pos, ct) in &p.ocg { let i = all.len(); all.push((i, pos, ct)); }
+        }
+        all
     } else {
         session.active_part().map(|p| p.ocg.clone()).unwrap_or_default()
     };
-    let candidates_local = candidate_centers_for_ocg(&source_ocg, min_x_constraint);
+    let mut candidates_local = candidate_centers_for_ocg(&source_ocg, min_x_constraint);
     if candidates_local.is_empty() {
-        snap.snapped_local = None;
-        for (e, _, _) in &preview_q { commands.entity(e).despawn(); }
-        return;
+        if source_ocg.is_empty() {
+            // Body fully deleted (Cell-Deletion Mode) — bootstrap the base
+            // seed position so the user can place a fresh first cell and
+            // rebuild the organism by hand.
+            let seed = match session.draft.symmetry {
+                Symmetry::Bilateral  => Vec3::new(MIN_X_BILATERAL, 0.0, 0.0),
+                Symmetry::NoSymmetry => Vec3::ZERO,
+            };
+            candidates_local = vec![seed];
+        } else {
+            snap.snapped_local = None;
+            for (e, _, _) in &preview_q { commands.entity(e).despawn(); }
+            return;
+        }
     }
 
     // Project each candidate to viewport coords; pick the one closest
@@ -302,10 +344,13 @@ pub fn handle_left_click_place(
     mode:        Res<WindowMode>,
     mouse:       Res<ButtonInput<MouseButton>>,
     snap:        Res<PlacementSnap>,
+    mesh_import: Res<MeshImport>,
     ui_interactions: Query<&Interaction>,
     mut session: ResMut<SpeciesSession>,
 ) {
     if *mode != WindowMode::SpeciesEditor { return; }
+    if mesh_import.active() { return; } // imported mesh suspends cell placement
+    if session.deletion_mode { return; } // left-click deletes, not places
     if !mouse.just_pressed(MouseButton::Left) { return; }
     let Some(target_local) = snap.snapped_local else { return };
     let Some(ct) = session.selected_cell_type else { return };
@@ -325,9 +370,32 @@ pub fn handle_left_click_place(
     // Place into the ACTIVE body part. Bail if none exists yet (the base
     // is seeded by "Spawn first Cell" before placement is possible).
     let active = session.active_body_part;
+
+    // Parent-by-contact: when this is the FIRST cell of the active part,
+    // its parent is whichever OTHER body part has a cell adjacent to it
+    // (the cell it's sticking to). This lets a limb attach to the main
+    // body or to any other limb purely by where the user places it — no
+    // explicit parent selection. Computed before the mutable borrow below.
+    let is_first = session.body_parts.get(active).map_or(false, |p| p.ocg.is_empty());
+    let parent_by_contact = if is_first {
+        let mut best: Option<(f32, usize)> = None;
+        for (pi, p) in session.body_parts.iter().enumerate() {
+            if pi == active { continue; }
+            for &(_, pos, _) in &p.ocg {
+                let d2 = (pos - target_local).length_squared();
+                if best.map_or(true, |(b, _)| d2 < b) { best = Some((d2, pi)); }
+            }
+        }
+        // Within one RD-adjacency step (same window physiology uses, ≤ 6.0).
+        match best { Some((d2, pi)) if d2 <= 6.0 => Some(pi), _ => Some(0) }
+    } else {
+        None
+    };
+
     let Some(part) = session.body_parts.get_mut(active) else { return };
     let idx = part.ocg.len();
     part.ocg.push((idx, target_local, ct));
+    if let Some(p) = parent_by_contact { part.parent = p; }
     let part_ocg = part.ocg.clone();
     session.dirty = true;
 

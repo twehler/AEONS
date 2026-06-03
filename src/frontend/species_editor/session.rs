@@ -256,6 +256,14 @@ pub struct EditorBodyPart {
     /// in the running simulation. The base body (index 0) is never a
     /// limb. Persisted to the `.species` file (v05+).
     pub is_limb: bool,
+    /// Index (into `body_parts`) of the body part this one attaches to.
+    /// `0` = the main body (a normal limb). A value pointing at another
+    /// LIMB makes this a first-grade **sub-limb** (a 2-DOF leg segment):
+    /// it gets a hinge joint to its parent limb exactly like a limb does
+    /// to the main body. Set at creation time from the active body part.
+    /// The base body (index 0) has `parent = 0` (self / ignored).
+    /// Persisted to the `.species` file (v07+).
+    pub parent: usize,
 }
 
 
@@ -266,12 +274,14 @@ pub struct EditorBodyPart {
 /// `body_parts[0]` is the base body; entries beyond it are appendages added
 /// via the Body-part index panel. `active_body_part` selects which one new
 /// cells are placed on.
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct SpeciesSession {
     pub draft: DraftSpecies,
 
     /// All body parts. Index 0 is the base body; later entries are
-    /// appendages. Empty until "Spawn first Cell" seeds the base.
+    /// appendages. The base is auto-seeded with one cell on session
+    /// creation / reset (see `seed_base`), so this is never empty —
+    /// there is no longer a "spawn first cell" step.
     pub body_parts: Vec<EditorBodyPart>,
 
     /// Index into `body_parts` of the part new cells are placed on.
@@ -281,9 +291,10 @@ pub struct SpeciesSession {
     /// cell follows the cursor — left-click is ignored.
     pub selected_cell_type: Option<CellType>,
 
-    /// `true` once the user has clicked "Spawn first Cell" (the base body
-    /// has its seed). Locks the cyclers and reveals the
-    /// bottom-panel + viewport-placement workflow.
+    /// Always `true` now that the base cell is auto-seeded — kept so the
+    /// bottom-panel / viewport-placement / preview systems that gate on
+    /// "growth mode" keep working unchanged. Cycler locking is driven by
+    /// `has_appended_cells()` instead.
     pub first_cell_spawned: bool,
 
     /// Save dispatch: when `Some(path)`, the next Update tick writes a
@@ -291,14 +302,26 @@ pub struct SpeciesSession {
     pub save_requested: Option<PathBuf>,
 
     /// `true` whenever the user has made changes that have not yet been
-    /// saved. Set by every mutating action; cleared on successful
-    /// `.species` write. Consumed by the Clear/New button.
+    /// saved. Set by every mutating action (cell placement, cycler
+    /// changes, renames); cleared on successful `.species` write and on
+    /// load. Consumed by the Clear/New button and the Load confirmation.
     pub dirty: bool,
 
     /// Rising-edge flag toggled by the Clear/New button when the
     /// session is dirty. The clear-modal lifecycle system spawns the
     /// modal on `true` and despawns it on `false`.
     pub show_clear_modal: bool,
+
+    /// Rising-edge flag toggled by the "Load Species" button when the
+    /// session is dirty. The load-modal lifecycle system spawns the
+    /// confirmation on `true` and despawns it on `false`; "Yes" then
+    /// proceeds with the file dialog + load.
+    pub show_load_modal: bool,
+
+    /// `true` while "Cell-Deletion Mode" is active: hovered cells are
+    /// highlighted deep-red and a left-click deletes the hovered cell.
+    /// Placement (preview + click-to-place) is suppressed while active.
+    pub deletion_mode: bool,
 
     /// Index of the body part currently being renamed in the Body-part
     /// index panel, if any. While `Some`, keystrokes edit `rename_buffer`
@@ -310,12 +333,64 @@ pub struct SpeciesSession {
     pub rename_buffer: String,
 }
 
+impl Default for SpeciesSession {
+    fn default() -> Self {
+        let mut s = Self {
+            draft:              DraftSpecies::default(),
+            body_parts:         Vec::new(),
+            active_body_part:   0,
+            selected_cell_type: None,
+            first_cell_spawned: true,
+            save_requested:     None,
+            dirty:              false,
+            show_clear_modal:   false,
+            show_load_modal:    false,
+            deletion_mode:      false,
+            renaming_body_part: None,
+            rename_buffer:      String::new(),
+        };
+        s.seed_base();
+        s
+    }
+}
+
 impl SpeciesSession {
-    /// Reset to a fresh state. Called by the Clear/New flow once the
-    /// user confirms (or unconditionally, if there were no unsaved
-    /// changes); `Default` covers the spawn-time case.
+    /// Reset to a fresh state (a single auto-seeded base cell). Called by
+    /// the Clear/New flow once the user confirms (or unconditionally, if
+    /// there were no unsaved changes); `Default` covers the spawn-time case.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// (Re)create the base body with a single seed cell, coloured by the
+    /// current metabolism (Photo → green, Heterotroph → red) and positioned
+    /// for the current symmetry (origin for NoSymmetry, the right-half seed
+    /// `(MIN_X_BILATERAL, 0, 0)` for Bilateral). Called on session
+    /// creation/reset and whenever the metabolism or symmetry cycler is
+    /// flipped *before any cell has been appended* — so the base preview
+    /// tracks those two options live, but only while it's still just the base.
+    pub fn seed_base(&mut self) {
+        let starter = self.draft.metabolism.starter_cell_type();
+        let pos = match self.draft.symmetry {
+            Symmetry::NoSymmetry => Vec3::ZERO,
+            Symmetry::Bilateral  => Vec3::new(crate::body_part::MIN_X_BILATERAL, 0.0, 0.0),
+        };
+        self.body_parts = vec![EditorBodyPart {
+            name:    "Base Body".to_string(),
+            ocg:     vec![(0usize, pos, starter)],
+            is_limb: false,
+            parent:  0,
+        }];
+        self.active_body_part   = 0;
+        self.first_cell_spawned = true;
+    }
+
+    /// `true` once the user has appended any cell beyond the single base
+    /// seed (extra cells on the base, or any appendage). Locks the
+    /// Metabolism + Symmetry cyclers, since both reinterpret / recolour the
+    /// base in ways that can't be reconciled with an already-built body.
+    pub fn has_appended_cells(&self) -> bool {
+        self.body_parts.iter().map(|p| p.ocg.len()).sum::<usize>() > 1
     }
 
     /// The body part new cells are placed on, if any exists.

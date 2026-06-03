@@ -73,6 +73,7 @@ fn reproduction_system(
     map_size:       Res<MapSize>,
     max_photoautotrophs: Res<crate::simulation_settings::MaxPhotoautotrophs>,
     max_herbivores:      Res<crate::simulation_settings::MaxHerbivores>,
+    ai_training:         Res<crate::simulation_settings::AiTrainingMode>,
     mut query:      Query<
         (Entity, &mut Organism, &Transform, Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
         With<OrganismRoot>,
@@ -152,7 +153,14 @@ fn reproduction_system(
         // Build the child's body parts from the parent's plan, using the
         // growth pipeline appropriate to the parent's symmetry. Offspring
         // inherit the parent's symmetry verbatim.
-        let child_body_parts = match organism.symmetry {
+        //
+        // AI-training mode: mutation is OFF — offspring spawn shape-identical
+        // to the parent, so the training cohort keeps a fixed morphology.
+        // Skip the growth/branch pipeline entirely and clone the parent's
+        // body parts verbatim.
+        let child_body_parts = if ai_training.0 {
+            organism.body_parts.clone()
+        } else { match organism.symmetry {
             Symmetry::NoSymmetry => {
                 // Legacy path. 20% chance: spawn a new branch body part.
                 // 80%: extend the root part's OCG by one cell.
@@ -314,7 +322,7 @@ fn reproduction_system(
                     parts
                 }
             }
-        };
+        } };
 
         // Stay inside the WORLD_SAFETY_MARGIN inset — same band the
         // initial cohort and `apply_world_bounds` agree on.

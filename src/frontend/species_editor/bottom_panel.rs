@@ -40,6 +40,7 @@ fn ui_color_for(ct: CellType) -> Color {
         CellType::Photo       => Color::srgb(0.2, 0.8, 0.2),
         CellType::NonPhoto    => Color::srgb(0.8, 0.2, 0.2),
         CellType::Placeholder => Color::srgb(0.2, 0.45, 0.95),
+        CellType::SubLimb     => Color::srgb(0.6, 0.2, 0.9),
     }
 }
 
@@ -48,6 +49,7 @@ fn label_for(ct: CellType) -> &'static str {
         CellType::Photo       => "Photo",
         CellType::NonPhoto    => "NonPhoto",
         CellType::Placeholder => "Placeholder",
+        CellType::SubLimb     => "Sub-Limb",
     }
 }
 
@@ -85,7 +87,7 @@ pub fn spawn_bottom_panel(parent: &mut ChildSpawnerCommands) {
             BackgroundColor(PANEL_BG_COLOR),
         ))
         .with_children(|panel| {
-            for ct in [CellType::Photo, CellType::NonPhoto, CellType::Placeholder] {
+            for ct in [CellType::Photo, CellType::NonPhoto, CellType::Placeholder, CellType::SubLimb] {
                 tile(panel, ct);
             }
         });

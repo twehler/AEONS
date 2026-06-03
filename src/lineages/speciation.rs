@@ -225,6 +225,7 @@ pub fn classify_organisms(
     mut commands: Commands,
     mut q:        Query<(Entity, &mut Organism, Option<&ImportedSpeciesOrigin>)>,
     timer:        Res<SpeciationTimer>,
+    ai_training:  Res<crate::simulation_settings::AiTrainingMode>,
 ) {
     // Piggy-back on `update_species_averages`'s timer — both fire
     // on the same tick, but classification needs the freshly-
@@ -314,10 +315,14 @@ pub fn classify_organisms(
                 // the new branch.
                 if nearest_dist <= SPECIES_SEPARATION_THRESHOLD && nearest_id != Some(current) {
                     org.species_id = nearest_id;
-                } else {
+                } else if !ai_training.0 {
                     let new_id = registry.create(org.dna.clone(), Some(current));
                     org.species_id = Some(new_id);
                 }
+                // AI-training mode (the gated branch above): no split-off into
+                // a new species — a drifted organism that fits no existing
+                // species simply stays in its current one, keeping the species
+                // set fixed for the training run.
             }
         }
     }

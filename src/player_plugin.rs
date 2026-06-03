@@ -9,11 +9,11 @@ use crate::simulation_settings::{PlayerControlsActive, WindowMode};
 // Notes on the new control flow (May 2026):
 //   * Cursor is NOT grabbed at startup. The frontend layer keeps it visible
 //     so the player can interact with the UI.
-//   * A left-click inside the viewport activates `PlayerControlsActive`
-//     (handled in `frontend.rs`); from then on WASD / Space / Shift /
-//     mouse-look run.
-//   * Esc deactivates `PlayerControlsActive` (handled here). Simulation
-//     keeps running; only the camera goes idle.
+//   * Esc TOGGLES `PlayerControlsActive` (handled here, Simulation mode
+//     only): the first press engages WASD / Space / Shift / mouse-look and
+//     captures the cursor; the next press releases it. Left-clicking the
+//     viewport no longer affects camera capture. Simulation keeps running
+//     either way; only the camera goes idle when controls are off.
 //   * Pausing/resuming the simulation is done via the Start/Stop button
 //     in the statistics panel — no keyboard shortcut for it.
 //
@@ -216,15 +216,40 @@ fn player_look(
 }
 
 
-/// Esc releases player controls (cursor freed by `apply_player_controls_state`
-/// in `frontend.rs`). The simulation continues running.
-fn release_player_controls_on_esc(
+/// Esc is the sole toggle for player camera control: pressing it engages
+/// WASD/mouse-look + cursor capture, pressing it again releases them (cursor
+/// freed by `apply_player_controls_state` in `frontend.rs`). The simulation
+/// continues running either way. Left-clicking the viewport no longer affects
+/// camera capture.
+///
+/// Gated to `WindowMode::Simulation`: in the editor modes the cursor must stay
+/// free for pointer-based placement, so Esc must not be able to grab it there
+/// (those modes already force `PlayerControlsActive` off on entry).
+fn toggle_player_controls_on_esc(
     keys:              Res<ButtonInput<KeyCode>>,
     key_bindings:      Res<KeyBindings>,
+    window_mode:       Res<WindowMode>,
     mut player_active: ResMut<PlayerControlsActive>,
 ) {
-    if keys.just_pressed(key_bindings.release_controls) && player_active.0 {
-        player_active.0 = false;
+    if *window_mode != WindowMode::Simulation { return; }
+    if keys.just_pressed(key_bindings.release_controls) {
+        player_active.0 = !player_active.0;
+    }
+}
+
+/// Spacebar starts flying from a standstill: in Simulation mode, while
+/// controls are OFF, the first Space press engages camera control (this is
+/// the advertised "press Space to fly" entry point). While already flying,
+/// Space keeps its normal "ascend" role in `player_move` — no conflict, since
+/// this only fires when controls are off. Esc remains the on/off toggle.
+fn engage_flying_on_space(
+    keys:              Res<ButtonInput<KeyCode>>,
+    window_mode:       Res<WindowMode>,
+    mut player_active: ResMut<PlayerControlsActive>,
+) {
+    if *window_mode != WindowMode::Simulation { return; }
+    if !player_active.0 && keys.just_pressed(KeyCode::Space) {
+        player_active.0 = true;
     }
 }
 
@@ -254,7 +279,8 @@ impl Plugin for PlayerPlugin {
             .add_systems(Startup, setup_player)
             .add_systems(Update, player_move)
             .add_systems(Update, player_look)
-            .add_systems(Update, release_player_controls_on_esc)
+            .add_systems(Update, toggle_player_controls_on_esc)
+            .add_systems(Update, engage_flying_on_space)
             .add_systems(Update, release_editor_look_on_lmb_up)
             .add_systems(Update, change_speed_on_scroll);
     }

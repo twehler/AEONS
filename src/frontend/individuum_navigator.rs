@@ -36,7 +36,7 @@ use bevy::window::PrimaryWindow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::colony::{Heterotroph, IntelligenceLevel, Organism, OrganismRoot};
+use crate::colony::{Heterotroph, Organism, OrganismRoot};
 use crate::frontend::{PANEL_BG_COLOR, ViewportImage};
 use crate::simulation_settings::{AutoSpawnHeteros, MinHeteroCount, MinHeteroCountEditState};
 
@@ -86,12 +86,39 @@ const LABEL_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.55);
 
 // ── Resources ────────────────────────────────────────────────────────────────
 
-/// Monotonically increasing counter used to mint identifiers. Never
-/// decremented — when an organism dies, its number is retired (so labels
-/// never reuse a name and the user can refer to a heterotroph by number
-/// without ambiguity).
+/// Per-species running index allocator. `next[species_id]` is the index the
+/// next organism joining that species will receive (1-based). Indices are
+/// monotonic per species and never reused, so an organism's `species#N`
+/// identifier is a stable handle even as others die. The name TRACKS the live
+/// lineages species: when an organism is reclassified into a different
+/// species, it is re-issued a fresh index in the new species.
 #[derive(Resource, Default)]
-pub struct HeterotrophCounter(pub u32);
+pub struct SpeciesIndexCounters {
+    next: std::collections::HashMap<u32, u32>,
+}
+
+/// Records the species an organism is currently NAMED under, plus the index
+/// it was issued within that species. Re-issued when `Organism::species_id`
+/// changes (live-species tracking). Absence means "not yet named".
+#[derive(Component)]
+pub struct SpeciesIndex {
+    pub species_id: u32,
+    pub index:      u32,
+}
+
+/// The heterotroph the user has selected by left-clicking it in the viewport.
+/// Its navigator button is highlighted green and scrolled into view. `None`
+/// when nothing is selected (cleared by clicking empty space / terrain).
+#[derive(Resource, Default)]
+pub struct SelectedOrganism(pub Option<Entity>);
+
+/// Emitted by `frontend::viewport_click` on a Simulation-mode viewport
+/// left-click, carrying the window-space cursor position. Consumed by
+/// `pick_organism`, which ray-casts to find the heterotroph under the cursor.
+#[derive(Message, Clone, Copy)]
+pub struct ViewportPick {
+    pub cursor: Vec2,
+}
 
 /// Master toggle for the in-world floating labels. Defaults to `true`
 /// so labels are visible from the start. Toggled via the checkbox at
@@ -153,7 +180,7 @@ struct NavigatorExportButton { target: Entity }
 struct ExportSpeciesRequested(Option<(Entity, std::path::PathBuf)>);
 
 #[derive(Component)]
-struct NavigatorButtonText;
+struct NavigatorButtonText { target: Entity }
 
 /// Marker on the "Show Individual Identifiers" checkbox.
 #[derive(Component)]
@@ -201,7 +228,7 @@ const MIN_HETERO_BG_FOCUSED: Color = Color::srgb(0.10, 0.30, 0.10);
 struct IndividualLabel { target: Entity }
 
 #[derive(Component)]
-struct IndividualLabelText;
+struct IndividualLabelText { target: Entity }
 
 /// Marker on the species-name sub-text inside the floating label.
 /// `update_label_species_text` rewrites this text whenever the
@@ -218,12 +245,18 @@ pub struct IndividuumNavigatorPlugin;
 impl Plugin for IndividuumNavigatorPlugin {
     fn build(&self, app: &mut App) {
         app
-            .init_resource::<HeterotrophCounter>()
+            .init_resource::<SpeciesIndexCounters>()
+            .init_resource::<SelectedOrganism>()
             .init_resource::<ShowIndividualIdentifiers>()
             .init_resource::<VerticalDividerDragState>()
             .init_resource::<ExportSpeciesRequested>()
+            .add_message::<ViewportPick>()
             .add_systems(Update, (
                 assign_individual_identifiers,
+                update_navigator_button_text,
+                update_label_name_text,
+                pick_organism,
+                apply_selection_highlight,
                 manage_label_lifecycle,
                 manage_navigator_list,
                 update_label_positions,
@@ -452,28 +485,185 @@ pub fn spawn_navigator_panel(parent: &mut ChildSpawnerCommands) {
 
 // ── Systems ──────────────────────────────────────────────────────────────────
 
-/// Stamp `IndividualIdentifier("Heterotroph N")` onto every newly-
-/// observed heterotroph root. Runs every frame; the `Added` filter
-/// keeps it cheap (zero work in steady state).
+/// Assign each heterotroph an `IndividualIdentifier` of the form
+/// `<species name>#<index>` — where `<species name>` is the live lineages
+/// `Species::name` (the `.species` file stem for imported lineages) and the
+/// index is a per-species running number.
+///
+/// Runs every frame over all heterotroph roots, but the per-organism work is
+/// an O(1) "has the species changed?" check, so steady-state cost is trivial.
+/// An organism is (re)named the first time it has a classified species, and
+/// again whenever the speciation system reclassifies it into a DIFFERENT
+/// species (live-species tracking, per the design choice) — at which point it
+/// is issued a fresh index within the new species. Until an organism has a
+/// classified `species_id`, it gets no identifier (and thus no navigator row /
+/// label) — that window is ~1 s after spawn.
 fn assign_individual_identifiers(
-    mut commands: Commands,
-    mut counter:  ResMut<HeterotrophCounter>,
-    new_q:        Query<
-        (Entity, &Organism, Option<&crate::colony::Carnivore>),
-        (Added<Heterotroph>, With<OrganismRoot>, Without<IndividualIdentifier>),
+    mut commands:  Commands,
+    mut counters:  ResMut<SpeciesIndexCounters>,
+    registry:      Res<crate::lineages::species::SpeciesRegistry>,
+    mut q:         Query<
+        (Entity, &Organism, Option<&mut SpeciesIndex>, Option<&mut IndividualIdentifier>),
+        (With<Heterotroph>, With<OrganismRoot>),
     >,
 ) {
-    for (entity, organism, carn) in &new_q {
-        counter.0 += 1; // kept for diagnostic stats; not used in the label
-        let kind = if carn.is_some() { "Carnivore" } else { "Herbivore" };
-        let level = match organism.intelligence_level {
-            IntelligenceLevel::Level0 => "L0",
-            IntelligenceLevel::Level1 => "L1",
-            IntelligenceLevel::Level2 => "L2",
-            IntelligenceLevel::Level3 => "L3",
+    for (entity, organism, maybe_idx, maybe_ident) in &mut q {
+        let Some(sid) = organism.species_id else { continue };
+        let Some(species) = registry.get(sid) else { continue };
+
+        // Only (re)issue when never named, or when the live species changed.
+        let needs_reissue = match &maybe_idx {
+            Some(si) => si.species_id != sid,
+            None     => true,
         };
-        commands.entity(entity)
-            .try_insert(IndividualIdentifier(format!("{kind} {level}")));
+        if !needs_reissue { continue; }
+
+        let index = {
+            let n = counters.next.entry(sid).or_insert(1);
+            let v = *n;
+            *n += 1;
+            v
+        };
+        let name = format!("{}#{}", species.name, index);
+
+        match maybe_idx {
+            Some(mut si) => { si.species_id = sid; si.index = index; }
+            None => {
+                commands.entity(entity).try_insert(SpeciesIndex { species_id: sid, index });
+            }
+        }
+        match maybe_ident {
+            Some(mut id) => { if id.0 != name { id.0 = name; } }
+            None => {
+                commands.entity(entity).try_insert(IndividualIdentifier(name));
+            }
+        }
+    }
+}
+
+/// Keep each navigator button's label text in sync with its target's current
+/// `IndividualIdentifier`. The name changes when an organism is reclassified
+/// into a new species, so the button text (set once at spawn) must follow.
+fn update_navigator_button_text(
+    idents:    Query<&IndividualIdentifier>,
+    mut texts: Query<(&NavigatorButtonText, &mut Text)>,
+) {
+    for (marker, mut text) in &mut texts {
+        if let Ok(id) = idents.get(marker.target) {
+            if text.0 != id.0 { text.0 = id.0.clone(); }
+        }
+    }
+}
+
+/// Same, for the in-world floating label's individual-name line.
+fn update_label_name_text(
+    idents:    Query<&IndividualIdentifier>,
+    mut texts: Query<(&IndividualLabelText, &mut Text)>,
+) {
+    for (marker, mut text) in &mut texts {
+        if let Ok(id) = idents.get(marker.target) {
+            if text.0 != id.0 { text.0 = id.0.clone(); }
+        }
+    }
+}
+
+/// Resolve a Simulation-mode viewport left-click to the heterotroph under the
+/// cursor and store it as the selection. The camera renders to an off-screen
+/// image, so the window cursor is first remapped into image-local pixels (same
+/// conversion the colony editor uses) before `viewport_to_world` builds the
+/// ray; Avian's `SpatialQuery` then returns the closest collider along it.
+///
+/// The closest hit is resolved to its `OrganismRoot` (the kinematic root for
+/// sliding/sessile organisms, or a body part → its parent root for limb ones).
+/// Only a heterotroph root becomes the selection; terrain, photoautotrophs, or
+/// a miss clear it (empty-click-clears, per the chosen behaviour).
+fn pick_organism(
+    mut picks:    MessageReader<ViewportPick>,
+    cameras:      Query<(&Camera, &GlobalTransform), With<crate::player_plugin::FlyCam>>,
+    viewport_q:   Query<(&ComputedNode, &UiGlobalTransform), With<ViewportImage>>,
+    spatial:      avian3d::prelude::SpatialQuery,
+    root_q:       Query<(), With<OrganismRoot>>,
+    hetero_q:     Query<(), With<Heterotroph>>,
+    childof_q:    Query<&ChildOf>,
+    mut selected: ResMut<SelectedOrganism>,
+) {
+    // Only the most recent click in the frame matters.
+    let Some(pick) = picks.read().last().copied() else { return };
+    let Ok((camera, cam_xf)) = cameras.single() else { return };
+
+    // Window cursor → viewport-image-local pixels (image-target camera).
+    let cursor_vp = match viewport_q.single() {
+        Ok((node, ui_xf)) => {
+            let inv      = node.inverse_scale_factor;
+            let size     = node.size() * inv;
+            let top_left = ui_xf.translation * inv - size * 0.5;
+            pick.cursor - top_left
+        }
+        Err(_) => pick.cursor,
+    };
+
+    let Ok(ray) = camera.viewport_to_world(cam_xf, cursor_vp) else { return };
+    let hit = spatial.cast_ray(
+        ray.origin,
+        ray.direction,
+        1000.0,
+        true,
+        &avian3d::prelude::SpatialQueryFilter::default(),
+    );
+
+    let mut new_sel = None;
+    if let Some(hit) = hit {
+        let e = hit.entity;
+        let root = if root_q.contains(e) {
+            Some(e)
+        } else if let Ok(co) = childof_q.get(e) {
+            let p = co.parent();
+            root_q.contains(p).then_some(p)
+        } else {
+            None
+        };
+        if let Some(root) = root {
+            if hetero_q.contains(root) {
+                new_sel = Some(root);
+            }
+        }
+    }
+    if selected.0 != new_sel {
+        selected.0 = new_sel;
+    }
+}
+
+/// React to a selection change: paint the selected heterotroph's navigator
+/// button green (text preserved), reset every other button to the default
+/// grey, and scroll the list so the selected button is in view.
+fn apply_selection_highlight(
+    selected:      Res<SelectedOrganism>,
+    mut buttons:   Query<(&NavigatorButton, &mut BackgroundColor)>,
+    list_q:        Query<&Children, With<NavigatorList>>,
+    button_lookup: Query<&NavigatorButton>,
+    mut scroll_q:  Query<&mut ScrollPosition, With<NavigatorList>>,
+) {
+    if !selected.is_changed() { return; }
+
+    for (btn, mut bg) in &mut buttons {
+        *bg = if Some(btn.target) == selected.0 {
+            BackgroundColor(Color::srgb(0.20, 0.55, 0.25)) // selected → green
+        } else {
+            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)) // default grey
+        };
+    }
+
+    let Some(target) = selected.0 else { return };
+    let Ok(children)  = list_q.single() else { return };
+    let Ok(mut scroll) = scroll_q.single_mut() else { return };
+    for i in 0..children.len() {
+        let child = children[i];
+        if let Ok(btn) = button_lookup.get(child) {
+            if btn.target == target {
+                scroll.y = i as f32 * (NAV_BUTTON_HEIGHT_PX + NAV_BUTTON_GAP_PX);
+                break;
+            }
+        }
     }
 }
 
@@ -522,7 +712,7 @@ fn manage_label_lifecycle(
         ))
         .with_children(|wrap| {
             wrap.spawn((
-                IndividualLabelText,
+                IndividualLabelText { target: entity },
                 Text::new(ident.0.clone()),
                 TextFont { font_size: LABEL_FONT_SIZE, ..default() },
                 TextColor(Color::WHITE),
@@ -703,7 +893,7 @@ fn manage_navigator_list(
         ))
         .with_children(|row| {
             row.spawn((
-                NavigatorButtonText,
+                NavigatorButtonText { target: entity },
                 Text::new(ident.0.clone()),
                 TextFont { font_size: 13.0, ..default() },
                 TextColor(Color::WHITE),

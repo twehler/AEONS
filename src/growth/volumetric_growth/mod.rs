@@ -231,10 +231,30 @@ pub fn build_smoothed_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
     }
     let centers: Vec<Vec3> = ocg.iter().map(|(_, p, _)| *p).collect();
     let (mut verts, tris, tri_src) = rebuild_mesh(&centers);
+
+    // BILATERAL guard: if the OCG spans BOTH sides of the YZ mirror plane
+    // (cells at x < 0 AND x > 0), this is a bilateral combined body (a right
+    // half + its X-mirror joined across a dense midline). Plain Laplacian
+    // smoothing pulls the sparse x-protruding side cells INTO that heavy
+    // midline and collapses them — the left/right halves visually vanish even
+    // though the cells/collider are intact. Freeze the X coordinate while
+    // smoothing (smooth only Y/Z) so the halves keep their full width; the
+    // surface still rounds in Y/Z. Single-sided parts (limbs, NoSymmetry
+    // bodies) smooth normally on all axes.
+    let min_x = ocg.iter().map(|(_, p, _)| p.x).fold(f32::INFINITY, f32::min);
+    let max_x = ocg.iter().map(|(_, p, _)| p.x).fold(f32::NEG_INFINITY, f32::max);
+    const MIDLINE_EPS: f32 = 0.1;
+    let bilateral = min_x < -MIDLINE_EPS && max_x > MIDLINE_EPS;
+
+    let orig_x: Vec<f32> = if bilateral { verts.iter().map(|v| v.x).collect() } else { Vec::new() };
     smooth_vertices::smooth_vertices(
         &mut verts, &tris,
         ADULT_SMOOTH_LAMBDA, ADULT_SMOOTH_ITERATIONS,
     );
+    if bilateral {
+        // Restore the original X of every vertex — Y/Z stay smoothed.
+        for (v, x) in verts.iter_mut().zip(orig_x) { v.x = x; }
+    }
     // Smoothing only moves positions; the per-tri source-cell mapping
     // (and therefore the colours) is unaffected.
     let tri_colors = ocg_tri_colors(ocg, &tri_src);
@@ -589,7 +609,7 @@ fn spawn_volumetric_mesh(
             is_sessile:           false,
             has_variable_form:    false,
             sliding_movement:     true,
-        limb_targets:         [0.0; 6],
+        limb_targets:         [0.0; 8],
             adult:                false,
             photo_cell_count:     1,
             non_photo_cell_count: 0,

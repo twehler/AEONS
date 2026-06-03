@@ -22,25 +22,18 @@
 // + carnivore-vs-herbivore split), and delegate assign / free / apply
 // to the shared helpers here.
 //
-// Observation layout (`IN = 55`):
-//   * energy_norm                 — 1  (energy / max_energy)
-//   * world model neighbours      — 24 (4 nearest × 6 fields, same as
-//                                       the sliding pools — see
-//                                       `world_model::encode_neighbours`)
-//   * joint angles                — 6  (up to 2 spherical limbs × 3 DOF)
-//   * joint angular velocities    — 6
-//   * base body pose+velocity     — 9  (3 orientation, 3 angular vel,
-//                                       3 linear vel)
-//   * per-limb foot contact       — 3  (base + 2 limbs; 0/1 floats)
-//   * prev action (recurrence)    — 6
-//   Total                          = 55
-//
-// Action layout (`OUT = 6`): target joint angle per DOF. The action
-// space is fixed-size; limbs that don't exist on a given organism
-// have their outputs ignored by the apply step (Phase 4). The actor
-// outputs `μ` directly; sampling adds Gaussian noise scaled by
-// `exp(log_std)`. Targets are then clamped to a sane range by the
-// PD controller in Phase 4.
+// EMERGENT per-joint control: the brain directly commands each limb hinge's
+// target angle and walking must EMERGE from RL — there is no CPG generating the
+// rhythm and no pursuit force aiming the body. The exact observation/action
+// layout is documented on the `IN` / `OUT` consts below; in summary:
+//   * Observation (`IN`): energy, body-local world-model neighbours, per-joint
+//     hinge angle (sin/cos) + angular velocity for up to MAX_LIMB_JOINTS joints,
+//     base pose/velocity + up-vector, per-limb foot contacts, prev action,
+//     nearest-prey bearing, and a phase clock (sin/cos) — the one rhythm aid.
+//   * Action (`OUT = MAX_LIMB_JOINTS`): one target hinge angle per limb body
+//     part (output k → body-part k+1). The actor outputs tanh-bounded `μ`;
+//     sampling adds Gaussian noise scaled by `exp(LOG_STD_INIT)`; the value is
+//     scaled by `LIMB_SWING_LIMIT` and tracked by the in-solver hinge motor.
 
 use bevy::prelude::*;
 use burn::module::{Initializer, Module, Param};
@@ -56,35 +49,46 @@ use crate::rl_helpers::{MyBackend, gaussian_noise};
 
 // ── Architecture constants ────────────────────────────────────────────────────
 
-/// Observation dimension. Layout:
-///   * `obs[0]`         — energy_norm                        (1)
-///   * `obs[1..25]`     — world-model neighbours              (24)
-///   * `obs[25..37]`    — joint angles (sin/cos × 3 axes × 2) (12)
-///   * `obs[37..43]`    — joint angular velocities (3 × 2)    (6)
-///   * `obs[43..55]`    — base orientation (sin/cos × 3 axes)
-///                        + angular vel (3) + linear vel (3)  (12)
-///   * `obs[55..58]`    — base up-vector `base_rot · +Y`       (3)
-///   * `obs[58..61]`    — per-limb contact (base + 2 limbs)   (3)
-///   * `obs[61..67]`    — prev_action recurrence              (6)
-///   * `obs[67..70]`    — nearest-prey bearing (body-local
-///                        dir_x, dir_z, dist_norm)            (3)
+/// Observation dimension. EMERGENT per-joint layout (`MAX_LIMB_JOINTS = 8`):
+///   * `obs[0]`           — energy_norm                          (1)
+///   * `obs[1..25]`       — world-model neighbours (body-local)  (24)
+///   * `obs[25..73]`      — per-joint angles: 8 joints × (sin,cos
+///                          of Euler-XYZ relative to base) = 8×6 (48)
+///   * `obs[73..97]`      — per-joint angular velocity: 8 × 3    (24)
+///   * `obs[97..109]`     — base orientation (sin/cos × 3 axes)
+///                          + angular vel (3) + linear vel (3)   (12)
+///   * `obs[109..112]`    — base up-vector `base_rot · +Y`        (3)
+///   * `obs[112..121]`    — per-limb contact (base + 8 limbs)    (9)
+///   * `obs[121..129]`    — prev_action recurrence (OUT)         (8)
+///   * `obs[129..132]`    — nearest-prey bearing (body-local
+///                          dir_x, dir_z, dist_norm)             (3)
+///   * `obs[132..134]`    — phase clock (sin, cos)               (2)
 ///
-/// Base orientation is encoded as `(sin, cos)` pairs of the Euler-XYZ
-/// angles (not raw angles) so the ±π wrap is continuous, matching the
-/// joint-angle encoding. The **up-vector** (`base_rot · +Y`) is the
-/// singularity-free tilt/fall signal: upright → `(0, 1, 0)`, on its
-/// side → `y ≈ 0`, upside-down → `y ≈ −1`. Its `.y` is exactly the
-/// `uprightness` term the reward grades on (`K_UP`), so the brain now
-/// *observes* the quantity it's *judged on* — letting it sense and
-/// recover from stumbles. The nearest-prey bearing block likewise
-/// closes the observation/reward gap for `K_HEADING` / `K_PROGRESS`.
-pub const IN:     usize = 70;
+/// Orientations are encoded as `(sin, cos)` pairs of Euler-XYZ angles (not raw
+/// angles) so the ±π wrap is continuous. The **up-vector** (`base_rot · +Y`) is
+/// the singularity-free tilt/fall signal; its `.y` is exactly the `uprightness`
+/// term the reward grades on. The nearest-prey bearing closes the
+/// observation/reward gap for `K_HEADING` / `K_PROGRESS`. The **phase clock** is
+/// the only "rhythm aid": `sin/cos(2π·GAIT_FREQUENCY_HZ·t)` of virtual time,
+/// handed to the brain so a feedforward policy can phase-lock a sustained gait
+/// oscillation — the brain still generates every joint command itself (no CPG).
+///
+/// `OUT = MAX_LIMB_JOINTS`: one target hinge angle per limb body part, so every
+/// joint (each hip AND knee, each Bilateral mirror half) is independently
+/// controlled and an alternating gait can EMERGE. `drive_limb_motors` maps
+/// `out[i-1] → body-part i`'s hinge motor target.
+pub const IN:     usize = 134;
 pub const HIDDEN: usize = 128;
-pub const OUT:    usize = 6;
+pub const OUT:    usize = 8;
+
+// `OUT` is the per-joint action dimension; it MUST equal `MAX_LIMB_JOINTS`
+// (the physics-side joint bound used by `drive_limb_motors`). A mismatch would
+// silently drop or wrap joint commands.
+const _: () = assert!(OUT == crate::simulation_settings::MAX_LIMB_JOINTS);
 
 pub use crate::simulation_settings::{
     ROLLOUT_LEN, PPO_EPOCHS, CLIP_EPS, GAMMA, LAMBDA, LR,
-    VALUE_LOSS_COEF, ENTROPY_COEF, LOG_STD_INIT,
+    VALUE_LOSS_COEF, ENTROPY_COEF, LOG_STD_INIT, GAIT_FREQUENCY_HZ,
 };
 
 // ── Reward shaping ──
@@ -117,7 +121,7 @@ pub use crate::simulation_settings::{
 // rewards constant outputs, which is exactly the freeze policy.
 pub use crate::simulation_settings::{
     K_EAT, K_REPRO, K_FWD, K_UP, K_IDLE, K_PROGRESS, K_HEADING, K_STEP,
-    IDLE_THRESH,
+    IDLE_THRESH, K_MOVE, SPEED_REWARD_CAP, K_SPIN,
 };
 
 
@@ -255,17 +259,18 @@ pub trait LimbSlot {
 /// by `apply_step`'s pre-pass. Fields default to zero so partial
 /// gathers (e.g. an organism missing a second limb) leave their slots
 /// at their natural neutral value.
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct LimbObsInputs {
     pub world_model:    [f32; 24],
-    /// Sin/cos pairs of relative-rotation Euler XYZ per limb. Layout:
-    /// `[sin x0, cos x0, sin y0, cos y0, sin z0, cos z0,
-    ///   sin x1, cos x1, sin y1, cos y1, sin z1, cos z1]`.
-    /// `cos` of zero is 1.0, so an absent limb's slot reads as "rest".
-    pub joint_sincos:   [f32; 12],
-    /// Per-limb angular velocity in the parent's local frame. Three
-    /// scalars per limb (×2 limbs).
-    pub joint_angvel:   [f32; 6],
+    /// Sin/cos pairs of each limb joint's relative-rotation Euler XYZ
+    /// (relative to the BASE body's rotation), for up to `MAX_LIMB_JOINTS`
+    /// joints. Layout per joint `j` (= body-part index `j+1`):
+    /// `[sin x, cos x, sin y, cos y, sin z, cos z]` at offset `j*6`.
+    /// Absent joints stay at the zero default (a constant the net ignores).
+    pub joint_sincos:   [f32; 48],   // 8 joints × 6
+    /// Per-limb-joint world-frame angular velocity, 3 scalars per joint
+    /// (× up to `MAX_LIMB_JOINTS`), at offset `j*3`.
+    pub joint_angvel:   [f32; 24],   // 8 joints × 3
     /// Base body's orientation as `(sin, cos)` pairs of Euler-XYZ (6)
     /// + angular velocity (3) + linear velocity (3). Sin/cos rather
     /// than raw angles so the ±π wrap is continuous (matching
@@ -277,9 +282,10 @@ pub struct LimbObsInputs {
     /// its side, `y≈−1` upside-down. `.y` equals the reward's
     /// `uprightness` term.
     pub base_up:        [f32; 3],
-    /// Contact flags for [base, limb0, limb1]. `1.0` while touching,
-    /// `0.0` otherwise.
-    pub limb_contact:   [f32; 3],
+    /// Contact flags for [base, limb1, limb2, …, limb8]. `1.0` while
+    /// touching, `0.0` otherwise. Index 0 is the base; index `i` (1..=8) is
+    /// body-part `i`. Foot-ground contact is the core gait feedback signal.
+    pub limb_contact:   [f32; 9],
     /// Base body's world-frame rotation, kept verbatim. Used by the
     /// world-model body-local encoder and by the reward shaper
     /// (forward-velocity projection, uprightness term). Not consumed
@@ -301,6 +307,26 @@ pub struct LimbObsInputs {
     pub nearest_prey_dir_xz: Option<Vec2>,
 }
 
+// Manual `Default` (the derive only supports arrays up to length 32, and
+// `joint_sincos` is `[f32; 48]`). All-zero arrays / identity rotation / `None`
+// — the neutral "no info" state used for organisms absent from the gather pass.
+impl Default for LimbObsInputs {
+    fn default() -> Self {
+        Self {
+            world_model:         [0.0; 24],
+            joint_sincos:        [0.0; 48],
+            joint_angvel:        [0.0; 24],
+            base_pose_vel:       [0.0; 12],
+            base_up:             [0.0; 3],
+            limb_contact:        [0.0; 9],
+            base_rot:            Quat::IDENTITY,
+            base_lin_vel:        Vec3::ZERO,
+            nearest_prey_dist:   None,
+            nearest_prey_dir_xz: None,
+        }
+    }
+}
+
 /// Assemble the per-tick observation for one organism. Combines its
 /// `Organism`-side state (energy, prev_action) with the physics-derived
 /// inputs the caller gathered from Avian.
@@ -318,6 +344,7 @@ pub fn build_observation(
     organism:     &Organism,
     prev_action:  &[f32; OUT],
     physics:      &LimbObsInputs,
+    phase:        f32,
 ) -> [f32; IN] {
     let mut obs = [0.0_f32; IN];
     let max_energy = organism.grown_cell_count() as f32 * MAX_ENERGY_PER_CELL;
@@ -325,14 +352,14 @@ pub fn build_observation(
         obs[0] = (organism.energy / max_energy).clamp(0.0, 1.0);
     }
     obs[1..25].copy_from_slice(&physics.world_model);
-    obs[25..37].copy_from_slice(&physics.joint_sincos);
-    obs[37..43].copy_from_slice(&physics.joint_angvel);
-    obs[43..55].copy_from_slice(&physics.base_pose_vel);   // 6 sincos + 3 angvel + 3 linvel
-    obs[55..58].copy_from_slice(&physics.base_up);          // up-vector
-    obs[58..61].copy_from_slice(&physics.limb_contact);
-    obs[61..67].copy_from_slice(prev_action);
+    obs[25..73].copy_from_slice(&physics.joint_sincos);     // 8 joints × 6
+    obs[73..97].copy_from_slice(&physics.joint_angvel);     // 8 joints × 3
+    obs[97..109].copy_from_slice(&physics.base_pose_vel);   // 6 sincos + 3 angvel + 3 linvel
+    obs[109..112].copy_from_slice(&physics.base_up);        // up-vector
+    obs[112..121].copy_from_slice(&physics.limb_contact);   // base + 8 limbs
+    obs[121..129].copy_from_slice(prev_action);             // OUT = 8
 
-    // Nearest-prey bearing in BODY-LOCAL frame (obs[67..70]):
+    // Nearest-prey bearing in BODY-LOCAL frame (obs[129..132]):
     // (dir_x, dir_z, dist_norm). The stored direction is world-frame;
     // rotate it through the base body's inverse yaw so it lands in the
     // same frame as the body-local world-model block. A real bearing
@@ -346,16 +373,24 @@ pub fn build_observation(
             let (sin_h, cos_h) = if len > 1e-6 { (fwd.x / len, fwd.z / len) } else { (0.0, 1.0) };
             // Inverse-yaw rotation, identical convention to
             // `world_model::encode_neighbours_body_local`.
-            obs[67] = dir_world.x * cos_h - dir_world.y * sin_h;
-            obs[68] = dir_world.x * sin_h + dir_world.y * cos_h;
-            obs[69] = (dist / crate::world_model::WORLD_MODEL_RADIUS).clamp(0.0, 1.0);
+            obs[129] = dir_world.x * cos_h - dir_world.y * sin_h;
+            obs[130] = dir_world.x * sin_h + dir_world.y * cos_h;
+            obs[131] = (dist / crate::world_model::WORLD_MODEL_RADIUS).clamp(0.0, 1.0);
         }
         _ => {
-            obs[67] = 0.0;
-            obs[68] = 0.0;
-            obs[69] = 1.0;
+            obs[129] = 0.0;
+            obs[130] = 0.0;
+            obs[131] = 1.0;
         }
     }
+
+    // Phase clock (obs[132..134]): sin/cos of the shared virtual-time phase
+    // oscillator. NOT a motor command — the brain reads it and learns to map
+    // phase → coordinated joint angles, the one rhythm aid that lets a
+    // feedforward policy sustain a gait oscillation while still generating
+    // every joint command itself.
+    obs[132] = phase.sin();
+    obs[133] = phase.cos();
     obs
 }
 
@@ -373,13 +408,12 @@ pub fn build_observation(
 ///   1. Find each organism's BASE body part (`BodyPartIndex(0)`), cache
 ///      its rotation + write base pose / velocity / base-contact
 ///      into the inputs map.
-///   2. Find each appendage (`BodyPartIndex ∈ {1, 2, 3, 4}`), compute
-///      joint relative rotation against the cached base rotation, fill
-///      the corresponding `joint_sincos` / `joint_angvel` / contact
-///      slot. Only the RIGHT half of a mirror pair contributes (half
-///      index 0 within the pair) so the observation stays size-stable;
-///      the brain receives one observation per limb pair regardless of
-///      whether one or two runtime body parts back the pair.
+///   2. Find each limb body part (`BodyPartIndex ∈ 1..=MAX_LIMB_JOINTS`),
+///      compute its rotation relative to the cached base rotation, and fill
+///      its OWN per-joint `joint_sincos` / `joint_angvel` / contact slot
+///      (joint `idx-1`). Every joint — each hip AND knee, each Bilateral
+///      mirror half — is observed independently, matching the per-joint
+///      action layout the brain controls.
 pub fn gather_limb_obs_inputs(
     body_parts:  &bevy::ecs::system::Query<(
         &bevy::prelude::ChildOf,
@@ -426,32 +460,31 @@ pub fn gather_limb_obs_inputs(
         base_pos.insert(root, pos.0);
     }
 
-    // Pass 2: limbs (idx 1..=4). Only the right half of each pair
-    // contributes to the joint observation slot — limb pair 0 is
-    // idx 1 (right) + idx 2 (left); pair 1 is idx 3 + idx 4. The brain
-    // sees one observation per pair, mirroring its action layout.
+    // Pass 2: limbs (idx 1..=MAX_LIMB_JOINTS). Each limb body part fills its
+    // OWN joint slot (joint = idx-1), measured relative to the base rotation.
+    // No pair/half collapsing — every joint is observed and controlled
+    // independently, so an alternating gait can emerge.
     for (child_of, idx, _pos, rot, ang_vel, _lin_vel, contact) in body_parts.iter() {
-        if idx.0 == 0 || idx.0 > 4 { continue; }
+        if idx.0 == 0 || idx.0 > OUT { continue; }
         let root = child_of.parent();
-        let Some(parent_rot) = base_rot.get(&root) else { continue };
-        let pair_idx = ((idx.0 - 1) / 2).min(1);
-        let half     = (idx.0 - 1) % 2;
-        if half != 0 { continue; }   // right-half-only contribution
-        let rel = parent_rot.inverse() * rot.0;
+        let Some(base_r) = base_rot.get(&root) else { continue };
+        let j = idx.0 - 1;   // 0-based joint slot
+        let rel = base_r.inverse() * rot.0;
         let (ex, ey, ez) = rel.to_euler(bevy::math::EulerRot::XYZ);
         let entry = out.entry(root).or_default();
-        let base = pair_idx * 6;
+        let base = j * 6;
         entry.joint_sincos[base    ] = ex.sin();
         entry.joint_sincos[base + 1] = ex.cos();
         entry.joint_sincos[base + 2] = ey.sin();
         entry.joint_sincos[base + 3] = ey.cos();
         entry.joint_sincos[base + 4] = ez.sin();
         entry.joint_sincos[base + 5] = ez.cos();
-        let av_base = pair_idx * 3;
+        let av_base = j * 3;
         entry.joint_angvel[av_base    ] = ang_vel.0.x;
         entry.joint_angvel[av_base + 1] = ang_vel.0.y;
         entry.joint_angvel[av_base + 2] = ang_vel.0.z;
-        entry.limb_contact[1 + pair_idx] = if contact.is_some_and(|c| c.in_contact) { 1.0 } else { 0.0 };
+        // Contact slot: base is 0, limb idx maps to slot idx (1..=8).
+        entry.limb_contact[idx.0] = if contact.is_some_and(|c| c.in_contact) { 1.0 } else { 0.0 };
     }
 
     // World-model neighbours, keyed on the base body's Avian position
@@ -650,6 +683,28 @@ impl BrainPoolLimb {
         );
         self.critic.b2 = self.critic.b2.clone().map(|x| x.slice_assign([s..s + 1, 0..1], t));
     }
+
+    /// Copy slot `src`'s actor + critic weight rows into slot `dst` — a fresh
+    /// occupant INHERITS a trained brain ("instinct") instead of starting from
+    /// the untrained warm-start. Used by the `assign_*_limb` systems so a newly
+    /// spawned (or reproduced) limb organism joins an already-trained population
+    /// competent — without it, a freshly placed Crawler just collapses and does
+    /// nothing until it learns from scratch. GPU-side row copy, no CPU
+    /// round-trip. Mirrors the sliding pools' inheritance path.
+    pub fn inherit_slot(&mut self, dst: u32, src: u32) {
+        use burn::tensor::Tensor as _;
+        if dst == src { return; }
+        let (d, s) = (dst as usize, src as usize);
+        self.actor.w1 = self.actor.w1.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..IN, 0..HIDDEN]); t.slice_assign([d..d+1, 0..IN, 0..HIDDEN], r) });
+        self.actor.b1 = self.actor.b1.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..HIDDEN]);       t.slice_assign([d..d+1, 0..HIDDEN], r) });
+        self.actor.w2 = self.actor.w2.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..HIDDEN, 0..OUT]); t.slice_assign([d..d+1, 0..HIDDEN, 0..OUT], r) });
+        self.actor.b2 = self.actor.b2.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..OUT]);          t.slice_assign([d..d+1, 0..OUT], r) });
+        self.actor.log_std = self.actor.log_std.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..OUT]); t.slice_assign([d..d+1, 0..OUT], r) });
+        self.critic.w1 = self.critic.w1.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..IN, 0..HIDDEN]); t.slice_assign([d..d+1, 0..IN, 0..HIDDEN], r) });
+        self.critic.b1 = self.critic.b1.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..HIDDEN]);        t.slice_assign([d..d+1, 0..HIDDEN], r) });
+        self.critic.w2 = self.critic.w2.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..HIDDEN, 0..1]);   t.slice_assign([d..d+1, 0..HIDDEN, 0..1], r) });
+        self.critic.b2 = self.critic.b2.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..1]);             t.slice_assign([d..d+1, 0..1], r) });
+    }
 }
 
 /// Serialise one `BrainRestoreLimb` to a byte buffer. Layout: a
@@ -798,10 +853,10 @@ pub struct BrainPoolLimb {
     /// tick had no prey direction (so first-frame and prey-just-
     /// appeared ticks don't fabricate a turn reward).
     pub prev_heading_alignment: Vec<Option<f32>>,
-    /// Per-slot limb-contact flags `[base, limb0, limb1]` as of the
+    /// Per-slot limb-contact flags `[base, limb1, …, limb8]` as of the
     /// previous apply tick. Diffed against the current flags to count
     /// stepping transitions for the `K_STEP` reward.
-    pub prev_limb_contact: Vec<[f32; 3]>,
+    pub prev_limb_contact: Vec<[f32; 9]>,
     /// Adam optimiser for the actor's parameters.
     pub opt_actor:  Box<dyn BrainOptActor>,
     /// Adam optimiser for the critic's parameters.
@@ -840,19 +895,92 @@ pub struct LimbTrainingStep {
 pub const LIMB_TRAINING_HISTORY_CAP: usize = 1024;
 
 impl BrainPoolLimb {
-    /// Allocate a fresh pool with batch dim `n`. Weights are uniform
-    /// `±0.5` (matching the sliding pools' init); biases zero;
-    /// per-organism `log_std` initialised to `LOG_STD_INIT`.
+    /// Allocate a fresh pool with batch dim `n`. Biases zero; per-organism
+    /// `log_std` initialised to `LOG_STD_INIT`.
+    ///
+    /// Weights use **Xavier** init, NOT the sliding pools' flat `Uniform ±0.5`.
+    /// With `IN = 134` a flat `±0.5` makes the pre-tanh activation enormous
+    /// (~134 terms × 0.5) → the actor's `μ` SATURATES at ±1 from the very first
+    /// step → every joint target is pinned at ±`LIMB_SWING_LIMIT` against its
+    /// mechanical stop → the legs are FROZEN at their extremes and never
+    /// oscillate, so no stroke, no propulsion, nothing for RL to reward
+    /// (confirmed in data: body `base_ang_vel ≈ 0` despite σ=0.5 exploration —
+    /// the legs weren't even moving). Fan-in-scaled Xavier keeps the initial
+    /// output near 0 (legs near rest), so exploration noise actually moves the
+    /// limbs and the policy can discover propulsive strokes. (The small sliding
+    /// nets, `IN = 31`, didn't saturate at ±0.5, which is why they were fine.)
     pub fn new(n: usize, device: CudaDevice) -> Self {
-        let w = Initializer::Uniform { min: -0.5, max: 0.5 };
+        // ~1/sqrt(fan_in) for fan_in≈IN=134 → ±0.086. Small, fan-scaled, and
+        // predictable regardless of how Burn infers fan-in on the batched
+        // [N, IN, HIDDEN] weight. Keeps initial activations unit-scale so `μ`
+        // does NOT saturate.
+        let w = Initializer::Uniform { min: -0.086, max: 0.086 };
         let z = Initializer::Zeros;
         let log_std_init = Initializer::Constant { value: LOG_STD_INIT as f64 };
 
+        // ── Actor OSCILLATORY WARM-START ───────────────────────────────────
+        // Pure per-tick Gaussian exploration almost never stumbles onto a
+        // COHERENT periodic propulsive stroke (data: legs jitter incoherently →
+        // net-zero force → body never moves → flat reward → no gait learned).
+        // So we INITIALISE the actor so the phase-clock input (obs[132]=sin,
+        // obs[133]=cos of the gait phase) drives each joint's target as
+        // `μ_k ≈ A·sin(phase + φ_k)` — i.e. the legs rhythmically stroke out of
+        // the box, with a per-joint phase offset so they don't all bounce in
+        // unison. This is a TRAINABLE init, NOT a CPG: the weights are ordinary
+        // policy parameters, so PPO is free to reshape, redirect, or abandon the
+        // oscillation as the reward dictates — locomotion is still learned and
+        // emergent, just bootstrapped near a rhythmic prior (standard practice
+        // for learned legged gaits). Mechanism: two hidden units are biased
+        // into relu's linear region (`b1 = WARMSTART_BIAS`) and fed only the
+        // sin/cos phase inputs (gain `WARMSTART_PHASE_GAIN`), so they carry
+        // `C ± g·sin` / `C ± g·cos`; the output layer recombines them as
+        // `A·sin(phase+φ_k)` via `cos(φ_k)·sin + sin(φ_k)·cos`, and `b2` cancels
+        // the resulting constant. Every other weight stays at the small random
+        // init so the rest of the policy (steering toward prey, posture, etc.)
+        // learns normally.
+        const WARMSTART_PHASE_GAIN: f32 = 2.0;  // g: sin/cos input → carrier hidden unit
+        const WARMSTART_BIAS:       f32 = 3.0;  // C: keeps carrier units in relu's linear region (C>g)
+        // a: output amplitude gain (final swing ≈ a·g·sin). Cut 0.25 → 0.10
+        // (2026-06-03) so the legs mostly HOLD a planted weight-bearing stance
+        // and only gently modulate — a ±37° swing was lifting the feet so far
+        // each cycle that the light body dropped onto its belly (unnatural,
+        // penetrating). A small swing keeps the feet planted (natural standing
+        // posture); the policy can grow the stride from there if rewarded.
+        const WARMSTART_AMP:        f32 = 0.25;
+        use rand::RngExt as _;
+        let mut rng = rand::rng();
+        let rand_small = |rng: &mut rand::rngs::ThreadRng| rng.random_range(-0.086_f32..0.086);
+        let phi = |k: usize| (k as f32) * std::f32::consts::FRAC_PI_2; // per-joint phase offset
+
+        let mut w1v = vec![0.0_f32; n * IN * HIDDEN];
+        for v in w1v.iter_mut() { *v = rand_small(&mut rng); }
+        let mut b1v = vec![0.0_f32; n * HIDDEN];
+        let mut w2v = vec![0.0_f32; n * HIDDEN * OUT];
+        for v in w2v.iter_mut() { *v = rand_small(&mut rng); }
+        let mut b2v = vec![0.0_f32; n * OUT];
+        for nn in 0..n {
+            // Hidden units 0 (sin carrier) and 1 (cos carrier): clear their
+            // input columns, then feed ONLY the phase inputs.
+            for inp in 0..IN {
+                w1v[nn * IN * HIDDEN + inp * HIDDEN + 0] = 0.0;
+                w1v[nn * IN * HIDDEN + inp * HIDDEN + 1] = 0.0;
+            }
+            w1v[nn * IN * HIDDEN + 132 * HIDDEN + 0] = WARMSTART_PHASE_GAIN; // sin → h0
+            w1v[nn * IN * HIDDEN + 133 * HIDDEN + 1] = WARMSTART_PHASE_GAIN; // cos → h1
+            b1v[nn * HIDDEN + 0] = WARMSTART_BIAS;
+            b1v[nn * HIDDEN + 1] = WARMSTART_BIAS;
+            for k in 0..OUT {
+                let (s, c) = (phi(k).sin(), phi(k).cos());
+                w2v[nn * HIDDEN * OUT + 0 * OUT + k] = WARMSTART_AMP * c; // h0 (sin) → out
+                w2v[nn * HIDDEN * OUT + 1 * OUT + k] = WARMSTART_AMP * s; // h1 (cos) → out
+                b2v[nn * OUT + k] = -WARMSTART_BIAS * WARMSTART_AMP * (c + s); // cancel constant
+            }
+        }
         let actor = LimbActor::<MyBackend> {
-            w1:      w.init([n, IN, HIDDEN], &device),
-            b1:      z.init([n, HIDDEN],     &device),
-            w2:      w.init([n, HIDDEN, OUT], &device),
-            b2:      z.init([n, OUT],        &device),
+            w1:      Param::from_tensor(Tensor::<MyBackend, 3>::from_data(TensorData::new(w1v, [n, IN, HIDDEN]), &device)),
+            b1:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(b1v, [n, HIDDEN]),     &device)),
+            w2:      Param::from_tensor(Tensor::<MyBackend, 3>::from_data(TensorData::new(w2v, [n, HIDDEN, OUT]), &device)),
+            b2:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(b2v, [n, OUT]),        &device)),
             log_std: log_std_init.init([n, OUT], &device),
         };
         let critic = LimbCritic::<MyBackend> {
@@ -879,7 +1007,7 @@ impl BrainPoolLimb {
             prev_reproductions: vec![0u8; n],
             prev_nearest_prey_dist: vec![None; n],
             prev_heading_alignment: vec![None; n],
-            prev_limb_contact:      vec![[0.0; 3]; n],
+            prev_limb_contact:      vec![[0.0; 9]; n],
             opt_actor,
             opt_critic,
             ticks_since_train: 0,
@@ -903,7 +1031,7 @@ impl BrainPoolLimb {
         self.prev_reproductions[s as usize] = 0;
         self.prev_nearest_prey_dist[s as usize] = None;
         self.prev_heading_alignment[s as usize] = None;
-        self.prev_limb_contact[s as usize] = [0.0; 3];
+        self.prev_limb_contact[s as usize] = [0.0; 9];
         Some(s)
     }
 
@@ -971,6 +1099,11 @@ impl BrainPoolLimb {
         obs_inputs:        &HashMap<Entity, LimbObsInputs>,
         virtual_time_secs: f32,
     ) {
+        // Shared phase-clock value fed to every brain this tick (sin/cos
+        // computed in `build_observation`). Derived from virtual time so it
+        // is invariant to TimeSpeed / frame rate, matching the brain cadence.
+        let phase = virtual_time_secs * std::f32::consts::TAU * GAIT_FREQUENCY_HZ;
+
         // ── 1. Collect active slots + observations. ─────────────────
         let mut input_buf: Vec<f32> = vec![0.0; self.n * IN];
         let mut active: Vec<(Entity, u32)> = Vec::new();
@@ -980,7 +1113,7 @@ impl BrainPoolLimb {
             if s >= self.n { continue; }
             let prev_action = self.prev_action[s];
             let phys = obs_inputs.get(&e).unwrap_or(&default_phys);
-            let obs = build_observation(&organism, &prev_action, phys);
+            let obs = build_observation(&organism, &prev_action, phys, phase);
             let base = s * IN;
             input_buf[base..base + IN].copy_from_slice(&obs);
             active.push((e, slot.slot()));
@@ -1091,22 +1224,38 @@ impl BrainPoolLimb {
             self.prev_heading_alignment[su] = alignment;
 
             // Stepping: count limb-contact transitions (a foot lifting
-            // or planting) since the last tick on the two LIMB flags
-            // (indices 1, 2 — index 0 is the base, deliberately
-            // excluded). Each flip of a 0/1 flag contributes 1.0, so
-            // `step_events ∈ [0, 2]`. Rewards cycling feet on/off the
-            // ground, the core of a gait.
+            // or planting) since the last tick over ALL limb flags
+            // (indices 1..=8 — index 0 is the base, deliberately
+            // excluded). Each flip of a 0/1 flag contributes 1.0.
+            // Rewards cycling feet on/off the ground, the core of a gait.
             let prev_lc = self.prev_limb_contact[su];
-            let step_events = (phys.limb_contact[1] - prev_lc[1]).abs()
-                            + (phys.limb_contact[2] - prev_lc[2]).abs();
+            let step_events: f32 = (1..phys.limb_contact.len())
+                .map(|k| (phys.limb_contact[k] - prev_lc[k]).abs())
+                .sum();
             self.prev_limb_contact[su] = phys.limb_contact;
 
-            let dense_reward = K_FWD      * forward_speed
+            // Base angular speed (spin/tumble), for the anti-degenerate
+            // penalty — keeps the "reward movement" gradient pointed at
+            // translation rather than the spin/flight the data showed.
+            let base_ang_speed = Vec3::new(
+                phys.base_pose_vel[6], phys.base_pose_vel[7], phys.base_pose_vel[8],
+            ).length();
+
+            // Movement reward is GATED on uprightness: a controlled, upright
+            // body that translates earns it; a tumbling / ballistic body
+            // (uprightness near 0 or negative while airborne) earns ~nothing.
+            // This is what makes controlled walking out-score the high-speed
+            // flight/spin degenerate the data showed (which otherwise wins
+            // even capped, because it racks up raw speed).
+            let upright_pos = uprightness.clamp(0.0, 1.0);
+            let dense_reward = K_MOVE     * speed.min(SPEED_REWARD_CAP) * upright_pos
+                             + K_FWD      * forward_speed
                              + K_UP       * uprightness * motion_gate
                              - K_IDLE     * (1.0 - motion_gate)
                              + K_PROGRESS * progress
                              + K_HEADING  * heading_gain
-                             + K_STEP     * step_events;
+                             + K_STEP     * step_events
+                             - K_SPIN     * base_ang_speed;
 
             let reward = event_reward + dense_reward;
             self.prev_predations[su]    = organism.predations;

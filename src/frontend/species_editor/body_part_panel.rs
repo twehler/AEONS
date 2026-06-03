@@ -161,10 +161,17 @@ pub fn handle_begin_new_body_part(
         match *interaction {
             Interaction::Pressed if enabled => {
                 let n = session.body_parts.len();
+                // A new part has no fixed parent. It attaches to whichever
+                // existing body part its FIRST cell ends up touching —
+                // decided by contact in `placement.rs`. `parent = 0` is a
+                // placeholder until then. The user toggles "Limb" and picks
+                // the cell colour manually; there is no special sub-limb
+                // category — a limb can stick to the body or another limb.
                 session.body_parts.push(EditorBodyPart {
                     name: format!("Body Part {n}"),
                     ocg:  Vec::new(),
                     is_limb: false,
+                    parent: 0,
                 });
                 session.active_body_part = n;
                 session.renaming_body_part = None;
@@ -381,6 +388,12 @@ pub fn sync_body_part_rows(
         let Some(part) = session.body_parts.get(i) else { continue };
         let new = if session.renaming_body_part == Some(i) {
             format!("{}_", session.rename_buffer)
+        } else if part.parent != 0 {
+            // Show what this part hangs off, so the limb→sub-limb hierarchy
+            // (and what "Begin New Body-Part" will attach to) is visible.
+            let parent_name = session.body_parts.get(part.parent)
+                .map(|p| p.name.as_str()).unwrap_or("?");
+            format!("{}  ↳ {}", part.name, parent_name)
         } else {
             part.name.clone()
         };

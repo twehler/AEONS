@@ -339,7 +339,7 @@ pub(super) fn respawn_template(
 /// if needed). The entity sits at the organism's local origin and cells
 /// render at their authored absolute positions — no per-frame rotation.
 /// Use `limb_body_part` instead when the appendage is flagged as a Limb.
-fn appendage_body_part(ocg: Vec<(usize, Vec3, CellType)>) -> crate::cell::BodyPart {
+fn appendage_body_part(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize) -> crate::cell::BodyPart {
     let cells = ocg.iter()
         .map(|(_, p, ct)| crate::cell::Cell::new(*p, *ct))
         .collect();
@@ -349,7 +349,7 @@ fn appendage_body_part(ocg: Vec<(usize, Vec3, CellType)>) -> crate::cell::BodyPa
         cells,
         ocg,
         attachment:   Some(crate::body_part::Attachment {
-            parent_idx:   0,
+            parent_idx,
             origin_local: Vec3::ZERO,
             rotation:     Quat::IDENTITY,
         }),
@@ -365,7 +365,7 @@ fn appendage_body_part(ocg: Vec<(usize, Vec3, CellType)>) -> crate::cell::BodyPa
 /// first cell (the attachment seed), exactly as the species-editor
 /// "Limb" toggle promises. Tagged `BodyPartKind::Limb` so
 /// `spawn_organism` attaches the `LimbAnimation` marker.
-fn limb_body_part(ocg: Vec<(usize, Vec3, CellType)>) -> crate::cell::BodyPart {
+fn limb_body_part(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize) -> crate::cell::BodyPart {
     let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
     let shifted_ocg: Vec<(usize, Vec3, CellType)> = ocg.iter()
         .map(|(i, p, ct)| (*i, *p - pivot, *ct))
@@ -379,7 +379,7 @@ fn limb_body_part(ocg: Vec<(usize, Vec3, CellType)>) -> crate::cell::BodyPart {
         cells,
         ocg:          shifted_ocg,
         attachment:   Some(crate::body_part::Attachment {
-            parent_idx:   0,
+            parent_idx,
             origin_local: pivot,
             rotation:     Quat::IDENTITY,
         }),
@@ -401,17 +401,35 @@ fn spawn_real_organism(
     // (parent_idx 0). For bilateral species each appendage is a mirrored
     // pair of runtime parts; for NoSymmetry it is one part.
     let mut body_parts = vec![root_body_part_from_ocg(&ocg)];
-    for (app_raw, is_limb) in &template.custom_appendages {
-        let make = |o: Vec<(usize, Vec3, CellType)>| -> crate::cell::BodyPart {
-            if *is_limb { limb_body_part(o) } else { appendage_body_part(o) }
-        };
-        match template.symmetry {
-            Symmetry::Bilateral => {
-                body_parts.push(make(app_raw.clone()));
-                body_parts.push(make(crate::body_part::mirror_right_to_left(app_raw)));
+    // Map an EDITOR body-part index (0 = base, a+1 = appendage `a`) to its
+    // runtime body-part index. NoSymmetry is 1:1; Bilateral expands each
+    // appendage into a right+left pair, so we track each side separately so
+    // a sub-limb's right half attaches to its parent's right half (and left
+    // to left). A sub-limb is always authored AFTER its parent, so the
+    // parent's runtime indices already exist when we reach the sub-limb.
+    let make = |o: Vec<(usize, Vec3, CellType)>, is_limb: bool, parent_idx: usize| -> crate::cell::BodyPart {
+        if is_limb { limb_body_part(o, parent_idx) } else { appendage_body_part(o, parent_idx) }
+    };
+    match template.symmetry {
+        Symmetry::NoSymmetry => {
+            // Editor index e → runtime index e (base 0, then appendages in order).
+            for (app_raw, is_limb, parent) in &template.custom_appendages {
+                body_parts.push(make(app_raw.clone(), *is_limb, *parent));
             }
-            Symmetry::NoSymmetry => {
-                body_parts.push(make(app_raw.clone()));
+        }
+        Symmetry::Bilateral => {
+            // runtime[e] right/left indices for each editor index.
+            let mut right_of: Vec<usize> = vec![0]; // editor 0 (base) → runtime 0
+            let mut left_of:  Vec<usize> = vec![0];
+            for (app_raw, is_limb, parent) in &template.custom_appendages {
+                let p_right = right_of[*parent];
+                let p_left  = left_of[*parent];
+                let r_idx = body_parts.len();
+                body_parts.push(make(app_raw.clone(), *is_limb, p_right));
+                let l_idx = body_parts.len();
+                body_parts.push(make(crate::body_part::mirror_right_to_left(app_raw), *is_limb, p_left));
+                right_of.push(r_idx);
+                left_of.push(l_idx);
             }
         }
     }

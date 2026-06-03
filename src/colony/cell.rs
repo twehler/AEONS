@@ -78,12 +78,17 @@ pub const CELL_COLLISION_RADIUS: f32 = CELL_SPACING * 0.7;
 pub enum CellType {
     Photo,
     NonPhoto,
-    /// Inert debug/placeholder cell. Renders blue (a body part containing
-    /// any Placeholder cell uses the debug-blue material — see
-    /// `OrganismMaterials::handle_for`). Never photosynthesises; counts as
-    /// body mass like `NonPhoto` for upkeep. Used by the species editor to
-    /// sketch out new body parts.
+    /// Inert debug/placeholder cell. Renders blue. Never photosynthesises;
+    /// counts as body mass like `NonPhoto` for upkeep. Used by the species
+    /// editor to sketch out new (main-body) limbs.
     Placeholder,
+    /// Inert placeholder cell rendered PURPLE — functionally identical to
+    /// `Placeholder` (non-photosynthetic, body-mass upkeep, sketch cell),
+    /// but a distinct colour so first-grade SUB-LIMBS (limbs attached to a
+    /// parent limb rather than the main body) read differently from their
+    /// parent limbs. The species editor auto-selects this type when
+    /// sketching a sub-limb; it can also be placed manually from the swatch.
+    SubLimb,
 }
 
 impl CellType {
@@ -103,6 +108,8 @@ impl CellType {
             CellType::NonPhoto    => [0.6038, 0.0331, 0.0331],
             // sRGB (0.2, 0.4, 0.95) — debug blue
             CellType::Placeholder => [0.0331, 0.1329, 0.8902],
+            // sRGB (0.6, 0.2, 0.9) — purple (sub-limb marker)
+            CellType::SubLimb     => [0.3186, 0.0331, 0.7874],
         }
     }
 
@@ -308,7 +315,7 @@ impl BodyPart {
             // Placeholder counts as non-photo body mass for upkeep.
             match c.cell_type {
                 CellType::Photo                          => p  += 1,
-                CellType::NonPhoto | CellType::Placeholder => np += 1,
+                CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => np += 1,
             }
         }
         (p, np)

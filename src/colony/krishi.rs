@@ -221,7 +221,7 @@ fn spawn_krishi(
         // Krishi keeps legacy sliding movement — it has a hand-built
         // static body and no limbs to drive locomotion through.
         sliding_movement:     true,
-        limb_targets:         [0.0; 6],
+        limb_targets:         [0.0; 8],
         // Krishi has a hand-built footprint and never grows — adult
         // from spawn. (No mesh smoothing is run because Krishi's body
         // part is `regrowable: false`, so spawn_organism skips mesh

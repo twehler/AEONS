@@ -73,7 +73,7 @@ fn root_part(ocg: &[(usize, Vec3, CellType)]) -> WireBodyPart {
     }
 }
 
-fn appendage_part(ocg: &[(usize, Vec3, CellType)], is_limb: bool) -> WireBodyPart {
+fn appendage_part(ocg: &[(usize, Vec3, CellType)], is_limb: bool, parent_idx: u32) -> WireBodyPart {
     if is_limb {
         // Rebase to first-cell pivot — mirrors `placement::limb_body_part`.
         let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
@@ -82,14 +82,14 @@ fn appendage_part(ocg: &[(usize, Vec3, CellType)], is_limb: bool) -> WireBodyPar
             .collect();
         WireBodyPart {
             kind:       BodyPartKind::Limb,
-            attachment: Some((0, pivot)),
+            attachment: Some((parent_idx, pivot)),
             cells:      shifted.iter().map(|(_, p, ct)| (*p, *ct)).collect(),
             ocg:        shifted,
         }
     } else {
         WireBodyPart {
             kind:       BodyPartKind::Organ,
-            attachment: Some((0, Vec3::ZERO)),
+            attachment: Some((parent_idx, Vec3::ZERO)),
             cells:      ocg.iter().map(|(_, p, ct)| (*p, *ct)).collect(),
             ocg:        ocg.to_vec(),
         }
@@ -112,15 +112,27 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
     //    constructs at runtime so saves round-trip pixel-for-pixel.
     let root_ocg = tpl.build_ocg();
     let mut parts: Vec<WireBodyPart> = vec![root_part(&root_ocg)];
-    for (app_raw, is_limb) in &tpl.custom_appendages {
-        match tpl.symmetry {
-            Symmetry::Bilateral => {
-                parts.push(appendage_part(app_raw, *is_limb));
-                let mirrored = crate::body_part::mirror_right_to_left(app_raw);
-                parts.push(appendage_part(&mirrored, *is_limb));
+    // Same editor→runtime parent mapping as `placement::spawn_real_organism`
+    // so the saved attachment indices match what spawn builds.
+    match tpl.symmetry {
+        Symmetry::NoSymmetry => {
+            for (app_raw, is_limb, parent) in &tpl.custom_appendages {
+                parts.push(appendage_part(app_raw, *is_limb, *parent as u32));
             }
-            Symmetry::NoSymmetry => {
-                parts.push(appendage_part(app_raw, *is_limb));
+        }
+        Symmetry::Bilateral => {
+            let mut right_of: Vec<u32> = vec![0];
+            let mut left_of:  Vec<u32> = vec![0];
+            for (app_raw, is_limb, parent) in &tpl.custom_appendages {
+                let p_right = right_of[*parent];
+                let p_left  = left_of[*parent];
+                let r_idx = parts.len() as u32;
+                parts.push(appendage_part(app_raw, *is_limb, p_right));
+                let l_idx = parts.len() as u32;
+                let mirrored = crate::body_part::mirror_right_to_left(app_raw);
+                parts.push(appendage_part(&mirrored, *is_limb, p_left));
+                right_of.push(r_idx);
+                left_of.push(l_idx);
             }
         }
     }
@@ -132,7 +144,7 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
         for (_, ct) in &p.cells {
             match ct {
                 CellType::Photo                            => photo_cells     += 1,
-                CellType::NonPhoto | CellType::Placeholder => non_photo_cells += 1,
+                CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => non_photo_cells += 1,
             }
         }
     }
@@ -204,6 +216,7 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
                 CellType::Photo       => 0,
                 CellType::NonPhoto    => 1,
                 CellType::Placeholder => 2,
+                CellType::SubLimb     => 3,
             });
             put_f32(buf, 1.0);       // cell_energy — DEFAULT_CELL_ENERGY
             put_u8 (buf, 0);         // neighbour_count — recomputed at load
@@ -218,6 +231,7 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
                 CellType::Photo       => 0,
                 CellType::NonPhoto    => 1,
                 CellType::Placeholder => 2,
+                CellType::SubLimb     => 3,
             });
         }
     }

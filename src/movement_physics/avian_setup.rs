@@ -17,20 +17,57 @@
 //
 //   * Limb-based organisms (`Organism::sliding_movement == false`) get
 //     a `RigidBody::Dynamic` PER BODY PART, each with its own compound
-//     collider (cells of that part), and a `SphericalJoint` between
-//     attached parts (anchor1 = `attachment.origin_local` in the
-//     parent, anchor2 = ZERO on the child since limb parts are rebased
-//     to a first-cell pivot). The base body is the root of the chain;
-//     limbs hang off it through spherical (3-DOF) joints. Brains
-//     drive PD target angles into those joints in Phase 4.
+//     collider (cells of that part), and a `RevoluteJoint` (1-DOF hinge
+//     + in-solver spring-damper motor) between attached parts. The joint
+//     is anchored at the limb's FIRST cell centre (anchor2 = ZERO on the
+//     child since limb parts are rebased to that pivot; anchor1 = the same
+//     point in the parent's frame), so the limb rotates about — and can
+//     never separate from — its attachment point. The base body is the
+//     root of the chain; limbs hang off it through these hinges. The brain
+//     drives each hinge's target angle directly (`drive_limb_motors`), so
+//     walking EMERGES from learned per-joint motion.
 //
 // Gravity is the Avian default (`Vec3::new(0.0, -9.81, 0.0)`), which
 // matches AEONS's `+Y`-up world.
 
 use avian3d::prelude::*;
 use bevy::prelude::*;
+use bevy::ecs::system::SystemParam;
 
 use crate::world_geometry::{HeightmapSampler, HEIGHTMAP_CELL_SIZE};
+
+
+/// Avian collision-filter hook: reject contacts between two colliders that
+/// belong to the SAME organism. Every body part is a flat child of its
+/// `OrganismRoot` (`commands.entity(root).add_child(child)` at spawn), so
+/// two body parts of one organism share the same `ChildOf` parent. A
+/// creature's own parts are held together by the joint chain; letting them
+/// ALSO collide makes the contact solver fight the joints (contact pushes
+/// apart, joint pulls together), and on the very light limb bodies that
+/// conflict erupts into explosive linear+angular velocity (the "flying"
+/// bug) and floods Avian's contact graph (the `prepare_contact_constraints`
+/// panic). Filtering same-organism pairs removes both at the source while
+/// leaving inter-organism collisions and limb↔terrain contacts intact.
+///
+/// Activated per collider by the `ActiveCollisionHooks::FILTER_PAIRS`
+/// component (added to every limb body part at spawn); registered via
+/// `PhysicsPlugins::with_collision_hooks`.
+#[derive(SystemParam)]
+pub struct SelfCollisionFilter<'w, 's> {
+    parents: Query<'w, 's, &'static ChildOf>,
+}
+
+impl CollisionHooks for SelfCollisionFilter<'_, '_> {
+    fn filter_pairs(&self, collider1: Entity, collider2: Entity, _commands: &mut Commands) -> bool {
+        match (self.parents.get(collider1), self.parents.get(collider2)) {
+            // Same organism root → same creature → don't collide.
+            (Ok(p1), Ok(p2)) => p1.parent() != p2.parent(),
+            // One/both have no parent (e.g. terrain, or a sliding organism's
+            // single root collider) → allow the contact.
+            _ => true,
+        }
+    }
+}
 
 
 pub struct AvianSetupPlugin;
@@ -52,7 +89,7 @@ pub use crate::simulation_settings::LIMB_JOINT_COMPLIANCE;
 
 impl Plugin for AvianSetupPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(PhysicsPlugins::default());
+        app.add_plugins(PhysicsPlugins::default().with_collision_hooks::<SelfCollisionFilter>());
         app.insert_resource(SubstepCount(LIMB_SOLVER_SUBSTEPS));
         // One-shot terrain collider — fires the first time
         // `HeightmapSampler` exists AND no collider has been spawned yet.
@@ -63,20 +100,19 @@ impl Plugin for AvianSetupPlugin {
                     .and(not(resource_exists::<TerrainColliderSpawned>)),
             ),
         );
-        // PD-style torque application for limb-based organisms — reads
-        // the brain's `Organism::limb_targets` and applies torques to
-        // the dynamic body-part rigid bodies. Runs in `FixedUpdate`,
-        // NOT `Update`: Avian steps the physics in `FixedPostUpdate`,
-        // which runs once per `FixedMain` iteration (N times per real
-        // frame, scaling with `TimeSpeed`). Avian clears applied forces
-        // after each step, so a torque applied once per real frame in
-        // `Update` only actuated ~1/N of the physics steps at high
-        // speed — the limbs coasted the rest. Running here re-applies
-        // the brain's target torque on EVERY physics step, so control
-        // authority is invariant to `TimeSpeed` / frame rate.
-        // `FixedUpdate` runs before `FixedPostUpdate` within each
-        // iteration, so the torque is in place when the step solves.
-        app.add_systems(FixedUpdate, apply_limb_pd_torques);
+        // Sweep dangling/leaked limb joints BEFORE the physics step so the
+        // solver never processes a joint whose body was despawned.
+        app.add_systems(PreUpdate, cleanup_orphaned_limb_joints);
+        // EMERGENT locomotion: the brain drives each limb hinge's target angle
+        // directly (no CPG generating the rhythm, no pursuit force aiming the
+        // body). `drive_limb_motors` just copies `Organism::limb_targets` onto
+        // the hinge motors. Runs in `FixedUpdate` (NOT `Update`): Avian steps
+        // the physics in `FixedPostUpdate`, N times per real frame at high
+        // `TimeSpeed`, and `FixedUpdate` runs first within each iteration — so
+        // the latest setpoint is in place when each step solves, invariant to
+        // `TimeSpeed` / frame rate. (The motor setpoint also persists on the
+        // joint, so Avian re-applies it every substep regardless.)
+        app.add_systems(FixedUpdate, drive_limb_motors);
         // Per-entity collision flags for limb-based body parts. Reads
         // `CollisionStart` / `CollisionEnd` messages emitted by Avian's
         // narrow phase.
@@ -90,6 +126,15 @@ impl Plugin for AvianSetupPlugin {
         // is double-buffered so a one-frame lag (matching the custom
         // collision path, which runs in `Last`) is harmless.
         app.add_systems(Update, emit_limb_contact_events);
+        // Per-part non-penetration floor: pushes only the body parts that dip
+        // below the terrain back up to the surface (legs fold; nothing is
+        // hoisted), so the world is solid concrete AND the posture stays natural
+        // (belly resting at the surface, no parts hanging in the air). Runs
+        // after Avian's step is synced for the frame; gated on the heightmap.
+        app.add_systems(
+            PostUpdate,
+            enforce_limb_floor.run_if(resource_exists::<HeightmapSampler>),
+        );
     }
 }
 
@@ -126,7 +171,7 @@ pub struct LimbContact {
 }
 
 
-/// Last torque commanded by `apply_limb_pd_torques` for this body
+/// Last torque commanded by `drive_limb_motors` for this body
 /// part, in world frame. Updated every brain-tick frame; read by
 /// `dataset_export` to log per-organism `torque_norm`. Pure telemetry
 /// — does not influence physics. Inserted at spawn on every limb-
@@ -135,31 +180,110 @@ pub struct LimbContact {
 pub struct LastAppliedTorque(pub Vec3);
 
 
-/// DIAGNOSTIC OVERRIDE (Tier 1 experiment, May 2026).
+/// Marker on each limb `RevoluteJoint` entity linking it back to the
+/// organism + body part it drives. `drive_limb_motors` queries these
+/// to set the joint motor's `target_position` from the brain's
+/// `Organism::limb_targets` each tick. `limb_entity` is the limb body
+/// part's entity (for `LastAppliedTorque` telemetry); `body_part` is its
+/// `BodyPartIndex` (used to pick the matching brain output `limb_targets[body_part-1]`).
+#[derive(Component, Clone, Copy)]
+pub struct LimbJointDrive {
+    pub organism:    Entity,
+    pub body_part:   usize,
+    pub limb_entity: Entity,
+}
+
+/// Despawn limb `RevoluteJoint` entities whose constrained bodies no longer
+/// exist. The joints are standalone entities (NOT children of the organism
+/// root), so when a body part is eaten (`predation`) or an organism dies
+/// (`energy`), nothing despawns the joints that referenced those bodies:
+/// they LEAK (accumulating forever over a long run) and DANGLE (pointing at
+/// despawned entities). A dangling joint feeds Avian's solver a stale body
+/// reference, which under heavy collider churn corrupts the contact graph
+/// and panics in `prepare_contact_constraints`. This sweep removes any limb
+/// joint with a missing endpoint. It runs in `PreUpdate` — before the
+/// `FixedMain` physics step — so the next solve never sees a dangling joint.
+pub fn cleanup_orphaned_limb_joints(
+    mut commands: Commands,
+    joints:       Query<(Entity, &avian3d::prelude::RevoluteJoint), With<LimbJointDrive>>,
+    bodies:       Query<(), With<RigidBody>>,
+) {
+    for (joint_entity, joint) in &joints {
+        // Both endpoints are limb body parts (Dynamic rigid bodies). If
+        // either no longer has a RigidBody, it was despawned → orphaned.
+        if bodies.get(joint.body1).is_err() || bodies.get(joint.body2).is_err() {
+            commands.entity(joint_entity).try_despawn();
+        }
+    }
+}
+
+
+/// Hard non-penetration floor for limb-based organisms — the world behaves like
+/// SOLID CONCRETE: no body part may sink below the terrain surface.
 ///
-/// When `Some(v)`, `apply_limb_pd_torques` ignores the brain's
-/// `Organism::limb_targets` and applies `v` (world-frame torque, N·m)
-/// to every limb body part every frame — base body included. The PD
-/// math is skipped entirely. This is the cheapest way to verify
-/// whether the force-injection pipeline (`Forces::apply_torque` →
-/// Avian integrator → body motion) is wired correctly.
+/// Avian's contact solver alone cannot guarantee this here: a limb organism
+/// rests its belly on the terrain while its RIGID leg joints (point_compliance
+/// = 0) demand the feet sit a fixed offset BELOW the body — geometrically below
+/// the surface. The belly contact (pinning the body down) and the foot contacts
+/// (pushing up) are mutually incompatible, so the finite-substep solver leaves
+/// the feet penetrating ~0.8–1.1 units (measured). That sinks the feet into the
+/// "concrete" and impairs locomotion.
 ///
-/// Expected outcome when `Some(Vec3::new(50.0, 0.0, 0.0))`:
-///   * If organisms tumble around, the brain output isn't reaching
-///     the controller / Avian is fine → the bug is in the brain →
-///     controller path.
-///   * If organisms still don't move, `Forces::apply_torque` isn't
-///     reaching the integrator → the bug is in the physics setup.
+/// This system enforces non-penetration PER PART (not a whole-body hoist): for
+/// each body part whose collider bottom is below the terrain, it lifts ONLY that
+/// part up to the surface and zeroes its downward velocity. A whole-organism
+/// rigid lift (the earlier version) raised the belly far above the ground to
+/// keep the lowest foot at the surface — leaving the body and other feet
+/// "hanging in the air" (the unnatural posture). Lifting each penetrating part
+/// individually instead lets the body settle NATURALLY: the belly rests at the
+/// surface and the lower legs/feet — which would otherwise jut below it — are
+/// pushed up to the surface too, the hinge joints simply folding to absorb the
+/// motion (they can't separate — the joint is a positional constraint, not a
+/// translation). Result: nothing penetrates AND nothing floats; the creature
+/// lies/stands with all its lowest points resting on the ground, gravity
+/// respected. A small margin keeps the collider bottoms a hair above the surface
+/// so they read as resting on it rather than flickering in/out of contact.
 ///
-/// Set back to `None` once the experiment is done.
-///
-/// Outcome (May 2026): with `MassPropertiesBundle::from_shape(...)`
-/// now wired in at spawn, the test produced visible body rotation —
-/// confirming the force-injection pipeline works and the original
-/// "frozen body" bug was the uninitialised inverse-inertia default.
-/// Kept here (set to `None`) as a quick switch for any future
-/// regression where the bodies appear to stop responding to torque.
-const CONSTANT_TORQUE_TEST: Option<Vec3> = None;
+/// Runs in `PostUpdate` (after Avian syncs the step's results), mirroring the
+/// sliding organisms' `apply_floor_collision`. Gated on `HeightmapSampler`.
+pub fn enforce_limb_floor(
+    heightmap: Res<HeightmapSampler>,
+    mut parts: Query<
+        (&crate::cell::BodyPartIndex, &ColliderAabb, &mut Position, &mut LinearVelocity),
+        With<LimbContact>,
+    >,
+) {
+    const FLOOR_MARGIN: f32 = -0.08;
+    // Cap the per-frame correction so the floor nudges a sunk part up gently
+    // over a few frames rather than TELEPORTING it (a large instantaneous jump
+    // injects energy through the joint and can fling a part — the rare deep
+    // outlier seen in the data). At the physics rate a few-frame convergence is
+    // imperceptible while staying non-penetrating.
+    const MAX_LIFT_PER_STEP: f32 = 3.0;
+    // The BASE belly gets a deadzone: it may graze / lightly contact the ground
+    // (its low-friction slide is the locomotion substrate and must stay
+    // undisturbed), and is only pushed back when it dips DEEPER than this — so
+    // the belly never deeply sinks but its sliding dynamics, hence the directed
+    // limb-propelled movement, are preserved. The LIMB feet (the "sub-limbs"
+    // the user saw sinking) are floored hard to the surface (deadzone 0).
+    const BASE_DEADZONE: f32 = 0.2;
+    for (bp_idx, aabb, mut position, mut linvel) in parts.iter_mut() {
+        let deadzone = if bp_idx.0 == 0 { BASE_DEADZONE } else { 0.0 };
+        let cx = 0.5 * (aabb.min.x + aabb.max.x);
+        let cz = 0.5 * (aabb.min.z + aabb.max.z);
+        let terrain = heightmap.height_at(cx, cz);
+        let pen = (terrain + FLOOR_MARGIN) - aabb.min.y - deadzone;   // > 0 ⇒ below the allowed level
+        if pen > 0.0 {
+            position.0.y += pen.min(MAX_LIFT_PER_STEP);
+            // Only cancel a DOWNWARD velocity that is faster than the gentle
+            // settle, so the leg's propulsion stroke (and the body weight
+            // pressing the feet for grip) is preserved — we don't freeze the
+            // part, just stop it driving further into the ground.
+            if linvel.0.y < -0.5 { linvel.0.y = -0.5; }
+        }
+    }
+}
+
 
 /// Read Avian's collision start/end messages and toggle each
 /// participating body part's `LimbContact` flag. Both colliders in an
@@ -309,142 +433,65 @@ fn spawn_terrain_collider(
 }
 
 
-// ── PD-on-angle torque controller ────────────────────────────────────────────
+// ── Limb hinge-motor target driver (EMERGENT, brain-driven) ──────────────────
 
-/// Position gain — torque-per-radian. Multiplies the joint-angle error
-/// (target − current) to produce the restoring torque component.
-///
-/// HIGH-gain PD position control (legged_gym / Isaac-Gym style): the
-/// gain must be large enough that, when the brain commands a target
-/// angle "into the ground" and the contact blocks the joint, the
-/// residual-error torque can actually drive the body upward — i.e.
-/// `KP × max_error ≳ body weight × lever`. At the old `KP = 12` the
-/// max spring torque (12 × MAX_JOINT_ANGLE ≈ 25 N·m) was below the
-/// organism's weight, so a planted limb could never press the body
-/// up — a concrete reason locomotion never emerged. `KP = 40` gives
-/// ≈ 84 N·m of stance authority, comfortably above a density-0.2
-/// organism's weight.
-use crate::simulation_settings::KP_TORQUE;
+use crate::simulation_settings::{LIMB_SWING_LIMIT, MAX_LIMB_JOINTS};
 
-use crate::simulation_settings::KD_TORQUE;
-
-use crate::simulation_settings::MAX_JOINT_ANGLE;
-
-/// Read `Organism::limb_targets` on each limb-based organism and apply
-/// PD-on-angle torques to its dynamic limb rigid bodies. The base body
-/// (`BodyPartIndex(0)`) is skipped — the brain only commands appendages.
+/// Drive each limb's hinge toward the brain's target angle by writing the
+/// `RevoluteJoint` **angular motor**'s `target_position` DIRECTLY from the
+/// brain's per-joint output. The motor itself (a stable
+/// `MotorModel::SpringDamper`, configured at spawn) runs inside Avian's XPBD
+/// solver every substep and tracks the setpoint; this system only refreshes
+/// the setpoint each physics step.
 ///
-/// Joint angle is computed as the relative rotation between the limb
-/// and its logical parent body-part (resolved via
-/// `Organism::body_parts[i].attachment.parent_idx`). The brain's
-/// target unit-vector is scaled by `MAX_JOINT_ANGLE` to get the desired
-/// Euler-XYZ angle in the parent's local frame. Torque is then
-/// `KP * (target − current) − KD * ω`, rotated back into world frame by
-/// the parent's orientation before `apply_torque` (which is world-frame
-/// in Avian).
+/// This is the EMERGENT-locomotion contract: there is NO central pattern
+/// generator producing the rhythm and NO pursuit force aiming the body. The
+/// brain must learn — per joint — a phase-locked angle trajectory whose ground
+/// reaction nets forward thrust (the reward in `limb_ppo.rs` shapes this). The
+/// brain is handed a phase-clock signal as an *observation* (see
+/// `build_observation`) so a feedforward policy can phase-lock a sustained
+/// oscillation, but it generates every joint command itself.
 ///
-/// Mapping from body-part index to `limb_targets` slice:
+/// Mapping: brain output `limb_targets[i-1]` (∈ [-1, 1]) → the hinge of
+/// body-part index `i`, scaled to a target hinge angle in
+/// `[-LIMB_SWING_LIMIT, +LIMB_SWING_LIMIT]`. Each runtime limb part (including
+/// every Bilateral-mirror half and every multi-segment knee) thus gets its own
+/// independent command, so an alternating / coordinated gait can emerge rather
+/// than being imposed. Parts beyond `MAX_LIMB_JOINTS` wrap modulo (rare).
 ///
-///   * idx 1, 2 → pair 0 (`limb_targets[0..3]`) — first appendage pair
-///   * idx 3, 4 → pair 1 (`limb_targets[3..6]`) — second appendage pair
-///
-/// The LEFT half of a pair (odd offset within a pair) gets its X-axis
-/// target sign-flipped so a mirrored pair swings in opposite directions.
-pub fn apply_limb_pd_torques(
+/// The in-solver motor acts on the hinge axis ONLY (1-DOF — structurally cannot
+/// push off-hinge), uses implicit-Euler integration (unconditionally stable),
+/// and reads the true hinge angle via `atan2` (no Euler decomposition → no
+/// gimbal singularity), which is why it has none of the failure modes of the
+/// old external `Forces::apply_torque` PD-on-Euler controller.
+pub fn drive_limb_motors(
     sim_running: Res<crate::simulation_settings::SimulationRunning>,
-    organisms: Query<&crate::colony::Organism>,
-    bp_rot:    Query<(&crate::cell::BodyPartIndex, &bevy::prelude::ChildOf, &Rotation), With<RigidBody>>,
-    mut bp_q:  Query<(
-        Entity,
-        &crate::cell::BodyPartIndex,
-        &bevy::prelude::ChildOf,
-        &Rotation,
-        Forces,
-    ), With<RigidBody>>,
+    organisms:   Query<&crate::colony::Organism>,
+    mut joints:  Query<(&LimbJointDrive, &mut avian3d::prelude::RevoluteJoint)>,
     mut torque_log: Query<&mut LastAppliedTorque>,
 ) {
-    // Do NOT apply torque while the simulation is paused (e.g. the
-    // user switched to the Colony / Species editor, which pauses
-    // `Time<Virtual>` and thereby freezes Avian's physics step).
-    // `Forces::apply_torque` ACCUMULATES into each body's integration
-    // buffer and that buffer is only cleared when a physics step runs.
-    // With the step frozen, every paused frame adds another dose of
-    // angular acceleration; the first resumed step then integrates the
-    // whole accumulated pile at once and the organisms explode outward.
-    // Gating on `SimulationRunning` keeps the buffer from accumulating
-    // while paused. (The brain apply systems are already paused — they
-    // run on a virtual-time `on_timer`.)
+    // Skip while paused: the motor setpoint persists on the joint component
+    // (Avian re-applies it every substep), so there is nothing to refresh.
     if !sim_running.0 { return; }
 
-    // ── Tier 1 diagnostic shortcut. If `CONSTANT_TORQUE_TEST` is on,
-    // bypass the brain + PD math entirely and inject a fixed world-
-    // frame torque into every limb body part (including the base, so
-    // we get a strong directly-observable spin if Avian is integrating
-    // anything). The early return below skips the entire normal
-    // pipeline so we can be sure the only forces in play are the
-    // constants we wrote here.
-    if let Some(test_torque) = CONSTANT_TORQUE_TEST {
-        for (e, _idx, parent, _rot, mut forces) in &mut bp_q {
-            let Ok(organism) = organisms.get(parent.parent()) else { continue };
-            if organism.sliding_movement { continue; }
-            forces.apply_torque(test_torque);
-            if let Ok(mut last) = torque_log.get_mut(e) { last.0 = test_torque; }
-        }
-        return;
-    }
-
-    // (organism_root, body_part_idx) → world rotation. Built in one pass
-    // so the actuator loop can look up each limb's logical parent
-    // without traversing the Bevy hierarchy (limbs are siblings of the
-    // base under `OrganismRoot`, joints are separate entities).
-    let mut rot_map: std::collections::HashMap<(Entity, usize), Quat> =
-        std::collections::HashMap::new();
-    for (idx, parent, rot) in &bp_rot {
-        rot_map.insert((parent.parent(), idx.0), rot.0);
-    }
-
-    for (e, idx, parent, child_rot, mut forces) in &mut bp_q {
-        let i = idx.0;
-        if i == 0 {
-            // Base body — record zero torque (we never command it).
-            if let Ok(mut last) = torque_log.get_mut(e) { last.0 = Vec3::ZERO; }
-            continue;
-        }
-        let Ok(organism) = organisms.get(parent.parent()) else { continue };
+    for (drive, mut joint) in &mut joints {
+        let Ok(organism) = organisms.get(drive.organism) else { continue };
         if organism.sliding_movement { continue; }
-        if i >= organism.body_parts.len() { continue; }
-        let Some(attach) = organism.body_parts[i].attachment.as_ref() else { continue };
-        let Some(&parent_rot) = rot_map.get(&(parent.parent(), attach.parent_idx))
-            else { continue };
+        let i = drive.body_part;
+        if i == 0 || i >= organism.body_parts.len() { continue; }
 
-        // Relative rotation in the parent's frame, decomposed to
-        // Euler-XYZ. Note: Euler decomposition has well-known
-        // singularities; for limb swings within ±π/2 the XYZ extraction
-        // is well-conditioned.
-        let q_rel = parent_rot.inverse() * child_rot.0;
-        let (cx, cy, cz) = q_rel.to_euler(EulerRot::XYZ);
-        let current = Vec3::new(cx, cy, cz);
+        // Pick this joint's brain output: body-part i ↔ output (i-1), wrapping
+        // beyond MAX_LIMB_JOINTS so deeper parts still get a (shared) command.
+        let out_idx = (i - 1) % MAX_LIMB_JOINTS;
+        let cmd = organism.limb_targets[out_idx].clamp(-1.0, 1.0);
+        let target = cmd * LIMB_SWING_LIMIT;
 
-        let pair_idx = ((i - 1) / 2).min(1);
-        let half_idx = (i - 1) % 2;
-        let base = pair_idx * 3;
-        let mut target_unit = Vec3::new(
-            organism.limb_targets[base],
-            organism.limb_targets[base + 1],
-            organism.limb_targets[base + 2],
-        );
-        if half_idx == 1 { target_unit.x = -target_unit.x; }
-        let target = target_unit * MAX_JOINT_ANGLE;
+        joint.motor.target_position = target;
+        joint.motor.enabled = true;
 
-        let ang_vel_world = forces.angular_velocity();
-        // Spring term lives in parent's local frame; rotate to world.
-        // KD damping is applied directly on world-frame ω.
-        let local_spring = KP_TORQUE * (target - current);
-        let torque = parent_rot * local_spring - KD_TORQUE * ang_vel_world;
-        forces.apply_torque(torque);
-        // Telemetry: record the world-frame torque magnitude so the
-        // dataset exporter can answer "is the controller producing
-        // anything at all?" without instrumenting Avian itself.
-        if let Ok(mut last) = torque_log.get_mut(e) { last.0 = torque; }
+        // Telemetry proxy: record the commanded hinge angle.
+        if let Ok(mut last) = torque_log.get_mut(drive.limb_entity) {
+            last.0 = Vec3::new(target, 0.0, 0.0);
+        }
     }
 }

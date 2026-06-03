@@ -50,13 +50,13 @@ pub struct LoadedSpecies {
     /// need to know the difference.
     pub ocg:               Vec<(usize, Vec3, CellType)>,
     /// Appendage parts (index ≥ 1 in the species), each as `(OCG,
-    /// is_limb)`: the raw stored OCG (right-half for bilateral, full
-    /// for NoSymmetry) and the limb flag (limbs spawn with
-    /// `BodyPartKind::Limb` and animate at runtime). Expanded to
-    /// runtime body parts at spawn (bilateral → mirrored pair
-    /// attached to the base; NoSymmetry → one attached part). Empty
-    /// for single-part / legacy species.
-    pub appendages:        Vec<(Vec<(usize, Vec3, CellType)>, bool)>,
+    /// is_limb, parent)`: the raw stored OCG (right-half for bilateral,
+    /// full for NoSymmetry), the limb flag, and the EDITOR parent index
+    /// (0 = main body; a value pointing at another limb = a sub-limb).
+    /// Expanded to runtime body parts at spawn (bilateral → mirrored pair
+    /// attached to the parent's matching side; NoSymmetry → one part).
+    /// Empty for single-part / legacy species.
+    pub appendages:        Vec<(Vec<(usize, Vec3, CellType)>, bool, usize)>,
     /// `Some` when this species was loaded from a `.species` v3 file
     /// that carried trained brain weights. Every organism spawned
     /// from this species gets a copy of the payload attached as a

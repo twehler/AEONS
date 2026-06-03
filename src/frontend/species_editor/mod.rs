@@ -22,6 +22,9 @@ pub mod body_part_panel;
 pub mod bottom_panel;
 pub mod camera;
 pub mod clear_modal;
+pub mod convert_to_cellular_mesh;
+pub mod deletion;
+pub mod mesh_import;
 pub mod placement;
 pub mod save;
 pub mod session;
@@ -76,6 +79,8 @@ impl Plugin for SpeciesEditorPlugin {
             .add_plugins(clear_modal::ClearModalPlugin)
             .init_resource::<session::SpeciesSession>()
             .init_resource::<placement::PlacementSnap>()
+            .init_resource::<mesh_import::MeshImport>()
+            .init_resource::<deletion::DeletionTarget>()
             .init_resource::<camera::StashedSimCameraTransform>()
             .init_resource::<undo::SpeciesUndo>()
             // Top-panel button + cycler handlers.
@@ -83,8 +88,10 @@ impl Plugin for SpeciesEditorPlugin {
                 top_panel::handle_cycler_clicks,
                 top_panel::sync_cycler_labels,
                 top_panel::sync_cycler_lock_state,
-                top_panel::handle_spawn_first_cell,
                 top_panel::handle_create_species,
+                top_panel::handle_load_species,
+                top_panel::manage_load_modal_visibility,
+                top_panel::handle_load_modal_buttons,
             ))
             // Bottom-panel tile picker.
             .add_systems(Update, (
@@ -109,6 +116,29 @@ impl Plugin for SpeciesEditorPlugin {
                 placement::update_preview_cell,
                 placement::handle_left_click_place,
             ))
+            // Cell-Deletion Mode: toggle button, hover highlight, click-delete.
+            // Hover runs before click so the click reads a fresh target.
+            .add_systems(Update, (
+                deletion::handle_cell_deletion_button,
+                (deletion::update_deletion_hover, deletion::handle_deletion_click).chain(),
+            ))
+            // Temporary `.glb` mesh import + Blender-style scaling.
+            .add_systems(Update, (
+                mesh_import::handle_import_button,
+                mesh_import::manage_warning_modal_visibility,
+                mesh_import::handle_warning_modal_buttons,
+                mesh_import::apply_imported_mesh_render_layers,
+                mesh_import::apply_mesh_scale,
+                mesh_import::manage_overlay_entities,
+                mesh_import::update_scale_interaction,
+                mesh_import::cleanup_on_mode_exit,
+                mesh_import::sync_with_session,
+            ))
+            // Voxelize an imported mesh into AEONS cells.
+            .add_systems(Update, (
+                convert_to_cellular_mesh::manage_convert_button_visibility,
+                convert_to_cellular_mesh::handle_convert_button,
+            ))
             // Undo (Ctrl+Z). `track` records prior states; `handle`
             // restores. `track` is ordered AFTER the mutating systems and
             // the undo handler so a restore is synced, not re-captured.
@@ -131,4 +161,6 @@ pub fn spawn_overlay_panels(parent: &mut ChildSpawnerCommands, top_offset_px: f3
     bottom_panel::spawn_bottom_panel(parent);
     body_part_panel::spawn_body_part_panel(parent, top_offset_px);
     clear_modal::spawn_clear_new_button(parent);
+    deletion::spawn_cell_deletion_button(parent);
+    convert_to_cellular_mesh::spawn_convert_button(parent);
 }

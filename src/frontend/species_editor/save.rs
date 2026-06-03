@@ -57,13 +57,14 @@ use super::session::{Classification, Metabolism, SpeciesMovement, SpeciesSession
 /// sliding (legacy), 0 = limb-based. Pre-v6 files default this flag
 /// to `true` on load (matches the simulation default before the
 /// physics + PPO pipeline existed).
+const MAGIC_V7:     &[u8; 8] = b"AEONSS07";
 const MAGIC_V6:     &[u8; 8] = b"AEONSS06";
 const MAGIC_V5:     &[u8; 8] = b"AEONSS05";
 const MAGIC_V4:     &[u8; 8] = b"AEONSS04";
 const MAGIC_V3:     &[u8; 8] = b"AEONSS03";
 const MAGIC_V2:     &[u8; 8] = b"AEONSS02";
 const MAGIC_V1:     &[u8; 8] = b"AEONSS01";
-const MAGIC: &[u8; 8] = MAGIC_V6;
+const MAGIC: &[u8; 8] = MAGIC_V7;
 
 
 pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
@@ -136,13 +137,22 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     let sliding_byte: u8 = if session.draft.movement.is_sliding() { 1 } else { 0 };
     buf.push(sliding_byte);
 
-    // v5: multi-part body with per-part `is_limb` flag. Skip empty parts
-    // (e.g. an appendage that was begun but never given a cell).
-    let parts: Vec<&super::session::EditorBodyPart> =
-        session.body_parts.iter().filter(|p| !p.ocg.is_empty()).collect();
-    buf.extend_from_slice(&(parts.len() as u32).to_le_bytes());
-    for part in parts {
-        write_body_part(&mut buf, &part.name, part.is_limb, &part.ocg);
+    // v5+: multi-part body with per-part `is_limb` flag. Skip empty parts
+    // (e.g. an appendage that was begun but never given a cell). Because
+    // filtering drops parts, the per-part `parent` index (into the FULL
+    // list) must be REMAPPED to the index within the filtered list, or a
+    // dropped part before a referenced one would shift every later parent.
+    let kept: Vec<usize> = session.body_parts.iter().enumerate()
+        .filter(|(_, p)| !p.ocg.is_empty()).map(|(i, _)| i).collect();
+    let mut remap = vec![0usize; session.body_parts.len()];
+    for (filtered_i, &full_i) in kept.iter().enumerate() { remap[full_i] = filtered_i; }
+    buf.extend_from_slice(&(kept.len() as u32).to_le_bytes());
+    for &full_i in &kept {
+        let part = &session.body_parts[full_i];
+        // A part's parent always has cells (contact-derived), so it's a kept
+        // part; `remap` gives its filtered index (defaults to 0 = base).
+        let parent_filtered = remap.get(part.parent).copied().unwrap_or(0);
+        write_body_part(&mut buf, &part.name, part.is_limb, parent_filtered, &part.ocg);
     }
 
     // Brain block — editor saves write `brain_present = 0`. Weights are
@@ -153,14 +163,16 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     buf
 }
 
-/// Write one v5 body part: `u32 name_len`, name bytes, `u8 is_limb`,
+/// Write one body part: `u32 name_len`, name bytes, `u8 is_limb`,
+/// `u32 parent` (v7+ — index of the parent body part; 0 = main body),
 /// `u32 ocg_count`, then the OCG entries (`u32 idx`, 3×`f32` pos, `u8`
 /// cell_type).
-fn write_body_part(buf: &mut Vec<u8>, name: &str, is_limb: bool, ocg: &[(usize, Vec3, CellType)]) {
+fn write_body_part(buf: &mut Vec<u8>, name: &str, is_limb: bool, parent: usize, ocg: &[(usize, Vec3, CellType)]) {
     let name_bytes = name.as_bytes();
     buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(name_bytes);
     buf.push(if is_limb { 1 } else { 0 });
+    buf.extend_from_slice(&(parent as u32).to_le_bytes());   // v7
     buf.extend_from_slice(&(ocg.len() as u32).to_le_bytes());
     for &(idx, pos, ct) in ocg {
         buf.extend_from_slice(&(idx as u32).to_le_bytes());
@@ -171,6 +183,7 @@ fn write_body_part(buf: &mut Vec<u8>, name: &str, is_limb: bool, ocg: &[(usize, 
             CellType::Photo       => 0,
             CellType::NonPhoto    => 1,
             CellType::Placeholder => 2,
+            CellType::SubLimb     => 3,
         });
     }
 }
@@ -230,7 +243,7 @@ pub fn encode_species_with_brain(
     buf.push(1);
     // v5: a trained export is a single "Base Body" part (never a limb).
     buf.extend_from_slice(&1u32.to_le_bytes());
-    write_body_part(&mut buf, "Base Body", false, ocg);
+    write_body_part(&mut buf, "Base Body", false, 0, ocg);
     buf.push(1);   // brain_present
     crate::intelligence_level_herbivore_1_sliding::encode_brain_restore(&mut buf, brain);
     buf
@@ -254,6 +267,9 @@ pub struct LoadedBodyPart {
     /// `true` when the part is flagged as a limb (animated at runtime).
     /// v1–v4 files default this to `false` on load.
     pub is_limb: bool,
+    /// Index of the parent body part (0 = main body). A value pointing at
+    /// another limb makes this a sub-limb. v1–v6 files default to `0`.
+    pub parent: usize,
     pub ocg:  Vec<(usize, Vec3, CellType)>,
 }
 
@@ -289,14 +305,15 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     fn err(msg: &str) -> Error { Error::new(ErrorKind::InvalidData, msg.to_string()) }
 
     if bytes.len() < 8 + 5 + 4 { return Err(err("species file too short for header")); }
+    let is_v7 = &bytes[..8] == MAGIC_V7;
     let is_v6 = &bytes[..8] == MAGIC_V6;
     let is_v5 = &bytes[..8] == MAGIC_V5;
     let is_v4 = &bytes[..8] == MAGIC_V4;
     let is_v3 = &bytes[..8] == MAGIC_V3;
     let is_v2 = &bytes[..8] == MAGIC_V2;
     let is_v1 = &bytes[..8] == MAGIC_V1;
-    if !is_v6 && !is_v5 && !is_v4 && !is_v3 && !is_v2 && !is_v1 {
-        return Err(err("species magic mismatch (expected AEONSS01..AEONSS06)"));
+    if !is_v7 && !is_v6 && !is_v5 && !is_v4 && !is_v3 && !is_v2 && !is_v1 {
+        return Err(err("species magic mismatch (expected AEONSS01..AEONSS07)"));
     }
 
     let mut c = 8usize;
@@ -305,7 +322,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let intel_byte   = bytes[c]; c += 1;
     let var_byte     = bytes[c]; c += 1;
     let sessile_byte = bytes[c]; c += 1;
-    let classification = if is_v2 || is_v3 || is_v4 || is_v5 || is_v6 {
+    let classification = if is_v2 || is_v3 || is_v4 || is_v5 || is_v6 || is_v7 {
         let b = bytes[c]; c += 1;
         match b {
             0 => Classification::Herbivore,
@@ -320,7 +337,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     // v6 introduced the movement-paradigm byte right after
     // classification. Older versions default to Sliding (legacy
     // behaviour, before physics + PPO existed).
-    let movement = if is_v6 {
+    let movement = if is_v6 || is_v7 {
         let b = bytes[c]; c += 1;
         match b {
             0 => SpeciesMovement::LimbMovement,
@@ -353,24 +370,24 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
 
     // Body parts. v4/v5/v6 store a count + named parts; v1–v3 store a single
     // OCG which we wrap as one "Base Body" part.
-    let body_parts: Vec<LoadedBodyPart> = if is_v4 || is_v5 || is_v6 {
+    let body_parts: Vec<LoadedBodyPart> = if is_v4 || is_v5 || is_v6 || is_v7 {
         if bytes.len() < c + 4 { return Err(err("missing body_part_count")); }
         let count = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
         let mut parts = Vec::with_capacity(count);
         for _ in 0..count {
-            parts.push(read_species_body_part(bytes, &mut c, is_v5 || is_v6)?);
+            parts.push(read_species_body_part(bytes, &mut c, is_v5 || is_v6 || is_v7, is_v7)?);
         }
         parts
     } else {
         if bytes.len() < c + 4 { return Err(err("missing ocg_count")); }
         let ocg_count = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
         let ocg = read_species_ocg(bytes, &mut c, ocg_count)?;
-        vec![LoadedBodyPart { name: "Base Body".to_string(), is_limb: false, ocg }]
+        vec![LoadedBodyPart { name: "Base Body".to_string(), is_limb: false, parent: 0, ocg }]
     };
 
     // Brain block (v3+). Layout: u8 brain_present, and if 1 the shared
     // BrainRestoreHerbivore1 payload. v1/v2 carry none.
-    let brain = if is_v3 || is_v4 || is_v5 || is_v6 {
+    let brain = if is_v3 || is_v4 || is_v5 || is_v6 || is_v7 {
         if c >= bytes.len() {
             None
         } else {
@@ -393,24 +410,32 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     })
 }
 
-/// Read one v4/v5 body part (name [+ is_limb if v5] + OCG), advancing `c`.
-fn read_species_body_part(bytes: &[u8], c: &mut usize, is_v5: bool) -> std::io::Result<LoadedBodyPart> {
+/// Read one body part (name [+ is_limb if v5+] [+ parent u32 if v7+] + OCG),
+/// advancing `c`. `has_is_limb` = v5+, `has_parent` = v7+.
+fn read_species_body_part(bytes: &[u8], c: &mut usize, has_is_limb: bool, has_parent: bool) -> std::io::Result<LoadedBodyPart> {
     let err = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
     if bytes.len() < *c + 4 { return Err(err("body part name length truncated")); }
     let name_len = u32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()) as usize; *c += 4;
     if bytes.len() < *c + name_len { return Err(err("body part name truncated")); }
     let name = String::from_utf8_lossy(&bytes[*c..*c+name_len]).into_owned(); *c += name_len;
-    let is_limb = if is_v5 {
+    let is_limb = if has_is_limb {
         if bytes.len() < *c + 1 { return Err(err("body part is_limb truncated")); }
         let b = bytes[*c]; *c += 1;
         b != 0
     } else {
         false
     };
+    let parent = if has_parent {
+        if bytes.len() < *c + 4 { return Err(err("body part parent truncated")); }
+        let p = u32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()) as usize; *c += 4;
+        p
+    } else {
+        0
+    };
     if bytes.len() < *c + 4 { return Err(err("body part ocg_count truncated")); }
     let ocg_count = u32::from_le_bytes(bytes[*c..*c+4].try_into().unwrap()) as usize; *c += 4;
     let ocg = read_species_ocg(bytes, c, ocg_count)?;
-    Ok(LoadedBodyPart { name, is_limb, ocg })
+    Ok(LoadedBodyPart { name, is_limb, parent, ocg })
 }
 
 /// Read `count` OCG entries advancing `c`.
@@ -428,6 +453,7 @@ fn read_species_ocg(bytes: &[u8], c: &mut usize, count: usize) -> std::io::Resul
             0 => CellType::Photo,
             1 => CellType::NonPhoto,
             2 => CellType::Placeholder,
+            3 => CellType::SubLimb,
             _ => return Err(err("unknown cell_type tag")),
         };
         ocg.push((idx, Vec3::new(x, y, z), ct));

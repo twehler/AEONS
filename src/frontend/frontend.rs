@@ -213,6 +213,7 @@ impl Plugin for FrontendPlugin {
             // a second `add_systems` call to stay under Bevy's tuple size
             // limit for variadic system configs.
             .add_systems(Update, (
+                dismiss_fly_hint,
                 statistics_panel::update_camera_coords_text,
                 statistics_panel::handle_max_phototrophs_input,
                 statistics_panel::update_max_phototrophs_text,
@@ -359,7 +360,32 @@ fn setup_panes(
                     },
                 ))
                 .observe(viewport_click)
-                .observe(viewport_press);
+                .observe(viewport_press)
+                .with_children(|vp| {
+                    // One-line startup hint, centred near the top of the
+                    // viewport. White text; despawned by `dismiss_fly_hint`
+                    // the first time the player starts flying.
+                    vp.spawn((
+                        FlyHint,
+                        Node {
+                            position_type:   PositionType::Absolute,
+                            top:             Val::Px(16.0),
+                            left:            Val::Px(0.0),
+                            width:           Val::Percent(100.0),
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        },
+                        Pickable::IGNORE,
+                    ))
+                    .with_children(|h| {
+                        h.spawn((
+                            Text::new("Press Space to fly"),
+                            TextFont { font_size: 18.0, ..default() },
+                            TextColor(Color::WHITE),
+                            Pickable::IGNORE,
+                        ));
+                    });
+                });
 
                 individuum_navigator::spawn_vertical_divider(top_row);
                 individuum_navigator::spawn_navigator_panel(top_row);
@@ -508,23 +534,56 @@ fn resize_render_target(
 }
 
 
+// ── Fly hint ─────────────────────────────────────────────────────────────────
+
+/// Marker on the one-line "Press Space to fly" startup hint over the viewport.
+#[derive(Component)]
+struct FlyHint;
+
+/// Despawn the fly hint the first time the player starts flying. Driven by
+/// `PlayerControlsActive` becoming true (Space engages it — see
+/// `player_plugin::engage_flying_on_space`). Once the hint entities are gone
+/// the query is empty, so this costs nothing thereafter.
+fn dismiss_fly_hint(
+    mut commands:  Commands,
+    player_active: Res<PlayerControlsActive>,
+    hints:         Query<Entity, With<FlyHint>>,
+) {
+    if !player_active.0 { return; }
+    for e in &hints {
+        commands.entity(e).despawn();
+    }
+}
+
+
 // ── Viewport click → activate player controls ────────────────────────────────
 
-/// Left-click inside the viewport TOGGLES player camera capture: a first
-/// click engages WASD/mouse-look (cursor captured), a second click
-/// releases them again (cursor visible). Esc still works as a one-way
-/// release. Works regardless of whether the simulation is running or
-/// paused — the player can fly around a frozen world to inspect it.
+/// Viewport left-click handling. Camera capture is NO LONGER toggled here —
+/// that is now driven solely by Esc (see `player_plugin::
+/// toggle_player_controls_on_esc`). This observer only forwards the click to
+/// the colony editor's placement logic; in Simulation and species-editor
+/// modes a viewport left-click does nothing to camera control.
 fn viewport_click(
     ev:                 On<Pointer<Click>>,
-    mut player_active:  ResMut<PlayerControlsActive>,
     window_mode:        Res<WindowMode>,
     windows:            Query<&Window, With<PrimaryWindow>>,
     mut click_writer:   MessageWriter<crate::camera::ViewportClick>,
+    mut pick_writer:    MessageWriter<individuum_navigator::ViewportPick>,
 ) {
     // Only respond to the primary (left) mouse button so right-clicks /
     // middle-clicks pass through cleanly.
     if !matches!(ev.button, PointerButton::Primary) { return; }
+    // Simulation mode: a left-click selects the heterotroph under the cursor
+    // (resolved by `individuum_navigator::pick_organism`). Camera capture is
+    // NOT affected — that's Esc/Space only.
+    if *window_mode == WindowMode::Simulation {
+        if let Ok(window) = windows.single() {
+            if let Some(cursor) = window.cursor_position() {
+                pick_writer.write(individuum_navigator::ViewportPick { cursor });
+            }
+        }
+        return;
+    }
     // In EditColony mode, left-click is the editor's "place organism"
     // verb — emit a `ViewportClick` at the cursor and let
     // `colony_editor::placement::handle_left_click` ray-cast against
@@ -537,15 +596,10 @@ fn viewport_click(
                 click_writer.write(crate::camera::ViewportClick { cursor });
             }
         }
-        return;
     }
-    // Species-editor mode handles its own left-click semantics
-    // (placing a cell at the cursor-snapped lattice position) in
-    // `species_editor::placement::handle_left_click_place`. The player
-    // controls must stay released so the cursor remains visible and
-    // usable for that pointer-based placement workflow.
-    if *window_mode == WindowMode::SpeciesEditor { return; }
-    player_active.0 = !player_active.0;
+    // Simulation and species-editor modes: viewport left-click is inert for
+    // camera control (Esc toggles it) and species placement is handled by the
+    // species editor's own observer.
 }
 
 /// Sets `EditorLookActive(true)` whenever the user presses LMB on the

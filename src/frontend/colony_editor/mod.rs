@@ -184,9 +184,9 @@ fn load_species_into_session(
     };
     let base_raw = loaded.body_parts.first().map(|p| p.ocg.clone()).unwrap_or_default();
     let ocg = expand(&base_raw);
-    let appendages: Vec<(Vec<(usize, bevy::math::Vec3, crate::cell::CellType)>, bool)> =
+    let appendages: Vec<(Vec<(usize, bevy::math::Vec3, crate::cell::CellType)>, bool, usize)> =
         loaded.body_parts.iter().skip(1)
-            .map(|p| (p.ocg.clone(), p.is_limb))
+            .map(|p| (p.ocg.clone(), p.is_limb, p.parent))
             .collect();
 
     let display_name = path.file_stem()

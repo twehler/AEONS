@@ -3,6 +3,7 @@
 #[path = "world/water.rs"]             mod water;
 
 #[path = "colony/colony.rs"]           mod colony;
+#[path = "colony/colony_save_load.rs"] mod colony_save_load;
 #[path = "colony/organism.rs"]         mod organism;
 #[path = "colony/cell.rs"]             mod cell;
 #[path = "colony/body_part.rs"]        mod body_part;
@@ -11,6 +12,7 @@
 #[path = "colony/krishi.rs"]           mod krishi;
 #[path = "colony/dataset_export.rs"]   mod dataset_export;
 #[path = "colony/time_series_log.rs"]  mod time_series_log;
+#[path = "colony/limb_time_series_log.rs"]  mod limb_time_series_log;
 
 #[path = "growth/volumetric_growth/mod.rs"] mod volumetric_growth;
 #[path = "growth/mutation.rs"]              mod mutation;
@@ -114,6 +116,11 @@ fn main() {
     let max_herbivores         = parse_max_herbivores(&args);
     let start_heterotrophs     = parse_start_heterotrophs(&args);
     let start_photoautotrophs  = parse_start_photoautotrophs(&args);
+    // Headless / batch run-control flags (used for autonomous data runs):
+    //   --time-speed X        initial TimeSpeed multiplier (virtual time)
+    //   --exit-after-secs N    auto-exit after N seconds of VIRTUAL time
+    let time_speed       = parse_f32_flag(&args, "--time-speed");
+    let exit_after_secs  = parse_f32_flag(&args, "--exit-after-secs");
     let positional             = collect_positionals(&args);
 
     if positional.is_empty() && !editor_flag {
@@ -172,10 +179,37 @@ fn main() {
         run_simulation(map_path, colony_path, show_wireframe, map_size,
                        max_phototrophs, max_herbivores,
                        start_heterotrophs, start_photoautotrophs,
-                       training_mode);
+                       training_mode, time_speed, exit_after_secs);
     }
 }
 
+
+/// Threshold (seconds of VIRTUAL time) at which `exit_after_virtual_secs`
+/// quits the app. Present only when `--exit-after-secs` is passed.
+#[derive(bevy::prelude::Resource)]
+struct ExitAfterVirtualSecs(f32);
+
+/// Auto-exit once the simulation's virtual clock passes the configured
+/// threshold — lets unattended data-collection runs terminate cleanly
+/// after capturing the milestone exports + time-series, without a manual
+/// kill. Uses `Time<Virtual>` so it's measured in sim time, not wall time.
+fn exit_after_virtual_secs(
+    vtime: bevy::prelude::Res<bevy::prelude::Time<bevy::prelude::Virtual>>,
+    limit: bevy::prelude::Res<ExitAfterVirtualSecs>,
+    mut exit: bevy::prelude::MessageWriter<bevy::app::AppExit>,
+) {
+    if vtime.elapsed_secs() >= limit.0 {
+        bevy::log::info!("exit-after-secs: virtual time {:.1}s ≥ {:.1}s — quitting", vtime.elapsed_secs(), limit.0);
+        exit.write(bevy::app::AppExit::Success);
+    }
+}
+
+/// Parse a `--flag VALUE` f32 out of argv (generic). Used by the
+/// autonomous-run controls `--time-speed` / `--exit-after-secs`.
+fn parse_f32_flag(args: &[String], flag: &str) -> Option<f32> {
+    let pos = args.iter().position(|a| a == flag)?;
+    args.get(pos + 1)?.parse::<f32>().ok()
+}
 
 /// Parse `--map-size X Z` out of argv. Returns `None` if the flag is
 /// absent or either value doesn't parse as a positive f32.
@@ -291,6 +325,8 @@ fn run_simulation(
     start_heterotrophs:     Option<usize>,
     start_photoautotrophs:  Option<usize>,
     training_mode:          bool,
+    time_speed:             Option<f32>,
+    exit_after_secs:        Option<f32>,
 ) {
     if let Ok(mut cache_path) = std::env::current_dir() {
         cache_path.push("caches");
@@ -383,6 +419,20 @@ fn run_simulation(
     // resource as "changed" on the first frame and flip the
     // statistics-panel checkbox mark to visible.
     app.insert_resource(simulation_settings::AiTrainingMode(training_mode));
+
+    // `--time-speed X` — initial virtual-time multiplier. Inserted before
+    // `FrontendPlugin`'s idempotent `init_resource::<TimeSpeed>()` so our
+    // value is preserved; the panel can still change it live.
+    if let Some(ts) = time_speed {
+        app.insert_resource(simulation_settings::TimeSpeed(ts.max(0.01)));
+    }
+    // `--exit-after-secs N` — auto-quit after N seconds of VIRTUAL time
+    // (for unattended data-collection runs). The system is only added when
+    // the flag is present, so normal interactive runs never exit early.
+    if let Some(secs) = exit_after_secs {
+        app.insert_resource(ExitAfterVirtualSecs(secs));
+        app.add_systems(Update, exit_after_virtual_secs);
+    }
 
     app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {

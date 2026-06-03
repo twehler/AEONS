@@ -33,20 +33,27 @@ impl FromWorld for BrainPoolL3Limb {
 
 pub fn assign_brains_l3_limb(
     mut pool:     NonSendMut<BrainPoolL3Limb>,
-    new:          Query<(Entity, &Organism, Option<&BrainRestoreLimb>), (
+    new:          Query<(Entity, &Organism, Option<&BrainRestoreLimb>, Option<&crate::rl_helpers::BrainInheritance>), (
         With<Heterotroph>,
         Without<BrainSlotL3Limb>,
     )>,
     mut commands: Commands,
 ) {
-    for (e, organism, restore) in new.iter() {
+    for (e, organism, restore, inheritance) in new.iter() {
         if !matches!(organism.intelligence_level, IntelligenceLevel::Level3) { continue; }
         if organism.sliding_movement { continue; }
         let Some(s) = pool.0.enrol(e) else { continue };
         if let Some(r) = restore {
             pool.0.restore_slot(s, r);
             commands.entity(e).try_remove::<BrainRestoreLimb>();
+        } else {
+            // Inherit a trained brain so the new organism isn't born helpless;
+            // prefer the explicit parent, else any other occupied slot.
+            let src = inheritance.and_then(|inh| pool.0.map.get(&inh.0).copied())
+                .or_else(|| pool.0.map.iter().filter_map(|(ent, sl)| (*ent != e && *sl != s).then_some(*sl)).next());
+            if let Some(src) = src { pool.0.inherit_slot(s, src); }
         }
+        if inheritance.is_some() { commands.entity(e).try_remove::<crate::rl_helpers::BrainInheritance>(); }
         commands.entity(e).try_insert(BrainSlotL3Limb(s));
     }
 }

@@ -19,14 +19,21 @@ use std::time::Duration;
 /// independent cap (`MaxHerbivores`). The GPU brain-pool batch dim
 /// (`OrganismPoolSize`) is derived separately from `MaxHerbivores`
 /// at startup, since only heterotrophs use brain slots.
-pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 800;
+// Lowered 800 → 150 (2026-06-02) to protect frame rate: photo organisms
+// reproduce up to this cap, and at 800 the scene bloated (meshes + colliders
+// + photosynthesis) until FPS collapsed progressively from ~60 to <1 over a
+// few minutes. 150 keeps prey plentiful for herbivores while holding ~60 FPS.
+pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 150;
 
 /// Launcher-side default for the herbivore reproduction cap. The
 /// reproduction system stops scheduling new herbivore births once
 /// this number is reached. Kept small by default so a fresh launch
 /// stays manageable; the launcher text field lifts it for AI-training
 /// runs.
-pub const DEFAULT_MAX_HERBIVORES: usize = 100;
+// Lowered 100 → 60 (2026-06-02): each limb herbivore is many dynamic bodies
+// + joints (CPU physics), so an unbounded herbivore population also crushes
+// FPS. 60 holds frame rate while leaving a healthy population to study.
+pub const DEFAULT_MAX_HERBIVORES: usize = 60;
 
 /// Launcher-side default for the initial herbivore cohort size at
 /// `spawn_colony` (when no colony save is loaded). Independent from
@@ -208,7 +215,23 @@ pub const MOVEMENT_ENERGY_COSTS_ENABLED: bool = true;
 /// lift→reposition→plant→press gait cycle works (swing is frictionless
 /// for free). Consumed by `colony::spawn_organism` /
 /// `spawn_loaded_organism`.
+// LIMB (foot) friction: HIGH, combined with `CoefficientCombine::Max` against
+// the terrain so a planted foot GRIPS (μ → 1.0) and gives the leg stroke an
+// anchor to pull the body against. Paired with a LOW-friction belly
+// (`BASE_FRICTION_COEFFICIENT`) this is the propulsion mechanism for emergent
+// crawling: data (2026-06-03) showed the creatures lie belly-down
+// (base_contact ≈ 0.91) and were friction-PINNED under the old uniform μ=0.75,
+// so no learned limb motion could translate them. Gripping feet + a slippery
+// belly let a leg stroke drag the body — the missing ground-reaction asymmetry.
 pub const LIMB_FRICTION_COEFFICIENT: f32 = 1.0;
+
+/// BASE-body (belly) friction: LOW, combined with `CoefficientCombine::Min`
+/// (μ → 0.0). The grippy LIMB feet do the propulsion (a stroke pushes off the
+/// ground); a low-friction belly lets that push slide the body forward instead
+/// of pinning it. The per-part floor (`enforce_limb_floor`) keeps every part
+/// at/above the terrain so this stays non-penetrating and natural-looking.
+pub const BASE_FRICTION_COEFFICIENT: f32 = 0.0;
+
 
 
 /// Global simulation-time multiplier. Drives `Time<Virtual>::set_relative_speed`,
@@ -286,7 +309,7 @@ impl Default for MaxPhotoautotrophs {
 /// disk churn (each save writes the entire colony state, ~tens of
 /// KB to a few MB depending on population). Higher values risk
 /// losing more progress between manual saves.
-pub const AUTOSAVE_INTERVAL_MINUTES: f32 = 5.0;
+pub const AUTOSAVE_INTERVAL_MINUTES: f32 = 10.0;
 
 
 /// Default minimum heterotroph count enforced by `AutoSpawnHeteros`.
@@ -611,45 +634,112 @@ pub const SPECIES_SEPARATION_THRESHOLD: f32 = 0.10;
 /// before reaching for 16.
 pub const LIMB_SOLVER_SUBSTEPS: u32 = 8;
 
-/// Very small "compliance" (inverse stiffness) on every limb
-/// `SphericalJoint`. `0.0` is the XPBD default and means "infinitely
-/// stiff", which in finite precision can produce worse numerical
-/// stability than a microscopic give. `1e-6` is invisible to the eye
-/// (joint drift bounded to sub-µm under typical impulses) but lets
-/// the solver converge gracefully under high-torque transients.
-pub const LIMB_JOINT_COMPLIANCE: f32 = 1e-6;
+/// "Compliance" (inverse stiffness) on every limb `SphericalJoint`.
+/// `0.0` means a perfectly rigid point-constraint: the XPBD solver fully
+/// projects the anchors back together each substep, so the joint can't
+/// drift apart under the high angular velocities the brain commands (and
+/// that future "hit"/melee behaviour will rely on) — unlike a non-zero
+/// give, which lets the limb separate when the reaction exceeds the
+/// solver's holding capacity at `LIMB_SOLVER_SUBSTEPS = 8`. The old note
+/// that `0.0` was "numerically fragile" predates the current base-damping
+/// setup; trying rigid first since it keeps full torque AND full ω.
+pub const LIMB_JOINT_COMPLIANCE: f32 = 0.0;
 
-/// Position gain — torque-per-radian. Multiplies the joint-angle error
-/// (target − current) to produce the restoring torque component.
+/// `max_torque` clamp (N·m) on each limb hinge's spring-damper
+/// `AngularMotor`. Avian clamps the motor's per-substep impulse to
+/// `max_torque · dt²`, so this bounds how hard the hinge can drive toward
+/// its target angle — the motor's "muscle strength". High enough that a
+/// planted limb commanded "into the ground" can press the body upward
+/// (`max_torque ≳ body weight × lever`); raise if limbs feel weak, lower
+/// if a stride looks too violent. (Superseded the external-PD gains
+/// `KP_TORQUE` / `KD_TORQUE` / `MAX_JOINT_ANGLE`, which were removed when
+/// the controller moved to the in-solver motor — see
+/// `LIMB_MOTOR_FREQUENCY`.)
+// EMERGENT-WALK regime (2026-06-03): the brain now drives each limb hinge's
+// target angle DIRECTLY (no CPG generating the rhythm), so the motor must have
+// enough authority to actually lift/push the body for a stride to net thrust —
+// 8 N·m was deliberately gentle/cosmetic for the old CPG-plus-pursuit design
+// and far too weak for active, learned locomotion. Raised to 25. The old
+// "explosions are self-launches at high torque" failure is now contained
+// structurally (not by starving the motor): the per-part velocity governor
+// (`MAX_LIMB_LINEAR_SPEED`/`MAX_LIMB_ANGULAR_SPEED`) bounds any launch impulse,
+// `SelfCollisionFilter` removes the constraint-conflict energy injection, and
+// `LIMB_ANGULAR_DAMPING` bleeds runaway build-up — so torque can be spent on
+// walking rather than capped to prevent flinging. Lower if data shows strides
+// look violent / bodies still launch despite the governor.
+// Scaled 25 → 6 with the 5× mass cut (2026-06-03): the spring-damper motor's
+// torque to track a target / hold the body up scales with the limb's rotational
+// inertia, so the lighter microscopic body needs proportionally less. Keeping
+// 25 on the light body would over-actuate and fling it. 6 is enough to stand
+// the body up and stroke the legs without launching it.
+pub const MAX_LIMB_TORQUE: f32 = 10.0;
+
+/// Hinge swing-angle limit on every limb `RevoluteJoint`
+/// (`with_angle_limits(-LIMB_SWING_LIMIT, +LIMB_SWING_LIMIT)`). The limb is
+/// a 1-DOF hinge (it CANNOT orbit/spin around the body — the prior 3-DOF
+/// ball joint's fragile angle-limits could be blown through; a revolute
+/// joint rigidly locks the two non-hinge axes via a bilateral constraint).
+/// This ±80° caps the in-plane swing range so the limb can't fold absurdly
+/// far through the body, while leaving a generous stride for locomotion.
+pub const LIMB_SWING_LIMIT: f32 = 80.0 * std::f32::consts::PI / 180.0;
+
+/// "Little twist" knob for limb hinges: the compliance (inverse stiffness,
+/// N·m/rad) of the `RevoluteJoint` axis-ALIGNMENT constraint
+/// (`with_align_compliance`). `0.0` = a perfectly rigid hinge with zero
+/// twist; a non-zero value softens the two off-hinge DOF so the limb can
+/// deviate from the pure hinge plane — a real shoulder/hip twist.
 ///
-/// HIGH-gain PD position control (legged_gym / Isaac-Gym style): the
-/// gain must be large enough that, when the brain commands a target
-/// angle "into the ground" and the contact blocks the joint, the
-/// residual-error torque can actually drive the body upward — i.e.
-/// `KP × max_error ≳ body weight × lever`. At the old `KP = 12` the
-/// max spring torque (12 × MAX_JOINT_ANGLE ≈ 25 N·m) was below the
-/// organism's weight, so a planted limb could never press the body
-/// up — a concrete reason locomotion never emerged. `KP = 40` gives
-/// ≈ 84 N·m of stance authority, comfortably above a density-0.2
-/// organism's weight.
-pub const KP_TORQUE: f32 = 40.0;
+/// IMPORTANT — this knob only became safe to raise once the limb motor
+/// moved into the solver: the old external PD applied torque on the
+/// off-hinge axes too, so softening this let that torque deflect the limb
+/// into the gimbal singularity (the "spastic explosion" bug at `5e-3`).
+/// The in-solver `AngularMotor` drives ONLY the hinge axis, so there is no
+/// longer any controller torque exciting the off-hinge DOF — the twist is
+/// governed solely by gravity/contact against this spring (damped by
+/// `LIMB_ANGULAR_DAMPING`) and stays bounded at any value. Raise for more
+/// twist; lower toward `0.0` for a stiffer hinge.
+///
+/// Raised 5e-3 → 3e-2 (2026-06-03) per the goal "limbs should be able to twist
+/// a little to make emergent walking easier": the primary swing stays the
+/// motorised 1-DOF hinge, but this softer alignment lets the planted foot
+/// rotate/conform a little against the ground rather than being locked to a
+/// single plane, giving the learned gait an extra passive DOF to find purchase.
+/// Still small — the hinge is the dominant DOF — so the limb cannot orbit.
+pub const LIMB_HINGE_ALIGN_COMPLIANCE: f32 = 3e-2;
 
-/// Velocity gain — torque-per-(rad/s). Scaled up with `KP` (ratio
-/// ≈ KP/10, the legged_gym convention) so the stiffer spring stays
-/// damped rather than oscillating/overshooting.
-pub const KD_TORQUE: f32 = 4.0;
-
-/// Maximum joint angle the brain can command on each Euler axis. The
-/// brain emits `limb_targets ∈ [-1, 1]` (tanh-clamped + sample-clamped
-/// in `limb_ppo`); multiplying by this constant maps it onto a usable
-/// ±60° swing range.
-// Raised from π/2 → 2π/3 (120°) so the brain can command a wider
-// swing range. Going to a full π would put us past the gimbal-lock
-// singularity of Euler-XYZ extraction (at ±π/2 on the second axis),
-// which would make the PD spring direction flip in the wrong way.
-// 2π/3 stays comfortably below that while still giving the brain
-// 33 % more range than before.
-pub const MAX_JOINT_ANGLE: f32 = 2.0 * std::f32::consts::FRAC_PI_3;
+/// Spring-damper motor parameters for the limb `RevoluteJoint`s. The limb
+/// is driven by Avian's **built-in angular motor** (`MotorModel::SpringDamper`,
+/// solved inside the XPBD step) toward a target hinge angle the brain sets
+/// each tick — NOT by an external `Forces::apply_torque` PD controller.
+/// This is what finally killed the limb instability: the in-solver motor
+/// acts on the hinge axis ONLY (1-DOF, structurally cannot push off-hinge),
+/// uses implicit-Euler integration (unconditionally stable — no
+/// explicit-`−KD·ω` blow-up), and reads the true hinge angle via `atan2`
+/// (no Euler-XYZ decomposition → no gimbal singularity). All three of the
+/// old failure modes (gimbal flip, explicit-damping divergence, off-hinge
+/// drive against a soft constraint) are removed at once.
+///
+/// `frequency` (Hz) = how fast the hinge converges on its target; higher =
+/// stiffer/snappier. `damping_ratio` 1.0 = critically damped (fastest
+/// approach with no overshoot). `MAX_LIMB_TORQUE` is reused as the motor's
+/// `max_torque` clamp.
+///
+/// Raised 1.0 → 4.0 (2026-06-03): the brain re-commands each joint's target
+/// angle every brain tick (~6.7 Hz of virtual time) and the gait it must learn
+/// cycles at ~`GAIT_FREQUENCY_HZ`. A 1 Hz motor settles too slowly to track a
+/// moving setpoint — the leg would lag a full cycle behind the command and
+/// never realise the intended pose. 4 Hz lets the hinge reach the commanded
+/// angle well within a tick so the learned joint trajectory actually happens.
+///
+/// Raised 4 → 10 (2026-06-03): the motor's stiffness ∝ frequency², and the legs
+/// must be STIFF enough that the planted feet HOLD the (light) body up off the
+/// ground rather than folding under it — at freq 4 the body sank onto its belly
+/// / drove the feet through the terrain. At freq 10 the leg holds a
+/// weight-bearing stance, so the body stands on its feet (natural posture, feet
+/// resting at the surface). The implicit-Euler motor is unconditionally stable
+/// at any frequency, so this adds no instability.
+pub const LIMB_MOTOR_FREQUENCY: f32 = 4.0;
+pub const LIMB_MOTOR_DAMPING_RATIO: f32 = 1.0;
 
 // (colony.rs)
 /// Angular damping for the BASE body of a limb-based organism. High,
@@ -662,21 +752,40 @@ pub const BASE_ANGULAR_DAMPING: f32 = 3.0;
 /// PD controller can produce dynamic swings — the policy can't lift
 /// the legs off the ground if every torque it commands gets drained
 /// to friction within a frame.
-pub const LIMB_ANGULAR_DAMPING: f32 = 1.0;
+// Raised 1 → 5 (2026-06-02): the limb "separations"/"explosions" are an
+// ESCALATING energy build-up on a minority of organisms (sep grows over
+// time) while stable walkers run bounded cycles. Strong angular damping
+// bleeds the runaway build-up (which is sustained high ω) without blocking
+// the brief propulsive kicks that drive walking — decoupling the otherwise
+// linked propulsion/separation. (Substeps couldn't decouple them.)
+pub const LIMB_ANGULAR_DAMPING: f32 = 7.0;
 
 /// Linear damping for every limb-based body part (base + limbs).
 /// Light — enough to bleed drift between actuator pulses, not enough
 /// to lock the organism in place.
-pub const LIMB_LINEAR_DAMPING:  f32 = 0.2;
+pub const LIMB_LINEAR_DAMPING:  f32 = 0.6;
 
-/// Material density used when deriving each limb-based body part's
-/// mass from its compound collider. Density × volume → mass; lower
-/// density → lower mass → lower normal force at ground contacts →
-/// less friction force resisting limb rotation. Set to 0.2 (down
-/// from the natural 1.0) because at full density a 25-cell organism
-/// sitting on the heightfield was friction-pinned at every ground
-/// contact, dwarfing the brain's PD torques.
-pub const LIMB_BODY_DENSITY: f32 = 0.2;
+/// Material density used when deriving the mass of **every** body part of a
+/// limb-based organism from its collider — the base body (index 0) AND every
+/// appendage limb, identically (only their angular damping differs). (Sliding
+/// organisms are kinematic, so density doesn't apply to them.) Density × volume
+/// → mass; lower density → lower mass → lower normal force at ground contacts →
+/// less friction resisting rotation, AND less body weight for the PD torques to
+/// lift/support. Lowered to 0.04 (an 80 % cut from the previous 0.2, itself
+/// down from the natural 1.0): with many cells per body part (large collider
+/// volume) the heavier mass left organisms too weak to stand or move — the
+/// fixed-magnitude PD torques couldn't overcome the body weight. Lighter mass
+/// restores the torque-to-weight ratio that lets them push up and walk.
+// MICROSCOPIC scale (2026-06-03): cut 0.04 → 0.008 (5× lighter). AEONS
+// organisms are amoeba/paramecium/ant-scale — VERY lightweight relative to
+// their volume. A light body lets gravity + Avian's per-contact resolution
+// settle the creature NATURALLY onto its feet: the legs easily hold the light
+// body up (standing posture, belly off the ground), the feet rest ON the
+// surface (no penetration), and no part is left rigidly hoisted/dangling. The
+// heavy 0.04 body collapsed belly-down and drove the feet through the terrain.
+// `MAX_LIMB_TORQUE` is scaled down with this (the spring-damper motor's needed
+// torque ∝ inertia), so the lighter body isn't flung.
+pub const BODY_PART_DENSITY: f32 = 0.012;
 
 
 // ── Brain RL hyperparameters (limb_ppo.rs) ──────────────────────────────────
@@ -705,12 +814,89 @@ pub const LR: f64 = 3e-4;
 pub const VALUE_LOSS_COEF: f32 = 0.5;
 
 /// Coefficient on the entropy bonus term.
-pub const ENTROPY_COEF: f32 = 0.03;
+///
+/// **Cut 0.03 → 0.005 after the 5-min data dive**: the limb pool's entropy
+/// was RISING over training (1.32 → 1.47) while `mean_return` FELL
+/// (−0.24 → −3.07). That is the signature of an entropy bonus larger than
+/// the (near-zero, noisy) advantage signal — PPO was maximising entropy
+/// (diffusing the policy) instead of reward. With a denser reward (below)
+/// the advantage now carries real signal; a small entropy term keeps
+/// exploration without dominating it.
+///
+/// Cut 0.005 → 0.0 (2026-06-03): across the emergent-walk runs entropy was
+/// still RISING (1.76 → 2.08) while the policy failed to lock onto any
+/// locomotion — the bonus was re-diffusing the policy faster than the (sparse,
+/// hard-won) movement advantage could concentrate it. Exploration is already
+/// supplied by the fixed sampling σ (`LOG_STD_INIT`), so the entropy bonus is
+/// redundant here and was actively preventing convergence onto a gait. Zeroing
+/// it lets any discovered propulsive stroke actually be reinforced.
+pub const ENTROPY_COEF: f32 = 0.0;
 
-/// Initial `log_std` for the diagonal-Gaussian policy. exp(-0.5) ≈ 0.61
-/// — a moderately wide initial distribution for exploration that the
-/// gradient will tighten once a reward signal emerges.
-pub const LOG_STD_INIT: f32 = 0.0;
+/// Exploration std (as `log σ`) for the diagonal-Gaussian limb policy.
+/// The sampler uses `σ = exp(LOG_STD_INIT)` directly. `exp(-1.2) ≈ 0.30`
+/// — moderate exploration on the gait-parameter outputs.
+///
+/// **Was `0.0` (σ = 1.0), which broke locomotion**: a unit-variance noise
+/// on a `[-1, 1]` action spans the whole range, so every 150 ms tick each
+/// joint target was essentially random and the policy mean barely mattered.
+/// The brain now sets each hinge target angle directly, so the noise perturbs
+/// the joint command itself; σ ≈ 0.3 keeps exploration meaningful while still
+/// letting a coherent phase-locked gait take shape rather than thrashing.
+/// Tuning lever: raise for more exploration if learning stalls, lower if the
+/// gait is too jittery.
+///
+/// Back to −1.2 (σ ≈ 0.30, 2026-06-03): the actor now WARM-STARTS into a
+/// rhythmic leg oscillation (see `BrainPoolLimb::new`), so exploration no
+/// longer has to DISCOVER a coherent stroke from white noise — it only needs to
+/// perturb the warm-started gait so PPO can shape it. A large σ (0.5) would
+/// drown the warm-start's ±0.46 oscillation in noise; σ ≈ 0.30 explores around
+/// the rhythm without erasing it.
+pub const LOG_STD_INIT: f32 = -1.2;
+
+
+// ── Limb locomotion: EMERGENT, brain-driven (avian_setup::drive_limb_motors) ──
+//
+// Locomotion is NO LONGER generated by a built-in CPG and is NOT assisted by a
+// pursuit force. Each limb hinge's target angle is set DIRECTLY from the
+// brain's per-joint output (`Organism::limb_targets[joint] · LIMB_SWING_LIMIT`),
+// and the in-solver spring-damper motor tracks it. Walking must EMERGE from RL:
+// the brain learns, per joint, a phase-locked angle trajectory that produces
+// ground reaction → forward thrust, shaped by the reward (forward velocity,
+// progress toward prey, stepping, anti-spin). The only "rhythm aid" is a phase
+// signal handed to the brain as an OBSERVATION (sin/cos of a slow virtual-time
+// clock) — the brain still decides every joint angle; the clock merely lets a
+// feedforward policy phase-lock a sustained oscillation instead of having to
+// invent a limit cycle from a reactive map. This is a phase-conditioned policy,
+// the standard way to get genuinely learned (not scripted) legged gaits.
+
+/// Number of limb hinge joints the brain can independently control / observe.
+/// This is the action dimension (`limb_ppo::OUT`) and the per-joint observation
+/// bound: brain output `k` drives the hinge of body-part index `k+1`. Chosen to
+/// cover the multi-segment Bilateral morphologies in `species/` (e.g. Crawler:
+/// base + 2 hips + 2 knees → 8 runtime limb parts after the mirror expansion),
+/// so every joint — left/right hip AND knee — gets its own learned command and
+/// an alternating gait can emerge. Parts beyond this wrap modulo (rare).
+/// MUST equal `limb_ppo::OUT`.
+pub const MAX_LIMB_JOINTS: usize = 8;
+
+/// Frequency (Hz of virtual time) of the phase-clock OBSERVATION fed to the
+/// limb brain. NOT a motor command — the brain reads `sin/cos(2π·f·t)` and
+/// learns how to map that phase onto each joint's target angle. Sets the
+/// natural cadence the learned gait tends to lock onto: ~1 Hz is a plausible
+/// stride rate for these small bodies. Invariant to `TimeSpeed`/frame rate
+/// (derived from virtual elapsed time at brain-tick time).
+pub const GAIT_FREQUENCY_HZ: f32 = 1.0;
+
+/// Hard velocity governor on every limb body part (`MaxLinearSpeed` /
+/// `MaxAngularSpeed` in Avian). The robust safety net against runaway
+/// "explosions"/joint-separation: a destabilising limb otherwise reaches huge
+/// velocity (data showed 70+ u/s linear, 90 rad/s angular while AIRBORNE) and
+/// the momentum is what the rigid point-constraint can't arrest in 8 substeps
+/// on the ultra-light bodies — so capping per-part speed keeps the joint
+/// impulse bounded (joints hold), forbids the airborne fling, and keeps motion
+/// moderate, while leaving a real walking stride (well under these) untouched.
+pub const MAX_LIMB_LINEAR_SPEED:  f32 = 9.0;  // u/s (caps fly-off; walking is far below)
+pub const MAX_LIMB_ANGULAR_SPEED: f32 = 14.0; // rad/s (caps spin-out; leg swings are below)
 
 
 // ── Brain reward weights (limb_ppo.rs) ──────────────────────────────────────
@@ -719,9 +905,18 @@ pub const K_EAT:      f32 = 4.0;
 pub const K_REPRO:    f32 = 5.0;
 /// Reward per unit of forward (heading-projected) velocity. Signed:
 /// directed travel pays, spin nets ~0, backward drift is penalised.
-pub const K_FWD:      f32 = 0.1;
+// Raised 0.1 → 0.3 (2026-06-03): once an organism translates at all, pay it
+// more for translating in its FACING direction, so the movement the brain
+// discovers is biased toward directed travel rather than undirected drift.
+pub const K_FWD:      f32 = 0.3;
 pub const K_UP:       f32 = 0.02;
-pub const K_IDLE:     f32 = 0.05;
+/// Flat idle penalty `−K_IDLE·(1−motion_gate)`. **Set to 0 after the data
+/// dive.** With the gait barely propelling most organisms, this term was
+/// the DOMINANT reward (≈ −0.04/tick, near-identical for every still
+/// organism regardless of its limb action) — a gradient-free negative
+/// plateau that made `mean_return` uniformly negative and taught nothing.
+/// It is replaced by `K_MOVE` (a positive, climbable movement gradient).
+pub const K_IDLE:     f32 = 0.0;
 /// Reward per world-unit of XZ distance closed to the nearest
 /// photoautotroph since the last brain tick. Gives a dense
 /// directional signal: any motion that nets closer-to-food is paid
@@ -741,24 +936,66 @@ pub const K_PROGRESS: f32 = 0.5;
 /// (not static facing) avoids the alive-bonus trap.
 pub const K_HEADING: f32 = 0.3;
 /// Reward per limb-contact TRANSITION (a foot lifting off or planting
-/// down) since the last tick, summed over the two limb pairs. A
+/// down) since the last tick, summed over all limb contact flags. A
 /// walking gait cycles feet on and off the ground; rewarding the
 /// transition gives a dense gradient toward *stepping* rather than
 /// either static contact (foot dragging) or static lift (foot waving
-/// in the air). Only the two LIMB contact flags are counted — the
+/// in the air). Only the LIMB contact flags are counted — the
 /// BASE contact flag is excluded (the base touching the ground is
 /// the body dragging, which we don't want to reward). Kept modest so
 /// it can't be farmed by high-frequency contact jitter — the speed /
 /// progress terms still dominate genuine locomotion. (A `feet
 /// air-time` shaping, as in legged_gym, is the natural refinement if
 /// jitter-farming shows up.)
-pub const K_STEP: f32 = 0.1;
+// DISABLED 0.1 → 0.0 (2026-06-03, data-driven): the first emergent-walk run
+// showed PPO mean_return climbing 0.65 → 4.9 over 18 updates with ZERO body
+// translation and every limb pinned at the ±swing-limit — the policy was
+// FARMING this term by flailing its feet on/off the ground (each contact
+// transition pays K_STEP) without ever locomoting. That is exactly the
+// "jitter-farming" failure this term's own doc warned about. Zeroed so the
+// only climbable rewards are the unfarmable movement terms (K_MOVE/K_FWD,
+// which are 0 at rest and require the body to actually translate). A proper
+// feet-air-time shaping could reintroduce stepping credit later without the
+// in-place-jitter exploit.
+pub const K_STEP: f32 = 0.0;
 
 /// Speed (world-units/sec) at which the uprightness reward fully
 /// activates and the idle penalty bottoms out. Below this the brain
 /// is treated as "not really moving" and the alive-bonus is dimmed
 /// proportionally.
 pub const IDLE_THRESH: f32 = 0.5;
+
+/// Reward per (capped) world-unit/s of RAW body speed — the dense,
+/// climbable "move at all" gradient that bootstraps exploration of
+/// locomotion. The data showed 76/80 organisms stuck at ~0.1 u/s with a
+/// flat (gradient-free) reward, so PPO never found that moving the limbs
+/// can move the body. Unlike `K_FWD` (forward-projected, ≈0 until the
+/// body already travels in its facing direction), this pays ANY motion,
+/// giving a slope out of the still basin. `K_FWD` + `K_PROGRESS` +
+/// `K_HEADING` then bend that motion toward prey; `K_SPIN` keeps it from
+/// degenerating into spin/flail. The term is GATED on uprightness in
+/// `limb_ppo.rs` so a tumbling/ballistic body earns ~nothing — controlled
+/// upright translation is the only way to collect it.
+///
+/// Raised 0.4 → 0.9 (2026-06-03): with the farmable `K_STEP` removed, this is
+/// now the primary bootstrap gradient out of "flail in place" — it must be the
+/// dominant climbable reward so the policy is pulled toward genuinely moving
+/// the body (which only happens when learned joint motion nets ground thrust)
+/// rather than sitting still. Still capped (`SPEED_REWARD_CAP`) and
+/// uprightness-gated, so it cannot be won by spinning or ballistic flight.
+pub const K_MOVE: f32 = 0.9;
+
+/// Cap (world-units/s) on the speed that `K_MOVE` rewards. Beyond this,
+/// extra speed earns nothing — so the ballistic "fling the body at 40 u/s"
+/// regime is not preferred over controlled locomotion at a sane pace.
+pub const SPEED_REWARD_CAP: f32 = 4.0;
+
+/// Penalty per rad/s of base ANGULAR speed. The only organisms that moved
+/// in the data were a few that destabilised into high-speed spin/flight
+/// (angular speed up to ~16 rad/s). Penalising base spin steers the
+/// movement gradient toward translation rather than tumbling, without
+/// touching the (legitimate) limb-joint angular velocities.
+pub const K_SPIN: f32 = 0.03;
 
 
 // ── Energy (energy.rs) ──────────────────────────────────────────────────────

@@ -159,14 +159,19 @@ pub struct Organism {
     /// `.colony` files). The species editor's "Sliding / Limb-Movement"
     /// cycler is the user-facing knob. Inherited verbatim by offspring.
     pub sliding_movement: bool,
-    /// Latest PD target joint angles the limb-based brain commanded
-    /// (radians). Layout: `[limb0_x, limb0_y, limb0_z, limb1_x, limb1_y,
-    /// limb1_z]` — two spherical (3-DOF) limbs maximum, matching
-    /// `limb_ppo::OUT`. The `apply_limb_pd_torques` system reads these
-    /// each physics tick and converts them to angular impulses on the
-    /// limbs' spherical joints. Ignored entirely for sliding organisms
-    /// (`sliding_movement == true`); never read or written there.
-    pub limb_targets: [f32; 6],
+    /// Latest target hinge angles the limb-based brain commanded, one PER
+    /// LIMB JOINT (radians, as a fraction of `LIMB_SWING_LIMIT` before
+    /// scaling). Layout: `limb_targets[k]` is the target for the hinge of
+    /// body-part index `k+1`, for up to `limb_ppo::OUT` (= `MAX_LIMB_JOINTS`,
+    /// currently 8) independently-controlled joints. `drive_limb_motors`
+    /// reads these each physics tick and writes each value (scaled by
+    /// `LIMB_SWING_LIMIT`) into the corresponding hinge motor's
+    /// `target_position`; the in-solver spring-damper motor then tracks it.
+    /// This is the EMERGENT-locomotion contract: the brain moves each limb
+    /// directly (no CPG generating the rhythm). Ignored entirely for sliding
+    /// organisms (`sliding_movement == true`); never read or written there.
+    /// Array length MUST equal `limb_ppo::OUT`.
+    pub limb_targets: [f32; 8],
     /// `true` once the organism has finished growing — i.e. its meshes
     /// have been smoothed via `volumetric_growth::smooth_vertices`. For
     /// non-variable-form organisms this is `true` from spawn (they don't
@@ -351,7 +356,7 @@ impl Organism {
             for cell in &bp.cells {
                 match cell.cell_type {
                     CellType::Photo                            => p  += 1,
-                    CellType::NonPhoto | CellType::Placeholder => np += 1,
+                    CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => np += 1,
                 }
             }
         }

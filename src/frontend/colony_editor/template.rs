@@ -150,12 +150,13 @@ pub struct OrganismTemplate {
     /// the cycler-driven path is bypassed.
     pub custom_ocg:    Option<Vec<(usize, Vec3, CellType)>>,
     /// Appendage parts from a multi-part `.species` file, each as
-    /// `(OCG, is_limb)`. The OCG is the raw stored shape (right-half
-    /// for bilateral, full for NoSymmetry); `is_limb = true` makes the
-    /// runtime spawn rebase the part to a first-cell pivot and tag it
-    /// as `BodyPartKind::Limb` so it animates. Empty for
+    /// `(OCG, is_limb, parent)`. The OCG is the raw stored shape
+    /// (right-half for bilateral, full for NoSymmetry); `is_limb = true`
+    /// makes the runtime spawn rebase the part to a first-cell pivot and
+    /// tag it as `BodyPartKind::Limb`; `parent` is the EDITOR parent index
+    /// (0 = main body, else a sub-limb of that limb). Empty for
     /// cycler-derived or single-part templates.
-    pub custom_appendages: Vec<(Vec<(usize, Vec3, CellType)>, bool)>,
+    pub custom_appendages: Vec<(Vec<(usize, Vec3, CellType)>, bool, usize)>,
     /// Display name from the species file (filename stem). `None`
     /// for cycler-derived templates; falls back to "Hetero/Photo #N"
     /// formatting in `display_name`.

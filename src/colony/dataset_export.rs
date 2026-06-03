@@ -449,8 +449,10 @@ fn write_limb_pool_csv(
         &mut w,
         "entity;t_virtual;slot;x;y;z;energy;energy_norm;predations;reproductions;\
          is_carnivore;intelligence_level;\
-         limb_target_0;limb_target_1;limb_target_2;limb_target_3;limb_target_4;limb_target_5;\
-         log_std_0;log_std_1;log_std_2;log_std_3;log_std_4;log_std_5;\
+         limb_target_0;limb_target_1;limb_target_2;limb_target_3;\
+         limb_target_4;limb_target_5;limb_target_6;limb_target_7;\
+         log_std_0;log_std_1;log_std_2;log_std_3;\
+         log_std_4;log_std_5;log_std_6;log_std_7;\
          base_lin_vel_x;base_lin_vel_y;base_lin_vel_z;\
          base_ang_vel_x;base_ang_vel_y;base_ang_vel_z;\
          base_speed_xz;max_torque_norm"
@@ -475,8 +477,8 @@ fn write_limb_pool_csv(
         let _ = writeln!(
             &mut w,
             "{};{};{};{};{};{};{};{};{};{};{};{};\
-             {};{};{};{};{};{};\
-             {};{};{};{};{};{};\
+             {};{};{};{};{};{};{};{};\
+             {};{};{};{};{};{};{};{};\
              {};{};{};{};{};{};{};{}",
             e.index(), t_virtual, slot,
             transform.translation.x, transform.translation.y, transform.translation.z,
@@ -484,9 +486,10 @@ fn write_limb_pool_csv(
             org.predations, org.reproductions,
             bool01(is_carn),
             intelligence_label(org.intelligence_level),
-            org.limb_targets[0], org.limb_targets[1], org.limb_targets[2],
-            org.limb_targets[3], org.limb_targets[4], org.limb_targets[5],
-            log_std[0], log_std[1], log_std[2], log_std[3], log_std[4], log_std[5],
+            org.limb_targets[0], org.limb_targets[1], org.limb_targets[2], org.limb_targets[3],
+            org.limb_targets[4], org.limb_targets[5], org.limb_targets[6], org.limb_targets[7],
+            log_std[0], log_std[1], log_std[2], log_std[3],
+            log_std[4], log_std[5], log_std[6], log_std[7],
             tel.base_lin_vel.x, tel.base_lin_vel.y, tel.base_lin_vel.z,
             tel.base_ang_vel.x, tel.base_ang_vel.y, tel.base_ang_vel.z,
             base_speed_xz, tel.max_torque_norm,

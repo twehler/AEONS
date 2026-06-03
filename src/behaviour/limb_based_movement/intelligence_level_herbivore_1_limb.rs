@@ -53,14 +53,14 @@ impl FromWorld for BrainPoolHerbivore1Limb {
 /// `!sliding_movement` extra filter so the two populations are disjoint.
 pub fn assign_brains_herbivore_1_limb(
     mut pool:     NonSendMut<BrainPoolHerbivore1Limb>,
-    new:          Query<(Entity, &Organism, Option<&BrainRestoreLimb>), (
+    new:          Query<(Entity, &Organism, Option<&BrainRestoreLimb>, Option<&crate::rl_helpers::BrainInheritance>), (
         With<Heterotroph>,
         Without<Carnivore>,
         Without<BrainSlotHerbivore1Limb>,
     )>,
     mut commands: Commands,
 ) {
-    for (e, organism, restore) in new.iter() {
+    for (e, organism, restore, inheritance) in new.iter() {
         if !matches!(organism.intelligence_level, IntelligenceLevel::Level1) { continue; }
         if organism.sliding_movement { continue; }
         let Some(s) = pool.0.enrol(e) else { continue };
@@ -70,7 +70,18 @@ pub fn assign_brains_herbivore_1_limb(
         if let Some(r) = restore {
             pool.0.restore_slot(s, r);
             commands.entity(e).try_remove::<BrainRestoreLimb>();
+        } else {
+            // No saved weights → INHERIT a trained brain so the new organism
+            // isn't born helpless (a fresh warm-start collapses until it learns
+            // from scratch). Prefer the explicit parent (reproduction); else any
+            // other occupied slot — join the already-trained population. `src`
+            // is computed (and the immutable borrow released) before the
+            // mutable `inherit_slot` call.
+            let src = inheritance.and_then(|inh| pool.0.map.get(&inh.0).copied())
+                .or_else(|| pool.0.map.iter().filter_map(|(ent, sl)| (*ent != e && *sl != s).then_some(*sl)).next());
+            if let Some(src) = src { pool.0.inherit_slot(s, src); }
         }
+        if inheritance.is_some() { commands.entity(e).try_remove::<crate::rl_helpers::BrainInheritance>(); }
         commands.entity(e).try_insert(BrainSlotHerbivore1Limb(s));
     }
 }

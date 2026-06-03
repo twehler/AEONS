@@ -1510,10 +1510,16 @@ pub fn apply_max_phototrophs_cull(
     photos:         Query<Entity, (With<OrganismRoot>, With<Photoautotroph>)>,
     mut message:    ResMut<CullMessage>,
 ) {
-    if !max_photo.is_changed() { return; }
+    // Enforce the cap whenever the live photoautotroph count exceeds it — NOT
+    // only when the cap RESOURCE changes. A colony loaded from disk spawns the
+    // raw saved population, which can be far above the cap (e.g. 1000+ photos);
+    // the old `is_changed`-only guard let that over-cap population persist for
+    // the whole run (reproduction is suppressed above the cap, but the existing
+    // excess was never trimmed) — a major, silent FPS sink. Cheap under the
+    // cap: a count + early return, no allocation.
     let cap = max_photo.0;
+    if photos.iter().count() <= cap { return; }
     let mut roots: Vec<Entity> = photos.iter().collect();
-    if roots.len() <= cap { return; }
 
     let to_remove = roots.len() - cap;
     let mut rng = rand::rng();
