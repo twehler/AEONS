@@ -1,28 +1,11 @@
 // Herbivore sensory layer.
 //
-// Every brain tick this module runs `update_target_distance`, which
-// scans for the nearest photoautotroph within `SENSORY_RADIUS` of
-// each herbivore and writes the result into `Organism::target_distance`.
-// Two consumers downstream:
-//
-//   1. The RL brain reads `target_distance / SENSORY_RADIUS` as one
-//      of its input observations (a tight-radius "am I near food?"
-//      channel that complements the broader 60-unit world model).
-//
-//   2. The same brain uses Δ`target_distance` between successive
-//      ticks as a *progress reward*: when the distance shrinks the
-//      agent earns a small reward, when it grows the agent pays a
-//      small penalty. This is added to the primary Δ`dopamine`
-//      reward — see `intelligence_level_herbivore_1_sliding::REINFORCE`.
-//
-// Implementation note: the scan reuses the heterotroph world-model
-// grid (`WorldModelGrid`) which is already rebuilt once per brain
-// tick by `world_model::rebuild_world_model_grid`. That grid has
-// bucket size = `WORLD_MODEL_RADIUS` (60 units), so probing 3×3
-// buckets covers every photo inside our 50-unit query radius
-// without any extra spatial-hash machinery. Cost is roughly
-// `Σ(heteros) × neighbours_in_3×3_buckets` per tick — under a
-// millisecond at 4k organisms.
+// `update_target_distance` (each brain tick) writes the nearest
+// photoautotroph distance within `SENSORY_RADIUS` into
+// `Organism::target_distance`. Consumed as (1) a "near food?" brain
+// input and (2) a per-tick progress reward (Δdistance). Reuses the
+// already-rebuilt `WorldModelGrid`; its bucket = `WORLD_MODEL_RADIUS`
+// ≥ the query radius, so a 3×3 bucket probe covers it.
 
 use bevy::prelude::*;
 

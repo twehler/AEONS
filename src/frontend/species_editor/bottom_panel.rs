@@ -1,16 +1,6 @@
-// Species editor — bottom panel.
-//
-// One row of "cell type tiles" — currently two (Photo, NonPhoto), but
-// the layout scales to N. Each tile is a small clickable square
-// displaying the cell's render colour as a flat swatch (the "icon
-// representation" agreed in the requirements: pre-rendered static
-// preview rather than a live 3D mesh-in-UI). Clicking a tile sets
-// `SpeciesSession::selected_cell_type`, which triggers the
-// preview-cell-follows-cursor flow in `placement.rs`.
-//
-// The panel is only visible after the first cell has been spawned —
-// before that the user is still configuring body-plan flags via the
-// cyclers in the top panel.
+// Species editor — bottom panel: a row of cell-type tiles (flat colour
+// swatches). Clicking a tile sets `SpeciesSession::selected_cell_type`, driving
+// the preview-cell flow in `placement.rs`.
 
 use bevy::prelude::*;
 
@@ -31,16 +21,18 @@ const TILE_BORDER_IDLE:     Color = Color::srgb(0.25, 0.25, 0.25);
 const TILE_BORDER_SELECTED: Color = Color::srgb(0.95, 0.95, 0.2);
 const TILE_BORDER_HOVER:    Color = Color::srgb(0.65, 0.65, 0.65);
 
-/// Concrete cell colours — match `CellType::color()` in `cell.rs`, but
-/// converted to Bevy `Color::srgb` for the UI tile fill. Kept in sync
-/// manually because the UI swatch is sRGB but `CellType::color()`
-/// returns linear RGB. A 1:1 sync would double-correct.
+/// UI tile colours, manually kept in sync with `CellType::color()`. NOT a 1:1
+/// copy: these are sRGB but `CellType::color()` returns linear RGB, so reusing
+/// it directly would double-correct.
 fn ui_color_for(ct: CellType) -> Color {
     match ct {
         CellType::Photo       => Color::srgb(0.2, 0.8, 0.2),
         CellType::NonPhoto    => Color::srgb(0.8, 0.2, 0.2),
         CellType::Placeholder => Color::srgb(0.2, 0.45, 0.95),
         CellType::SubLimb     => Color::srgb(0.6, 0.2, 0.9),
+        CellType::YellowCell  => Color::srgb(1.0, 0.95, 0.1),
+        CellType::OrangeCell  => Color::srgb(1.0, 0.55, 0.0),
+        CellType::BrownCell   => Color::srgb(0.45, 0.27, 0.12),
     }
 }
 
@@ -50,6 +42,9 @@ fn label_for(ct: CellType) -> &'static str {
         CellType::NonPhoto    => "NonPhoto",
         CellType::Placeholder => "Placeholder",
         CellType::SubLimb     => "Sub-Limb",
+        CellType::YellowCell  => "Yellow",
+        CellType::OrangeCell  => "Orange",
+        CellType::BrownCell   => "Brown",
     }
 }
 
@@ -138,8 +133,7 @@ pub fn handle_tile_clicks(
     }
 }
 
-/// Highlight the selected tile and update hover borders. Runs every
-/// frame (cheap — only ~2 tiles).
+/// Highlight the selected tile and update hover borders.
 pub fn sync_tile_borders(
     session:     Res<SpeciesSession>,
     mut tiles:   Query<(&Interaction, &CellTypeTile, &mut BorderColor)>,

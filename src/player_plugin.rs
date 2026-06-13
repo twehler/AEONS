@@ -4,22 +4,16 @@ use bevy::window::PrimaryWindow;
 
 use crate::simulation_settings::{PlayerControlsActive, WindowMode};
 
-// Major credit goes to: https://github.com/sburris0/bevy_flycam
+// Credit: https://github.com/sburris0/bevy_flycam
 //
-// Notes on the new control flow (May 2026):
-//   * Cursor is NOT grabbed at startup. The frontend layer keeps it visible
-//     so the player can interact with the UI.
-//   * Esc TOGGLES `PlayerControlsActive` (handled here, Simulation mode
-//     only): the first press engages WASD / Space / Shift / mouse-look and
-//     captures the cursor; the next press releases it. Left-clicking the
-//     viewport no longer affects camera capture. Simulation keeps running
-//     either way; only the camera goes idle when controls are off.
-//   * Pausing/resuming the simulation is done via the Start/Stop button
-//     in the statistics panel — no keyboard shortcut for it.
+// Control flow:
+//   * Cursor is NOT grabbed at startup (frontend keeps it visible for UI).
+//   * Esc TOGGLES `PlayerControlsActive` (Simulation mode only): engages
+//     WASD/Space/Shift/mouse-look + cursor capture, then releases.
+//   * Pause/resume is the statistics-panel Start/Stop button — no key.
 //
-// Movement systems consume `Time<Real>` so the camera keeps responding
-// when `Time<Virtual>` is paused (player should be able to look around
-// and reposition while the world is frozen).
+// Movement systems use `Time<Real>` so the camera responds while
+// `Time<Virtual>` is paused.
 
 
 // Mouse sensitivity and movement speed
@@ -82,14 +76,10 @@ impl Default for KeyBindings {
 pub struct FlyCam;
 
 
-/// True while the player is holding LMB AFTER pressing it over the
-/// viewport image, in `WindowMode::EditColony`. Drives the editor's
-/// "hold-LMB-to-rotate" semantics in `player_look`. Set to `true`
-/// by the viewport's `Pointer<Pressed>` observer (in `frontend.rs`),
-/// cleared by `release_editor_look_on_lmb_up` on every LMB release.
-///
-/// In Simulation mode this resource is unused — `player_look` reads
-/// `PlayerControlsActive` instead.
+/// True while holding LMB after pressing over the viewport image in
+/// `WindowMode::EditColony` — drives "hold-LMB-to-rotate" in `player_look`.
+/// Set by the viewport's `Pointer<Pressed>` observer (frontend.rs), cleared
+/// by `release_editor_look_on_lmb_up`. Unused in Simulation mode.
 #[derive(Resource, Default)]
 pub struct EditorLookActive(pub bool);
 
@@ -97,23 +87,16 @@ pub struct EditorLookActive(pub bool);
 fn setup_player(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
-        // Tight far plane bounds both the visible mesh set and the
-        // directional light's cascade-shadow ortho fit. Bevy 0.18's
-        // default is 1000 units; at large maps that pulls a huge swath
-        // of terrain into every shadow-pass draw and inflates extract-
-        // phase work over many entities.
+        // Tight far plane bounds both the visible mesh set and the cascade-
+        // shadow ortho fit; Bevy's 1000-unit default inflates shadow/extract
+        // cost on large maps.
         Projection::Perspective(PerspectiveProjection {
             far: 300.0,
             near: 0.1,
             ..default()
         }),
         FlyCam,
-        // Spawn at altitude 100 looking down-away from the origin (the
-        // OPPOSITE XZ direction from the previous toward-origin gaze).
-        // The XZ delta from camera position to target is (+20, +20) —
-        // exactly the negation of the (-20, -20) delta the old
-        // `Vec3::ZERO` target produced — and the Y drop stays the same
-        // so the pitch matches the prior frame.
+        // Spawn at altitude 100 looking down-away from the origin.
         Transform::from_xyz(20.0, 100.0, 20.0).looking_at(Vec3::new(40.0, 0.0, 40.0), Vec3::Y),
         AmbientLight {
             color: Color::srgb(0.8, 0.8, 1.0),
@@ -124,11 +107,8 @@ fn setup_player(mut commands: Commands) {
 }
 
 
-// Handles keyboard input and movement. Active in Simulation mode
-// while `PlayerControlsActive` is on (post-click cursor capture); in
-// EditColony mode the camera is always WASD-controllable (cursor is
-// never grabbed but movement still applies — matches the standalone
-// editor's WASD-always semantics).
+// Keyboard movement. Active in Simulation mode while `PlayerControlsActive`
+// is on; in EditColony mode the camera is always WASD-controllable.
 fn player_move(
     keys:          Res<ButtonInput<KeyCode>>,
     real_time:     Res<Time<Real>>,
@@ -182,10 +162,8 @@ fn player_look(
     mut state:       MessageReader<MouseMotion>,
     mut query:       Query<&mut Transform, With<FlyCam>>,
 ) {
-    // In Simulation mode rotation is gated on the captured-cursor
-    // flag; in EditColony mode it's gated on the editor's hold-LMB
-    // state — set when the user presses LMB on the viewport image
-    // (not over a panel) and cleared on LMB release.
+    // Rotation gated on the captured-cursor flag (Simulation) or the
+    // hold-LMB state (EditColony).
     let active = match *window_mode {
         WindowMode::Simulation    => player_active.0,
         WindowMode::EditColony    => editor_look.0,
@@ -216,15 +194,9 @@ fn player_look(
 }
 
 
-/// Esc is the sole toggle for player camera control: pressing it engages
-/// WASD/mouse-look + cursor capture, pressing it again releases them (cursor
-/// freed by `apply_player_controls_state` in `frontend.rs`). The simulation
-/// continues running either way. Left-clicking the viewport no longer affects
-/// camera capture.
-///
-/// Gated to `WindowMode::Simulation`: in the editor modes the cursor must stay
-/// free for pointer-based placement, so Esc must not be able to grab it there
-/// (those modes already force `PlayerControlsActive` off on entry).
+/// Esc toggles player camera control (WASD/mouse-look + cursor capture).
+/// Gated to `WindowMode::Simulation`: editor modes need the cursor free for
+/// pointer placement, so Esc must not grab it there.
 fn toggle_player_controls_on_esc(
     keys:              Res<ButtonInput<KeyCode>>,
     key_bindings:      Res<KeyBindings>,
@@ -237,11 +209,9 @@ fn toggle_player_controls_on_esc(
     }
 }
 
-/// Spacebar starts flying from a standstill: in Simulation mode, while
-/// controls are OFF, the first Space press engages camera control (this is
-/// the advertised "press Space to fly" entry point). While already flying,
-/// Space keeps its normal "ascend" role in `player_move` — no conflict, since
-/// this only fires when controls are off. Esc remains the on/off toggle.
+/// Space engages camera control from a standstill (Simulation mode, controls
+/// OFF). While already flying, Space keeps its "ascend" role in `player_move`
+/// — no conflict since this only fires when controls are off.
 fn engage_flying_on_space(
     keys:              Res<ButtonInput<KeyCode>>,
     window_mode:       Res<WindowMode>,
@@ -254,12 +224,8 @@ fn engage_flying_on_space(
 }
 
 
-/// Clears `EditorLookActive` whenever the user releases LMB. The
-/// flag is set by the viewport's `Pointer<Pressed>` observer in
-/// `frontend.rs` — pressing the viewport image in EditColony mode
-/// starts a rotation hold; releasing the button ends it, regardless
-/// of where the cursor is at release time (so a drag that wanders
-/// over a panel still ends cleanly).
+/// Clears `EditorLookActive` on LMB release, regardless of cursor location
+/// (so a drag that wanders over a panel still ends cleanly).
 pub fn release_editor_look_on_lmb_up(
     mouse:           Res<ButtonInput<MouseButton>>,
     mut editor_look: ResMut<EditorLookActive>,

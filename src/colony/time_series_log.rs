@@ -1,17 +1,10 @@
 // Continuous per-organism time-series logger.
 //
-// Every `LOG_INTERVAL_SECS` virtual seconds the system writes one
-// CSV row per Level1 herbivore to `datasets/time_series_<timestamp>.csv`
-// (alongside the milestone snapshots, so the analysis suite can pick
-// it up — see `data-analysis/time_series.R`).
-// The file is opened lazily on the first log tick and stays open
-// for the lifetime of the process. Lets us trace per-individual
-// learning trajectories (mu_angle, value_v, mean_reward_64 over
-// virtual time) instead of relying on two point-in-time snapshots
-// at minute 1 and minute 45 to infer learning dynamics.
-//
-// Cadence is gated on the simulation actually running, so paused
-// intervals don't pollute the log with redundant rows.
+// Every `LOG_INTERVAL_SECS` virtual seconds, writes one CSV row per Level1
+// herbivore to `datasets/time_series_<timestamp>.csv` (for
+// `data-analysis/time_series.R`) to trace per-individual learning trajectories
+// over virtual time. File opened lazily, kept open for the process lifetime.
+// Gated on the sim running so paused intervals don't add redundant rows.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -25,21 +18,16 @@ use crate::intelligence_level_herbivore_1_sliding::{
 };
 
 
-/// Default cadence for time-series rows. 5 virtual seconds gives
-/// ~12 samples per minute per herbivore; with ~200 herbivores
-/// that's ~24k rows / hour or ~3 MB / hour — comfortable.
+/// Cadence for time-series rows (virtual seconds).
 const LOG_INTERVAL_SECS: f32 = 5.0;
 
 
-/// Lazy-init logger state. The writer is `None` until the first
-/// log tick, at which point a file is created at
-/// `logs/time_series_<timestamp>.csv` and the header is written.
+/// Lazy-init logger state; `writer` is `None` until the first log tick.
 #[derive(Resource, Default)]
 pub struct TimeSeriesLogger {
     writer:         Option<BufWriter<File>>,
     last_log_secs:  f32,
-    /// Set true once we've TRIED to open the writer; prevents
-    /// repeated error-spam if file creation failed once.
+    /// True once writer-open was attempted; prevents repeated error-spam.
     init_attempted: bool,
 }
 
@@ -73,10 +61,8 @@ pub fn tick_time_series_logger(
                 return;
             }
         }
-        // NB: timestamped filename, so it is NOT touched by
-        // `dataset_export::rotate_existing_datasets` (which only
-        // matches the `simulation_dataset_*` prefix) — each run keeps
-        // its own trace file in `datasets/`.
+        // Timestamped filename → not touched by `rotate_existing_datasets`
+        // (which only matches the `simulation_dataset_*` prefix).
         match File::create(&path) {
             Ok(f) => {
                 let mut w = BufWriter::new(f);
@@ -101,8 +87,7 @@ pub fn tick_time_series_logger(
 
     let Some(writer) = logger.writer.as_mut() else { return; };
 
-    // Single GPU forward pass to populate per-slot telemetry, then
-    // pure CPU indexing per organism.
+    // Single GPU forward pass; per-organism lookups are then pure CPU.
     let telemetry = pool.snapshot_telemetry();
 
     let mut row = String::with_capacity(256);
@@ -125,8 +110,6 @@ pub fn tick_time_series_logger(
         );
         let _ = writer.write_all(row.as_bytes());
     }
-    // Flush every tick so a crash doesn't lose the most recent
-    // window. Cost is one fsync ~= a few ms; we're already running
-    // at 5 s cadence so amortised cost is negligible.
+    // Flush every tick so a crash doesn't lose the most recent window.
     let _ = writer.flush();
 }

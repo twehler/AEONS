@@ -1,37 +1,11 @@
 // Cell, BodyPart, and procedural mesh generation.
 //
-// New architecture (May 2026 rewrite):
-//
-//   - A `Cell` is a *vertex-cell*: a logical 3D point of a given `CellType`
-//     (Photo or NonPhoto). Cells are not rendered directly — they parametrise
-//     the mesh that wraps them.
-//
-//   - A `BodyPart` is a list of cells with a local offset relative to the
-//     organism root. Each body part renders as one Bevy `Mesh` (one entity).
-//
-//   - An `Organism` is a list of body parts. The organism root entity owns
-//     the world transform; each body part is a child entity with its own
-//     `Transform::from_translation(local_offset)` and its own `Mesh3d`.
-//
-// Mesh generation rules (`generate_body_part_mesh`):
-//   - 0 cells     → empty mesh
-//   - 1 cell      → rhombic dodecahedron centred on the cell. This is the
-//                   canonical starter shape for every freshly-spawned
-//                   organism (one body part, one cell of the appropriate
-//                   trophic type — Photo for photoautotrophs, NonPhoto for
-//                   heterotrophs).
-//   - 2+ cells    → subdivided icosphere wrapping the cell cloud, with each
-//                   surface vertex displaced toward the nearest cell to give
-//                   an organic bumpy silhouette and per-vertex colours
-//                   blended from cell influence. Surface regions weakly
-//                   influenced by any cell fade to plain white (the safety
-//                   fallback the design requires).
-//
-// Vertex colouring: for each surface vertex we compute an inverse-square
-// falloff weighted average of nearby cells' colours (Photo green / NonPhoto
-// red), then lerp toward white as the total influence weakens. This ensures
-// every body part is fully covered in green/red spots near cells with white
-// only appearing where cells genuinely don't reach — exactly the spec.
+//   - A `Cell` is a vertex-cell: a logical 3D point of a `CellType`. Cells
+//     are not rendered directly — they parametrise the wrapping mesh.
+//   - A `BodyPart` is a list of cells with a local offset; renders as one
+//     Bevy `Mesh` (one entity).
+//   - An `Organism` is a list of body parts. The root owns the world
+//     transform; each body part is a child with its own offset + `Mesh3d`.
 
 use bevy::prelude::*;
 
@@ -39,41 +13,30 @@ use bevy::prelude::*;
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
 /// Uniform spacing between neighbouring cells inside a body part. Growth
-/// always places new cells at exactly this distance from their nearest
-/// existing neighbour, which guarantees consistent topology across all
-/// organisms and keeps mesh generation well-conditioned.
+/// places new cells at exactly this distance from their nearest neighbour,
+/// guaranteeing consistent topology and well-conditioned mesh generation.
 pub const CELL_SPACING: f32 = 1.0;
 
-/// Half-extent of the rhombic-dodecahedron starter shape used for the
-/// 1-cell body part. The full polyhedron spans `4*RD_HALF_SIZE` along each
-/// of its principal axes.
+/// Half-extent of the rhombic-dodecahedron 1-cell starter shape. The full
+/// polyhedron spans `4*RD_HALF_SIZE` along each principal axis.
 pub const RD_HALF_SIZE: f32 = 0.5;
 
-/// Outward padding the wrapping mesh takes beyond the cell cloud so cells
-/// sit comfortably under the surface (otherwise extreme cells coincide with
-/// the icosphere and look pinched).
+/// Outward padding the wrapping mesh takes beyond the cell cloud so extreme
+/// cells don't coincide with the icosphere and look pinched.
 pub const MESH_PADDING: f32 = CELL_SPACING * 0.55;
 
-/// Effective collision radius of a single cell — sphere-vs-sphere narrow
-/// phase uses this. Sized so the cell-cell contact threshold
-/// (`CELL_COLLISION_RADIUS * 2 = 1.4`) gives generous along-axis
-/// tolerance for the bilateral body-plan's perpendicular cell offset
-/// of `MIN_X_BILATERAL ≈ 1.155`. The along-axis contact window for
-/// the closest flanking cell is `√(1.4² − 1.155²) ≈ 0.79` units,
-/// which absorbs both the brake's parking position (root-to-root
-/// → 0) and any minor angular misalignment of the approach. With
-/// the previous radius of 0.6 (threshold 1.2) the along-axis window
-/// shrunk to ~0.32 units, and the V-shape would silently flank prey
-/// without ever triggering predation when the approach was off-axis.
+/// Single-cell collision radius (sphere-vs-sphere narrow phase). Sized so the
+/// contact threshold (2× = 1.4) gives an along-axis window of
+/// `√(1.4² − 1.155²) ≈ 0.79` units against the bilateral perpendicular offset
+/// `MIN_X_BILATERAL ≈ 1.155` — enough that the V-shape triggers predation
+/// even on an off-axis approach.
 pub const CELL_COLLISION_RADIUS: f32 = CELL_SPACING * 0.7;
 
 
 // ── Cell type ────────────────────────────────────────────────────────────────
 
-/// The two cell types defined by the new architecture. Photo cells drive
-/// photosynthesis (green); NonPhoto cells are everything else (mild red).
-/// Additional types can be added later — the colouring code is data-driven
-/// off `color()` so adding a variant requires no other edits here.
+/// Cell types. Photo drives photosynthesis (green); NonPhoto is everything
+/// else (red). Colouring is data-driven off `color()`.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub enum CellType {
     Photo,
@@ -82,23 +45,23 @@ pub enum CellType {
     /// counts as body mass like `NonPhoto` for upkeep. Used by the species
     /// editor to sketch out new (main-body) limbs.
     Placeholder,
-    /// Inert placeholder cell rendered PURPLE — functionally identical to
-    /// `Placeholder` (non-photosynthetic, body-mass upkeep, sketch cell),
-    /// but a distinct colour so first-grade SUB-LIMBS (limbs attached to a
-    /// parent limb rather than the main body) read differently from their
-    /// parent limbs. The species editor auto-selects this type when
-    /// sketching a sub-limb; it can also be placed manually from the swatch.
+    /// Inert PURPLE cell — identical to `Placeholder` but a distinct colour
+    /// so sub-limbs (limbs attached to a parent limb) read differently from
+    /// their parent limbs. Auto-selected by the species editor for sub-limbs.
     SubLimb,
+    /// Behaves exactly like `NonPhoto` (non-photosynthetic body mass); only the
+    /// render colour differs. Placeholder for future differentiated cell roles.
+    YellowCell,
+    /// Behaves exactly like `NonPhoto`; renders orange. See `YellowCell`.
+    OrangeCell,
+    /// Behaves exactly like `NonPhoto`; renders brown. See `YellowCell`.
+    BrownCell,
 }
 
 impl CellType {
-    /// Linear-RGB colour written into `Mesh::ATTRIBUTE_COLOR` (Bevy treats
-    /// vertex colours as linear). The numeric values are the linear-space
-    /// equivalents of the sRGB display colours we want — i.e. they match
-    /// what the legacy whole-part `Color::srgb(...)` materials produced
-    /// on screen, just delivered per-vertex now. If you change one,
-    /// keep the comment in sync so the intended display colour stays
-    /// obvious.
+    /// Linear-RGB colour for `Mesh::ATTRIBUTE_COLOR` (Bevy treats vertex
+    /// colours as linear). Values are the linear equivalents of the sRGB
+    /// display colours noted per arm — keep the comments in sync.
     #[inline]
     pub fn color(&self) -> [f32; 3] {
         match self {
@@ -110,11 +73,16 @@ impl CellType {
             CellType::Placeholder => [0.0331, 0.1329, 0.8902],
             // sRGB (0.6, 0.2, 0.9) — purple (sub-limb marker)
             CellType::SubLimb     => [0.3186, 0.0331, 0.7874],
+            // sRGB (1.0, 0.95, 0.1) — yellow
+            CellType::YellowCell  => [1.0, 0.8879, 0.0099],
+            // sRGB (1.0, 0.55, 0.0) — orange
+            CellType::OrangeCell  => [1.0, 0.2623, 0.0],
+            // sRGB (0.45, 0.27, 0.12) — brown
+            CellType::BrownCell   => [0.1651, 0.0578, 0.0144],
         }
     }
 
-    /// True for cell types that contribute photosynthetic energy. Only
-    /// `Photo` does; `NonPhoto` and `Placeholder` are non-photosynthetic.
+    /// True only for `Photo`; all others are non-photosynthetic.
     #[inline]
     pub fn is_photo(&self) -> bool {
         matches!(self, CellType::Photo)
@@ -124,55 +92,37 @@ impl CellType {
 
 // ── Cell ─────────────────────────────────────────────────────────────────────
 
-/// Energy a freshly grown cell starts with. Owned by `physiology.rs` —
-/// every constructor here uses it as the default so cells exist in a
-/// well-defined initial state regardless of who builds them.
+/// Energy a freshly grown cell starts with.
 pub const DEFAULT_CELL_ENERGY: f32 = 1.0;
 
-/// Maximum number of rhombic-dodecahedron neighbours any single cell can
-/// have. The RD lattice exposes exactly 18 adjacency slots (6 axis-aligned
-/// + 12 FCC face-diagonal — see `volumetric_growth/dodecahedron::SLOT_DIRS`).
-/// All physiology formulas that scale with neighbour density should
-/// normalise against this constant rather than a hardcoded literal.
+/// Max RD neighbours any cell can have: the lattice exposes exactly 18
+/// adjacency slots (6 axis-aligned + 12 FCC face-diagonal). Neighbour-density
+/// formulas should normalise against this, not a literal.
 pub const MAX_RD_NEIGHBOURS: u8 = 18;
 
 
-/// Photosynthesis-specific data stored on Photo cells.
-///
-/// `neighbour_count` mirrors `Cell::neighbour_count` so the value is
-/// available without an additional indirection when the physiology tick
-/// only iterates the photo subset. `energy_production` is the cached
-/// per-tick output, derived from the formula
+/// Photosynthesis data cached on Photo cells.
 ///
 ///   E = BASE_PHOTO_PRODUCTION
 ///       + (PHOTO_PRODUCTION_PER_CELL / MAX_RD_NEIGHBOURS) * neighbour_count
 ///
-/// The constant baseline (0.2) ensures isolated single-cell photoautotrophs
-/// still gain a small amount of energy per tick — without it, a gen-0
-/// 1-cell organism (zero neighbours) would never reach the reproduction
-/// threshold and the species would die out at gen 0.
-///
-/// Both fields change only when the cell's neighbour set changes (currently
-/// only at birth — new cells appended during reproduction trigger a
-/// recompute on the affected body part). Per-tick reads of
-/// `energy_production` are O(1).
+/// The baseline keeps isolated 1-cell photoautotrophs gaining energy, so a
+/// gen-0 organism can still reach the reproduction threshold. Both fields
+/// change only when the neighbour set changes; per-tick reads are O(1).
 #[derive(Clone, Debug)]
 pub struct PhotosyntheticCell {
     pub neighbour_count:   u8,
     pub energy_production: f32,
 }
 
-/// Floor on per-cell photosynthetic production, applied before the
-/// neighbour-count term. Guarantees isolated photo cells still produce
-/// non-zero energy.
+/// Floor on per-cell photosynthetic production (before the neighbour term);
+/// keeps isolated photo cells producing non-zero energy.
 pub const BASE_PHOTO_PRODUCTION: f32 = 0.2;
 
 impl PhotosyntheticCell {
-    /// Build a `PhotosyntheticCell` for a cell whose current neighbour
-    /// count is `n`, using `photo_production_per_cell` as the baseline
-    /// "fully-surrounded" production rate (i.e. the value for n = 18).
-    /// Caller passes the constant rather than us importing it from
-    /// `energy.rs` to keep `cell.rs` free of cross-module deps.
+    /// Build for neighbour count `n`. `photo_production_per_cell` is the
+    /// fully-surrounded rate (n = 18); passed in to keep `cell.rs` free of
+    /// cross-module deps.
     #[inline]
     pub fn new(n: u8, photo_production_per_cell: f32) -> Self {
         let n_clamped = n.min(MAX_RD_NEIGHBOURS);
@@ -188,26 +138,20 @@ pub struct Cell {
     /// Position relative to the body part's origin.
     pub local_pos: Vec3,
     pub cell_type: CellType,
-    /// Per-cell energy reservoir. Read and updated by `PhysiologyPlugin`
-    /// (in `src/physiology/physiology.rs`); independent of the
-    /// organism-level `Organism::energy`. Used as the basis for cell-level
-    /// physiology rules (decay, photosynthesis credit, growth gating, …).
+    /// Per-cell energy reservoir, owned by `PhysiologyPlugin`; independent of
+    /// `Organism::energy`. Basis for cell-level physiology rules.
     pub cell_energy: f32,
-    /// Count of RD-adjacent neighbour cells (within the same body part).
-    /// Range [0, MAX_RD_NEIGHBOURS = 18]. Updated only when cells are added
-    /// or removed (currently birth + predation), not per tick.
+    /// RD-adjacent neighbour count within the same body part, range
+    /// [0, MAX_RD_NEIGHBOURS]. Updated at composition changes, not per tick.
     pub neighbour_count: u8,
-    /// Some(...) only for Photo cells, carrying their cached photosynthesis
-    /// data. None for NonPhoto cells. `physiology::recompute_body_part`
-    /// keeps this in lockstep with `cell_type` and `neighbour_count`.
+    /// `Some` only for Photo cells (cached photosynthesis data); kept in sync
+    /// with `cell_type`/`neighbour_count` by `physiology::recompute_body_part`.
     pub photo: Option<PhotosyntheticCell>,
 }
 
 impl Cell {
-    /// Construct a cell with the default starting energy, no neighbours
-    /// counted yet, and no photosynthetic data populated. Body-part
-    /// constructors call `physiology::recompute_body_part` after assembling
-    /// their cell list, which fills in `neighbour_count` and `photo`.
+    /// Cell with default energy, no neighbours counted, no photo data;
+    /// `physiology::recompute_body_part` fills `neighbour_count`/`photo` later.
     #[inline]
     pub fn new(local_pos: Vec3, cell_type: CellType) -> Self {
         Self {
@@ -223,8 +167,7 @@ impl Cell {
 
 // ── Body part ────────────────────────────────────────────────────────────────
 
-/// Anatomical role of a body part. Currently a hint; not consumed by
-/// anything load-bearing yet.
+/// Anatomical role of a body part. Currently a hint only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyPartKind {
     Body,
@@ -237,57 +180,43 @@ pub struct BodyPart {
     pub kind: BodyPartKind,
     /// Offset of this body part's origin relative to the organism root.
     pub local_offset: Vec3,
-    /// Cells composing this body part. Mesh, collision, energy and
-    /// photosynthesis counts all read from here.
+    /// Cells composing this body part. Mesh/collision/energy/photo read here.
     pub cells: Vec<Cell>,
-    /// Per-part genome — order-of-cell-growth ledger for THIS body part.
-    /// Each entry is `(index, position relative to body-part origin, type)`.
-    /// `volumetric_growth::build_mesh_from_ocg` welds vertices across all
-    /// positions it sees, so every body part owns its own OCG; sharing
-    /// across parts would fuse mesh topology and break independent rotation.
+    /// Per-part genome: order-of-cell-growth ledger `(index, pos relative to
+    /// part origin, type)`. Each body part owns its own OCG — `build_mesh_from_ocg`
+    /// welds across all positions, so sharing would fuse topology and break
+    /// independent rotation.
     pub ocg: Vec<(usize, Vec3, CellType)>,
-    /// Some(...) when this body part hangs off another. `None` for the root
-    /// part (index 0). The attachment carries the pivot point in the parent's
-    /// local frame plus a rotation Quat for future limb animation.
+    /// `Some` when this part hangs off another; `None` for the root (index 0).
+    /// Carries the pivot point in the parent's local frame plus a rotation Quat.
     pub attachment: Option<crate::body_part::Attachment>,
-    /// True after `predation.rs` has eaten this body part. Marks it as
-    /// soft-deleted: cells are cleared and the child mesh entity is
-    /// despawned, but the slot stays in `Organism::body_parts` so existing
-    /// `BodyPartIndex` references on sibling children remain stable. All
-    /// iteration sites filter on `is_alive()`.
+    /// True after predation ate this part — soft-deleted: cells cleared and
+    /// mesh despawned, but the slot stays so sibling `BodyPartIndex` references
+    /// stay stable. All iteration sites filter on `is_alive()`.
     pub consumed: bool,
-    /// Debug flag — render this body part with a blue material instead of
-    /// the trophic colour. Set on freshly-spawned branches so the user can
-    /// see appendages clearly while the system is being developed.
+    /// Debug: render blue instead of the trophic colour (set on fresh branches).
     pub debug_blue: bool,
-    /// Can this body part still grow? When `false`, mesh-building and
-    /// mutation skip this part (used by Krishi's hand-built body, where
-    /// the cell layout is fixed).
+    /// When `false`, mesh-building and mutation skip this part (Krishi's
+    /// hand-built fixed body).
     pub regrowable: bool,
 }
 
 impl BodyPart {
-    /// True if the body part still has at least one cell and has not been
-    /// eaten by a predator. Iterators that compute aggregate properties
-    /// (mass, bounding radius, photo cell count) skip non-alive body parts.
+    /// True if the part still has a cell and hasn't been eaten. Aggregate-
+    /// property iterators skip non-alive parts.
     #[inline]
     pub fn is_alive(&self) -> bool {
         !self.consumed && !self.cells.is_empty()
     }
 
-    /// Local-space AABB enclosing all grown cells, padded so the wrapping
-    /// mesh fits inside it. Returns `None` for body parts with no grown
-    /// cells (the only legitimate case is a body part that has just been
-    /// scheduled but not yet had its first cell grown). Currently unused —
-    /// kept as a building block for future spatial-index optimisations of
-    /// world-mesh collision queries.
+    /// Local-space AABB enclosing all grown cells, padded for the wrapping
+    /// mesh. `None` when there are no grown cells. Currently unused.
     #[allow(dead_code)]
     pub fn local_aabb(&self) -> Option<(Vec3, Vec3)> {
         if self.cells.is_empty() { return None; }
         let mut lo = Vec3::splat(f32::INFINITY);
         let mut hi = Vec3::splat(f32::NEG_INFINITY);
-        // Pad enough to cover both the icosphere mesh wrapping and the
-        // single-cell rhombic-dodecahedron starter shape.
+        // Pad to cover both the icosphere mesh and the RD starter shape.
         let pad = Vec3::splat(MESH_PADDING.max(2.0 * RD_HALF_SIZE));
         for c in &self.cells {
             lo = lo.min(c.local_pos - pad);
@@ -312,10 +241,11 @@ impl BodyPart {
     pub fn cell_counts(&self) -> (u32, u32) {
         let mut p = 0; let mut np = 0;
         for c in &self.cells {
-            // Placeholder counts as non-photo body mass for upkeep.
+            // Placeholder/SubLimb count as non-photo body mass for upkeep.
             match c.cell_type {
                 CellType::Photo                          => p  += 1,
-                CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => np += 1,
+                CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb
+                | CellType::YellowCell | CellType::OrangeCell | CellType::BrownCell => np += 1,
             }
         }
         (p, np)
@@ -325,14 +255,12 @@ impl BodyPart {
 
 // ── Marker components ────────────────────────────────────────────────────────
 
-/// Marker on the child entity that owns the body part's `Mesh3d`. Used by
-/// the gizmo and mesh-rebuild systems to find body-part meshes.
+/// Marker on the child entity owning the body part's `Mesh3d`.
 #[derive(Component)]
 pub struct OrganismMesh;
 
-/// Index back into `Organism::body_parts` for a body-part child entity.
-/// Lets systems that walk children (mesh rebuild, collision visualisation)
-/// recover which body part each child represents in O(1).
+/// Index back into `Organism::body_parts` for a body-part child entity (O(1)
+/// recovery for systems that walk children).
 #[derive(Component, Clone, Copy)]
 pub struct BodyPartIndex(pub usize);
 

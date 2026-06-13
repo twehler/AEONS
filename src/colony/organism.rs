@@ -1,17 +1,11 @@
-// Organism — top-level component data for one creature in the simulation.
+// Organism — top-level component data for one creature.
 //
-// Moved out of `colony.rs` so the struct definition has a dedicated home as
-// the simulation grows. `colony.rs` re-exports everything in this module via
-// `pub use crate::organism::*;` so the rest of the codebase keeps importing
-// `crate::colony::Organism` etc. unchanged.
+// `colony.rs` re-exports this module (`pub use crate::organism::*;`) so the
+// rest of the codebase keeps importing `crate::colony::Organism` etc.
 //
 // The cell-tally fields (`photo_cell_count`, `non_photo_cell_count`) are
-// caches updated only at construction time (i.e. at birth — currently the
-// only event that mutates an organism's cell composition). Predation, which
-// removes cells from a body part, also adjusts these counts so the cache
-// stays consistent. They let downstream systems (energy, physiology) read
-// the cell mix in O(1) instead of iterating every body part's cells each
-// tick.
+// caches maintained at composition changes (birth + predation) so downstream
+// systems read the cell mix in O(1) instead of iterating every cell per tick.
 
 use bevy::prelude::*;
 use rand::prelude::*;
@@ -21,18 +15,14 @@ use crate::cell::*;
 
 // ── Organism ─────────────────────────────────────────────────────────────────
 
-/// Body-plan symmetry strategy. Read by reproduction to pick which growth
-/// pipeline to run; by spawn helpers to decide whether to build one or two
-/// body parts. Inherited verbatim by offspring (mutation never changes
-/// symmetry — that would require restructuring the child's body, currently
-/// out of scope).
+/// Body-plan symmetry strategy. Selects the growth pipeline and how many
+/// body parts spawn builds. Inherited verbatim; mutation never changes it.
 ///
-/// * `NoSymmetry` — the legacy single-root path: body_parts[0] is the root,
-///   subsequent entries are branches (the 20% branch-spawn path runs).
-/// * `Bilateral`  — body_parts[0] is the right half (cells with x ≥
-///   `body_part::MIN_X_BILATERAL`); body_parts[1] is the left half (mirror
-///   across the YZ-plane). Reproduction grows the right half by one cell
-///   and re-mirrors the left. Branches are skipped for bilateral organisms.
+/// * `NoSymmetry` — single-root: body_parts[0] is the root, later entries
+///   are branches (the 20% branch-spawn path runs).
+/// * `Bilateral`  — body_parts[0] holds both halves combined (right cells
+///   with x ≥ `body_part::MIN_X_BILATERAL` plus their YZ-plane mirror).
+///   Reproduction grows the right half by one cell and re-mirrors. No branches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Symmetry {
     NoSymmetry,
@@ -40,29 +30,59 @@ pub enum Symmetry {
 }
 
 
-/// Intelligence level — selects WHICH brain pool processes the organism
-/// AND the size of that pool's MLP. All non-Level0 pools share the same
-/// REINFORCE-style RL training loop (reward = energy delta) and the
-/// same I/O dimensions; they differ only in hidden-layer width:
+/// Locomotion paradigm. Selects the physics representation, brain pool, and
+/// movement-driving system. Inherited verbatim; defaults to `Sliding`.
 ///
-///   * `Level0` — no brain, no GPU work. Sessile organisms always get
-///     this; movement systems skip them anyway. Implemented in
-///     `intelligence_level_0.rs` (a marker only — the file has no
-///     systems and no resources).
-///   * `Level1` — small RL brain. Hidden width tuned to be cheap.
-///   * `Level2` — medium RL brain.
-///   * `Level3` — large RL brain.
+/// `is_sliding()` is the kinematic family (`Sliding` only): kinematic
+/// root, REINFORCE brain pool, `apply_movement`-driven, manual collision
+/// separation, contact predation. Everything else (including Swimming, now a
+/// DYNAMIC limb-physics mode) takes the dynamic/limb path; `is_swimming()`
+/// gates Swimming's fluid specialisations on top of that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MovementMode {
+    /// Kinematic root; REINFORCE brain writes movement_speed/direction; apply_movement translates the root. 2D (XZ + gravity).
+    #[default]
+    Sliding,
+    /// Dynamic per-part rigid bodies + revolute joints; PPO brain outputs joint target angles (terrestrial).
+    LimbBasedWalking,
+    /// Dynamic per-part rigid bodies + BALL (spherical) joints, neutral buoyancy, confined below the water plane; the swimming PPO brain (swimming_movement/) outputs 3-axis joint targets and propulsion emerges from blade-element fluid drag.
+    Swimming,
+    /// Placeholder for a future fluid-flight mode; currently routed to the dynamic path, inert.
+    Flying,
+}
+impl MovementMode {
+    /// Kinematic-root family: REINFORCE brain pool, apply_movement-driven, manual collision separation, contact predation. True for Sliding only (Swimming is now a dynamic limb-physics mode).
+    pub fn is_sliding(self) -> bool { matches!(self, MovementMode::Sliding) }
+    /// 3D-free, gravity-exempt, water-confined. True only for Swimming.
+    pub fn is_swimming(self) -> bool { matches!(self, MovementMode::Swimming) }
+    /// Canonical `Organism::ground_based` value for this movement paradigm:
+    /// sliders/walkers live on the ground (`true`); swimmers (and future
+    /// flyers) live in the fluid volume (`false`). Phototrophs may OVERRIDE
+    /// this to `false` via the species editor (floating algae) — every other
+    /// organism derives it from here.
+    pub fn default_ground_based(self) -> bool {
+        !matches!(self, MovementMode::Swimming | MovementMode::Flying)
+    }
+    /// Display label for the species-editor cycler / UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            MovementMode::Sliding          => "Sliding",
+            MovementMode::LimbBasedWalking  => "Limb-Movement",
+            MovementMode::Swimming          => "Swimming",
+            MovementMode::Flying            => "Flying",
+        }
+    }
+}
+
+
+/// Intelligence level — selects which brain pool processes the organism
+/// and that pool's MLP width.
+///   * `Level0` — no brain, no GPU work; sessile organisms always get this
+///     (movement systems skip them). Marker only (`intelligence_level_0.rs`).
+///   * `Level1`/`Level2`/`Level3` — small/medium/large RL brains.
 ///
-/// **Assignment policy**:
-///   * Initial colony spawn (in `spawn_colony`): rolled by
-///     `IntelligenceLevel::for_initial_spawn` per the documented
-///     distribution (photoautotrophs 80% Level0 / 20% Level1 — the
-///     80% naturally falls out of the existing `has_variable_form`
-///     roll since sessile organisms always get Level0; heterotrophs
-///     50% Level1 / 40% Level2 / 10% Level3).
-///   * Reproduction: offspring inherits the parent's
-///     `intelligence_level` verbatim (no re-roll, no mutation).
-///   * Loaded colony: deserialised from the save file as-is.
+/// Assignment: initial spawn rolls via `for_initial_spawn`; reproduction
+/// inherits the parent's level verbatim; load deserialises as-is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntelligenceLevel {
     Level0,
@@ -83,23 +103,14 @@ impl IntelligenceLevel {
         if is_sessile { return IntelligenceLevel::Level0; }
         match kind {
             OrganismKind::Photoautotroph => {
-                // Photoautotrophs are now always Level 0 — the L1
-                // photo brain was silenced (it produced a "river of
-                // algae" flow-field behaviour that wasn't useful at
-                // the simulation's current scale). Mobile photos
-                // still exist as a body plan but they sit on Level 0
-                // alongside the sessile variable-form ones.
+                // Photoautotrophs are always Level 0 (the L1 photo brain
+                // is silenced). Mobile photos sit on Level 0 too.
                 IntelligenceLevel::Level0
             }
             OrganismKind::Heterotroph => {
-                // Levels 2 and 3 are placeholder-only after the L1
-                // rewrite (see `intelligence_level_2_sliding.rs` /
-                // `intelligence_level_3_sliding.rs`). All mobile heterotroph
-                // initial-spawn rolls collapse to Level 1 so no
-                // brain-less organism is ever produced. Save files
-                // that record explicit Level2 / Level3 values still
-                // load with the level preserved — only the random
-                // roll changed.
+                // L2/L3 are placeholder-only at initial spawn; all mobile
+                // heterotroph rolls collapse to Level 1. (Save files with
+                // explicit L2/L3 still load with the level preserved.)
                 let _ = rng.random::<f32>();
                 IntelligenceLevel::Level1
             }
@@ -109,184 +120,118 @@ impl IntelligenceLevel {
 
 #[derive(Component, Clone)]
 pub struct Organism {
-    /// Every body part the organism has, alive or consumed. Layout depends
-    /// on `symmetry`:
-    ///   * `NoSymmetry`: index 0 is the root; subsequent entries are
-    ///     branches that reference their parent through
-    ///     `BodyPart::attachment`.
-    ///   * `Bilateral`: index 0 is the right half (cells with x > 0);
-    ///     index 1 is the left half (mirror).
-    /// Each body part owns its own OCG; the global organism cell catalogue
-    /// is the union of all `body_parts[*].ocg` over alive parts.
+    /// Every body part, alive or consumed. Layout depends on `symmetry`
+    /// (see `Symmetry`). Each part owns its own OCG; the organism cell
+    /// catalogue is the union of `body_parts[*].ocg` over alive parts.
     pub body_parts: Vec<BodyPart>,
     /// Body-plan strategy — see `Symmetry`.
     pub symmetry: Symmetry,
-    /// Brain tier — see `IntelligenceLevel`. Set at spawn from
-    /// `is_sessile` and trophic kind via
-    /// `IntelligenceLevel::for_spawn`. Read by `spawn_organism` /
-    /// `spawn_loaded_organism` to decide which marker components to
-    /// insert (e.g. `BrainLevel0` for sessile organisms). Inherited
-    /// verbatim by offspring through reproduction / continuous
-    /// growth — but since the inputs (`is_sessile`, `kind`) inherit
-    /// verbatim too, the inherited value is always self-consistent
-    /// with `IntelligenceLevel::for_spawn`.
+    /// Brain tier — see `IntelligenceLevel`. Inherited verbatim by offspring;
+    /// since its inputs (`is_sessile`, kind) also inherit, it stays consistent.
     pub intelligence_level: IntelligenceLevel,
-    /// When `true`, the organism never moves: `apply_movement` skips it
-    /// entirely, regardless of whatever `movement_speed` /
-    /// `movement_direction` the brain systems write. Inherited verbatim
-    /// by offspring. Auto-set whenever `has_variable_form` is true.
+    /// When `true` the organism never moves (`apply_movement` skips it,
+    /// ignoring brain writes). Inherited; auto-set when `has_variable_form`.
     pub is_sessile: bool,
-    /// When `true`, the organism is forced to `Symmetry::NoSymmetry` and
-    /// `is_sessile` (a plant-like body that grows asymmetrically and
-    /// stays rooted). Inherited verbatim by offspring. The roll happens
-    /// at initial colony spawn (80% chance for photoautotrophs); after
-    /// that the trait is hereditary.
+    /// When `true`, forced to `NoSymmetry` + `is_sessile` (plant-like body
+    /// that grows asymmetrically and stays rooted). Rolled at initial spawn
+    /// (80% for photoautotrophs); inherited thereafter.
     pub has_variable_form: bool,
-    /// Movement paradigm.
-    ///
-    ///   * `true`  (default) → "sliding": the brain writes
-    ///     `movement_speed` / `movement_direction` directly and
-    ///     `apply_movement` translates the organism root by those
-    ///     each tick. This is the current behaviour of every system
-    ///     prior to limb-based locomotion.
-    ///   * `false`           → "limb-based": the organism is a
-    ///     rigid-body chain in Avian's physics world. Brains output
-    ///     PD target joint angles per spherical limb joint; movement
-    ///     emerges from friction between the limbs and the terrain.
-    ///
-    /// Set at spawn (defaults `true` for legacy colonies, initial
-    /// cohort, reproduction, and any pre-format-bump `.species` /
-    /// `.colony` files). The species editor's "Sliding / Limb-Movement"
-    /// cycler is the user-facing knob. Inherited verbatim by offspring.
-    pub sliding_movement: bool,
-    /// Latest target hinge angles the limb-based brain commanded, one PER
-    /// LIMB JOINT (radians, as a fraction of `LIMB_SWING_LIMIT` before
-    /// scaling). Layout: `limb_targets[k]` is the target for the hinge of
-    /// body-part index `k+1`, for up to `limb_ppo::OUT` (= `MAX_LIMB_JOINTS`,
-    /// currently 8) independently-controlled joints. `drive_limb_motors`
-    /// reads these each physics tick and writes each value (scaled by
-    /// `LIMB_SWING_LIMIT`) into the corresponding hinge motor's
-    /// `target_position`; the in-solver spring-damper motor then tracks it.
-    /// This is the EMERGENT-locomotion contract: the brain moves each limb
-    /// directly (no CPG generating the rhythm). Ignored entirely for sliding
-    /// organisms (`sliding_movement == true`); never read or written there.
-    /// Array length MUST equal `limb_ppo::OUT`.
-    pub limb_targets: [f32; 8],
-    /// `true` once the organism has finished growing — i.e. its meshes
-    /// have been smoothed via `volumetric_growth::smooth_vertices`. For
-    /// non-variable-form organisms this is `true` from spawn (they don't
-    /// grow during their own lifetime — only their offspring inherit
-    /// extra cells). For variable-form organisms this flips to `true`
-    /// inside `continuous_growth` on the tick where their grown cell
-    /// count first reaches `MAX_CELLS`. Once `true`, no further
-    /// smoothing work runs on the organism.
+    /// Movement paradigm. Inherited verbatim; defaults to `Sliding`.
+    /// See `MovementMode`: four variants —
+    ///   * `Sliding` — kinematic root; REINFORCE brain writes
+    ///     `movement_speed`/`movement_direction`, `apply_movement` translates
+    ///     the root each tick. 2D (XZ + gravity).
+    ///   * `LimbBasedWalking` — dynamic per-part rigid-body chain in Avian;
+    ///     PPO brain outputs joint target angles, locomotion emerges.
+    ///   * `Swimming` — dynamic per-part bodies on BALL (spherical) joints,
+    ///     neutral buoyancy, water-confined; the swimming PPO brain
+    ///     (`swimming_movement/`) writes 3-axis joint targets into the root's
+    ///     `SwimJointTargets` and locomotion emerges from fluid drag.
+    ///   * `Flying` — future fluid-flight placeholder, routed to the dynamic
+    ///     path, currently inert.
+    /// `is_sliding()` selects the kinematic family (`Sliding` only);
+    /// everything else takes the dynamic/limb path.
+    pub movement_mode: MovementMode,
+    /// `true` = lives on the ground (sliders/walkers): gravity always applies.
+    /// `false` = lives in the water volume (swimmers, future flyers, and
+    /// WATER-BASED phototrophs — floating algae): gravity applies ONLY while
+    /// the organism is above the water surface, so it neither sinks to the
+    /// bottom nor rises out of the water. Derived from `movement_mode`
+    /// (`default_ground_based()`) for every organism except phototrophs,
+    /// which may opt into water-based via the species editor. Inherited
+    /// verbatim by offspring.
+    pub ground_based: bool,
+    /// Latest limb commands from the brain. SWING `limb_targets[0..8]`: body-part
+    /// `k+1`'s hinge target (fraction of `LIMB_SWING_LIMIT`), read by
+    /// `drive_limb_motors`. GROUPED TWIST `limb_targets[8..10]`: per-group twist
+    /// effort about the limbs' long axes (fraction of `MAX_LIMB_TWIST_TORQUE`),
+    /// read by `drive_limb_twist` — the off-swing-axis DOF so limbs move in 3D.
+    /// The brain moves each limb directly (no CPG). Ignored for sliding organisms.
+    /// Array length MUST equal `limb_ppo::OUT` (= MAX_LIMB_JOINTS + N_LIMB_TWIST_GROUPS, 10).
+    pub limb_targets: [f32; 10],
+    /// `true` once meshes have been smoothed (`volumetric_growth::smooth_vertices`).
+    /// `true` from spawn for non-variable-form organisms; for variable-form it
+    /// flips in `continuous_growth` when grown cells first reach `MAX_CELLS`.
     pub adult: bool,
-    /// Cached count of `CellType::Photo` cells across all alive body parts.
-    /// Updated only when cells are added or removed (currently birth +
-    /// predation). Read by `energy.rs` and `physiology.rs` for per-tick
-    /// energy bookkeeping without re-iterating every cell.
+    /// Cached `CellType::Photo` count over alive body parts. Maintained at
+    /// composition changes (birth + predation); read by energy/physiology.
     pub photo_cell_count: i32,
-    /// Cached count of `CellType::NonPhoto` cells across all alive body
-    /// parts. Same lifecycle as `photo_cell_count`.
+    /// Cached `CellType::NonPhoto` count; same lifecycle as `photo_cell_count`.
     pub non_photo_cell_count: i32,
     pub energy: f32,
-    /// True when the organism's position has an unobstructed line to the sun.
-    /// Maintained by `photosynthesis.rs` and consumed by Level 1 brains.
+    /// True when the organism has an unobstructed line to the sun. Maintained
+    /// by `photosynthesis.rs`.
     pub in_sunlight: bool,
-    /// Hard gate consulted by `reproduction.rs`: once `true`, this organism
-    /// will never spawn another offspring for the rest of its life.
+    /// Once `true`, `reproduction.rs` never spawns another offspring.
     pub reproduced: bool,
-    /// Running count of successful reproductions, used by `reproduction.rs`
-    /// to decide when to flip `reproduced` (heterotrophs flip after the
-    /// first, photoautotrophs after the second).
+    /// Successful-reproduction count; `reproduction.rs` flips `reproduced`
+    /// after the first (heterotrophs) or second (photoautotrophs).
     pub reproductions: u8,
-    /// Running count of successful predation events (body parts eaten by
-    /// THIS organism, only meaningful for heterotrophs). Incremented by
-    /// `predation_system` on every eat. Read by the Level 1 hetero brain
-    /// as the eat-event reward signal (compared per-tick against its
-    /// stored `prev_predations`) — this replaced the old "energy spike
-    /// = eat" heuristic, which fired false positives on any energy
-    /// gain and missed events that were immediately drained back.
-    /// Saturating-wraps at `u8::MAX`; for the brain that's irrelevant
-    /// since it only reads the per-tick delta. Not currently saved to
-    /// `.colony` files (resets to 0 on load).
+    /// Successful-predation count (body parts eaten by this organism). The
+    /// Level 1 hetero brain reads the per-tick delta as its eat-reward signal.
+    /// Saturating-wraps at `u8::MAX`; not saved to `.colony` (resets on load).
     pub predations: u8,
-    /// Continuous hunger signal in `[0, 1]`: 0 = no urge to feed, 1 =
-    /// maximum urge. Recomputed every energy tick by
-    /// `energy::update_hunger_levels`. The formula is
-    /// classification-specific:
-    ///   * Photoautotroph        → 0 (they photosynthesise; no
-    ///                             pursuit motivation).
-    ///   * Heterotroph (Herbivore, no Carnivore marker)
-    ///                           → `clamp(5^(-E + 0.1), 0, 1)` where
-    ///                             `E = energy / max_energy`.
-    ///   * Heterotroph (Carnivore)
-    ///                           → reserved; currently mirrors the
-    ///                             herbivore formula but the
-    ///                             function in `energy.rs` is set up
-    ///                             so a different curve can be
-    ///                             plugged in without touching the
-    ///                             call sites.
-    ///
-    /// Read by the herbivore brain to continuously scale aggression:
-    /// hunger 1 → full-speed beeline at the nearest food; hunger 0
-    /// → relaxed cruise. Read by future carnivore behaviour too.
+    /// Hunger signal in `[0, 1]` (0 = no urge, 1 = max), recomputed each
+    /// energy tick by `energy::update_hunger_levels`; formula is
+    /// classification-specific (see `energy.rs`). Read by the herbivore brain
+    /// to scale pursuit aggression.
     pub hunger: f32,
-    /// Continuous reward signal in `[0, 1]` used by the herbivore RL
-    /// brain. Bumped by +0.6 (clamped at 1.0) on every successful
-    /// predation event and set to exactly 1.0 on every successful
-    /// reproduction. Depletes every virtual second by `hunger / 3`
-    /// (so hungry organisms forget rewards faster, sated ones keep
-    /// the afterglow longer). The brain reads the per-tick delta of
-    /// this field as its policy-gradient reward signal.
+    /// Reward signal in `[0, 1]` for the herbivore RL brain. +0.6 (clamp 1.0)
+    /// per predation, 1.0 per reproduction; depletes by `hunger/3` per virtual
+    /// second. The brain reads the per-tick delta as its reward.
     pub dopamine: f32,
     /// Distance (world units) to the nearest photoautotroph within
-    /// `behaviour::sensory::SENSORY_RADIUS` (= 50). Written every
-    /// brain tick by `update_target_distance`; saturates at the
-    /// radius value when no photo is in range. Consumed by the
-    /// herbivore RL brain as both an input observation AND as a
-    /// secondary reward channel (Δ < 0 ⇒ reward, Δ > 0 ⇒ penalty),
-    /// complementing the primary `dopamine` signal.
+    /// `sensory::SENSORY_RADIUS` (=50); saturates at the radius when none in
+    /// range. Written each brain tick. The herbivore brain uses it as both an
+    /// observation and a secondary reward channel (Δ<0 reward, Δ>0 penalty).
     pub target_distance: f32,
     pub movement_speed: f32,
     pub movement_direction: Vec3,
     pub velocity: Vec3,
     pub is_climbing: bool,
-    /// Vertical metres climbed since the last energy tick, awaiting payment
-    /// at `ELEVATION_ENERGY_PER_UNIT` per unit. Reset to 0 each tick. Krishi
-    /// is excluded from the energy system entirely so its debt never drains.
+    /// Vertical metres climbed since the last energy tick, paid at
+    /// `ELEVATION_ENERGY_PER_UNIT`; reset to 0 each tick. Krishi is excluded
+    /// from the energy system so its debt never drains.
     pub climb_energy_debt: f32,
-    /// Cached output of `compute_bounding_radius` — the maximum distance
-    /// from the organism root that any grown cell can reach. Updated only
-    /// at composition-change events (birth, growth, predation) by
-    /// `recompute_caches`. Read every frame by movement / floor /
-    /// buoyancy queries — caching this avoids an O(cells) walk per
-    /// access × thousands of accesses per frame.
+    /// Cached max distance from the root any grown cell can reach. Updated at
+    /// composition changes by `recompute_caches`; read every frame by
+    /// movement/floor/buoyancy queries to avoid an O(cells) walk per access.
     pub cached_bounding_radius: f32,
 
-    /// Fixed-dimension genome vector — see `lineages::dna`. Slots
-    /// 0..5 (structural / metabolic fields) are filled at
-    /// `spawn_organism` time and never change after birth; slots
-    /// 5..11 (L1 hetero brain genes) start at 0.0 and are populated
-    /// by `lineages::speciation::sync_dna_from_brain_pool` once the
-    /// brain-pool slot is assigned. Used by the speciation system
-    /// to classify organisms into species.
+    /// Fixed-dimension genome vector — see `lineages::dna`. Structural slots
+    /// are filled at spawn and frozen; brain-gene slots start 0.0 and are
+    /// populated by speciation once the brain slot is assigned. Used to
+    /// classify organisms into species.
     pub dna: Vec<f32>,
 
-    /// Which species this organism belongs to. `None` immediately
-    /// after spawn and until the first speciation tick. The
-    /// speciation system either keeps the value (drift still within
-    /// 5% of species centroid), reassigns it to a better-fitting
-    /// existing species, or forks a brand-new species. Offspring
-    /// inherit the parent's `species_id` at reproduction; the next
-    /// speciation tick re-evaluates whether the child still fits.
+    /// Species this organism belongs to. `None` until the first speciation
+    /// tick, which keeps/reassigns/forks it. Offspring inherit the parent's,
+    /// re-evaluated on the next tick.
     pub species_id: Option<u32>,
 }
 
 impl Organism {
-    /// Total currently-grown cells across alive body parts. Predation-
-    /// consumed body parts are skipped — they no longer contribute to
-    /// energy, weight or photosynthesis bookkeeping.
+    /// Total grown cells across alive body parts (consumed parts skipped).
     #[inline]
     pub fn grown_cell_count(&self) -> usize {
         self.body_parts.iter()
@@ -295,34 +240,29 @@ impl Organism {
             .sum()
     }
 
-    /// (photo_count, non_photo_count) — read straight from the cached
-    /// fields. Maintainers of `body_parts` MUST keep these counts in sync
-    /// (see `physiology::recompute_body_parts` and `predation_system`).
+    /// (photo_count, non_photo_count) from the cached fields. Maintainers of
+    /// `body_parts` MUST keep these in sync (recompute_body_parts, predation).
     #[inline]
     pub fn cell_counts(&self) -> (u32, u32) {
         (self.photo_cell_count.max(0) as u32, self.non_photo_cell_count.max(0) as u32)
     }
 
-    /// Effective biological mass — proportional to grown cell count of
-    /// alive body parts. Floored at 1.0 so single-cell juveniles don't
-    /// divide by zero in energy / drag calculations.
+    /// Effective biological mass ∝ grown cell count. Floored at 1.0 so
+    /// single-cell juveniles don't divide by zero in energy/drag math.
     #[inline]
     pub fn weight(&self) -> f32 {
         (self.grown_cell_count() as f32).max(1.0)
     }
 
-    /// Maximum distance from the organism root that any grown cell on any
-    /// alive body part can reach. Reads the cached value populated by
-    /// `recompute_caches`. For broad-phase collision and water buoyancy
-    /// — needs a conservative upper bound, not exact geometry.
+    /// Cached max distance from the root any grown cell can reach. A
+    /// conservative upper bound for broad-phase collision and buoyancy.
     #[inline]
     pub fn bounding_radius(&self) -> f32 {
         self.cached_bounding_radius
     }
 
-    /// Re-derive the bounding radius from the current `body_parts`. For
-    /// branches the distance is taken in the parent body part's frame
-    /// (origin + cell offset). Called from `recompute_caches`.
+    /// Re-derive the bounding radius from `body_parts`. Branch distances are
+    /// taken in the parent's frame (origin + cell offset).
     fn compute_bounding_radius(&self) -> f32 {
         let mut max_r = 2.0 * RD_HALF_SIZE; // single-cell starter floor
         let pad = MESH_PADDING.max(2.0 * RD_HALF_SIZE);
@@ -345,10 +285,8 @@ impl Organism {
         self.body_parts.iter().filter(|b| b.is_alive()).count()
     }
 
-    /// Recompute `photo_cell_count` and `non_photo_cell_count` from the
-    /// current `body_parts` content. Called by the construction helpers in
-    /// `colony.rs` / `reproduction.rs` / `krishi.rs` after any mutation to
-    /// the body-part list, so the caches reflect the truth at that moment.
+    /// Recompute the cached cell counts (+ bounding radius) from `body_parts`.
+    /// Construction helpers call this after mutating the body-part list.
     pub fn recompute_cell_counts(&mut self) {
         let mut p = 0i32;
         let mut np = 0i32;
@@ -356,7 +294,8 @@ impl Organism {
             for cell in &bp.cells {
                 match cell.cell_type {
                     CellType::Photo                            => p  += 1,
-                    CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => np += 1,
+                    CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb
+                    | CellType::YellowCell | CellType::OrangeCell | CellType::BrownCell => np += 1,
                 }
             }
         }
@@ -365,11 +304,8 @@ impl Organism {
         self.cached_bounding_radius = self.compute_bounding_radius();
     }
 
-    /// Update only the cached bounding radius — call this from sites
-    /// that maintain `photo_cell_count` / `non_photo_cell_count`
-    /// incrementally and don't want to re-iterate every cell.
-    /// Currently used by `continuous_growth` (after appending a cell)
-    /// and `predation` (after consuming a body part).
+    /// Update only the cached bounding radius — for sites that maintain the
+    /// cell counts incrementally (continuous_growth, predation).
     #[inline]
     pub fn recompute_bounding_radius(&mut self) {
         self.cached_bounding_radius = self.compute_bounding_radius();
@@ -387,37 +323,25 @@ pub struct Photoautotroph;
 #[derive(Component, Clone, Copy)]
 pub struct Heterotroph;
 
-/// Sub-classification of heterotrophs — `Carnivore` targets and
-/// consumes other heterotrophs; the absence of this marker on a
-/// heterotroph means "herbivore" (default), which targets and
-/// consumes photoautotrophs (existing behaviour). The Species
-/// Editor's Classification cycler controls which marker is added at
-/// spawn time. Brain pools (IL2 / IL3 / IL herbivore_1) read this
-/// marker to decide which neighbour type to chase. Initial-spawn
-/// heterotrophs (no species file) default to herbivore.
+/// Heterotroph sub-class: `Carnivore` chases/eats other heterotrophs; its
+/// absence means herbivore (default), which chases/eats photoautotrophs.
+/// Brain pools read this to pick which neighbour type to chase. Initial-spawn
+/// heterotrophs default to herbivore.
 #[derive(Component, Clone, Copy)]
 pub struct Carnivore;
 
 
-/// Per-organism ancestry + age tracking, for the dataset-export
-/// "lineage" diagnostic columns. Attached to every OrganismRoot at
-/// spawn time. NOT persisted to `.colony` files yet — loaded
-/// organisms re-initialise as initial-cohort (`parent_id = None`,
-/// `spawn_time_secs = current virtual time`, `times_reproduced_self
-/// = 0`). The runtime-side history is sufficient for the current
-/// diagnostic use case; bumping the .colony format to save it is a
-/// follow-up.
+/// Per-organism ancestry + age tracking for the dataset-export lineage
+/// columns. Attached to every OrganismRoot at spawn. NOT persisted to
+/// `.colony` — loaded organisms re-init as initial-cohort.
 #[derive(Component, Debug, Clone)]
 pub struct LineageRecord {
-    /// `Some(parent)` for offspring of a reproduction event;
-    /// `None` for initial-cohort spawns, auto-spawns, editor
-    /// placements, and loaded organisms.
+    /// `Some(parent)` for reproduction offspring; `None` for initial-cohort,
+    /// auto-spawns, editor placements, and loaded organisms.
     pub parent_id:            Option<Entity>,
-    /// Virtual-time seconds when the organism was spawned.
+    /// Virtual-time seconds at spawn.
     pub spawn_time_secs:      f32,
-    /// Number of successful reproductions this organism has
-    /// performed. Incremented by `reproduction_system` each time it
-    /// produces a child.
+    /// Successful reproductions by this organism (bumped by reproduction_system).
     pub times_reproduced_self: u32,
 }
 

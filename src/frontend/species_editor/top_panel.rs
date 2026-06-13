@@ -1,37 +1,23 @@
-// Species editor — top panel.
+// Species editor — top panel: metabolism/intelligence/symmetry/form/movement
+// cyclers + Import/Load/Save actions.
 //
-// Six buttons laid out left-to-right:
-//   1. Metabolism cycler        (Photoautotroph / Heterotroph)
-//   2. Intelligence cycler      (Level 0 / 1 / 2 / 3)
-//   3. Symmetry cycler          (No Symmetry / Bilateral)
-//   4. Form cycler              (Variable / Fixed)
-//   5. Spawn first Cell         (action)
-//   6. Create Species           (action — opens Save-As dialog)
-//
-// The cyclers stay editable even after the first cell is spawned, so a
-// loaded species can be re-tuned (e.g. Sliding ↔ Limb-Movement). The one
-// exception is the Symmetry cycler, which locks once cells exist because
-// it changes how the stored OCG is interpreted. "Load Species" decodes a
-// `.species` file into the live session for further editing.
-//
-// Spawn first Cell creates the OCG's first entry at the local origin
-// for NoSymmetry, or at `(MIN_X_BILATERAL, 0, 0)` for Bilateral.
-// Create Species opens a native file dialog and stashes the chosen
-// path in `SpeciesSession::save_requested`; the actual file write
-// happens in `save.rs::dispatch_save_requests`.
+// Cyclers stay editable after cells exist (so a loaded species can be
+// re-tuned), except Symmetry, which locks once cells exist because it
+// changes how the stored OCG is interpreted.
 
 use bevy::prelude::*;
 use std::path::PathBuf;
 
 use crate::cell::CellType;
 use crate::colony::{IntelligenceLevel, Symmetry};
+use crate::organism::MovementMode;
 use crate::frontend::PANEL_BG_COLOR;
 use crate::simulation_settings::WindowMode;
 
 use super::session::{
     cycle_intelligence, cycle_symmetry, intelligence_label, symmetry_label,
     Classification, DraftSpecies, EditorBodyPart, Form, Metabolism, Mobility,
-    SpeciesMovement, SpeciesSession,
+    SpeciesSession,
 };
 use super::save::{load_species, LoadedSpecies};
 use super::mesh_import::{ImportMeshButton, IMPORT_BG};
@@ -55,7 +41,7 @@ const ACTION_BG_LOAD:      Color = Color::srgb(0.45, 0.35, 0.62); // purple — 
 pub struct SpeciesTopPanel;
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
-pub enum CyclerKind { Metabolism, Mobility, Classification, Intelligence, Symmetry, Form, Movement }
+pub enum CyclerKind { Metabolism, Mobility, Classification, Intelligence, Symmetry, Form, Movement, Grounding }
 
 #[derive(Component, Clone, Copy)]
 pub struct Cycler(pub CyclerKind);
@@ -111,10 +97,9 @@ pub fn spawn_top_panel(parent: &mut ChildSpawnerCommands, top_offset_px: f32) {
             cycler_button(bar, CyclerKind::Symmetry,       symmetry_label(draft.symmetry));
             cycler_button(bar, CyclerKind::Form,           draft.form.label());
             cycler_button(bar, CyclerKind::Movement,       draft.movement.label());
+            cycler_button(bar, CyclerKind::Grounding,      grounding_label(draft.ground_based));
 
-            // Action buttons — wider than cyclers. (The base cell is now
-            // auto-seeded from the metabolism cycler, so there is no longer a
-            // "Spawn first Cell" button.)
+            // The base cell is auto-seeded from the metabolism cycler.
             action_button::<ImportMeshButton>(bar, "Import Mesh (.glb)", IMPORT_BG);
             action_button::<LoadSpeciesButton>(bar, "Load Species",   ACTION_BG_LOAD);
             action_button::<CreateSpeciesButton>(bar, "Save Species", ACTION_BG_SUCCESS);
@@ -180,10 +165,8 @@ impl Default for LoadSpeciesButton     { fn default() -> Self { Self } }
 
 // ── Cycler click handler ────────────────────────────────────────────────────
 
-/// Pick the canonical starting intelligence level for a given
-/// (mobility, classification) pair. Used by both the Mobility and
-/// Classification click handlers so toggling either knob snaps the
-/// intelligence to a valid value.
+/// Canonical starting intelligence for a (mobility, classification) pair,
+/// so toggling either knob snaps intelligence to a valid value.
 fn default_intelligence_for(m: Mobility, c: Classification) -> IntelligenceLevel {
     match (m, c) {
         (Mobility::Sessile,  _)                       => IntelligenceLevel::Level0,
@@ -192,11 +175,26 @@ fn default_intelligence_for(m: Mobility, c: Classification) -> IntelligenceLevel
     }
 }
 
-/// Canonical default symmetry for a metabolism. Heterotrophs are
-/// bilaterally symmetric (like real animals); photoautotrophs default
-/// to no symmetry (plant-like radial/irregular growth). Applied when
-/// the metabolism cycler is toggled; the user can still re-cycle the
-/// symmetry knob afterwards.
+/// Cycle through the THREE author-able movement modes in order
+/// Sliding → LimbBasedWalking → Swimming → (back to Sliding). `Flying` is a
+/// placeholder and deliberately excluded; any non-author-able value snaps
+/// back to `Sliding`.
+fn cycle_movement(m: MovementMode) -> MovementMode {
+    match m {
+        MovementMode::Sliding          => MovementMode::LimbBasedWalking,
+        MovementMode::LimbBasedWalking => MovementMode::Swimming,
+        MovementMode::Swimming         => MovementMode::Sliding,
+        MovementMode::Flying           => MovementMode::Sliding,
+    }
+}
+
+/// Display label for the Grounding cycler (`DraftSpecies::ground_based`).
+fn grounding_label(ground_based: bool) -> &'static str {
+    if ground_based { "Ground-Based" } else { "Water-Based" }
+}
+
+/// Canonical default symmetry for a metabolism: heterotrophs Bilateral
+/// (animal-like), photoautotrophs NoSymmetry (plant-like). Re-cyclable.
 fn default_symmetry_for(m: Metabolism) -> Symmetry {
     match m {
         Metabolism::Heterotroph    => Symmetry::Bilateral,
@@ -213,20 +211,22 @@ pub fn handle_cycler_clicks(
 
     for (interaction, cycler, mut bg) in &mut interactions {
         // Per-cycler lock (must mirror `sync_cycler_lock_state`):
-        //   * Metabolism + Symmetry lock once any cell has been APPENDED
-        //     beyond the base seed. Both recolour / reinterpret the base
-        //     (Photo↔Hetero starter colour; Bilateral right-half vs
-        //     NoSymmetry full part) in ways that can't be reconciled with an
-        //     already-built body. While it's still just the base they stay
-        //     editable and re-seed the base preview live.
+        //   * Metabolism + Symmetry lock once cells are appended beyond the
+        //     base seed — both reinterpret the base in ways incompatible with
+        //     an already-built body.
         //   * Intelligence + Movement lock while Sessile (sessile ⇒ Level0 +
-        //     Sliding). Other cyclers stay editable at all times.
-        // Locked cyclers `continue` so the greyed colour set by
-        // `sync_cycler_lock_state` persists.
+        //     Sliding).
+        //   * Grounding locks for everything EXCEPT phototrophs — only a
+        //     phototroph may be made water-based (floating algae); every
+        //     other organism derives `ground_based` from its movement mode.
+        // Locked cyclers `continue` to keep the greyed colour.
         let locked = match cycler.0 {
             CyclerKind::Metabolism | CyclerKind::Symmetry => session.has_appended_cells(),
             CyclerKind::Intelligence | CyclerKind::Movement => {
                 session.draft.mobility == Mobility::Sessile
+            }
+            CyclerKind::Grounding => {
+                session.draft.metabolism != Metabolism::Photoautotroph
             }
             _ => false,
         };
@@ -236,55 +236,46 @@ pub fn handle_cycler_clicks(
             Interaction::Pressed => {
                 match cycler.0 {
                     CyclerKind::Metabolism => {
-                        // Reachable only before any cell is appended (locked
-                        // otherwise). Toggle metabolism, snap symmetry to its
-                        // canonical default (Heterotroph → Bilateral,
-                        // Photoautotroph → NoSymmetry), and re-seed the base
-                        // so its colour (Photo green / Hetero red) and seed
-                        // position update live.
+                        // Toggle metabolism, snap symmetry to its canonical
+                        // default, and re-seed the base so colour/position update.
                         session.draft.metabolism = session.draft.metabolism.cycle();
                         session.draft.symmetry = default_symmetry_for(session.draft.metabolism);
+                        // Grounding is a phototroph-only override: leaving
+                        // Photoautotroph snaps it back to the movement-mode
+                        // default so the (now greyed-out) cycler shows the
+                        // value the spawn will actually use.
+                        if session.draft.metabolism != Metabolism::Photoautotroph {
+                            session.draft.ground_based =
+                                session.draft.movement.default_ground_based();
+                        }
                         session.seed_base();
                     }
                     CyclerKind::Mobility => {
-                        // Toggle, then enforce the Mobility ↔ Intelligence
-                        // coupling: sessile species are auto-Level0;
-                        // newly-mobile species default to Level1
-                        // (herbivore) or Level2 (carnivore).
+                        // Enforce Mobility ↔ Intelligence coupling.
                         session.draft.mobility = session.draft.mobility.cycle();
                         session.draft.intelligence = default_intelligence_for(
                             session.draft.mobility, session.draft.classification,
                         );
-                        // Sessile organisms must be on the sliding path
-                        // (Kinematic root, immovable to physics). Snap
-                        // the movement cycler when entering Sessile so
-                        // the user doesn't inadvertently leave a stale
-                        // LimbMovement selection — `spawn_organism`
-                        // would coerce it anyway but the UI should
-                        // reflect what will actually happen.
+                        // Sessile must be on the sliding path (Kinematic root);
+                        // snap the movement cycler so the UI reflects what
+                        // `spawn_organism` will coerce anyway.
                         if session.draft.mobility == Mobility::Sessile {
-                            session.draft.movement = SpeciesMovement::Sliding;
+                            session.draft.movement = MovementMode::Sliding;
                         }
                     }
                     CyclerKind::Classification => {
-                        // Toggle classification, then re-apply the
-                        // intelligence default for the new pairing.
-                        // Carnivore must be ≥ Level2; if the current
-                        // intelligence is < Level2 we'd otherwise be
-                        // out of valid range.
+                        // Re-apply the intelligence default (Carnivore needs ≥ Level2).
                         session.draft.classification = session.draft.classification.cycle();
                         session.draft.intelligence = default_intelligence_for(
                             session.draft.mobility, session.draft.classification,
                         );
                     }
                     CyclerKind::Intelligence => {
-                        // Sessile → locked at Level0 (no cycling).
-                        // Mobile herbivore → cycles {L1, L2, L3}.
-                        // Mobile carnivore → cycles {L2, L3} (L1 not valid).
+                        // Sessile locked at Level0; herbivore cycles {L1,L2,L3},
+                        // carnivore cycles {L2,L3}.
                         if session.draft.mobility == Mobility::Sessile { continue; }
                         let next = cycle_intelligence(session.draft.intelligence);
-                        // Skip Level0 (sessile-only) and, for carnivores,
-                        // also skip Level1.
+                        // Skip Level0 (sessile-only) and, for carnivores, Level1.
                         let mut candidate = next;
                         for _ in 0..4 {
                             if candidate == IntelligenceLevel::Level0
@@ -297,23 +288,30 @@ pub fn handle_cycler_clicks(
                         session.draft.intelligence = candidate;
                     }
                     CyclerKind::Symmetry => {
-                        // Reachable only before any cell is appended. Toggle
-                        // and re-seed the base at the correct seed position
-                        // for the new symmetry.
+                        // Re-seed the base at the correct position for the new symmetry.
                         session.draft.symmetry = cycle_symmetry(session.draft.symmetry);
                         session.seed_base();
                     }
                     CyclerKind::Form     => session.draft.form     = session.draft.form.cycle(),
                     CyclerKind::Movement => {
-                        // Sessile species are locked to Sliding (their
-                        // root is a physics-immovable Kinematic body).
-                        // Match the Intelligence cycler's pattern.
+                        // Sessile is locked to Sliding (Kinematic root).
                         if session.draft.mobility == Mobility::Sessile { continue; }
-                        session.draft.movement = session.draft.movement.cycle();
+                        // 3-way cycle: Sliding → LimbBasedWalking → Swimming.
+                        session.draft.movement = cycle_movement(session.draft.movement);
+                        // Non-phototrophs derive Grounding from the movement
+                        // mode — keep the greyed-out cycler label honest.
+                        if session.draft.metabolism != Metabolism::Photoautotroph {
+                            session.draft.ground_based =
+                                session.draft.movement.default_ground_based();
+                        }
+                    }
+                    CyclerKind::Grounding => {
+                        // Phototroph-only (locked otherwise, see above):
+                        // toggle Ground-Based ↔ Water-Based (floating algae).
+                        session.draft.ground_based = !session.draft.ground_based;
                     }
                 }
-                // Any cycler change is an unsaved edit — so Load/Clear know
-                // to confirm before discarding.
+                // Mark unsaved so Load/Clear confirm before discarding.
                 session.dirty = true;
                 *bg = BackgroundColor(CYCLER_BG_HOVER);
             }
@@ -323,8 +321,7 @@ pub fn handle_cycler_clicks(
     }
 }
 
-/// Sync cycler labels with `session.draft` whenever the session
-/// changes. Edge-triggered so the per-frame cost is essentially zero.
+/// Sync cycler labels with `session.draft`. Edge-triggered on session change.
 pub fn sync_cycler_labels(
     session:   Res<SpeciesSession>,
     mut texts: Query<(&CyclerValueText, &mut Text)>,
@@ -339,28 +336,28 @@ pub fn sync_cycler_labels(
             CyclerKind::Symmetry       => symmetry_label(session.draft.symmetry).to_string(),
             CyclerKind::Form           => session.draft.form.label().to_string(),
             CyclerKind::Movement       => session.draft.movement.label().to_string(),
+            CyclerKind::Grounding      => grounding_label(session.draft.ground_based).to_string(),
         };
         if text.0 != new { text.0 = new; }
     }
 }
 
-/// Visually grey-out cyclers based on lock state:
-///   * Once any cell is appended beyond the base seed → Metabolism +
-///     Symmetry locked (they recolour / reinterpret the base).
-///   * While sessile (Mobility = Sessile) → Intelligence + Movement
-///     locked (Level0 + Sliding only).
-/// Other cyclers stay active. Mirrors the lock in `handle_cycler_clicks`.
+/// Grey-out locked cyclers (appended cells → Metabolism+Symmetry; sessile →
+/// Intelligence+Movement). Mirrors the lock in `handle_cycler_clicks`.
 pub fn sync_cycler_lock_state(
     session:     Res<SpeciesSession>,
     mut cyclers: Query<(&Cycler, &mut BackgroundColor)>,
 ) {
     if !session.is_changed() { return; }
-    let appended = session.has_appended_cells();
-    let sessile  = session.draft.mobility == Mobility::Sessile;
+    let appended  = session.has_appended_cells();
+    let sessile   = session.draft.mobility == Mobility::Sessile;
+    let not_photo = session.draft.metabolism != Metabolism::Photoautotroph;
     for (cycler, mut bg) in &mut cyclers {
         let locked = match cycler.0 {
             CyclerKind::Metabolism | CyclerKind::Symmetry => appended,
             CyclerKind::Intelligence | CyclerKind::Movement => sessile,
+            // Grounding is editable ONLY while constructing a phototroph.
+            CyclerKind::Grounding => not_photo,
             _ => false,
         };
         *bg = BackgroundColor(if locked { CYCLER_BG_LOCKED } else { CYCLER_BG_ACTIVE });
@@ -410,11 +407,9 @@ pub fn handle_create_species(
 
 // ── Load Species ──────────────────────────────────────────────────────────
 
-/// Replace the live editor session with a decoded `.species` file. Mutating
-/// the session through `ResMut` trips its `is_changed` flag, which drives the
-/// mesh / cycler-label / lock-state refreshers — so the editor re-renders the
-/// loaded body and updates the cyclers automatically. The file's brain weights
-/// (if any) are dropped: the editor works on morphology + options, not brains.
+/// Replace the live session with a decoded `.species`. The `ResMut` change
+/// drives the mesh/cycler/lock refreshers, so the editor re-renders. Brain
+/// weights are dropped (the editor works on morphology + options).
 fn apply_loaded_species(session: &mut SpeciesSession, loaded: LoadedSpecies) {
     session.reset();
     session.draft = DraftSpecies {
@@ -425,15 +420,15 @@ fn apply_loaded_species(session: &mut SpeciesSession, loaded: LoadedSpecies) {
         mobility:       if loaded.is_sessile { Mobility::Sessile } else { Mobility::Mobile },
         classification: loaded.classification,
         movement:       loaded.movement,
+        ground_based:   loaded.ground_based,
     };
     session.body_parts = loaded.body_parts.into_iter()
         .map(|p| EditorBodyPart { name: p.name, ocg: p.ocg, is_limb: p.is_limb, parent: p.parent })
         .collect();
     session.active_body_part = 0;
-    // A loaded body has appended cells, so Metabolism + Symmetry lock; every
-    // other option stays editable (e.g. Sliding → Limb-Movement).
+    // A loaded body has appended cells → Metabolism + Symmetry lock.
     session.first_cell_spawned = !session.body_parts.is_empty();
-    // Freshly loaded state matches the file on disk → not dirty.
+    // Freshly loaded state matches disk → not dirty.
     session.dirty = false;
 }
 
@@ -551,7 +546,7 @@ fn spawn_load_modal(commands: &mut Commands) {
                     ..default()
                 })
                 .with_children(|row| {
-                    // "No" first (left), highlighted as the safe default.
+                    // "No" first (left), the safe default.
                     row.spawn((
                         LoadModalNoButton,
                         Button,

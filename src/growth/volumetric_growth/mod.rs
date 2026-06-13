@@ -1,22 +1,16 @@
 // Volumetric growth — translation-only RD/tetra cell attachment.
 //
-// Algorithm (Blender-inspired "remove doubles → drop interior faces" pipeline):
-//
-//   1. Each placed cell's centre lives in `centers`.
-//   2. To get geometry, every cell emits its full 14 verts + 24 triangles in
-//      canonical (axis-aligned, untranslated) form, summed with the cell centre.
-//   3. Coincident vertices across cells are welded by a HashMap on quantised
-//      positions (eps = 1e-4 — six orders of magnitude below RD's 1.0 minimum
-//      vertex spacing).
-//   4. After welding, a triangle shared by two adjacent cells appears with
-//      identical (welded) vertex indices in both cells. Sorted-key duplicates
-//      are interior faces and are dropped on both sides.
-//   5. Surviving triangles inherit outward winding from their unique source
-//      cell — no global recalc is required.
-//
-// The whole mesh is recomputed from `centers` each tick; with ≤ 30 cells × 14
-// verts = 420 verts this is sub-millisecond. There is no surgical merge, no
-// boundary-loop extraction, no zipper stitch, no fill-holes post-pass.
+// Mesh pipeline ("remove doubles → drop interior faces"):
+//   1. Each placed cell centre lives in `centers`.
+//   2. Every cell emits its 14 verts + 24 triangles in canonical (axis-aligned,
+//      untranslated) form, summed with the cell centre.
+//   3. Coincident vertices are welded by HashMap on quantised positions
+//      (eps 1e-4, far below RD's 1.0 min vertex spacing).
+//   4. A triangle shared by two adjacent cells gets identical welded indices in
+//      both; sorted-key duplicates are interior faces and dropped on both sides.
+//   5. Surviving triangles keep outward winding from their unique source cell.
+// Hole-free by construction on the RD lattice with shared orientation.
+// Whole mesh recomputed each tick (≤30 cells × 14 verts ≈ sub-ms).
 
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -129,9 +123,8 @@ fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>, Vec<u32>) {
     let mut verts: Vec<Vec3> = Vec::new();
     let mut vmap: HashMap<(i64, i64, i64), u32> = HashMap::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
-    // Parallel to `tris`: which cell (index into `centers`) emitted each
-    // triangle. Survives the dedup so callers can colour kept triangles
-    // by their source cell's `CellType`.
+    // Parallel to `tris`: source cell index per triangle; survives dedup so
+    // callers can colour kept triangles by their cell's `CellType`.
     let mut tri_src: Vec<u32> = Vec::new();
 
     for (cell_idx, &c) in centers.iter().enumerate() {
@@ -156,9 +149,9 @@ fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>, Vec<u32>) {
         }
     }
 
-    // Drop interior triangles. Boundary triangles have sorted-key multiplicity
-    // 1; shared faces (multiplicity 2) cancel. RD lattice geometry guarantees
-    // no triangle is shared by 3+ cells, so multiplicity is always 1 or 2.
+    // Drop interior triangles: boundary faces have sorted-key multiplicity 1,
+    // shared faces 2 (cancel). RD geometry guarantees no face is shared by 3+
+    // cells, so multiplicity is always 1 or 2.
     let mut bucket: HashMap<[u32; 3], u32> = HashMap::new();
     for &t in &tris {
         let mut k = t;
@@ -182,19 +175,15 @@ fn rebuild_mesh(centers: &[Vec3]) -> (Vec<Vec3>, Vec<[u32; 3]>, Vec<u32>) {
 
 // ── OCG pathway ───────────────────────────────────────────────────────────────
 
-/// Smoothing parameters used when an organism becomes `adult`. `lambda`
-/// is the per-iteration blend toward the one-ring centroid (0 = identity,
-/// 1 = collapse to centroid); `iterations` controls how many passes the
-/// Jacobi smoother runs. The values here give a soft "rounded" silhouette
-/// over a 30-cell rhombic-dodecahedron blob without erasing the lobes
-/// produced by branch attachments.
+/// Smoothing parameters used when an organism becomes `adult`. `lambda` is the
+/// per-iteration blend toward the one-ring centroid (0 = identity, 1 = collapse);
+/// `iterations` is the Jacobi pass count. Tuned to round the silhouette without
+/// erasing branch-attachment lobes.
 pub const ADULT_SMOOTH_LAMBDA:     f32   = 0.3;
 pub const ADULT_SMOOTH_ITERATIONS: usize = 3;
 
-/// Produce the (un-smoothed) flat mesh by treating each OCG entry's
-/// position as a cell centre and running the translate → weld → dedup
-/// pipeline. Used during growth, when each new cell adds a faceted
-/// rhombic-dodecahedron lobe.
+/// Un-smoothed flat mesh: each OCG entry's position is a cell centre run
+/// through translate → weld → dedup. Used during growth (faceted lobes).
 pub fn build_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
     if ocg.is_empty() {
         return build_flat_mesh(&[], &[]);
@@ -205,10 +194,9 @@ pub fn build_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
     geometry::build_flat_mesh_colored(&verts, &tris, Some(&tri_colors))
 }
 
-/// Same as `build_mesh_from_ocg` but WITHOUT per-vertex colours. The
-/// resulting mesh is rendered solely by its `StandardMaterial::base_color`
-/// — used for the species-editor preview cell (a translucent blue
-/// indicator that should NOT inherit the snapped cell type's colour).
+/// Like `build_mesh_from_ocg` but WITHOUT per-vertex colours, so it renders by
+/// `StandardMaterial::base_color`. Used for the species-editor preview cell,
+/// which must not inherit the snapped cell type's colour.
 pub fn build_uncolored_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
     if ocg.is_empty() {
         return build_flat_mesh(&[], &[]);
@@ -218,13 +206,10 @@ pub fn build_uncolored_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
     build_flat_mesh(&verts, &tris)
 }
 
-/// Same as `build_mesh_from_ocg` but additionally runs the Jacobi
-/// vertex smoother (`smooth_vertices`) before constructing the Bevy
-/// mesh. Called once per organism — at spawn for non-variable-form
-/// organisms (they don't grow during their lifetime) and on the
-/// continuous-growth tick that crosses `MAX_CELLS` for variable-form
-/// organisms. After that the mesh stays smoothed for the rest of the
-/// organism's life; no per-frame smoothing cost.
+/// Like `build_mesh_from_ocg` but runs the Jacobi vertex smoother first.
+/// Called once per organism (at spawn for non-variable-form, or on the
+/// growth tick crossing `MAX_CELLS` for variable-form); the mesh then stays
+/// smoothed with no per-frame cost.
 pub fn build_smoothed_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
     if ocg.is_empty() {
         return build_flat_mesh(&[], &[]);
@@ -232,15 +217,12 @@ pub fn build_smoothed_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
     let centers: Vec<Vec3> = ocg.iter().map(|(_, p, _)| *p).collect();
     let (mut verts, tris, tri_src) = rebuild_mesh(&centers);
 
-    // BILATERAL guard: if the OCG spans BOTH sides of the YZ mirror plane
-    // (cells at x < 0 AND x > 0), this is a bilateral combined body (a right
-    // half + its X-mirror joined across a dense midline). Plain Laplacian
-    // smoothing pulls the sparse x-protruding side cells INTO that heavy
-    // midline and collapses them — the left/right halves visually vanish even
-    // though the cells/collider are intact. Freeze the X coordinate while
-    // smoothing (smooth only Y/Z) so the halves keep their full width; the
-    // surface still rounds in Y/Z. Single-sided parts (limbs, NoSymmetry
-    // bodies) smooth normally on all axes.
+    // BILATERAL guard: an OCG spanning both sides of the YZ mirror plane
+    // (x<0 AND x>0) is a combined body (right half + X-mirror across a dense
+    // midline). Plain Laplacian smoothing would collapse the sparse side cells
+    // into that heavy midline (halves visually vanish, cells/collider intact).
+    // Freeze X while smoothing (Y/Z only) to preserve width. Single-sided
+    // parts (limbs, NoSymmetry) smooth on all axes.
     let min_x = ocg.iter().map(|(_, p, _)| p.x).fold(f32::INFINITY, f32::min);
     let max_x = ocg.iter().map(|(_, p, _)| p.x).fold(f32::NEG_INFINITY, f32::max);
     const MIDLINE_EPS: f32 = 0.1;
@@ -252,11 +234,10 @@ pub fn build_smoothed_mesh_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> Mesh {
         ADULT_SMOOTH_LAMBDA, ADULT_SMOOTH_ITERATIONS,
     );
     if bilateral {
-        // Restore the original X of every vertex — Y/Z stay smoothed.
+        // Restore original X; Y/Z stay smoothed.
         for (v, x) in verts.iter_mut().zip(orig_x) { v.x = x; }
     }
-    // Smoothing only moves positions; the per-tri source-cell mapping
-    // (and therefore the colours) is unaffected.
+    // Smoothing moves positions only; tri→source mapping (colours) unaffected.
     let tri_colors = ocg_tri_colors(ocg, &tri_src);
     geometry::build_flat_mesh_colored(&verts, &tris, Some(&tri_colors))
 }
@@ -289,11 +270,8 @@ pub fn grow_ocg_one_step(
         state.centers.push(*center);
         update_lattice_bookkeeping(&mut state, *center);
     }
-    // Dodecahedron candidate generation reads only `frontier_pos` and
-    // `occupied` (both populated by `update_lattice_bookkeeping`), so the
-    // full mesh rebuild is wasted work. Tetrahedron mode (currently
-    // unused) still needs the cached `triangles` slab — keep the rebuild
-    // there.
+    // Dodecahedron candidates read only `frontier_pos`/`occupied`, so the mesh
+    // rebuild is wasted work; only Tetrahedron mode needs the cached triangles.
     if matches!(GROWTH_MODE, GrowthMode::Tetrahedron) {
         let (v, t, _) = rebuild_mesh(&state.centers);
         state.vertices = v;
@@ -314,15 +292,10 @@ pub fn grow_ocg_one_step(
     new_ocg
 }
 
-/// Return ALL valid next-cell centre positions given the current OCG.
-/// `min_x = Some(v)` filters to candidates with `centre.x >= v − 1e-3`
-/// (used by the bilateral right-half-only path). `min_x = None` means
-/// no constraint.
-///
-/// Exposed for interactive tools (the Species Editor) that need to
-/// enumerate the lattice frontier instead of picking randomly.
-/// Internally this is the same machinery `grow_ocg_one_step` uses;
-/// just without the final random `pick`.
+/// All valid next-cell centres for the current OCG. `min_x = Some(v)` filters
+/// to `centre.x >= v − 1e-3` (bilateral right-half-only path); `None` = no
+/// constraint. Exposed for the Species Editor to enumerate the lattice frontier
+/// (same machinery as `grow_ocg_one_step`, without the random pick).
 pub fn candidate_centers_for_ocg(
     ocg:   &[(usize, Vec3, CellType)],
     min_x: Option<f32>,
@@ -338,8 +311,7 @@ pub fn candidate_centers_for_ocg(
         state.vertices = v;
         state.triangles = t;
     }
-    // Editor authoring path: `respect_upward = false` so the user can
-    // place cells freely in 3D, including below the root.
+    // Editor authoring: `respect_upward = false` for free 3D placement (incl. below root).
     let raw = collect_candidates(&state, false);
     match min_x {
         Some(v) => {
@@ -350,13 +322,9 @@ pub fn candidate_centers_for_ocg(
     }
 }
 
-/// As `grow_ocg_one_step`, but only candidate cells with `x >= min_x` are
-/// considered. Returns the parent OCG unchanged when no candidate satisfies
-/// the constraint. Used by the bilateral pipeline to keep the right half
-/// strictly on the +X side of the YZ mirror plane.
-///
-/// `min_x` is checked against the candidate's centre with a tiny float-drift
-/// slack (`-1e-3`) — see body_part::MIN_X_BILATERAL for rationale.
+/// `grow_ocg_one_step` restricted to candidates with `x >= min_x` (slack -1e-3
+/// for float drift; see body_part::MIN_X_BILATERAL). Keeps the bilateral right
+/// half on the +X side of the YZ mirror plane; returns parent OCG if none fit.
 pub fn grow_ocg_one_step_constrained(
     ocg:   &[(usize, Vec3, CellType)],
     rng:   &mut impl rand::Rng,
@@ -370,7 +338,7 @@ pub fn grow_ocg_one_step_constrained(
         state.centers.push(*center);
         update_lattice_bookkeeping(&mut state, *center);
     }
-    // Same Dodec-mode rebuild_mesh skip as in grow_ocg_one_step.
+    // Dodec-mode rebuild_mesh skip (see grow_ocg_one_step).
     if matches!(GROWTH_MODE, GrowthMode::Tetrahedron) {
         let (v, t, _) = rebuild_mesh(&state.centers);
         state.vertices = v;
@@ -507,16 +475,9 @@ fn face_normal(tri: &[u32; 3], verts: &[Vec3]) -> Vec3 {
 
 // ── Candidate generation ──────────────────────────────────────────────────────
 
-/// Generate the set of legal next-cell positions for `state`.
-///
-/// `respect_upward` controls whether the `GROW_ONLY_UPWARDS` flag is
-/// honoured:
-///   * `true`  — used by the procedural growth pipeline (continuous
-///     growth + reproduction-time mutation). Keeps plant-like organisms
-///     growing skyward instead of burrowing into the heightfield.
-///   * `false` — used by the Species Editor's authoring tool, where
-///     the user explicitly wants free 3D placement around the existing
-///     cells (no axis restriction).
+/// Legal next-cell positions for `state`. `respect_upward` honours
+/// `GROW_ONLY_UPWARDS`: `true` for procedural growth (keeps plants skyward,
+/// not burrowing); `false` for the Species Editor's free 3D placement.
 fn collect_candidates(state: &VolumetricState, respect_upward: bool) -> Vec<CandidateInfo> {
     match GROWTH_MODE {
         GrowthMode::Dodecahedron => collect_candidates_dodec(state, respect_upward),
@@ -530,7 +491,7 @@ fn collect_candidates_dodec(state: &VolumetricState, respect_upward: bool) -> Ve
         .frontier_pos
         .values()
         .filter_map(|&center| {
-            // Pick any occupied lattice neighbour to derive the attach direction.
+            // Any occupied lattice neighbour gives the attach direction.
             let parent_center = dodecahedron::SLOT_DIRS
                 .iter()
                 .map(|&dir| center - dir * scale)
@@ -608,8 +569,9 @@ fn spawn_volumetric_mesh(
             intelligence_level:   crate::organism::IntelligenceLevel::Level1,
             is_sessile:           false,
             has_variable_form:    false,
-            sliding_movement:     true,
-        limb_targets:         [0.0; 8],
+            movement_mode:        crate::organism::MovementMode::Sliding,
+            ground_based:         true,
+        limb_targets:         [0.0; 10],
             adult:                false,
             photo_cell_count:     1,
             non_photo_cell_count: 0,
@@ -627,10 +589,8 @@ fn spawn_volumetric_mesh(
             is_climbing: false,
             climb_energy_debt: 0.0,
             cached_bounding_radius: 0.0,
-            // Dev sandbox spawn — give it a structurally correct DNA
-            // vector even though this entity is never seen by the
-            // speciation system in practice (the sandbox plugin is
-            // not wired into the regular simulation app).
+            // Dev sandbox spawn — structurally correct DNA, though this entity
+            // is never seen by speciation (sandbox plugin isn't wired into the sim).
             dna: crate::lineages::dna::structural_dna(
                 crate::organism::OrganismKind::Photoautotroph,
                 crate::organism::Symmetry::NoSymmetry,

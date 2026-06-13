@@ -13,6 +13,7 @@
 #[path = "colony/dataset_export.rs"]   mod dataset_export;
 #[path = "colony/time_series_log.rs"]  mod time_series_log;
 #[path = "colony/limb_time_series_log.rs"]  mod limb_time_series_log;
+#[path = "colony/limb_force_probe.rs"]      mod limb_force_probe;
 
 #[path = "growth/volumetric_growth/mod.rs"] mod volumetric_growth;
 #[path = "growth/mutation.rs"]              mod mutation;
@@ -29,13 +30,15 @@
 #[path = "behaviour/limb_based_movement/intelligence_level_herbivore_1_limb.rs"]     mod intelligence_level_herbivore_1_limb;
 #[path = "behaviour/limb_based_movement/intelligence_level_2_limb.rs"]               mod intelligence_level_2_limb;
 #[path = "behaviour/limb_based_movement/intelligence_level_3_limb.rs"]               mod intelligence_level_3_limb;
+#[path = "behaviour/swimming_movement/swim_ppo.rs"]                                  mod swim_ppo;
+#[path = "behaviour/swimming_movement/intelligence_level_1_swimming.rs"]             mod intelligence_level_1_swimming;
 #[path = "behaviour/predation.rs"]                  mod predation;
 #[path = "behaviour/photosynthesis.rs"]             mod photosynthesis;
 #[path = "behaviour/sensory.rs"]                    mod sensory;
 
 #[path = "movement_physics/movement.rs"]           mod movement;
 #[path = "movement_physics/organism_collision.rs"] mod organism_collision;
-#[path = "movement_physics/avian_setup.rs"]        mod avian_setup;
+#[path = "movement_physics/rapier_setup.rs"]        mod rapier_setup;
 
 #[path = "physiology/physiology.rs"]   mod physiology;
 
@@ -51,18 +54,14 @@ mod simulation_settings;
 #[path = "frontend/species_navigator.rs"]       mod species_navigator;
 #[path = "frontend/tree_view.rs"]               mod tree_view;
 
-// Colony editor — alternate entry point, reuses `WorldPlugin` /
-// `WaterPlugin` for terrain rendering but skips every simulation
-// plugin. The flycam in `editor_camera` is distinct from
-// `player_plugin`'s capture-and-hold camera. The editor's source
-// now lives under `frontend/colony_editor/` since it doubles as the
-// in-engine Edit-Colony window mode.
+// Colony editor — alternate entry point: reuses `WorldPlugin`/`WaterPlugin`
+// for terrain, skips every simulation plugin. Doubles as the in-engine
+// Edit-Colony window mode.
 #[path = "frontend/colony_editor/camera.rs"]    mod camera;
 #[path = "frontend/colony_editor/mod.rs"]       mod colony_editor;
 
-// Species editor — manual organism construction with `.species` save
-// output. Lives at world position `SPECIES_EDITOR_ORIGIN` so its
-// visuals don't overlap the running simulation.
+// Species editor — manual organism construction with `.species` save output.
+// Lives at `SPECIES_EDITOR_ORIGIN` so its visuals don't overlap the sim.
 #[path = "frontend/species_editor/mod.rs"]      mod species_editor;
 
 use bevy::{
@@ -84,33 +83,29 @@ use launcher::{LaunchMode, run_launcher};
 // ── Entry point ──────────────────────────────────────────────────────────────
 //
 // One binary, two roles, decided by argv:
+//   * NO positional path args → launcher mode (eframe window); on Start it
+//     re-spawns this executable as a subprocess and waits for it to exit.
+//   * POSITIONAL path arg(s)  → simulation mode (Bevy + Burn).
 //
-//   * NO positional path args   → launcher mode (eframe window). On Start
-//     the launcher re-spawns this same executable as a subprocess with the
-//     chosen paths and waits for it to exit.
-//   * POSITIONAL path arg(s)    → simulation mode (Bevy + Burn).
-//
-// Why a subprocess? winit (which both eframe and bevy_winit use) hard-
-// errors with `RecreationAttempt` if `EventLoop::new` is called twice in
-// one process — there is no supported way to run an eframe event loop
-// followed by a Bevy event loop sequentially. Forking the simulation
-// into a fresh child avoids that singleton restriction; from the user's
-// perspective they still launch one binary and the launcher still drives
-// path selection. The original `cargo run` shell stays blocked on the
-// parent until the simulation exits, mirroring normal Unix UX.
+// Subprocess is required: winit's `EventLoop::new` is a singleton and hard-
+// errors if called twice in one process, so an eframe loop can't be followed
+// by a Bevy loop. The parent `cargo run` shell stays blocked until exit.
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let show_wireframe = args.iter().any(|a| a == "--wireframe");
     let editor_flag    = args.iter().any(|a| a == "--editor");
-    // `--trainingmode` — boots the simulation with AI-training mode
-    // active (heterotroph despawn is suppressed at 0 energy). The
-    // statistics-panel checkbox shows as checked from the first
-    // frame because `update_ai_training_checkbox_mark` triggers on
-    // the resource's just-inserted "changed" flag.
+    // `--trainingmode` — boot with AI-training mode active (heterotroph
+    // despawn suppressed at 0 energy).
     let training_mode  = args.iter().any(|a| a == "--trainingmode");
-    // `--map-size X Z` — parse before collecting positionals so the
-    // two numeric values don't end up in the positional list.
+    // `--reload-limb-brains` — honour saved limb-brain weights even under the
+    // STANDING task (default: standing fresh-inits, since legacy colonies hold
+    // locomotion brains). Set this when loading a colony that was SAVED after a
+    // standing run, so the trained standing policy is re-loaded and re-demonstrated
+    // (the durable-success artifact — see colonies/*_standing.colony).
+    let reload_limb_brains = args.iter().any(|a| a == "--reload-limb-brains");
+    // `--map-size X Z` — parse before collecting positionals so the two
+    // numeric values don't end up in the positional list.
     let map_size = parse_map_size(&args).unwrap_or(world_geometry::MapSize::default());
     let max_phototrophs        = parse_max_phototrophs(&args);
     let max_herbivores         = parse_max_herbivores(&args);
@@ -121,13 +116,16 @@ fn main() {
     //   --exit-after-secs N    auto-exit after N seconds of VIRTUAL time
     let time_speed       = parse_f32_flag(&args, "--time-speed");
     let exit_after_secs  = parse_f32_flag(&args, "--exit-after-secs");
+    // `--water-level Y` — world-space Y of the global water surface (seeds the
+    // `WaterLevel` resource). `--adjust-colony-dimensions` — when loading a
+    // colony, override its saved dimensions with the launcher values.
+    let water_level      = parse_water_level(&args);
+    let adjust_colony_dimensions = args.iter().any(|a| a == "--adjust-colony-dimensions");
     let positional             = collect_positionals(&args);
 
     if positional.is_empty() && !editor_flag {
-        // Launcher mode — show the eframe window with both action
-        // buttons. The chosen mode is forwarded to a freshly-spawned
-        // child process (subprocess re-spawn is necessary because
-        // winit's EventLoop is a singleton).
+        // Launcher mode — chosen mode is forwarded to a freshly-spawned
+        // child (winit EventLoop is a singleton, so re-spawn is required).
         let Some(mode) = run_launcher() else { return; };
         match mode {
             LaunchMode::RunSimulation {
@@ -135,6 +133,7 @@ fn main() {
                 max_phototrophs, max_herbivores,
                 start_heterotrophs, start_photoautotrophs,
                 training_mode: launcher_training_mode,
+                water_level, adjust_colony_dimensions,
             } => {
                 respawn(&[
                     Some(map_path),
@@ -151,10 +150,14 @@ fn main() {
                     Some(start_heterotrophs.to_string()),
                     Some("--start-photos".into()),
                     Some(start_photoautotrophs.to_string()),
-                    // The launcher's checkbox is the source of truth
-                    // for the child: even if the parent was started
-                    // with `--trainingmode`, an unchecked box here
-                    // resets it to false (and vice-versa).
+                    // World-space water-surface Y for the `WaterLevel` resource.
+                    Some("--water-level".into()),
+                    Some(water_level.to_string()),
+                    // Override a loaded colony's saved dimensions with the
+                    // launcher values (currently the water level).
+                    if adjust_colony_dimensions { Some("--adjust-colony-dimensions".into()) } else { None },
+                    // Launcher's checkbox is the source of truth for the
+                    // child, overriding the parent's `--trainingmode`.
                     if launcher_training_mode { Some("--trainingmode".into()) } else { None },
                 ]);
             }
@@ -179,7 +182,8 @@ fn main() {
         run_simulation(map_path, colony_path, show_wireframe, map_size,
                        max_phototrophs, max_herbivores,
                        start_heterotrophs, start_photoautotrophs,
-                       training_mode, time_speed, exit_after_secs);
+                       training_mode, time_speed, exit_after_secs, reload_limb_brains,
+                       water_level, adjust_colony_dimensions);
     }
 }
 
@@ -196,11 +200,33 @@ struct ExitAfterVirtualSecs(f32);
 fn exit_after_virtual_secs(
     vtime: bevy::prelude::Res<bevy::prelude::Time<bevy::prelude::Virtual>>,
     limit: bevy::prelude::Res<ExitAfterVirtualSecs>,
+    mut save_requested: bevy::prelude::ResMut<colony::SaveRequested>,
     mut exit: bevy::prelude::MessageWriter<bevy::app::AppExit>,
+    mut save_stage: bevy::prelude::Local<u8>,
 ) {
-    if vtime.elapsed_secs() >= limit.0 {
-        bevy::log::info!("exit-after-secs: virtual time {:.1}s ≥ {:.1}s — quitting", vtime.elapsed_secs(), limit.0);
-        exit.write(bevy::app::AppExit::Success);
+    if vtime.elapsed_secs() < limit.0 { return; }
+    // SAVE-ON-EXIT: persist the final state (incl. trained limb-brain weights) to
+    // `autosaves/exit_<time>.colony` BEFORE quitting, so unattended training runs
+    // leave a reloadable artifact (reload with `--reload-limb-brains`). Stage 0:
+    // request the save. Stage 1+: wait until `save_colony_system` has consumed the
+    // request (flushed to disk), then exit.
+    match *save_stage {
+        0 => {
+            let now = chrono::Local::now();
+            let path = std::path::Path::new("autosaves")
+                .join(format!("exit_{}.colony", now.format("%d-%m-%Y-%H-%M-%S")));
+            bevy::log::info!("exit-after-secs: virtual time {:.1}s ≥ {:.1}s — saving {} before quit",
+                vtime.elapsed_secs(), limit.0, path.display());
+            save_requested.0 = Some(path);
+            *save_stage = 1;
+        }
+        _ => {
+            // Give the writer at least one tick to flush, then exit.
+            if save_requested.0.is_none() {
+                bevy::log::info!("exit-after-secs: save flushed — quitting");
+                exit.write(bevy::app::AppExit::Success);
+            }
+        }
     }
 }
 
@@ -208,6 +234,14 @@ fn exit_after_virtual_secs(
 /// autonomous-run controls `--time-speed` / `--exit-after-secs`.
 fn parse_f32_flag(args: &[String], flag: &str) -> Option<f32> {
     let pos = args.iter().position(|a| a == flag)?;
+    args.get(pos + 1)?.parse::<f32>().ok()
+}
+
+/// Parse `--water-level Y` out of argv. Returns `None` if the flag is
+/// absent or the value doesn't parse as an f32; callers fall back to
+/// `DEFAULT_WATER_LEVEL`.
+fn parse_water_level(args: &[String]) -> Option<f32> {
+    let pos = args.iter().position(|a| a == "--water-level")?;
     args.get(pos + 1)?.parse::<f32>().ok()
 }
 
@@ -282,6 +316,10 @@ fn collect_positionals(args: &[String]) -> Vec<String> {
             i += 2; // skip flag + value
             continue;
         }
+        if a == "--water-level" {
+            i += 2; // skip flag + value
+            continue;
+        }
         if a.starts_with("--") {
             i += 1;
             continue;
@@ -327,6 +365,9 @@ fn run_simulation(
     training_mode:          bool,
     time_speed:             Option<f32>,
     exit_after_secs:        Option<f32>,
+    reload_limb_brains:     bool,
+    water_level:            Option<f32>,
+    adjust_colony_dimensions: bool,
 ) {
     if let Ok(mut cache_path) = std::env::current_dir() {
         cache_path.push("caches");
@@ -339,24 +380,14 @@ fn run_simulation(
     }
 
     let mut app = App::new();
-    let movement_mode = movement::MovementMode::TwoD;
 
     let world_path_input = Path::new(&map_path);
 
-    // `Time<Virtual>` defaults its `max_delta` to 250 ms — frames
-    // that take longer have the excess silently discarded from
-    // virtual time. That's Bevy's anti-spiral-of-death safety, but
-    // it conflicts with AEONS's observational use of the simulation
-    // clock: the A2C training step, CubeCL kernel compilation, and
-    // dense predation passes all occasionally produce frames well
-    // past 250 ms, and each such frame underspends virtual time by
-    // `real_delta − 250 ms`. Over a 2-hour run this can swallow
-    // tens of minutes from the displayed sim timer.
-    //
-    // Bump the cap to 60 s so realistic frame stutters don't clip
-    // virtual-time accumulation. A genuine pathology that produces
-    // a >60 s frame is also a genuine reason to want the clock
-    // pinned anyway.
+    // `Time<Virtual>` defaults `max_delta` to 250 ms (Bevy's anti-spiral-of-
+    // death cap), silently discarding the excess from virtual time. AEONS
+    // uses the sim clock observationally and routinely produces >250 ms
+    // frames (training step, CubeCL compile, dense predation), which would
+    // accumulate large under-counts over a long run. Bump the cap to 60 s.
     let mut virtual_time = Time::<Virtual>::default();
     virtual_time.set_max_delta(std::time::Duration::from_secs(60));
     app.insert_resource(virtual_time);
@@ -368,61 +399,47 @@ fn run_simulation(
     // / pos-normalisation site that previously read the MAP_MAX_X/Z consts.
     app.insert_resource(map_size);
 
-    // Photoautotroph cap. The launcher's "Max Phototrophic Organisms"
-    // field flows through here as `--max-phototrophs N`. Drives ONLY
-    // the photo running-population cap; brain-pool sizing is
-    // independent (see below). Falling through to `init_resource`
-    // defaults (= DEFAULT_MAX_PHOTOAUTOTROPHS) when no flag is
-    // supplied is fine — the resources are inserted BEFORE
-    // `BehaviourPlugin` builds the brain pools.
+    // Global water surface (`--water-level Y`; absent ⇒ `DEFAULT_WATER_LEVEL`).
+    // A loaded `.colony` overrides this with its saved level unless
+    // `--adjust-colony-dimensions` was passed.
+    app.insert_resource(environment::WaterLevel(
+        water_level.unwrap_or(environment::DEFAULT_WATER_LEVEL),
+    ));
+    app.insert_resource(simulation_settings::AdjustColonyDimensions(adjust_colony_dimensions));
+
+    // Photoautotroph running-population cap (`--max-phototrophs N`). Brain-
+    // pool sizing is independent (below). Inserted BEFORE `BehaviourPlugin`
+    // builds the pools; absent ⇒ `init_resource` default.
     if let Some(n) = max_phototrophs {
         let n = n.max(1);
         app.insert_resource(simulation_settings::MaxPhotoautotrophs(n));
     }
-    // Herbivore reproduction cap from the launcher's "Max Herbivores"
-    // field (or `--max-herbivores N` argv). When absent, the default
-    // from `MaxHerbivores::default()` (i.e. `DEFAULT_MAX_HERBIVORES`)
-    // is used via the resource's `init_resource` registration.
-    //
-    // The GPU brain-pool size (`OrganismPoolSize`) is derived from
-    // this value with generous headroom: heterotrophs are the only
-    // brain-using organisms, so the pool only needs to cover them.
-    // We multiply by 4× so the user can raise `MaxHerbivores` at
-    // runtime through the statistics panel without running out of
-    // brain slots — beyond 4× the brain pool will run dry and extra
-    // heteros spawn brain-less until a slot frees up.
+    // Herbivore reproduction cap (`--max-herbivores N`; absent ⇒ default).
+    // The GPU brain pool (`OrganismPoolSize`) is sized 4× this — only
+    // heterotrophs use brains, and 4× headroom lets the user raise the cap
+    // at runtime before the pool runs dry (extra heteros spawn brain-less
+    // until a slot frees).
     if let Some(n) = max_herbivores {
         let n = n.max(1);
         app.insert_resource(simulation_settings::MaxHerbivores(n));
         app.insert_resource(simulation_settings::OrganismPoolSize((n * 4).max(16)));
     }
-    // Initial-cohort herbivore count from the launcher's "Start
-    // Heterotroph Number" field (or `--start-heteros N`). When
-    // absent, defaults to `DEFAULT_START_HETEROTROPHS` via the
-    // resource's `init_resource` registration.
+    // Initial-cohort herbivore count (`--start-heteros N`; absent ⇒ default).
     if let Some(n) = start_heterotrophs {
         app.insert_resource(simulation_settings::StartHeterotrophs(n));
     }
-    // Initial-cohort photoautotroph count from the launcher's
-    // "Spawn Phototrophic Organisms" field (or `--start-photos N`).
-    // When absent, falls back to the resource's `init_resource`
-    // default = `DEFAULT_START_PHOTOAUTOTROPHS`.
+    // Initial-cohort photoautotroph count (`--start-photos N`; absent ⇒ default).
     if let Some(n) = start_photoautotrophs {
         app.insert_resource(simulation_settings::StartPhotoautotrophs(n));
     }
 
-    // AI-training mode — inserted BEFORE `FrontendPlugin` adds its
-    // `init_resource::<AiTrainingMode>()` so the idempotent init
-    // sees our value and preserves it. With `training_mode = true`,
-    // `energy::manage_energy` will suppress heterotroph despawns at
-    // 0 energy, and `update_ai_training_checkbox_mark` will see the
-    // resource as "changed" on the first frame and flip the
-    // statistics-panel checkbox mark to visible.
+    // AI-training mode — inserted BEFORE `FrontendPlugin`'s idempotent
+    // `init_resource::<AiTrainingMode>()` so our value is preserved.
     app.insert_resource(simulation_settings::AiTrainingMode(training_mode));
+    app.insert_resource(simulation_settings::ReloadLimbBrains(reload_limb_brains));
 
     // `--time-speed X` — initial virtual-time multiplier. Inserted before
-    // `FrontendPlugin`'s idempotent `init_resource::<TimeSpeed>()` so our
-    // value is preserved; the panel can still change it live.
+    // `FrontendPlugin`'s idempotent `init_resource::<TimeSpeed>()` so it's preserved.
     if let Some(ts) = time_speed {
         app.insert_resource(simulation_settings::TimeSpeed(ts.max(0.01)));
     }
@@ -441,18 +458,15 @@ fn run_simulation(
             }.into(),
             ..default()
         }))
-        .add_plugins(avian_setup::AvianSetupPlugin)
+        .add_plugins(rapier_setup::RapierSetupPlugin)
         .add_plugins(world_geometry::WorldPlugin{
-            // std::path::Path doesn't have to_string() implemented because
-            // input could be anything; use .to_string_lossy().into_owned()
-            // instead. The glb is resolved relative to Bevy's asset root
-            // (`assets/`); a leading `assets/` segment is stripped by the
-            // plugin.
+            // glb resolves relative to Bevy's asset root (`assets/`); a
+            // leading `assets/` segment is stripped by the plugin.
             world_path: world_path_input.to_string_lossy().into_owned(),
         })
         .add_plugins(player_plugin::PlayerPlugin)
         .add_plugins(frontend::FrontendPlugin)
-        .add_plugins(movement::MovementPlugin::with_mode(movement_mode))
+        .add_plugins(movement::MovementPlugin)
         .add_plugins(colony::ColonyPlugin)
         .add_plugins(energy::EnergyPlugin)
         .add_plugins(physiology::PhysiologyPlugin)
@@ -489,6 +503,9 @@ fn run_editor(map_path: String, map_size: world_geometry::MapSize) {
 
     let mut app = App::new();
     app.insert_resource(map_size);
+    // Editor's `water.rs` systems + the editor colony writer need these.
+    app.insert_resource(environment::WaterLevel::default());
+    app.insert_resource(simulation_settings::AdjustColonyDimensions(false));
     app.add_plugins(DefaultPlugins.set(RenderPlugin {
         render_creation: WgpuSettings {
             features: WgpuFeatures::POLYGON_MODE_LINE,
@@ -509,14 +526,10 @@ fn run_editor(map_path: String, map_size: world_geometry::MapSize) {
 
 
 fn setup(mut commands: Commands) {
-    // Light. Bevy's default `CascadeShadowConfig` uses 4 cascades and
-    // re-extracts the full caster set per cascade per frame — at our
-    // mesh-entity counts that's the dominant render-pipeline cost.
-    // Override to a single cascade with the same far-plane as the camera
-    // (300 units): one extract pass, one shadow draw, identical visual
-    // for our flat-ish maps. `DirectionalLightShadowMap::size = 2048` is
-    // also the Bevy default; halving it cheapens the shadow-pass GPU
-    // workload without visible aliasing on our terrain scale.
+    // Light. Bevy's default 4-cascade shadow config re-extracts the full
+    // caster set per cascade per frame — the dominant render cost at our
+    // entity counts. Single cascade + halved shadow-map size cuts that with
+    // no visible difference on our flat-ish terrain.
     commands.insert_resource(bevy::light::DirectionalLightShadowMap { size: 1024 });
     commands.spawn((
         DirectionalLight {
@@ -524,9 +537,8 @@ fn setup(mut commands: Commands) {
             shadows_enabled: true,
             ..default()
         },
-        // Render to both the default layer (0, simulation) AND the
-        // species editor layer (1) so species cells get illuminated
-        // when the camera is rendering only layer 1.
+        // Render to layer 0 (simulation) AND layer 1 (species editor) so
+        // species cells are lit when the camera renders only layer 1.
         bevy::camera::visibility::RenderLayers::from_layers(&[0, species_editor::SPECIES_EDITOR_LAYER]),
         bevy::light::CascadeShadowConfigBuilder {
             num_cascades:             1,

@@ -1,48 +1,32 @@
 // Continuous per-organism time-series logger for LIMB-BASED organisms.
 //
-// The milestone dataset snapshots (`dataset_export.rs`) capture one
-// instant per organism, which can't reveal whether a limb organism's
-// gait actually OSCILLATES, whether its body TRAVELS, or whether it just
-// spins in place. This logger fills that gap: every `LOG_INTERVAL_SECS`
-// virtual seconds it appends one CSV row per limb-based organism
-// (`sliding_movement == false`) to
-// `datasets/limb_time_series_<timestamp>.csv`, capturing the full
-// locomotion picture over time so `data-analysis/limb_brains.R` can trace
-// it.
+// Milestone snapshots (`dataset_export.rs`) capture one instant and can't show
+// whether a gait oscillates, the body travels, or it just spins in place.
+// Every `LOG_INTERVAL_SECS` virtual seconds this appends one CSV row per
+// limb-based organism (`!movement_mode.is_sliding()`) to
+// `datasets/limb_time_series_<timestamp>.csv` for `data-analysis/limb_brains.R`.
 //
-// Per row we record:
-//   * the 6 brain outputs (`limb_target_*`) — now the CPG gait params
-//     (per pair: amplitude, posture offset, steering bias);
-//   * `motor_target_norm` — max |LastAppliedTorque| across the organism's
-//     body parts. `drive_limb_motors` stores the commanded hinge
-//     angle (radians) there, so this is the "is the CPG driving the
-//     motors, and is the setpoint non-zero / changing?" signal;
-//   * the BASE body part's world position + planar speed + angular-speed
-//     magnitude (from Avian) — "is the body travelling, or spinning in
-//     place?";
-//   * `target_distance` (XZ distance to the nearest photo) — "is it
-//     closing on prey?";
-//   * energy + predations — outcome.
+// Per row: the brain outputs (`limb_target_*`); `motor_target_norm` (max
+// |LastAppliedTorque|, the commanded hinge angle in radians); the BASE body's
+// world pos + planar/angular speed; `target_distance` to nearest photo;
+// energy + predations.
 //
-// Sampling at 1 s (limb organisms are few) aliases the ~`GAIT_FREQUENCY_HZ`
-// gait, so across many samples `motor_target_norm` and the base velocity
-// SCATTER if the gait is live and stay flat if it is not — enough to
-// distinguish "CPG oscillating" from "CPG dead" without a high-rate trace.
+// 1 s sampling aliases the ~`GAIT_FREQUENCY_HZ` gait, so across samples the
+// torque/velocity SCATTER if the gait is live and stay flat if dead.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use bevy::prelude::*;
-use avian3d::prelude::{LinearVelocity, AngularVelocity};
+use bevy_rapier3d::prelude::Velocity;
 
 use crate::colony::{Organism, OrganismRoot};
 use crate::cell::BodyPartIndex;
-use crate::avian_setup::LastAppliedTorque;
+use crate::rapier_setup::LastAppliedTorque;
 
 
-/// Cadence for limb time-series rows (virtual seconds). 1 s gives a dense
-/// trajectory; with only a handful of limb organisms the file stays tiny.
+/// Cadence for limb time-series rows (virtual seconds).
 const LOG_INTERVAL_SECS: f32 = 1.0;
 
 
@@ -51,6 +35,21 @@ pub struct LimbTimeSeriesLogger {
     writer:         Option<BufWriter<File>>,
     last_log_secs:  f32,
     init_attempted: bool,
+    /// Running MAX joint separation per organism SINCE the last emitted row. The
+    /// logger runs every frame but only writes every `LOG_INTERVAL_SECS`; without
+    /// this, a sub-second separation transient (the kind seen on screen between
+    /// 1 Hz samples) is computed and discarded. Folded each frame, emitted + cleared
+    /// each row, so `joint_sep_max` is a TRUE interval max, not an instantaneous sample.
+    acc_joint_sep:  std::collections::HashMap<Entity, f32>,
+    /// Virtual time each organism was first seen — used to skip the first ~1 s, where
+    /// the freshly-spawned child `GlobalTransform`s aren't yet propagated and the
+    /// joint-separation calc reads a spurious ~5-8 (the artifact that masqueraded as
+    /// real separation and triggered a wrong multibody detour).
+    first_seen:     std::collections::HashMap<Entity, f32>,
+    /// Base (idx 0) world position last frame — a large jump means the fall-reset
+    /// teleported the organism, whose 1-frame anchor mismatch is also not real
+    /// separation; that frame is skipped from the accumulator.
+    last_base_pos:  std::collections::HashMap<Entity, Vec3>,
 }
 
 
@@ -58,6 +57,7 @@ pub struct LimbTimeSeriesLogger {
 #[derive(Default, Clone, Copy)]
 struct BaseState {
     pos:             Vec3,
+    up_y:            f32,  // world-Y component of the base body's local +Y (uprightness)
     lin_vel:         Vec3,
     ang_vel:         Vec3,
     motor_target:    f32, // max |LastAppliedTorque| across this organism's parts
@@ -81,17 +81,58 @@ pub fn tick_limb_time_series_logger(
         &bevy::prelude::ChildOf,
         &BodyPartIndex,
         &GlobalTransform,
-        &LinearVelocity,
-        &AngularVelocity,
+        &Velocity,
         &LastAppliedTorque,
-        &crate::avian_setup::LimbContact,
+        &crate::rapier_setup::LimbContact,
     )>,
+    joint_q:      Query<&crate::rapier_setup::LimbJointDrive>,
+    gt_q:         Query<&GlobalTransform>,
 ) {
     if !sim_running.0 { return; }
-
     let now = virtual_time.elapsed_secs();
+
+    // Per-organism MAX joint separation THIS FRAME: world distance between each
+    // limb's rotation point (its anchor) and the parent attachment point.
+    // Guiderail: must stay ~0 (a rigid joint never separates). >0 ⇒ the joint is
+    // being pulled apart (what the user observed as "limbs separating").
+    let mut joint_sep_frame: std::collections::HashMap<Entity, f32> = std::collections::HashMap::new();
+    for drive in &joint_q {
+        if let (Ok(limb_gt), Ok(par_gt)) = (gt_q.get(drive.limb_entity), gt_q.get(drive.parent)) {
+            let limb_pt = limb_gt.transform_point(drive.anchor2);
+            let par_pt  = par_gt.transform_point(drive.anchor1);
+            let sep = (limb_pt - par_pt).length();
+            let m = joint_sep_frame.entry(drive.organism).or_insert(0.0);
+            if sep > *m { *m = sep; }
+        }
+    }
+
+    // Base (idx 0) world position THIS frame, for teleport detection.
+    let mut base_now: std::collections::HashMap<Entity, Vec3> = std::collections::HashMap::new();
+    for (child_of, idx, gt, _, _, _) in &bp_q {
+        if idx.0 == 0 { base_now.insert(child_of.parent(), gt.translation()); }
+    }
+
+    // Fold this frame's separation into the running interval-max, skipping
+    // GLITCH frames so the metric is honest AND catches sub-second transients:
+    //   * first SETTLE seconds of an organism's life → spawn-propagation artifact;
+    //   * a base jump > TELEPORT_JUMP → the fall-reset teleported it this frame.
+    const SETTLE_SECS: f32 = 1.0;
+    const TELEPORT_JUMP: f32 = 1.0;
+    for (&org, &sep) in &joint_sep_frame {
+        let first = *logger.first_seen.entry(org).or_insert(now);
+        let cur = base_now.get(&org).copied();
+        let teleported = matches!((logger.last_base_pos.get(&org).copied(), cur),
+            (Some(prev), Some(c)) if (c - prev).length() > TELEPORT_JUMP);
+        if let Some(c) = cur { logger.last_base_pos.insert(org, c); }
+        if now - first < SETTLE_SECS || teleported { continue; }
+        let m = logger.acc_joint_sep.entry(org).or_insert(0.0);
+        if sep > *m { *m = sep; }
+    }
+
     if now - logger.last_log_secs < LOG_INTERVAL_SECS { return; }
     logger.last_log_secs = now;
+    // Emit the interval-max separation and reset the accumulator for the next window.
+    let joint_sep = std::mem::take(&mut logger.acc_joint_sep);
 
     // Lazy-init the writer on the first log tick.
     if !logger.init_attempted {
@@ -117,7 +158,9 @@ pub fn tick_limb_time_series_logger(
                       base_speed_xz;base_ang_vel_mag;\
                       base_contact;contact_count;nearest_org_dist;max_part_dist;min_clearance;\
                       min_limb_clearance;base_clearance;limb_planted_frac;approach_align;\
-                      target_distance;energy;predations;fps\n",
+                      target_distance;energy;predations;fps;twist_cmd_norm;joint_sep_max;\
+                      base_upright;base_tilt_deg;standing;stand_score;\
+                      is_swimming;base_speed3d\n",
                 ) {
                     error!("limb-time-series: header write failed: {e}");
                     return;
@@ -131,35 +174,30 @@ pub fn tick_limb_time_series_logger(
         }
     }
 
-    // Global render/step rate — low FPS at high TimeSpeed means large
-    // effective physics dt, which itself can destabilise the solver, so we
-    // log it alongside the per-organism state.
+    // Render/step rate: low FPS at high TimeSpeed → large physics dt that can
+    // destabilise the solver, so log it alongside per-organism state.
     let fps = diagnostics
         .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|d| d.smoothed())
         .unwrap_or(0.0) as f32;
 
-    // Photo positions, for the approach-alignment metric (is the body's
-    // velocity actually pointing at the nearest prey? — the clean
-    // directedness signal, unconfounded by predation).
+    // Photo positions for the approach-alignment metric.
     let photo_pos: Vec<Vec3> = photos.iter().map(|gt| gt.translation()).collect();
 
     let Some(writer) = logger.writer.as_mut() else { return; };
 
-    // Build per-organism base-body state from the Avian body-part query.
+    // Per-organism base-body state from the Avian body-part query.
     let mut base: std::collections::HashMap<Entity, BaseState> =
         std::collections::HashMap::new();
-    // All body-part world positions per organism, to measure how far limbs /
-    // sub-limbs have SEPARATED from the base (joints should hold them within
-    // a few units; large values = the joint failed and the part flew off).
+    // All body-part world positions per organism, for the limb-separation
+    // metric (large values = a joint failed and the part flew off).
     let mut all_parts: std::collections::HashMap<Entity, Vec<Vec3>> =
         std::collections::HashMap::new();
-    // LIMB-only part positions (idx > 0), to measure the FEET / sub-limbs'
-    // ground clearance separately from the belly — that's the part the user
-    // saw sinking, and what the non-penetration floor must keep on the surface.
+    // LIMB-only positions (idx > 0), for feet/sub-limb ground clearance
+    // measured separately from the belly.
     let mut limb_parts: std::collections::HashMap<Entity, Vec<Vec3>> =
         std::collections::HashMap::new();
-    for (child_of, idx, gt, lin, ang, torque, contact) in &bp_q {
+    for (child_of, idx, gt, vel, torque, contact) in &bp_q {
         let root = child_of.parent();
         all_parts.entry(root).or_default().push(gt.translation());
         if idx.0 != 0 { limb_parts.entry(root).or_default().push(gt.translation()); }
@@ -169,22 +207,21 @@ pub fn tick_limb_time_series_logger(
         entry.contact_count += contact.count;
         if idx.0 == 0 {
             entry.pos          = gt.translation();
-            entry.lin_vel      = lin.0;
-            entry.ang_vel      = ang.0;
+            entry.up_y         = (gt.rotation() * Vec3::Y).y;
+            entry.lin_vel      = vel.linear;
+            entry.ang_vel      = vel.angular;
             entry.base_contact = contact.in_contact;
             entry.seen         = true;
         } else {
-            // Limb part: count it, and whether it's planted on the ground.
-            // A natural posture has the feet PLANTED (high planted fraction)
-            // bearing the body, not dangling in the air.
+            // Limb part: count it and whether it's planted (natural posture
+            // bears the body on planted feet, not dangling).
             entry.limbs_total += 1;
             if contact.in_contact { entry.limbs_planted += 1; }
         }
     }
 
-    // Nearest OTHER limb-organism distance (XZ), to test whether explosions
-    // coincide with inter-organism proximity/collision. O(n²) over the few
-    // dozen limb organisms, once per log tick — cheap.
+    // Nearest OTHER limb-organism distance (XZ): does instability coincide
+    // with inter-organism proximity? O(n²) over a few dozen organisms.
     let positions: Vec<(Entity, Vec3)> =
         base.iter().filter(|(_, b)| b.seen).map(|(&e, b)| (e, b.pos)).collect();
     let nearest_dist = |e: Entity, p: Vec3| -> f32 {
@@ -200,9 +237,8 @@ pub fn tick_limb_time_series_logger(
 
     let mut row = String::with_capacity(256);
     for (entity, org) in org_q.iter() {
-        // Limb-based organisms only (the sliding pools have their own
-        // time-series logger).
-        if org.sliding_movement { continue; }
+        // Limb-based organisms only (sliding pools log elsewhere).
+        if org.movement_mode.is_sliding() { continue; }
 
         let b = base.get(&entity).copied().unwrap_or_default();
         let speed_xz = (b.lin_vel.x * b.lin_vel.x + b.lin_vel.z * b.lin_vel.z).sqrt();
@@ -215,31 +251,22 @@ pub fn tick_limb_time_series_logger(
         };
 
         let near = if b.seen { nearest_dist(entity, b.pos) } else { 999.0 };
-        // Max distance of any body part from the base — the limb/sub-limb
-        // SEPARATION metric. Should stay small (creature's own size); large
-        // = a joint failed and the part separated.
+        // Limb-separation metric: max part distance from the base (large =
+        // a joint failed).
         let max_part_dist = all_parts.get(&entity).map_or(0.0, |ps| {
             ps.iter().map(|p| (*p - b.pos).length()).fold(0.0_f32, f32::max)
         });
-        // Penetration metric: the SMALLEST clearance of any body part above
-        // the terrain (part world-Y minus heightmap height at that XZ). A
-        // negative value means a part's origin is BELOW the ground surface —
-        // i.e. it has sunk into the "concrete" world mesh. 0 ≈ resting on the
-        // surface; positive = held above it. This is the signal for the
-        // "nothing penetrates the world mesh" goal.
+        // Penetration metric: smallest clearance of any part above terrain
+        // (part Y − heightmap height). Negative = sunk into the world mesh.
         let min_clearance = match (&heightmap, all_parts.get(&entity)) {
             (Some(hm), Some(ps)) => ps.iter()
                 .map(|p| p.y - hm.height_at(p.x, p.z))
                 .fold(f32::MAX, f32::min),
             _ => 999.0,
         };
-        // Posture metrics for the "natural posture" goal:
-        //  * base_clearance — how high the BASE body sits above the terrain.
-        //    A natural standing posture holds the body UP off the ground
-        //    (positive), borne by the legs; ~0 = belly dragging on the floor.
-        //  * limb_planted_frac — fraction of the limb parts (feet) currently
-        //    touching the ground. ~1 = all feet planted (natural, weight-
-        //    bearing); low = legs dangling in the air "defying gravity".
+        // Posture metrics: base_clearance = how high the base sits above
+        // terrain (~0 = belly dragging); limb_planted_frac = fraction of feet
+        // touching the ground (~1 = natural weight-bearing).
         let base_clearance = match &heightmap {
             Some(hm) if b.seen => b.pos.y - hm.height_at(b.pos.x, b.pos.z),
             _ => 999.0,
@@ -247,20 +274,16 @@ pub fn tick_limb_time_series_logger(
         let limb_planted_frac = if b.limbs_total > 0 {
             b.limbs_planted as f32 / b.limbs_total as f32
         } else { 0.0 };
-        // FEET/sub-limb clearance: the minimum clearance over the LIMB parts
-        // only (excludes the belly). This is the direct measure of the user's
-        // complaint — "the sub-limbs are always sunken". Should stay >= ~0
-        // (the non-penetration floor keeps the feet on the surface), even when
-        // the belly is allowed to graze/slide on the ground.
+        // Feet/sub-limb clearance: min clearance over LIMB parts only
+        // (excludes the belly). Should stay >= ~0 via the non-penetration floor.
         let min_limb_clearance = match (&heightmap, limb_parts.get(&entity)) {
             (Some(hm), Some(ps)) if !ps.is_empty() => ps.iter()
                 .map(|p| p.y - hm.height_at(p.x, p.z))
                 .fold(f32::MAX, f32::min),
             _ => 999.0,
         };
-        // Approach alignment: dot(base velocity dir, dir to nearest photo),
-        // in XZ. +1 = moving straight at nearest prey, −1 = straight away,
-        // 0 = sideways/still. The clean directed-pursuit metric.
+        // Approach alignment (XZ): dot(velocity dir, dir to nearest photo).
+        // +1 = straight at prey, −1 = away, 0 = sideways/still.
         let approach_align = {
             let v = Vec2::new(b.lin_vel.x, b.lin_vel.z);
             let mut best = f32::MAX; let mut pdir = Vec2::ZERO;
@@ -272,6 +295,24 @@ pub fn tick_limb_time_series_logger(
             if v.length() > 0.05 && best < f32::MAX { v.normalize().dot(pdir) } else { 0.0 }
         };
 
+        // ── STANDING diagnostics (the goal's success signals) ──
+        // base_upright: world-Y of the base's local +Y (1=upright, 0=on side,
+        // −1=inverted). base_tilt_deg: angle off vertical. standing: the success
+        // flag (upright AND belly off the floor AND enough planted legs incl.
+        // sub-limbs). stand_score: the reward's primary tall×level×support term.
+        let up_y       = b.up_y;
+        let upright01  = (0.5 * (1.0 + up_y)).clamp(0.0, 1.0);
+        let tilt_deg   = up_y.clamp(-1.0, 1.0).acos().to_degrees();
+        let tall = if base_clearance < 900.0 {
+            (base_clearance / crate::simulation_settings::STAND_HEIGHT_TARGET).clamp(0.0, 1.0)
+        } else { 0.0 };
+        let foot_support = (b.limbs_planted as f32
+            / crate::simulation_settings::STAND_MIN_FEET).clamp(0.0, 1.0);
+        let stand_score = tall * upright01 * foot_support;
+        let standing = (upright01 > crate::simulation_settings::STAND_UPRIGHT_MIN
+            && !b.base_contact
+            && (b.limbs_planted as f32) >= crate::simulation_settings::STAND_MIN_FEET) as u8;
+
         row.clear();
         use std::fmt::Write as _;
         let _ = write!(
@@ -281,8 +322,10 @@ pub fn tick_limb_time_series_logger(
              {:.4};{:.3};{:.3};{:.3};\
              {:.4};{:.4};\
              {};{};{:.2};{:.2};{:.3};{:.3};{:.3};{:.3};{:.3};\
-             {:.3};{:.3};{};{:.1}\n",
-            now, entity.index(), il, bool01(org.sliding_movement),
+             {:.3};{:.3};{};{:.1};{:.4};{:.4};\
+             {:.4};{:.2};{};{:.4};\
+             {};{:.4}\n",
+            now, entity.index(), il, bool01(org.movement_mode.is_sliding()),
             org.limb_targets[0], org.limb_targets[1], org.limb_targets[2], org.limb_targets[3],
             org.limb_targets[4], org.limb_targets[5], org.limb_targets[6], org.limb_targets[7],
             b.motor_target, b.pos.x, b.pos.y, b.pos.z,
@@ -290,6 +333,22 @@ pub fn tick_limb_time_series_logger(
             bool01(b.base_contact), b.contact_count, near, max_part_dist, min_clearance,
             min_limb_clearance, base_clearance, limb_planted_frac, approach_align,
             org.target_distance, org.energy, org.predations, fps,
+            // TWIST usage: mean |twist command| over the grouped twist outputs
+            // (limb_targets[MAX_LIMB_JOINTS..]). >0 ⇒ the brain is actively twisting.
+            {
+                let tw = &org.limb_targets[crate::simulation_settings::MAX_LIMB_JOINTS..];
+                tw.iter().map(|t| t.abs()).sum::<f32>() / tw.len().max(1) as f32
+            },
+            // JOINT SEPARATION: max world distance over this organism's limb joints
+            // between the limb's rotation point and its parent attachment point.
+            joint_sep.get(&entity).copied().unwrap_or(0.0),
+            // STANDING success signals.
+            up_y, tilt_deg, standing, stand_score,
+            // SWIMMING: trophic-mode flag + the base body's full 3D linear
+            // speed (vs. base_speed_xz which drops the vertical component) so
+            // the R suite can correlate stroke outputs with 3D propulsion.
+            bool01(org.movement_mode.is_swimming()),
+            (b.lin_vel.x * b.lin_vel.x + b.lin_vel.y * b.lin_vel.y + b.lin_vel.z * b.lin_vel.z).sqrt(),
         );
         let _ = writer.write_all(row.as_bytes());
     }

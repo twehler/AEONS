@@ -1,29 +1,20 @@
-// Editor-wide working state.
-//
-// `EditorSession` owns the list of templates the user has created,
-// the currently-selected one (right-click placement target), and the
-// draft fields the bottom "Create" panel binds to. Centralising it
-// here keeps every UI / placement / save system reading from a single
-// source of truth.
+// Editor-wide working state. `EditorSession` is the single source of
+// truth shared by every UI / placement / save system: created templates,
+// the active selection, draft fields, and loaded species.
 
 use bevy::prelude::*;
 
-use crate::organism::{IntelligenceLevel, Symmetry};
+use crate::organism::{IntelligenceLevel, MovementMode, Symmetry};
 use crate::colony_editor::template::{Form, Metabolism, OrganismTemplate};
 use crate::cell::CellType;
 
 
 // ── Loaded species ──────────────────────────────────────────────────────────
 //
-// One entry per `.species` file the user has loaded in this editor
-// session. The body plan + OCG come from the file; per-organism
-// hyperparameter genes (curiosity, K_EAT, σ, etc.) are NOT stored on
-// the species and are re-sampled from `simulation_settings.rs`'s
-// `L1_*_RANGE` ranges at brain-slot assignment time, every time a
-// species-derived organism is spawned. This matches the existing
-// reproduction / initial-spawn paths and means "load a species" is a
-// pure body-blueprint operation — gene diversity comes from the
-// pool, not from the file.
+// One entry per loaded `.species` file. Body plan + OCG come from the
+// file; per-organism hyperparameter genes are NOT stored and are
+// re-sampled from `L1_*_RANGE` at brain-slot assignment per spawn — so
+// "load a species" is a pure body-blueprint operation.
 
 #[derive(Clone, Debug)]
 pub struct LoadedSpecies {
@@ -35,41 +26,29 @@ pub struct LoadedSpecies {
     pub intelligence:      IntelligenceLevel,
     pub form:              Form,
     pub is_sessile:        bool,
-    /// `true` ⇒ Carnivore (target other heterotrophs);
-    /// `false` ⇒ Herbivore (target photoautotrophs, default).
-    /// Drives the `Carnivore` marker component at spawn time, which
-    /// IL2 / IL3 brains read to filter their prey type.
+    /// `true` ⇒ Carnivore, `false` ⇒ Herbivore. Drives the `Carnivore`
+    /// marker that IL2/IL3 brains read to filter prey type.
     pub is_carnivore:      bool,
-    /// Maps to `Organism::sliding_movement` at spawn. `true` = legacy
-    /// sliding, `false` = limb-based physics + PPO. Sourced from the
-    /// species editor's "Sliding / Limb-Movement" cycler.
-    pub sliding_movement:  bool,
-    /// Base-body OCG ready for `root_body_part_from_ocg`. For bilateral
-    /// species this has been pre-expanded to right + mirrored-left
-    /// at load time so downstream code (placement, save) doesn't
-    /// need to know the difference.
+    /// Maps to `Organism::movement_mode` (loaded from the `.species` file).
+    pub movement_mode:  MovementMode,
+    /// Maps to `Organism::ground_based` (loaded from the `.species` file;
+    /// only ever an override for phototrophs — floating, water-based algae).
+    pub ground_based:   bool,
+    /// Base-body OCG (pre-expanded to right + mirrored-left for bilateral,
+    /// so downstream placement/save need not special-case it).
     pub ocg:               Vec<(usize, Vec3, CellType)>,
-    /// Appendage parts (index ≥ 1 in the species), each as `(OCG,
-    /// is_limb, parent)`: the raw stored OCG (right-half for bilateral,
-    /// full for NoSymmetry), the limb flag, and the EDITOR parent index
-    /// (0 = main body; a value pointing at another limb = a sub-limb).
-    /// Expanded to runtime body parts at spawn (bilateral → mirrored pair
-    /// attached to the parent's matching side; NoSymmetry → one part).
-    /// Empty for single-part / legacy species.
+    /// Appendage parts as `(OCG, is_limb, parent)` — raw stored OCG,
+    /// limb flag, and EDITOR parent index. Expanded to runtime parts at
+    /// spawn (bilateral → mirrored pair). Empty for single-part species.
     pub appendages:        Vec<(Vec<(usize, Vec3, CellType)>, bool, usize)>,
-    /// `Some` when this species was loaded from a `.species` v3 file
-    /// that carried trained brain weights. Every organism spawned
-    /// from this species gets a copy of the payload attached as a
-    /// `BrainRestoreHerbivore1` component, which the herbivore pool's
-    /// `assign_brains_herbivore_1` consumes to seed the slot. `None`
-    /// for fresh species-editor saves and legacy v1/v2 files.
+    /// `Some` when the `.species` file carried trained brain weights;
+    /// each spawn gets a copy as a `BrainRestoreHerbivore1` consumed by
+    /// `assign_brains_herbivore_1`. `None` for fresh/legacy files.
     pub brain: Option<crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1>,
 }
 
 
-/// Pending fields for the bottom-panel cyclers. Each left-click on
-/// the map reads this snapshot and turns it into a fresh
-/// `OrganismTemplate`.
+/// Pending fields for the bottom-panel cyclers.
 #[derive(Clone, Copy)]
 pub struct DraftOrganism {
     pub metabolism:   Metabolism,
@@ -80,11 +59,8 @@ pub struct DraftOrganism {
 
 impl Default for DraftOrganism {
     fn default() -> Self {
-        // Bilateral + Fixed is the only invariant-compatible default
-        // we can pick that doesn't force the user into a particular
-        // shape: it works with every metabolism and intelligence
-        // level. (Variable form would force NoSymmetry on the
-        // first render.)
+        // Bilateral + Fixed: invariant-compatible with every metabolism
+        // and intelligence level (Variable would force NoSymmetry).
         Self {
             metabolism:   Metabolism::Heterotroph,
             intelligence: IntelligenceLevel::Level1,
@@ -98,59 +74,38 @@ impl Default for DraftOrganism {
 /// All editor state worth referencing from more than one place.
 #[derive(Resource, Default)]
 pub struct EditorSession {
-    /// Monotonically-increasing identifier issued to every created
-    /// template. Never decremented.
+    /// Monotonic id issued to every created template.
     pub next_id:    u32,
-    /// All organism templates the user has created.
+    /// All created organism templates.
     pub templates:  Vec<OrganismTemplate>,
-    /// Identifier of the currently-selected template, or `None` if
-    /// nothing is selected. Right-click placement targets this one.
+    /// Currently-selected template (right-click placement target), or `None`.
     pub active_id:  Option<u32>,
     /// Fields bound to the bottom-panel cyclers.
     pub draft:      DraftOrganism,
-    /// One-shot flag set by the inventory panel's Save button.
-    /// `colony_editor::save_dispatch` consumes it on the next tick
-    /// to open a file dialog and write the .colony file.
+    /// One-shot Save flag; consumed by `dispatch_save_requests`.
     pub save_requested: bool,
 
-    /// True iff the editor state has unsaved changes. Set by every
-    /// system that mutates `templates` (create / move). Reset to
-    /// `false` after a successful save. The Return-to-Menu flow
-    /// reads this to decide whether to show the unsaved-work modal.
+    /// Unsaved changes since the last save. Drives the unsaved-work modal.
     pub dirty:          bool,
 
-    /// Set by the inventory panel's "Return to Menu" button. The
-    /// dispatcher in `mod.rs` consumes it on the next tick:
-    ///   * `dirty == false` ⇒ exit immediately
-    ///   * `dirty == true`  ⇒ raise `show_exit_modal` so the modal
-    ///                         appears, blocking input until the
-    ///                         user resolves it.
+    /// "Return to Menu" flag; the `mod.rs` dispatcher exits if clean,
+    /// or raises `show_exit_modal` if dirty.
     pub exit_requested: bool,
 
-    /// True while the unsaved-work confirmation modal should be
-    /// visible. Toggled by the Return-to-Menu button (on) and the
-    /// modal's own Yes/No buttons (off; Yes also triggers the exit).
+    /// Whether the unsaved-work confirmation modal is visible.
     pub show_exit_modal: bool,
 
-    /// True while the "Clear All" confirmation modal should be
-    /// visible. Set by the Clear-All button (`inventory_panel`) and
-    /// reset by the modal's own Yes/No buttons. Yes additionally
-    /// drains every template AND despawns every live `OrganismRoot`
-    /// in the simulation — destructive enough to warrant an explicit
-    /// confirmation step.
+    /// Whether the "Clear All" confirmation modal is visible. Yes drains
+    /// every template AND despawns every live `OrganismRoot`.
     pub show_clear_modal: bool,
 
     // ── Species navigator state ───────────────────────────────────
-    /// All `.species` files the user has loaded this editor session.
+    /// All `.species` files loaded this session.
     pub loaded_species:        Vec<LoadedSpecies>,
-    /// Monotonic id issued to each loaded species.
+    /// Monotonic id per loaded species.
     pub next_species_id:       u32,
-    /// Currently-selected species (highlighted in the navigator list).
-    /// Drives both single-click placement and bulk-spawn.
+    /// Selected species; drives single-click placement and bulk-spawn.
     pub selected_species_id:   Option<u32>,
-    /// One-shot: when set, `dispatch_load_species_requests` reads the
-    /// file on the next Update tick, decodes it, mirrors the OCG if
-    /// Bilateral, and appends a new `LoadedSpecies`. The Load Species
-    /// button stuffs the rfd-chosen path here.
+    /// One-shot rfd-chosen path; consumed by `dispatch_load_species_requests`.
     pub load_species_path:     Option<std::path::PathBuf>,
 }

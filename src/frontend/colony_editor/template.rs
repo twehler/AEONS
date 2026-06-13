@@ -1,22 +1,18 @@
 // Per-organism data the editor manipulates.
 //
-// `OrganismTemplate` is the editor's working representation of an
-// organism: just enough metadata for the user to pick its trophic
-// strategy + intelligence + symmetry, plus the world position. The
-// actual mesh / Bevy entity is kept in lock-step via a separate
-// `template_entity` field that the placement system updates.
+// `OrganismTemplate` is the editor's working representation: trophic
+// strategy + intelligence + symmetry + world position. Its mesh entity
+// is kept in lock-step via the `entity` field.
 
 use bevy::prelude::*;
 
 use crate::cell::CellType;
-use crate::organism::{IntelligenceLevel, Symmetry};
+use crate::organism::{IntelligenceLevel, MovementMode, Symmetry};
 use crate::body_part::MIN_X_BILATERAL;
 
 
-/// Trophic strategy. Mirrors `OrganismKind` from the simulation but
-/// kept as an editor-local enum so the UI can iterate variants
-/// without pulling in the simulation's invariants. Convertible
-/// back to `OrganismKind` for save-time emission.
+/// Trophic strategy. Editor-local mirror of `OrganismKind`, convertible
+/// back for save-time emission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metabolism {
     Heterotroph,
@@ -45,8 +41,7 @@ impl Metabolism {
         }
     }
 
-    /// Trophic colour used for the editor preview mesh — green for
-    /// photoautotrophs, red for heterotrophs.
+    /// Preview-mesh colour: green photoautotroph, red heterotroph.
     pub fn preview_colour(self) -> Color {
         match self {
             Metabolism::Photoautotroph => Color::srgb(0.20, 0.80, 0.20),
@@ -56,9 +51,7 @@ impl Metabolism {
 }
 
 
-/// Cycle helper for `IntelligenceLevel` — we re-export here so the
-/// UI can treat it like the other editor enums without an extra
-/// `match` site.
+/// Label helper for `IntelligenceLevel`.
 pub fn intel_label(level: IntelligenceLevel) -> &'static str {
     match level {
         IntelligenceLevel::Level0 => "Intel 0 (sessile)",
@@ -94,13 +87,9 @@ pub fn sym_cycle(sym: Symmetry) -> Symmetry {
 }
 
 
-/// Body-plan form. Maps directly to `Organism::has_variable_form`:
-///   * `Variable` ⇒ has_variable_form = true ⇒ sessile, plant-like.
-///   * `Fixed`    ⇒ has_variable_form = false ⇒ mobile, animal-like.
-///
-/// The simulation enforces the invariant `Variable ⇒ NoSymmetry`;
-/// the editor's creation panel mirrors that automatically (cycling
-/// to Variable forces symmetry to NoSymmetry, and vice versa).
+/// Body-plan form → `Organism::has_variable_form`. `Variable` ⇒ sessile;
+/// `Fixed` ⇒ mobile. Invariant `Variable ⇒ NoSymmetry` is enforced by
+/// the simulation and mirrored by the creation panel's cyclers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
     Variable,
@@ -128,10 +117,8 @@ pub fn form_cycle(form: Form) -> Form {
 }
 
 
-/// One organism the user has created in the editor.
-///
-/// Identified by a stable `id` (a monotonic counter) so the
-/// inventory-panel UI can reference rows without entity churn.
+/// One created organism, keyed by a stable monotonic `id` so the
+/// inventory UI can reference rows without entity churn.
 #[derive(Clone, Debug)]
 pub struct OrganismTemplate {
     pub id:           u32,
@@ -143,52 +130,36 @@ pub struct OrganismTemplate {
     /// Bevy entity holding the visual marker in the 3D world. Kept
     /// in lock-step with `position` by the placement system.
     pub entity:       Entity,
-    /// If `Some`, this template originated from a loaded `.species`
-    /// file and carries the species's full OCG (already
-    /// bilateral-expanded if applicable). When present, `build_ocg`
-    /// returns this verbatim — the default 1- or 2-cell shape from
-    /// the cycler-driven path is bypassed.
+    /// If `Some`, this template is `.species`-sourced and carries the
+    /// full OCG (bilateral-expanded if applicable); `build_ocg` returns
+    /// it verbatim.
     pub custom_ocg:    Option<Vec<(usize, Vec3, CellType)>>,
-    /// Appendage parts from a multi-part `.species` file, each as
-    /// `(OCG, is_limb, parent)`. The OCG is the raw stored shape
-    /// (right-half for bilateral, full for NoSymmetry); `is_limb = true`
-    /// makes the runtime spawn rebase the part to a first-cell pivot and
-    /// tag it as `BodyPartKind::Limb`; `parent` is the EDITOR parent index
-    /// (0 = main body, else a sub-limb of that limb). Empty for
-    /// cycler-derived or single-part templates.
+    /// Appendage parts as `(OCG, is_limb, parent)`. OCG is the raw stored
+    /// shape (right-half for bilateral); `is_limb` rebases to a first-cell
+    /// pivot + tags `BodyPartKind::Limb`; `parent` is the EDITOR parent
+    /// index (0 = main body). Empty for single-part templates.
     pub custom_appendages: Vec<(Vec<(usize, Vec3, CellType)>, bool, usize)>,
-    /// Display name from the species file (filename stem). `None`
-    /// for cycler-derived templates; falls back to "Hetero/Photo #N"
-    /// formatting in `display_name`.
+    /// Display name (species filename stem); `None` ⇒ "Hetero/Photo #N".
     pub species_name:  Option<String>,
-    /// Carnivore classification flag, set from the source species's
-    /// `Classification` byte (or `false` for cycler-derived
-    /// templates and Herbivore species). When `true`, the spawn
-    /// pipeline attaches a `Carnivore` marker on the OrganismRoot
-    /// so IL2 / IL3 brains hunt other heterotrophs instead of
-    /// photoautotrophs.
+    /// Carnivore flag. When `true`, spawn attaches a `Carnivore` marker
+    /// so IL2/IL3 brains hunt heterotrophs instead of photoautotrophs.
     pub is_carnivore:  bool,
-    /// Maps to `Organism::sliding_movement`. `true` = legacy sliding,
-    /// `false` = limb-based physics + PPO. Sourced from the species
-    /// editor's movement cycler via `LoadedSpecies::sliding_movement`.
-    /// Defaults to `true` for cycler-derived templates (the standalone
-    /// "Create Organism" path in the colony editor — these stay on the
-    /// sliding path until the user explicitly imports a limb species).
-    pub sliding_movement: bool,
-    /// Maps to `Organism::is_sessile`, taken verbatim from the
-    /// species-editor Mobility cycler. The simulation enforces the
-    /// invariant `has_variable_form ⇒ is_sessile` independently in
-    /// `spawn_organism`, so a `Variable + Mobile` species would still
-    /// be coerced to sessile at spawn — but the inverse pairing
-    /// (`Fixed + Sessile`) is a legitimate user choice that only this
-    /// field can carry through to the runtime.
+    /// Maps to `Organism::movement_mode`. Defaults `MovementMode::Sliding`
+    /// for cycler templates; `.species`-sourced templates carry the loaded mode.
+    pub movement_mode: MovementMode,
+    /// Maps to `Organism::is_sessile` (species-editor Mobility cycler).
+    /// `spawn_organism` independently coerces `has_variable_form ⇒ sessile`;
+    /// the `Fixed + Sessile` pairing is only carryable through this field.
     pub is_sessile: bool,
+    /// Maps to `Organism::ground_based`. Only an override for phototrophs
+    /// (floating, water-based algae); `spawn_organism` coerces heterotrophs
+    /// to the movement-mode default.
+    pub ground_based: bool,
 }
 
 impl OrganismTemplate {
-    /// Display name used in the inventory panel and as a save-file
-    /// fingerprint. Format: "Hetero #3", "Photo #5", or for species-
-    /// loaded templates the species name + sequence number.
+    /// Inventory-panel display name: "Hetero #3" / "Photo #5", or
+    /// "<species> #N" for species-loaded templates.
     pub fn display_name(&self) -> String {
         if let Some(ref name) = self.species_name {
             return format!("{name} #{}", self.id);
@@ -200,29 +171,22 @@ impl OrganismTemplate {
         format!("{prefix} #{}", self.id)
     }
 
-    /// Maps directly to `Organism::has_variable_form` in the save
-    /// format. Set by the user via the bottom-panel "Form" cycler;
-    /// the simulation invariant `Variable ⇒ NoSymmetry` is enforced
-    /// at the cycler level so this never disagrees with `symmetry`.
+    /// Maps to `Organism::has_variable_form`. Invariant `Variable ⇒
+    /// NoSymmetry` is enforced at the cycler, so it never disagrees with `symmetry`.
     pub fn has_variable_form(&self) -> bool {
         self.form.is_variable()
     }
 
-    /// Sessile flag, honouring the species editor's Mobility cycler.
-    /// `is_sessile` and `has_variable_form` are independent in the
-    /// species file: a user can author a fixed-form sessile organism
-    /// (a stone-like creature with a fixed body plan). The OR with
-    /// `has_variable_form` preserves the simulation invariant
-    /// `Variable ⇒ Sessile` for safety.
+    /// Sessile flag. `is_sessile` and `has_variable_form` are independent
+    /// in the species file (a fixed-form sessile organism is valid); the
+    /// OR preserves the invariant `Variable ⇒ Sessile`.
     pub fn is_sessile(&self) -> bool {
         self.is_sessile || self.form.is_variable()
     }
 
-    /// Build the per-body-part OCG for the save format. If
-    /// `custom_ocg` is set (species-loaded template), return its
-    /// contents directly. Otherwise fall back to the cycler-derived
-    /// shape: single-cell for `NoSymmetry`, two cells at
-    /// `(±MIN_X_BILATERAL, 0, 0)` for `Bilateral`.
+    /// Build the per-body-part OCG. Returns `custom_ocg` verbatim if set,
+    /// else the cycler shape: 1 cell (NoSymmetry) or a `±MIN_X_BILATERAL`
+    /// pair (Bilateral).
     pub fn build_ocg(&self) -> Vec<(usize, Vec3, CellType)> {
         if let Some(ref ocg) = self.custom_ocg {
             return ocg.clone();
@@ -237,19 +201,11 @@ impl OrganismTemplate {
         }
     }
 
-    /// Bounding-sphere radius used for right-click hit-testing
-    /// against the rendered mesh. Sized just generously enough to
-    /// cover the visible rhombic-dodecahedron extent for each
-    /// supported symmetry.
-    ///
-    /// One RD cell with `EDGE_LEN = 1.0` has long-radius
-    /// `MIN_X_BILATERAL ≈ 1.155` from the cell centre. A bilateral
-    /// pair sits two cell-centres apart along X, so its outermost
-    /// point sits at `|center| + cell_radius ≈ 2 · MIN_X_BILATERAL`.
+    /// Bounding-sphere radius for right-click hit-testing. One RD cell
+    /// (`EDGE_LEN = 1.0`) has long-radius `MIN_X_BILATERAL ≈ 1.155`; a
+    /// bilateral pair reaches `≈ 2·MIN_X_BILATERAL`.
     pub fn pick_radius(&self) -> f32 {
-        // Species-loaded templates can have up to 30 cells in any
-        // configuration; compute the radius from the OCG's bounding
-        // sphere plus one cell-padding.
+        // Species OCG: bounding sphere plus one cell of padding.
         if let Some(ref ocg) = self.custom_ocg {
             let max_r = ocg.iter()
                 .map(|(_, p, _)| p.length())

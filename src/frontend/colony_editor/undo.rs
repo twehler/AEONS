@@ -1,27 +1,10 @@
 // Editor undo system + global keyboard shortcuts.
 //
-// Two shortcuts handled here:
-//   * Ctrl+Z — pop the most recent `EditorAction` off the undo
-//     stack and reverse its effect on `EditorSession::templates`.
-//   * Ctrl+S — set `session.save_requested = true`, which
-//     `dispatch_save_requests` in `mod.rs` consumes to open the
-//     file dialog and write a `.colony` file.
+//   * Ctrl+Z — pop the most recent `EditorAction` and reverse it.
+//   * Ctrl+S — set `save_requested` (consumed by `mod.rs`).
 //
-// What can be undone:
-//   * Created(ids)            — single-click placement OR bulk-add.
-//                               Undo despawns each entity and
-//                               removes it from `session.templates`.
-//   * Deleted(template)       — right-click delete.
-//                               Undo re-spawns the visual + pushes
-//                               the template back into the list
-//                               with a fresh `Entity` reference.
-//   * Cleared(templates)      — inventory panel's "Clear All".
-//                               Undo re-spawns every snapshotted
-//                               template at its original position.
-//
-// The stack is capped (`MAX_UNDO_DEPTH`) so a very long editing
-// session doesn't grow unbounded. Older actions silently fall off
-// the bottom when the cap is exceeded.
+// Undoable actions: Created (despawn each), Deleted (re-spawn), Cleared
+// (re-spawn all). The stack is capped at `MAX_UNDO_DEPTH`.
 
 use bevy::prelude::*;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -31,30 +14,22 @@ use crate::colony_editor::session::EditorSession;
 use crate::colony_editor::template::OrganismTemplate;
 
 
-/// How many actions stay on the undo stack. After this many edits
-/// the oldest action is dropped on each new push. 100 is generous
-/// for a single editing session and bounded in memory.
+/// Undo-stack depth; oldest action drops once exceeded.
 const MAX_UNDO_DEPTH: usize = 100;
 
 
-/// Single reversible edit. Each variant carries enough information
-/// to UNDO itself — the redo direction isn't currently supported.
+/// Single reversible edit (undo-only; no redo).
 pub enum EditorAction {
-    /// A batch of templates that were just created. Single-click
-    /// placement produces `Created(vec![id])`; bulk-add produces
-    /// `Created(vec![ids…])`. Undo despawns each.
+    /// Templates just created (single-click or bulk). Undo despawns each.
     Created(Vec<u32>),
-    /// A template that was deleted. Undo re-spawns it.
+    /// A deleted template. Undo re-spawns it.
     Deleted(OrganismTemplate),
-    /// "Clear All" — many templates wiped at once. Undo re-spawns
-    /// every one of them with fresh visual entities.
+    /// "Clear All". Undo re-spawns every snapshotted template.
     Cleared(Vec<OrganismTemplate>),
 }
 
 
-/// LIFO history of edits since the editor was opened (capped at
-/// `MAX_UNDO_DEPTH`). Mutated by every system that creates / deletes
-/// templates.
+/// LIFO edit history, capped at `MAX_UNDO_DEPTH`.
 #[derive(Resource, Default)]
 pub struct UndoStack {
     actions: Vec<EditorAction>,
@@ -72,10 +47,8 @@ impl UndoStack {
         self.actions.pop()
     }
 
-    /// Wipe the entire history. Currently unused; reserved for a
-    /// future "load a different colony into the editor" flow that
-    /// would otherwise allow undo to resurrect templates from the
-    /// previous session.
+    /// Wipe the history. Unused; reserved for a future "load a
+    /// different colony" flow.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.actions.clear();
@@ -95,9 +68,7 @@ impl Plugin for UndoPlugin {
                 handle_undo_shortcut,
                 handle_save_shortcut,
             )
-                // Merged mode: only consume Ctrl+Z / Ctrl+S while
-                // EditColony is active. Standalone editor (no
-                // WindowMode resource) always fires.
+                // Merged: only while EditColony active. Standalone: always.
                 .run_if(in_edit_mode_or_standalone));
     }
 }
@@ -112,13 +83,9 @@ fn in_edit_mode_or_standalone(mode: Option<Res<crate::simulation_settings::Windo
 
 // ── Shortcut handlers ───────────────────────────────────────────────────────
 //
-// Both shortcuts match on the LOGICAL key (`Key::Character`) rather
-// than the physical key code. `KeyCode::KeyZ` corresponds to the
-// USB-HID position of "Z" on a US QWERTY layout — on QWERTZ
-// (German) the key the user reads as "Z" sits at the physical
-// KeyY position, on AZERTY at KeyW, on Dvorak elsewhere again. The
-// logical-key path means Ctrl + the-key-labelled-Z works on every
-// layout.
+// Both shortcuts match the LOGICAL key (`Key::Character`), not the
+// physical `KeyCode`, so Ctrl+the-key-labelled-Z/S works regardless of
+// keyboard layout (QWERTZ/AZERTY/Dvorak).
 
 fn handle_undo_shortcut(
     keys:           Res<ButtonInput<KeyCode>>,
@@ -158,9 +125,7 @@ fn handle_undo_shortcut(
                     }
                 }
             }
-            // After an undo of a creation, the user is back to the
-            // state before the edit — still treated as dirty unless
-            // the stack is empty AND the template list is empty.
+            // Stays dirty unless both the template list and the stack are empty.
             session.dirty = !session.templates.is_empty()
                           || !undo_stack.actions.is_empty();
         }
@@ -210,8 +175,7 @@ fn handle_save_shortcut(
         }
     }
     if !trigger { return; }
-    // Mirrors the Save Colony… button — `dispatch_save_requests`
-    // consumes this flag on the next tick to open the file dialog.
+    // Mirrors the Save Colony… button; consumed by `dispatch_save_requests`.
     session.save_requested = true;
 }
 

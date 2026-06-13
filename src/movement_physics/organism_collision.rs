@@ -1,15 +1,12 @@
-// Organism-vs-organism contact detection.
+// Organism-vs-organism contact detection (sliding↔sliding only).
 //
-// Three-phase pipeline (mirrors the old design but indexed by body parts):
-//   1. Broad phase  — root-position spatial hash, cheap distance test.
-//   2. Mid phase    — body-part-pair bounding-sphere overlap test.
-//   3. Narrow phase — cell-vs-cell sphere intersection between the two
-//                     candidate body parts.
+// Three-phase pipeline:
+//   1. Broad  — root-position spatial hash, distance test.
+//   2. Mid    — body-part bounding-sphere overlap.
+//   3. Narrow — cell-vs-cell sphere intersection.
 //
-// On contact, this system emits one `OrganismContactEvent` per body-part
-// pair that touched. The event carries the body-part indices on each side
-// so `predation.rs` can scope its consumption to the body part that was
-// physically reached, rather than nuking the whole prey on first contact.
+// Emits one `OrganismContactEvent` per touching body-part pair (carrying the
+// indices) so `predation.rs` scopes consumption to the part physically reached.
 
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -20,10 +17,8 @@ use crate::colony::*;
 
 // ── Events ───────────────────────────────────────────────────────────────────
 
-/// Fired whenever a body part of one organism physically touches a body
-/// part of another. Carries both organisms and the body-part indices that
-/// made contact. Consumed by `predation.rs` (and any future interaction
-/// logic — e.g. mating, parasitism).
+/// Fired when a body part of one organism touches a body part of another.
+/// Consumed by `predation.rs`.
 #[derive(Message, Clone, Copy)]
 pub struct OrganismContactEvent {
     pub a:           Entity,
@@ -80,8 +75,8 @@ fn neighbour_keys(key: [i32; 3]) -> [[i32; 3]; 27] {
 
 // ── Snapshot types ───────────────────────────────────────────────────────────
 
-/// Captured per body part once per tick; the world-space cell positions are
-/// pre-computed so the cell-pair narrow phase doesn't have to re-transform.
+/// Per-body-part snapshot; cell world positions pre-computed so the narrow
+/// phase doesn't re-transform.
 struct BodyPartSnapshot {
     index:           usize,
     world_centroid:  Vec3,
@@ -92,22 +87,13 @@ struct BodyPartSnapshot {
 struct OrganismSnapshot {
     entity:         Entity,
     root_world_pos: Vec3,
-    /// Type flags captured so the push accumulator can detect
-    /// predator-prey pairs and skip them. Predation handles
-    /// "separation" by consuming the prey one body part at a time —
-    /// pushing the predator away from the prey only fights that
-    /// resolution and produces the visible "approach → contact →
-    /// pushed back → re-approach" dance.
+    /// Type flags (currently unused by the event-only path; retained).
     is_photo:       bool,
     is_carnivore:   bool,
-    /// `false` for limb-based organisms. This custom collision system
-    /// computes cell world positions as `root_transform × local`,
-    /// which is only valid for sliding organisms (single Kinematic
-    /// root). Limb organisms have independent Dynamic body-part bodies
-    /// whose true world positions come from Avian, so any pair
-    /// involving a limb organism is skipped here and handled by
-    /// `avian_setup::emit_limb_contact_events` instead.
-    sliding_movement: bool,
+    /// `false` for limb organisms. This system computes cell positions as
+    /// `root_transform × local`, valid only for sliding organisms; limb
+    /// pairs are skipped here and handled by `emit_limb_contact_events`.
+    sliding:        bool,
     body_parts:     Vec<BodyPartSnapshot>,
 }
 
@@ -118,17 +104,9 @@ fn snapshot(
     is_photo:     bool,
     is_carnivore: bool,
 ) -> OrganismSnapshot {
-    // One snapshot per alive body part. Each body part's OCG lives in its
-    // own local frame; for branches that frame is offset from the root by
-    // the attachment origin (parent_idx = 0 in the current single-level
-    // hierarchy). We approximate the world position by adding the attachment
-    // origin in the parent's frame, then transforming by the root.
-    //
-    // This ignores the branch's own `attachment.rotation` for now — once
-    // body-part rotation is animated, branch cell positions should be
-    // computed via `parent_world * Translate(origin) * Rotate * cell_local`.
-    // Until then, attachment.rotation is Quat::IDENTITY and the simpler
-    // composition is exact.
+    // One snapshot per alive body part. World position = root transform
+    // applied to (attachment origin + cell local). Ignores
+    // `attachment.rotation` — exact while it stays Quat::IDENTITY.
     let mut body_parts: Vec<BodyPartSnapshot> = Vec::new();
     for (idx, bp) in organism.body_parts.iter().enumerate() {
         if !bp.is_alive() { continue; }
@@ -158,7 +136,7 @@ fn snapshot(
         root_world_pos: transform.translation,
         is_photo,
         is_carnivore,
-        sliding_movement: organism.sliding_movement,
+        sliding: organism.movement_mode.is_sliding(),
         body_parts,
     }
 }
@@ -198,8 +176,7 @@ pub fn apply_organism_collision(
             .push(i);
     }
 
-    // Dedup set for emitted events. Positional separation accumulator
-    // removed — see the comment in the narrow phase below.
+    // Dedup set for emitted events (no positional separation — see narrow phase).
     let mut emitted: HashSet<(Entity, Entity, usize, usize)> = HashSet::new();
 
     let cell_contact_d  = CELL_COLLISION_RADIUS * 2.0;
@@ -217,15 +194,10 @@ pub fn apply_organism_collision(
                 if idx_b <= idx_a { continue; }
                 let snap_b = &snapshots[idx_b];
 
-                // Skip any pair involving a limb-based organism. Their
-                // true body-part world positions live in Avian, not in
-                // `root_transform × local`, so this system would test
-                // collisions against stale geometry. `avian_setup::
-                // emit_limb_contact_events` handles every limb-involved
-                // contact via Avian's narrow phase instead — routing it
-                // through the same `OrganismContactEvent` that predation
-                // already consumes. (Sliding↔sliding pairs stay here.)
-                if !snap_a.sliding_movement || !snap_b.sliding_movement {
+                // Skip pairs involving a limb organism (their true positions
+                // live in Avian, not `root × local`); `emit_limb_contact_events`
+                // handles those. Sliding↔sliding pairs stay here.
+                if !snap_a.sliding || !snap_b.sliding {
                     continue;
                 }
 
@@ -243,17 +215,14 @@ pub fn apply_organism_collision(
                         if bp_d.length_squared() >= r_sum * r_sum { continue; }
 
                         // Narrow phase: cell-pair sphere intersection.
-                        // Quadratic in cells per body part — fine because
-                        // typical body parts carry < 50 cells in adult form
-                        // and the broad/mid phases keep most pairs out.
+                        // Quadratic but cheap (<50 cells/part, broad/mid prune).
                         for &ca in &bp_a.cells_world {
                             for &cb in &bp_b.cells_world {
                                 let d2 = (cb - ca).length_squared();
                                 if d2 >= cell_contact_d2 || d2 < 1e-6 { continue; }
 
-                                // Canonical (entity, body-part) key for dedup
-                                // — sort by entity so (A,B,bp_a,bp_b) and
-                                // (B,A,bp_b,bp_a) collapse to one event.
+                                // Canonical key (sort by entity) so the pair
+                                // collapses to one event regardless of order.
                                 let key = if snap_a.entity < snap_b.entity {
                                     (snap_a.entity, snap_b.entity, bp_a.index, bp_b.index)
                                 } else {
@@ -269,29 +238,10 @@ pub fn apply_organism_collision(
                                     });
                                 }
 
-                                // Positional separation removed. Every
-                                // push variant we tried (speed-scaled
-                                // deflection, half-overlap shove,
-                                // sessile-aware routing, predator-prey
-                                // skip) introduced a different failure
-                                // mode. Most recently: two herbivores
-                                // converging on the same photo got
-                                // shoved off-axis perpendicular to
-                                // their shared photo-axis on every
-                                // collision tick, while the brain
-                                // pulled them back; the result was an
-                                // axis-locked slide-on-one-spot that
-                                // never released until the organism
-                                // starved.
-                                //
-                                // Conclusion: the collision system now
-                                // ONLY emits events (so predation
-                                // continues to fire). Geometric overlap
-                                // between two herbivores is tolerated
-                                // — they stack visually for the brief
-                                // window before predation finishes the
-                                // shared photo, then naturally
-                                // separate as they re-target.
+                                // Events only — no positional push (every push
+                                // variant introduced a worse failure mode).
+                                // Geometric overlap is tolerated; organisms
+                                // separate naturally as they re-target.
                             }
                         }
                     }
@@ -300,10 +250,7 @@ pub fn apply_organism_collision(
         }
     }
 
-    // No push-application step — see the narrow-phase comment for
-    // why positional separation was removed. `params.p1()` (the
-    // `&mut Transform` query) is now unused; we keep it on the
-    // signature so the previous pushed-write code can be reinstated
-    // by uncommenting if a future failure mode requires it.
+    // No push step (events only). `params.p1()` (`&mut Transform`) is unused
+    // but kept on the signature for easy reinstatement.
     let _ = params;
 }

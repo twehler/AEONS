@@ -5,14 +5,11 @@ pub const VERT_COUNT: usize = 14;
 
 // ── Lattice slot directions ───────────────────────────────────────────────────
 //
-// A rhombic dodecahedron tiles 3-space exactly. Neighbouring cell centres lie
-// at  centre + SLOT_DIRS[i] * center_scale(edge).
-//
-// The 18 slots split into two groups:
-//   • 6 axis-aligned  (magnitude 1.0)  – next-nearest BCC neighbours
-//   • 12 face-diagonal (magnitude √0.5) – nearest  FCC neighbours
-//
-// All 18 together span the full coordination shell of the RD tiling.
+// RD tiles 3-space exactly; neighbour centres lie at
+// centre + SLOT_DIRS[i] * center_scale(edge). The 18 slots:
+//   • 6 axis-aligned  (mag 1.0)  – next-nearest BCC neighbours
+//   • 12 face-diagonal (mag √0.5) – nearest FCC neighbours
+// Together they span the full RD coordination shell.
 
 pub const SLOT_DIRS: [Vec3; 18] = [
     // 6 axis-aligned

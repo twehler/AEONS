@@ -1,32 +1,11 @@
 // Individuum navigator + per-organism identity labels.
 //
-// Two coupled features live here so they share state (the
-// `IndividualIdentifier` component) and a single set of book-keeping systems:
-//
-//   1. Each heterotroph receives a procedurally-generated name on spawn
-//      ("Heterotroph 1", "Heterotroph 2", …). The name is stored in the
-//      `IndividualIdentifier` component on the OrganismRoot entity.
-//
-//   2. A small floating UI label is rendered above each named organism in
-//      the 3D viewport. The label always faces the camera (it's a screen-
-//      space UI Node positioned per frame from `Camera::world_to_viewport`)
-//      and displays the organism's identifier.
-//
-//   3. A right-side "Individuum Navigator" panel lists every named
-//      organism as a button. The panel mirrors the statistics panel's
-//      visual language (same background colour, same drag-handle
-//      affordance for resize) and lives inside the same top row as the
-//      viewport, so its height tracks whatever the statistics-panel
-//      divider is currently set to.
-//
-//   4. A "Show Individual Identifiers" checkbox at the top of the
-//      panel toggles the in-viewport labels (the panel itself, the
-//      counter, and the button list are unaffected). Identifier
-//      assignment is independent of the toggle — turning labels off
-//      only hides the visualisation, never the underlying data.
-//
-// Only heterotrophs are tracked for now. Photoautotrophs and Krishi do
-// not receive identifiers.
+// Coupled features sharing the `IndividualIdentifier` component: per-heterotroph
+// name on spawn; a per-frame `Camera::world_to_viewport`-positioned floating UI
+// label above each named organism; a right-side navigator panel of buttons; and
+// a "Show Individual Identifiers" checkbox toggling only the labels (identifier
+// assignment is independent — off hides the visualisation, not the data).
+// Only heterotrophs are tracked (no photoautotrophs / Krishi).
 
 use bevy::prelude::*;
 use bevy::input::keyboard::KeyboardInput;
@@ -43,90 +22,68 @@ use crate::simulation_settings::{AutoSpawnHeteros, MinHeteroCount, MinHeteroCoun
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/// Initial navigator-panel width (logical px). Picked to fit a single
-/// "Heterotroph N" button comfortably.
+/// Initial navigator-panel width (logical px).
 pub const NAV_INITIAL_WIDTH_PX: f32 = 220.0;
 /// Lower bound on the navigator panel's width while dragging.
 pub const NAV_MIN_WIDTH_PX:     f32 = 120.0;
-/// Lower bound on the viewport's width while dragging the vertical
-/// divider — symmetrical with `frontend::VIEWPORT_MIN_PX` for the
-/// horizontal divider.
+/// Lower bound on viewport width while dragging the vertical divider —
+/// symmetrical with `frontend::VIEWPORT_MIN_PX`.
 pub const NAV_VIEWPORT_MIN_PX:  f32 = 50.0;
-/// Thickness of the vertical drag-handle separating viewport from
-/// navigator panel (logical px).
+/// Vertical drag-handle thickness (logical px).
 pub const NAV_DIVIDER_WIDTH_PX: f32 = 6.0;
 
 const PANEL_PADDING_PX:    f32   = 8.0;
-/// Height of one navigator-list row. Sized to fit two stacked text
-/// lines (name on top, intelligence level below) plus a little breathing
-/// room.
+/// Navigator-list row height; fits two stacked text lines.
 const NAV_BUTTON_HEIGHT_PX:f32   = 44.0;
 const NAV_BUTTON_GAP_PX:   f32   = 4.0;
-/// Font size of the secondary "Intelligence: Level N" line. Smaller
-/// than the name so the visual hierarchy reads name-first at a glance.
 const NAV_BUTTON_SUBTEXT_FONT: f32 = 11.0;
-/// Subtext colour — dimmer than the name to underscore the hierarchy.
 const NAV_BUTTON_SUBTEXT_COLOR: Color = Color::srgb(0.70, 0.70, 0.70);
 const CHECKBOX_SIZE_PX:    f32   = 16.0;
 const LABEL_FONT_SIZE:     f32   = 13.0;
-/// Vertical world-space offset between the organism's transform and
-/// the projected anchor point used for the floating label. Small
-/// because cells are roughly 1.0 unit and the label should hover just
-/// above the body.
+/// World-space lift of the floating-label anchor above the organism
+/// transform (cells are ~1.0 unit).
 const LABEL_WORLD_LIFT:    f32   = 2.0;
-/// Pixel padding between the projected anchor point and the bottom
-/// edge of the label (the label sits ABOVE the anchor by this amount).
+/// Pixel gap above the anchor; the label sits ABOVE the anchor by this much.
 const LABEL_ANCHOR_GAP_PX: f32   = 4.0;
 /// Logical pixels scrolled per mouse-wheel notch.
 const SCROLL_STEP_PX:      f32   = 32.0;
-/// Floating-label background. Translucent so the world stays readable
-/// behind the text.
+/// Floating-label background; translucent so the world stays readable.
 const LABEL_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.55);
 
 
 // ── Resources ────────────────────────────────────────────────────────────────
 
-/// Per-species running index allocator. `next[species_id]` is the index the
-/// next organism joining that species will receive (1-based). Indices are
-/// monotonic per species and never reused, so an organism's `species#N`
-/// identifier is a stable handle even as others die. The name TRACKS the live
-/// lineages species: when an organism is reclassified into a different
-/// species, it is re-issued a fresh index in the new species.
+/// Per-species running index allocator (1-based, monotonic, never reused), so
+/// `species#N` is a stable handle. Name TRACKS live species: reclassification
+/// re-issues a fresh index in the new species.
 #[derive(Resource, Default)]
 pub struct SpeciesIndexCounters {
     next: std::collections::HashMap<u32, u32>,
 }
 
-/// Records the species an organism is currently NAMED under, plus the index
-/// it was issued within that species. Re-issued when `Organism::species_id`
-/// changes (live-species tracking). Absence means "not yet named".
+/// Species an organism is currently NAMED under + the index issued within it.
+/// Re-issued when `Organism::species_id` changes. Absence = not yet named.
 #[derive(Component)]
 pub struct SpeciesIndex {
     pub species_id: u32,
     pub index:      u32,
 }
 
-/// The heterotroph the user has selected by left-clicking it in the viewport.
-/// Its navigator button is highlighted green and scrolled into view. `None`
-/// when nothing is selected (cleared by clicking empty space / terrain).
+/// Heterotroph selected by viewport left-click; its navigator button is
+/// highlighted and scrolled into view. `None` clears on empty/terrain click.
 #[derive(Resource, Default)]
 pub struct SelectedOrganism(pub Option<Entity>);
 
 /// Emitted by `frontend::viewport_click` on a Simulation-mode viewport
-/// left-click, carrying the window-space cursor position. Consumed by
-/// `pick_organism`, which ray-casts to find the heterotroph under the cursor.
+/// left-click (window-space cursor). Consumed by `pick_organism` (ray-cast).
 #[derive(Message, Clone, Copy)]
 pub struct ViewportPick {
     pub cursor: Vec2,
 }
 
-/// Master toggle for the in-world floating labels. Defaults to `true`
-/// so labels are visible from the start. Toggled via the checkbox at
-/// the top of the navigator panel.
-///
-/// Identifier assignment and the navigator-panel button list ignore
-/// this flag entirely — turning it off ONLY hides the in-viewport
-/// labels.
+/// Master toggle for the in-world floating labels (default `true`).
+/// Identifier assignment and the navigator button list ignore this flag —
+/// turning it off ONLY hides the in-viewport labels.
 #[derive(Resource)]
 pub struct ShowIndividualIdentifiers(pub bool);
 
@@ -134,8 +91,8 @@ impl Default for ShowIndividualIdentifiers {
     fn default() -> Self { Self(true) }
 }
 
-/// Captured at DragStart so subsequent Drag events resolve to an
-/// absolute width — same pattern as `frontend::DividerDragState`.
+/// Captured at DragStart so subsequent Drag events resolve to an absolute
+/// width (same pattern as `frontend::DividerDragState`).
 #[derive(Resource, Default)]
 struct VerticalDividerDragState {
     initial_panel_width: f32,
@@ -144,18 +101,15 @@ struct VerticalDividerDragState {
 
 // ── Components ───────────────────────────────────────────────────────────────
 
-/// Display name attached to an organism's root entity. Currently issued
-/// only to heterotrophs (see `assign_individual_identifiers`).
+/// Display name on an organism's root entity. Heterotrophs only.
 #[derive(Component, Clone)]
 pub struct IndividualIdentifier(pub String);
 
-/// Marker on the right-hand navigator panel — `vertical_divider_drag`
-/// queries on this to resize the panel as the divider is dragged.
+/// Marker on the right-hand navigator panel.
 #[derive(Component)]
 pub struct NavigatorPanel;
 
-/// Marker on the vertical drag-handle between viewport and navigator
-/// panel.
+/// Marker on the vertical drag-handle between viewport and navigator panel.
 #[derive(Component)]
 pub struct VerticalDivider;
 
@@ -163,19 +117,16 @@ pub struct VerticalDivider;
 #[derive(Component)]
 struct NavigatorList;
 
-/// Marker on each per-organism button in the navigator list. `target`
-/// references the organism root entity.
+/// Per-organism button in the navigator list; `target` = organism root.
 #[derive(Component)]
 struct NavigatorButton { target: Entity }
 
 /// Per-row "Export species" button. Click → file-save dialog →
-/// the pending entity + path land in `ExportSpeciesRequested` for
-/// `dispatch_export_species_requests` to consume next Update tick.
+/// `(entity, path)` into `ExportSpeciesRequested` for the worker.
 #[derive(Component)]
 struct NavigatorExportButton { target: Entity }
 
-/// One-shot request resource: `Some((target_entity, path))` while
-/// a dialog has completed and the worker hasn't run yet.
+/// One-shot request: `Some((entity, path))` between dialog and worker run.
 #[derive(Resource, Default)]
 struct ExportSpeciesRequested(Option<(Entity, std::path::PathBuf)>);
 
@@ -186,23 +137,19 @@ struct NavigatorButtonText { target: Entity }
 #[derive(Component)]
 struct IdentifiersCheckbox;
 
-/// Marker on the inner filled square that visualises the checkbox's
-/// "checked" state. Hidden via `Display::None` when unchecked.
+/// Inner filled square showing "checked"; hidden via `Display::None`.
 #[derive(Component)]
 struct IdentifiersCheckboxMark;
 
-/// Marker on the "Auto-Spawn Heterotrophs" checkbox at the bottom of
-/// the navigator panel.
+/// Marker on the "Auto-Spawn Heterotrophs" checkbox.
 #[derive(Component)]
 struct AutoSpawnCheckbox;
 
-/// Inner-fill marker for the auto-spawn checkbox (mirrors
-/// `IdentifiersCheckboxMark`).
+/// Inner-fill marker for the auto-spawn checkbox.
 #[derive(Component)]
 struct AutoSpawnCheckboxMark;
 
-/// Marker on the row containing the "Min count" input field. Hidden via
-/// `Display::None` when `AutoSpawnHeteros(false)`.
+/// "Min count" input row; hidden via `Display::None` when `AutoSpawnHeteros(false)`.
 #[derive(Component)]
 struct MinHeteroCountRow;
 
@@ -214,26 +161,22 @@ struct MinHeteroCountInput;
 #[derive(Component)]
 struct MinHeteroCountText;
 
-/// Max digits accepted in the min-count buffer — bounded so the user
-/// can't paste a runaway integer.
+/// Max digits in the min-count buffer (bounds runaway paste).
 const MIN_HETERO_BUFFER_MAX_LEN: usize = 6;
 const MIN_HETERO_BG_IDLE:    Color = Color::srgb(0.18, 0.18, 0.18);
 const MIN_HETERO_BG_FOCUSED: Color = Color::srgb(0.10, 0.30, 0.10);
 
-/// One per labelled organism. `target` references the OrganismRoot.
-/// Labels are spawned as children of the `ViewportImage` so their
-/// `Val::Px` positions are already in viewport-local pixel coordinates
-/// — the exact space `Camera::world_to_viewport` returns.
+/// One per labelled organism (`target` = OrganismRoot). Spawned as a child of
+/// `ViewportImage` so `Val::Px` positions are viewport-local pixels — the exact
+/// space `Camera::world_to_viewport` returns.
 #[derive(Component)]
 struct IndividualLabel { target: Entity }
 
 #[derive(Component)]
 struct IndividualLabelText { target: Entity }
 
-/// Marker on the species-name sub-text inside the floating label.
-/// `update_label_species_text` rewrites this text whenever the
-/// target organism's `species_id` changes so the label always shows
-/// the current species classification under the individual name.
+/// Species-name sub-text inside the floating label; kept in sync with the
+/// target organism's `species_id` by `update_label_species_text`.
 #[derive(Component)]
 struct IndividualLabelSpecies { target: Entity }
 
@@ -278,8 +221,8 @@ impl Plugin for IndividuumNavigatorPlugin {
 
 // ── Layout helpers (called from frontend::setup_panes) ──────────────────────
 
-/// Spawn the vertical drag-handle that separates the viewport from the
-/// navigator panel. Called inside the top row's `with_children`.
+/// Spawn the vertical drag-handle between viewport and navigator panel.
+/// Called inside the top row's `with_children`.
 pub fn spawn_vertical_divider(parent: &mut ChildSpawnerCommands) {
     parent.spawn((
         VerticalDivider,
@@ -295,9 +238,7 @@ pub fn spawn_vertical_divider(parent: &mut ChildSpawnerCommands) {
     .observe(vertical_divider_drag);
 }
 
-/// Spawn the navigator panel as a child of the parent (the layout's top
-/// row). The panel's width starts at `NAV_INITIAL_WIDTH_PX` and is later
-/// resized by the vertical-divider observers.
+/// Spawn the navigator panel as a child of the layout's top row.
 pub fn spawn_navigator_panel(parent: &mut ChildSpawnerCommands) {
     parent.spawn((
         NavigatorPanel,
@@ -368,9 +309,8 @@ pub fn spawn_navigator_panel(parent: &mut ChildSpawnerCommands) {
         ));
 
         // ── Scrollable list of per-organism buttons ────────────────────
-        // `Overflow::scroll_y()` enables clipping + scroll-position
-        // honouring; the actual mouse-wheel handling lives in
-        // `navigator_scroll`.
+        // `Overflow::scroll_y()` enables clipping; mouse-wheel handling
+        // lives in `navigator_scroll`.
         panel.spawn((
             NavigatorList,
             Node {
@@ -385,8 +325,6 @@ pub fn spawn_navigator_panel(parent: &mut ChildSpawnerCommands) {
         ));
 
         // ── Footer: Auto-Spawn checkbox + (conditional) min-count input ─
-        // Sits below the scrollable list and pinned to the bottom of
-        // the panel by `flex_shrink: 0`.
         panel.spawn(Node {
             flex_direction: FlexDirection::Column,
             margin:         UiRect::top(Val::Px(8.0)),
@@ -437,8 +375,7 @@ pub fn spawn_navigator_panel(parent: &mut ChildSpawnerCommands) {
                 ));
             });
 
-            // Min-count row — collapsed by default, revealed when the
-            // checkbox is ticked.
+            // Min-count row — collapsed until the checkbox is ticked.
             footer.spawn((
                 MinHeteroCountRow,
                 Node {
@@ -485,19 +422,11 @@ pub fn spawn_navigator_panel(parent: &mut ChildSpawnerCommands) {
 
 // ── Systems ──────────────────────────────────────────────────────────────────
 
-/// Assign each heterotroph an `IndividualIdentifier` of the form
-/// `<species name>#<index>` — where `<species name>` is the live lineages
-/// `Species::name` (the `.species` file stem for imported lineages) and the
-/// index is a per-species running number.
-///
-/// Runs every frame over all heterotroph roots, but the per-organism work is
-/// an O(1) "has the species changed?" check, so steady-state cost is trivial.
-/// An organism is (re)named the first time it has a classified species, and
-/// again whenever the speciation system reclassifies it into a DIFFERENT
-/// species (live-species tracking, per the design choice) — at which point it
-/// is issued a fresh index within the new species. Until an organism has a
-/// classified `species_id`, it gets no identifier (and thus no navigator row /
-/// label) — that window is ~1 s after spawn.
+/// Assign each heterotroph an `IndividualIdentifier` `<species name>#<index>`
+/// (live `Species::name` + per-species running index). (Re)named on first
+/// classification and on reclassification into a DIFFERENT species (fresh index
+/// in the new one). No `species_id` ⇒ no identifier (and no row/label), a ~1 s
+/// window after spawn. Per-organism work is an O(1) "species changed?" check.
 fn assign_individual_identifiers(
     mut commands:  Commands,
     mut counters:  ResMut<SpeciesIndexCounters>,
@@ -541,9 +470,8 @@ fn assign_individual_identifiers(
     }
 }
 
-/// Keep each navigator button's label text in sync with its target's current
-/// `IndividualIdentifier`. The name changes when an organism is reclassified
-/// into a new species, so the button text (set once at spawn) must follow.
+/// Keep each navigator button's label in sync with its target's
+/// `IndividualIdentifier` (the name changes on reclassification).
 fn update_navigator_button_text(
     idents:    Query<&IndividualIdentifier>,
     mut texts: Query<(&NavigatorButtonText, &mut Text)>,
@@ -567,21 +495,17 @@ fn update_label_name_text(
     }
 }
 
-/// Resolve a Simulation-mode viewport left-click to the heterotroph under the
-/// cursor and store it as the selection. The camera renders to an off-screen
-/// image, so the window cursor is first remapped into image-local pixels (same
-/// conversion the colony editor uses) before `viewport_to_world` builds the
-/// ray; Avian's `SpatialQuery` then returns the closest collider along it.
-///
-/// The closest hit is resolved to its `OrganismRoot` (the kinematic root for
-/// sliding/sessile organisms, or a body part → its parent root for limb ones).
-/// Only a heterotroph root becomes the selection; terrain, photoautotrophs, or
-/// a miss clear it (empty-click-clears, per the chosen behaviour).
+/// Resolve a viewport left-click to the heterotroph under the cursor and select
+/// it. The camera renders off-screen, so the window cursor is remapped into
+/// image-local pixels before `viewport_to_world` builds the ray; `SpatialQuery`
+/// returns the closest collider. The hit resolves to its `OrganismRoot`
+/// (kinematic root, or body part → parent root for limb organisms). Only a
+/// heterotroph root selects; terrain / photoautotroph / miss clears.
 fn pick_organism(
     mut picks:    MessageReader<ViewportPick>,
     cameras:      Query<(&Camera, &GlobalTransform), With<crate::player_plugin::FlyCam>>,
     viewport_q:   Query<(&ComputedNode, &UiGlobalTransform), With<ViewportImage>>,
-    spatial:      avian3d::prelude::SpatialQuery,
+    rapier:       bevy_rapier3d::prelude::ReadRapierContext,
     root_q:       Query<(), With<OrganismRoot>>,
     hetero_q:     Query<(), With<Heterotroph>>,
     childof_q:    Query<&ChildOf>,
@@ -603,17 +527,17 @@ fn pick_organism(
     };
 
     let Ok(ray) = camera.viewport_to_world(cam_xf, cursor_vp) else { return };
-    let hit = spatial.cast_ray(
+    let Ok(ctx) = rapier.single() else { return };
+    let hit = ctx.cast_ray(
         ray.origin,
-        ray.direction,
+        ray.direction.as_vec3(),
         1000.0,
         true,
-        &avian3d::prelude::SpatialQueryFilter::default(),
+        bevy_rapier3d::prelude::QueryFilter::default(),
     );
 
     let mut new_sel = None;
-    if let Some(hit) = hit {
-        let e = hit.entity;
+    if let Some((e, _toi)) = hit {
         let root = if root_q.contains(e) {
             Some(e)
         } else if let Ok(co) = childof_q.get(e) {
@@ -633,9 +557,8 @@ fn pick_organism(
     }
 }
 
-/// React to a selection change: paint the selected heterotroph's navigator
-/// button green (text preserved), reset every other button to the default
-/// grey, and scroll the list so the selected button is in view.
+/// On selection change: paint the selected button green, reset others to grey,
+/// scroll the list so the selected button is in view.
 fn apply_selection_highlight(
     selected:      Res<SelectedOrganism>,
     mut buttons:   Query<(&NavigatorButton, &mut BackgroundColor)>,
@@ -667,16 +590,11 @@ fn apply_selection_highlight(
     }
 }
 
-/// Mirror identifier set ↔ label set:
-///   * spawn a label entity (as a child of the `ViewportImage`) for any
-///     newly-tagged organism,
-///   * despawn labels whose target organism has been despawned.
-///
-/// Parenting under `ViewportImage` is what keeps the projection math
-/// trivial: `world_to_viewport` returns coords relative to the
-/// viewport's top-left, and the label's `Val::Px(left/top)` is also
-/// relative to its parent's top-left — so the two systems share the
-/// same origin and the per-frame update is just a scale-factor divide.
+/// Mirror identifier set ↔ label set: spawn a label (child of `ViewportImage`)
+/// per newly-tagged organism, despawn labels whose target is gone.
+/// Parenting under `ViewportImage` keeps projection trivial: both
+/// `world_to_viewport` and the label's `Val::Px` share the viewport top-left
+/// origin, so the per-frame update is just a scale-factor divide.
 fn manage_label_lifecycle(
     mut commands:    Commands,
     viewport_q:      Query<Entity, With<ViewportImage>>,
@@ -698,10 +616,7 @@ fn manage_label_lifecycle(
                 top:           Val::Px(-9999.0),
                 left:          Val::Px(-9999.0),
                 padding:       UiRect::axes(Val::Px(5.0), Val::Px(2.0)),
-                // Two-line label: individual name on top, species
-                // name underneath. Column so the species text wraps
-                // beneath the individual name even at long species
-                // labels.
+                // Two-line label (name over species); column so species wraps beneath.
                 flex_direction: FlexDirection::Column,
                 align_items:    AlignItems::Center,
                 ..default()
@@ -718,10 +633,8 @@ fn manage_label_lifecycle(
                 TextColor(Color::WHITE),
                 Pickable::IGNORE,
             ));
-            // Species sub-line. Empty until the speciation system
-            // classifies the organism; `update_label_species_text`
-            // (registered alongside the panel systems) fills it in
-            // and keeps it in sync with `Organism::species_id`.
+            // Species sub-line; empty until classified, then kept in sync
+            // by `update_label_species_text`.
             wrap.spawn((
                 IndividualLabelSpecies { target: entity },
                 Text::new(String::new()),
@@ -744,33 +657,26 @@ fn manage_label_lifecycle(
     }
 }
 
-/// Project every label-target organism's world position into the
-/// viewport pane and set the label's absolute UI position. Labels that
-/// fall outside the viewport rect (off-screen, behind camera, or
-/// occluded by a UI panel) are hidden via `Visibility::Hidden` so they
-/// never bleed onto the navigator / statistics panels.
+/// Project each label-target's world position into the viewport and set the
+/// label's absolute UI position. Labels outside the viewport rect (off-screen /
+/// behind camera) are hidden so they never bleed onto the side panels.
 fn update_label_positions(
     show:        Res<ShowIndividualIdentifiers>,
     window_mode: Res<crate::simulation_settings::WindowMode>,
     cameras:     Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     viewport_q:  Query<&ComputedNode, With<ViewportImage>>,
     organism_q:  Query<&GlobalTransform, With<OrganismRoot>>,
-    // Base-body-part transforms, keyed by their parent OrganismRoot.
-    // For LIMB-based organisms the root entity's transform is frozen at
-    // the spawn position — only the per-part `RigidBody::Dynamic`
-    // children actually move (Avian writes their world pose). The trunk
-    // part (`BodyPartIndex(0)`) is the organism's true location, so the
-    // label tracks it. For sliding organisms the trunk part sits at
-    // identity-local under a root that `apply_movement` moves, so its
-    // `GlobalTransform` equals the root's — correct on both paths.
+    // Base-body-part transforms, keyed by parent OrganismRoot. For LIMB
+    // organisms the root transform is frozen at spawn and only the dynamic
+    // parts move, so the label tracks the trunk part (`BodyPartIndex(0)`),
+    // the true location. For sliding organisms the trunk's GlobalTransform
+    // equals the root's — correct on both paths.
     base_part_q: Query<(&ChildOf, &crate::cell::BodyPartIndex, &GlobalTransform)>,
     mut labels:  Query<(&IndividualLabel, &ComputedNode, &mut Node, &mut Visibility)>,
 ) {
-    // Hide all labels when the user is in any mode other than the
-    // simulation (Edit Colony, Lineages, Species Editor). The labels
-    // are UI nodes parented under the viewport image, so `RenderLayers`
-    // doesn't filter them out the way it does the 3D mesh entities —
-    // they need an explicit visibility gate.
+    // Hide all labels outside Simulation mode. The labels are UI nodes under
+    // the viewport image, so `RenderLayers` doesn't filter them like 3D meshes
+    // — they need an explicit visibility gate.
     let labels_disabled = !show.0
         || *window_mode != crate::simulation_settings::WindowMode::Simulation;
     if labels_disabled {
@@ -783,26 +689,17 @@ fn update_label_positions(
     let Ok((camera, cam_xf)) = cameras.single() else { return };
     let Ok(viewport_node)    = viewport_q.single() else { return };
 
-    // Labels are children of the `ViewportImage`, so their `Val::Px`
-    // (logical) origin coincides with the viewport's top-left.
-    // `Camera::world_to_viewport` returns coords in the same image-
-    // local space (top-left origin, Y down) in physical pixels (image
-    // targets default to scale_factor=1.0). Multiplying by the node's
-    // inverse_scale_factor lands us in window-logical pixels, which
-    // is what `Val::Px` consumes. No `UiGlobalTransform`, no manual
-    // window-half offset.
-    //
-    // `world_to_viewport` returns Err for points behind the camera or
-    // beyond the depth range — those cases hide the label for free.
-    // Points outside the viewport's X/Y range still return Ok with
-    // out-of-rect coords; we hide those with the explicit bounds
-    // check against `viewport_node.size()`.
+    // Labels are children of `ViewportImage`, so their `Val::Px` origin is the
+    // viewport top-left. `world_to_viewport` returns physical pixels in the same
+    // top-left/Y-down space (image targets default scale_factor=1.0); multiply
+    // by inverse_scale_factor for window-logical px (`Val::Px`). It returns Err
+    // behind the camera / beyond depth (hidden for free); out-of-X/Y still
+    // returns Ok, so the explicit bounds check below hides those.
     let inv_scale         = viewport_node.inverse_scale_factor;
     let viewport_size     = viewport_node.size();
 
-    // Map each OrganismRoot to its trunk part's (`BodyPartIndex(0)`)
-    // world position. This is the moving anchor for limb organisms; for
-    // sliding organisms it coincides with the root.
+    // Map each OrganismRoot to its trunk part's (`BodyPartIndex(0)`) world
+    // position — the moving anchor for limb organisms.
     let mut base_pos: HashMap<Entity, Vec3> = HashMap::new();
     for (parent, idx, gx) in &base_part_q {
         if idx.0 == 0 {
@@ -811,8 +708,7 @@ fn update_label_positions(
     }
 
     for (label, label_node, mut node, mut vis) in &mut labels {
-        // Prefer the trunk part's world position; fall back to the root
-        // transform if (briefly) no base part is registered.
+        // Prefer the trunk part; fall back to the root transform.
         let anchor = match base_pos.get(&label.target) {
             Some(p) => *p,
             None => match organism_q.get(label.target) {
@@ -839,8 +735,7 @@ fn update_label_positions(
 
         // Image-local physical px → viewport-local logical px (Val::Px).
         let anchor_logical = vp * inv_scale;
-        // Centre the label horizontally on the anchor and seat its
-        // bottom edge a few pixels above the anchor point.
+        // Centre on the anchor, bottom edge a few px above it.
         let label_size_logical = label_node.size() * label_node.inverse_scale_factor;
         node.left = Val::Px(anchor_logical.x - label_size_logical.x * 0.5);
         node.top  = Val::Px(anchor_logical.y - label_size_logical.y - LABEL_ANCHOR_GAP_PX);
@@ -848,17 +743,8 @@ fn update_label_positions(
     }
 }
 
-/// Sync the navigator-list buttons with the current set of labelled
-/// organisms. Same pattern as `manage_label_lifecycle`: spawn for every
-/// new identifier, despawn when the target organism is gone.
-///
-/// Each button stacks two rows:
-///   1. The procedurally-minted name ("Heterotroph N").
-///   2. "Intelligence: Level N" — read once at spawn time. The
-///      `intelligence_level` field is set when the organism is
-///      created and inherited verbatim by offspring, so it never
-///      mutates and a one-shot read on `Added<IndividualIdentifier>`
-///      is sufficient.
+/// Sync the navigator-list buttons with the labelled-organism set (spawn on new
+/// identifier, despawn when the target is gone).
 fn manage_navigator_list(
     mut commands:    Commands,
     list_q:          Query<Entity, With<NavigatorList>>,
@@ -872,10 +758,8 @@ fn manage_navigator_list(
     let Ok(list) = list_q.single() else { return };
 
     for (entity, ident, _organism) in &new_q {
-        // Row: identifier text on the left, "Export" button on the
-        // right. The outer container is now a layout-only Node
-        // (the previous `Button` tag had no click handler bound to
-        // it; the Export sub-button is the only interactive child).
+        // Row: identifier text left, "Export" button right. Outer container is
+        // layout-only; the Export sub-button is the only interactive child.
         let btn = commands.spawn((
             NavigatorButton { target: entity },
             Node {
@@ -955,11 +839,8 @@ fn handle_identifiers_checkbox(
     }
 }
 
-/// Mouse-wheel scroll handler for the navigator list. Walks all
-/// MouseWheel events for the frame and applies them when the cursor is
-/// inside the navigator panel's screen-space rect. The bevy_picking
-/// `Pointer<Scroll>` event isn't a thing in Bevy 0.18, so we handle
-/// the wheel-vs-cursor-rect check ourselves.
+/// Mouse-wheel scroll for the navigator list; applied when the cursor is inside
+/// the panel rect. (No `Pointer<Scroll>` in Bevy 0.18 — we do the rect check.)
 fn navigator_scroll(
     mut wheel_evs: MessageReader<MouseWheel>,
     windows:       Query<&Window, With<PrimaryWindow>>,
@@ -976,12 +857,9 @@ fn navigator_scroll(
     let Some(cursor_logical) = window.cursor_position() else { return };
     let Ok((panel_node, panel_ui_xf)) = panel_q.single() else { return };
 
-    // `Window::cursor_position` is window-LOGICAL pixels with origin
-    // at the top-left. `UiGlobalTransform.translation` is the node
-    // centre in PHYSICAL pixels with the same top-left origin (the
-    // UI projection matrix in 0.18 is `orthographic_rh(0,w,h,0)`).
-    // So one multiply by `inverse_scale_factor` lands the panel rect
-    // in the same units as the cursor.
+    // `cursor_position` is window-logical px (top-left origin);
+    // `UiGlobalTransform.translation` is the node centre in physical px (same
+    // origin). One multiply by `inverse_scale_factor` matches their units.
     let inv_scale = panel_node.inverse_scale_factor;
     let size      = panel_node.size() * inv_scale;
     let centre    = panel_ui_xf.translation * inv_scale;
@@ -1021,9 +899,8 @@ fn vertical_divider_drag(
     let Ok(window) = windows.single() else { return };
     let Ok(mut node) = panel_q.single_mut() else { return };
     let max_w = (window.width() - NAV_DIVIDER_WIDTH_PX - NAV_VIEWPORT_MIN_PX).max(NAV_MIN_WIDTH_PX);
-    // Drag right ⇒ shrink panel; drag left ⇒ expand. ev.distance is
-    // cumulative from DragStart, so anchoring on `state.initial_panel_width`
-    // produces a stable absolute width regardless of drag speed.
+    // Drag right ⇒ shrink, left ⇒ expand. ev.distance is cumulative from
+    // DragStart; anchoring on initial width gives a stable absolute width.
     let new_w = (state.initial_panel_width - ev.distance.x).clamp(NAV_MIN_WIDTH_PX, max_w);
     node.width = Val::Px(new_w);
 }
@@ -1054,9 +931,7 @@ fn update_auto_spawn_checkbox_mark(
     }
 }
 
-/// Reveal / hide the min-count input row based on the master flag.
-/// Edge-triggered on `auto` change so the layout cost is paid only at
-/// toggle events.
+/// Reveal / hide the min-count input row on `auto` change (edge-triggered).
 fn update_min_hetero_row_visibility(
     auto:      Res<AutoSpawnHeteros>,
     mut row_q: Query<&mut Node, With<MinHeteroCountRow>>,
@@ -1067,10 +942,9 @@ fn update_min_hetero_row_visibility(
     }
 }
 
-/// Click + keyboard router for the min-count integer-input field.
-/// Mirrors `handle_max_organisms_input` in the statistics panel:
-/// click-on-input enters edit mode, Enter commits, Escape cancels,
-/// click-outside commits. Digits-only.
+/// Click + keyboard router for the min-count field (mirrors
+/// `handle_max_organisms_input`): click focuses, Enter / click-outside commits,
+/// Escape cancels. Digits-only.
 fn handle_min_hetero_input(
     mouse:         Res<ButtonInput<MouseButton>>,
     mut keyboard:  MessageReader<KeyboardInput>,
@@ -1079,8 +953,7 @@ fn handle_min_hetero_input(
     mut state:     ResMut<MinHeteroCountEditState>,
     mut min_count: ResMut<MinHeteroCount>,
 ) {
-    // When the row is hidden the user can't see / click the field, but
-    // we still drain the keyboard reader so events don't accumulate.
+    // Row hidden: drain the keyboard reader so events don't accumulate.
     if !auto.0 {
         for _ in keyboard.read() {}
         if state.focused {
@@ -1161,11 +1034,8 @@ fn update_min_hetero_text(
 }
 
 
-/// Refresh each label's species sub-text. Reads the species id off
-/// the target organism (`Organism::species_id`) and resolves it to a
-/// name via `SpeciesRegistry`. The check is cheap — both queries are
-/// O(label count), and we only write when the rendered string would
-/// actually change (avoids needless `Changed<Text>` traffic).
+/// Refresh each label's species sub-text from `Organism::species_id` via
+/// `SpeciesRegistry`. Writes only on change (avoids `Changed<Text>` churn).
 fn update_label_species_text(
     organisms:    Query<&crate::organism::Organism>,
     registry:     Res<crate::lineages::species::SpeciesRegistry>,
@@ -1188,24 +1058,15 @@ fn update_label_species_text(
 
 // ── Export Trained Species — per-row button handlers ───────────────────────
 //
-// Two-stage workflow (mirrors the Save / Export Dataset pattern in the
-// statistics panel):
-//   1. `handle_export_buttons` — on `Interaction::Pressed`, pause the
-//      simulation, open a blocking native save dialog, and stash the
-//      `(target_entity, path)` pair in `ExportSpeciesRequested` if the
-//      user picked a path. Cancel leaves the sim paused (the user can
-//      resume manually). The pause is so the brain snapshot taken in
-//      step 2 doesn't get smeared by an in-progress training tick.
-//   2. `dispatch_export_species_requests` — consumes the request,
-//      pulls the trained brain via `pool.extract_slot`, extracts the
-//      organism's body plan + (bilateral-right-half) OCG, and writes a
-//      `.species` v3 file with `brain_present = 1`. Errors land in
-//      `error!`; success lands in `info!`. Resource resets to `None`
-//      either way so the next click starts fresh.
+// Two-stage workflow:
+//   1. `handle_export_buttons` — pause the sim, open a blocking save dialog,
+//      stash `(entity, path)` in `ExportSpeciesRequested`. Pause is so the
+//      step-2 brain snapshot isn't smeared by an in-progress training tick.
+//   2. `dispatch_export_species_requests` — pull the brain, extract body plan +
+//      (bilateral-right-half) OCG, write a `.species` v3 file. Resets to `None`.
 
-/// Click handler for the per-row Export button. Blocks on a native
-/// save dialog; on success, writes `(entity, path)` into the
-/// `ExportSpeciesRequested` resource for the worker to consume.
+/// Per-row Export button handler. Blocks on a save dialog; on success writes
+/// `(entity, path)` into `ExportSpeciesRequested` for the worker.
 fn handle_export_buttons(
     interactions: Query<
         (&Interaction, &NavigatorExportButton),
@@ -1242,9 +1103,8 @@ fn handle_export_buttons(
     }
 }
 
-/// Worker — runs every Update. Consumes one pending export request,
-/// snapshots the organism's brain from the herbivore pool, encodes
-/// the .species v3 payload, and writes it to disk.
+/// Worker — consumes one pending export request, snapshots the brain from the
+/// herbivore pool, encodes the .species v3 payload, writes to disk.
 fn dispatch_export_species_requests(
     mut request: ResMut<ExportSpeciesRequested>,
     pool:        NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
@@ -1281,9 +1141,8 @@ fn dispatch_export_species_requests(
     };
     let classification = if is_carn { Classification::Carnivore } else { Classification::Herbivore };
 
-    // OCG: bilateral organisms maintain a mirror-expanded body part 0,
-    // so for the .species file (which stores RIGHT-half only) we
-    // filter to `p.x > 0`. NoSymmetry organisms save the full OCG.
+    // .species stores the RIGHT half only: filter bilateral body-part-0 to
+    // `p.x > 0`; NoSymmetry saves the full OCG.
     let ocg_full = if org.body_parts.is_empty() {
         warn!("export species: entity {:?} has no body parts", entity);
         return;
@@ -1315,8 +1174,7 @@ fn dispatch_export_species_requests(
         &brain,
     );
 
-    // Ensure target directory exists (the default suggested by the
-    // dialog is `./species/`, but the user may have picked elsewhere).
+    // Ensure target directory exists (user may have picked outside ./species/).
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(parent) {

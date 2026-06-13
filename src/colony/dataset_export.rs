@@ -1,22 +1,9 @@
-// CSV dataset export.
+// CSV dataset export. One-shot worker driven by `ExportDatasetRequested`.
 //
-// One-shot worker driven by the `ExportDatasetRequested` resource.
-// When the user clicks "Export Simulation Dataset" in the statistics
-// panel, that handler pauses the simulation, opens a native save
-// dialog, and writes the chosen path into the resource. The system
-// below picks the path up on the next Update tick, snapshots every
-// living organism, and writes a `;`-separated CSV file.
-//
-// Row order: Carnivores → Herbivores → Photoautotrophs. Within each
-// group, organisms are emitted in whatever order the Bevy query
-// yields them (effectively archetype-then-spawn order).
-//
-// Columns: identity + transform + every scalar/enum field of
-// `Organism` (the `body_parts` Vec is summarised by two derived
-// counts; the raw nested structure would not fit in a flat CSV
-// cleanly), followed by all 19 DNA slots emitted as individual
-// `dna_<name>` columns — the DNA vector itself never appears as one
-// opaque column.
+// Row order: Carnivores → Herbivores → Photoautotrophs.
+// Columns: identity + transform + every scalar/enum field of `Organism`
+// (body_parts summarised by two derived counts), followed by all 19 DNA
+// slots as individual `dna_<name>` columns.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -30,23 +17,16 @@ use crate::organism::{IntelligenceLevel, LineageRecord, Symmetry};
 use std::collections::HashMap;
 
 
-/// Filled by the statistics-panel handler on a click. Consumed by
-/// `export_dataset_system` on the next Update tick. `None` means
-/// "nothing to do".
+/// Filled by the statistics-panel handler on a click; consumed by
+/// `export_dataset_system`. `None` means nothing to do.
 #[derive(Resource, Default)]
 pub struct ExportDatasetRequested(pub Option<PathBuf>);
 
 
-/// Schedule of automatic dataset exports keyed on virtual elapsed
-/// time. Each entry fires once when `Time<Virtual>::elapsed_secs()`
-/// first crosses the configured threshold; the entry is consumed
-/// (popped) so subsequent ticks don't re-fire. Survives sim
-/// pausing — only virtual time advances the trigger, so pausing
-/// the simulation just delays the export.
-///
-/// Entries are written to `datasets/<label>.csv` (and the matching
-/// `_training_stats.csv` / `_brain_probe.csv` side-cars via the
-/// normal export pipeline). The directory is created on demand.
+/// Schedule of automatic dataset exports keyed on virtual elapsed time.
+/// Each entry fires once when `elapsed_secs()` first crosses its threshold,
+/// then is popped. Keyed on virtual time, so sim pausing just delays it.
+/// Writes `datasets/<label>.csv` plus side-cars; dir created on demand.
 #[derive(Resource)]
 pub struct AutoExportSchedule {
     pub pending: Vec<(f32, &'static str)>,
@@ -54,23 +34,14 @@ pub struct AutoExportSchedule {
 
 impl Default for AutoExportSchedule {
     fn default() -> Self {
-        // (virtual seconds, label/filename stem). One entry per
-        // milestone — declared in time-order so the drain processes
-        // them in sequence. Filenames are fixed (not timestamped) so
-        // re-runs OVERWRITE prior exports cleanly (`File::create`
-        // truncates) AFTER `rotate_existing_datasets` has bumped the
-        // previous run's artefacts to `#1` at startup.
+        // (virtual seconds, label/filename stem), declared in time-order
+        // so the drain processes them in sequence. Fixed filenames so
+        // re-runs overwrite cleanly after `rotate_existing_datasets`.
         Self {
             pending: vec![
-                // Baseline snapshot. Fires at virtual t=15 s instead
-                // of 0 because the world load + `spawn_colony` are
-                // gated on the async glb load (`HeightmapSampler`)
-                // and don't finish until ~7 seconds of virtual time
-                // — at virtual t=0 the colony hasn't been spawned yet
-                // and the snapshot CSV would come out empty. 15 s is
-                // comfortably after spawn + first brain enrolment but
-                // before any meaningful PPO update has fired, so the
-                // analysis scripts get a clean "initial" reference.
+                // Baseline. Fires at t=15 s, not 0: world load +
+                // spawn_colony are gated on the async glb load and don't
+                // finish until ~7 s, so a t=0 snapshot would be empty.
                 (     15.0, "simulation_dataset_0_SECONDS"),
                 (     60.0, "simulation_dataset_1_MINUTE"),
                 (    180.0, "simulation_dataset_3_MINUTES"),
@@ -93,21 +64,11 @@ impl Default for AutoExportSchedule {
 }
 
 
-/// Rotate prior-run dataset artefacts so each new simulation starts
-/// with the bare names free. Bumps every `#N` to `#N+1` (descending,
-/// so we never write to a file that exists), then renames every
-/// suffix-free `simulation_dataset_*.csv` to `…#1.csv`. This produces
-/// a clean history: the current run lives at the bare names, the
-/// previous run at `#1`, the run before that at `#2`, and so on.
-///
-/// Operates on the `datasets/` directory. Skips silently if the
-/// directory doesn't exist yet (first run). Side-cars
-/// (`_training_stats.csv`, `_brain_probe.csv`) get rotated the same
-/// way — the suffix pattern matcher treats them as independent files
-/// that all happen to share the `simulation_dataset_` prefix.
-///
-/// Failures are logged at `warn!` and otherwise swallowed; one
-/// stuck rename shouldn't crash the simulation.
+/// Rotate prior-run dataset artefacts so each new run gets the bare names
+/// free. Bumps every `#N` to `#N+1` (descending, so we never overwrite an
+/// existing file), then renames suffix-free `simulation_dataset_*.csv` to
+/// `…#1.csv`. Operates on `datasets/`; no-op if absent. Side-cars rotate the
+/// same way (they share the prefix). Rename failures are logged and swallowed.
 pub fn rotate_existing_datasets() {
     let dir = std::path::Path::new("datasets");
     if !dir.exists() { return; }
@@ -121,8 +82,7 @@ pub fn rotate_existing_datasets() {
         }
     };
 
-    // Collect every dataset-shaped file as (path, stem, level)
-    // where `level == 0` means no `#N` suffix.
+    // (path, stem, level); level == 0 means no `#N` suffix.
     let mut found: Vec<(std::path::PathBuf, String, u32)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -136,8 +96,7 @@ pub fn rotate_existing_datasets() {
         }
     }
 
-    // Highest level first so we never collide. Within a level the
-    // order doesn't matter — each rename's destination is unique.
+    // Highest level first so renames never collide.
     found.sort_by(|a, b| b.2.cmp(&a.2));
 
     for (old_path, stem, level) in found {
@@ -151,9 +110,7 @@ pub fn rotate_existing_datasets() {
 }
 
 /// Parse `simulation_dataset_<stem>[#<level>].csv` → (stem, level).
-/// Returns `None` if the name doesn't match the dataset prefix or
-/// extension. Stems may contain underscores, digits, mixed case —
-/// everything between the dataset prefix and `#`/`.csv`.
+/// `None` if the name lacks the dataset prefix or `.csv` extension.
 fn parse_rotation_filename(name: &str) -> Option<(String, u32)> {
     let trimmed = name.strip_suffix(".csv")?;
     if !trimmed.starts_with("simulation_dataset_") { return None; }
@@ -167,11 +124,9 @@ fn parse_rotation_filename(name: &str) -> Option<(String, u32)> {
 }
 
 
-/// Drains `AutoExportSchedule` as virtual time crosses each
-/// threshold, populating `ExportDatasetRequested` with a path under
-/// `datasets/`. Idempotent — once an entry fires, it's removed.
-/// Skips silently if a prior export request is still pending
-/// (avoids racing on the single-slot resource).
+/// Drains `AutoExportSchedule` as virtual time crosses each threshold,
+/// filling `ExportDatasetRequested` with a `datasets/` path. Skips while a
+/// prior request is still pending (the resource is single-slot).
 pub fn tick_auto_export_schedule(
     virtual_time: Res<Time<Virtual>>,
     mut schedule: ResMut<AutoExportSchedule>,
@@ -181,8 +136,7 @@ pub fn tick_auto_export_schedule(
     if request.0.is_some() { return; }
 
     let now = virtual_time.elapsed_secs();
-    // Find the first entry whose threshold has been crossed. Stable
-    // ordering means we drain in the order entries were declared.
+    // First entry whose threshold has been crossed (declaration order).
     let idx = schedule.pending.iter().position(|(t, _)| now >= *t);
     if let Some(i) = idx {
         let (_t, label) = schedule.pending.remove(i);
@@ -198,11 +152,9 @@ pub fn tick_auto_export_schedule(
 }
 
 
-/// Snapshot every live organism into a `;`-separated CSV at the
-/// requested path. The path is `.take()`-d so a single click produces
-/// a single write — subsequent ticks find the resource empty and
-/// skip. Errors are logged at `error!` and silently swallowed
-/// otherwise so a file-system failure doesn't disrupt the simulation.
+/// Snapshot every live organism into a `;`-separated CSV at the requested
+/// path. The path is `.take()`-d so one click → one write. Errors are
+/// logged and swallowed so a filesystem failure doesn't disrupt the sim.
 pub fn export_dataset_system(
     mut req: ResMut<ExportDatasetRequested>,
     query:   Query<
@@ -213,16 +165,13 @@ pub fn export_dataset_system(
         ),
         With<OrganismRoot>,
     >,
-    // Per body-part Avian state + last-applied-torque, used to build a
-    // per-organism telemetry map for the limb-pool CSV writer below.
-    // Joined to the organism root via `ChildOf::parent()` (every limb
-    // body part is a child of the `OrganismRoot`).
+    // Per body-part Avian state + last-applied-torque, joined to the
+    // organism root via `ChildOf::parent()`, for the limb-pool CSV writer.
     limb_bp_q: Query<(
         &bevy::prelude::ChildOf,
         &crate::cell::BodyPartIndex,
-        &avian3d::prelude::LinearVelocity,
-        &avian3d::prelude::AngularVelocity,
-        &crate::avian_setup::LastAppliedTorque,
+        &bevy_rapier3d::prelude::Velocity,
+        &crate::rapier_setup::LastAppliedTorque,
     )>,
     virtual_time: Res<Time<Virtual>>,
     pool:         NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
@@ -241,9 +190,7 @@ pub fn export_dataset_system(
     };
     let mut out = BufWriter::new(file);
 
-    // Snapshot every slot's brain output once — single forward
-    // pass on the GPU, then per-organism row lookups are pure
-    // CPU indexing.
+    // Single GPU forward pass; per-organism lookups are then pure CPU.
     let telemetry = pool.snapshot_telemetry();
 
     if let Err(e) = write_csv(&mut out, &query, virtual_time.elapsed_secs(), &pool, &telemetry) {
@@ -258,11 +205,8 @@ pub fn export_dataset_system(
 
     info!("exported simulation dataset to {}", path.display());
 
-    // ── Side-car: training-statistics CSV. Filename derived from
-    // the dataset path: `<stem>_training_stats.csv` in the same
-    // directory. Contains the last ≤ TRAINING_HISTORY_CAP completed
-    // training steps, one row each. Errors are non-fatal — the
-    // dataset CSV is the primary artifact.
+    // ── Side-car: `<stem>_training_stats.csv` — last
+    // ≤ TRAINING_HISTORY_CAP completed training steps, one row each.
     let stats_path = match path.file_stem().and_then(|s| s.to_str()) {
         Some(stem) => path.with_file_name(format!("{stem}_training_stats.csv")),
         None       => path.with_extension("training_stats.csv"),
@@ -280,11 +224,8 @@ pub fn export_dataset_system(
         Err(e) => error!("training-stats: failed to create {}: {}", stats_path.display(), e),
     }
 
-    // ── Side-car: brain-weight probe CSV. Picks 10 top eaters +
-    // 10 bottom eaters + 10 random middle for weight inspection.
-    // For each selected organism, writes 12 rows (one per weight
-    // tensor) with n/mean/std/min/max/l2_norm. Compact enough to
-    // analyse in R without a binary reader.
+    // ── Side-car: `<stem>_brain_probe.csv` — 10 top + 10 bottom + 10
+    // random-middle eaters, one row per weight tensor with summary stats.
     let probe_path = match path.file_stem().and_then(|s| s.to_str()) {
         Some(stem) => path.with_file_name(format!("{stem}_brain_probe.csv")),
         None       => path.with_extension("brain_probe.csv"),
@@ -302,31 +243,24 @@ pub fn export_dataset_system(
         Err(e) => error!("brain-probe: failed to create {}: {}", probe_path.display(), e),
     }
 
-    // ── Per-pool limb-brain side-cars. One CSV per limb pool
-    // listing every organism currently enrolled in it, with current
-    // state + the limb-brain's per-organism log_std stats. Filenames:
-    // `<stem>_limb_<level>.csv`. Snapshots are cheap (one GPU→CPU
-    // sync per tensor); writes are no-ops when the pool is empty.
+    // ── Per-pool limb-brain side-cars `<stem>_limb_<level>.csv`: one row
+    // per enrolled organism with state + per-organism log_std stats.
     let snap_h  = pool_limb_h.0.snapshot();
     let snap_l2 = pool_limb_l2.0.snapshot();
     let snap_l3 = pool_limb_l3.0.snapshot();
 
-    // ── Build per-organism Avian telemetry map ────────────────────
-    // For each organism root, gather:
-    //   * BASE body's (LinearVelocity, AngularVelocity) — idx 0
-    //   * max |torque| across all body parts — diagnostic for whether
-    //     the PD controller is producing anything at all.
-    // Stored in a HashMap keyed by the OrganismRoot entity.
+    // Per-organism Avian telemetry: BASE body's lin/ang velocity (idx 0)
+    // + max |torque| across parts, keyed by the OrganismRoot entity.
     let mut limb_telemetry: std::collections::HashMap<Entity, LimbBodyTelemetry> =
         std::collections::HashMap::new();
-    for (child_of, idx, lin_vel, ang_vel, torque) in &limb_bp_q {
+    for (child_of, idx, vel, torque) in &limb_bp_q {
         let root = child_of.parent();
         let entry = limb_telemetry.entry(root).or_default();
         let t_norm = torque.0.length();
         if t_norm > entry.max_torque_norm { entry.max_torque_norm = t_norm; }
         if idx.0 == 0 {
-            entry.base_lin_vel = lin_vel.0;
-            entry.base_ang_vel = ang_vel.0;
+            entry.base_lin_vel = vel.linear;
+            entry.base_ang_vel = vel.angular;
             entry.base_seen = true;
         }
     }
@@ -344,36 +278,27 @@ pub fn export_dataset_system(
         virtual_time.elapsed_secs(),
     );
 
-    // ── Side-car: limb-pool training-stats CSVs. One per limb pool
-    // that has any logged training history. Filename:
-    // `<stem>_limb_<pool>_training_stats.csv`. The schema mirrors the
-    // sliding pool's training_stats CSV exactly, so the same R reader
-    // can ingest both.
+    // ── Side-car: limb-pool training-stats CSVs (one per pool with
+    // history). Schema matches the sliding pool's so one R reader fits both.
     write_limb_training_stats(&path, "limb_herbivore_1", pool_limb_h.0.training_history());
     write_limb_training_stats(&path, "limb_l2",          pool_limb_l2.0.training_history());
     write_limb_training_stats(&path, "limb_l3",          pool_limb_l3.0.training_history());
 }
 
-/// Per-organism Avian telemetry assembled in `export_dataset_system`
-/// and threaded into `write_limb_pool_csv`. Defaults are all-zero so
-/// organisms whose body parts aren't yet in Avian's query
-/// (e.g., between PreUpdate spawn and FixedPostUpdate physics step)
-/// still get a sensible row.
+/// Per-organism Avian telemetry for `write_limb_pool_csv`. All-zero default
+/// so organisms whose body parts aren't yet in Avian's query still get a row.
 #[derive(Default, Clone, Copy)]
 struct LimbBodyTelemetry {
     base_lin_vel:    Vec3,
     base_ang_vel:    Vec3,
     max_torque_norm: f32,
-    /// True iff the base body part appeared in the query at all.
-    /// False usually means the organism is sliding (no Avian dynamic
-    /// bodies) — in which case the velocity columns will be 0 but
-    /// torque_norm is also 0, which is correct.
+    /// True iff the base body part appeared in the query. False usually
+    /// means a sliding organism (no Avian dynamic bodies).
     base_seen:       bool,
 }
 
-/// Write a single limb-pool's training-step history to a side-car
-/// CSV. Filename: `<stem>_<pool>_training_stats.csv`. Silent no-op
-/// when the history is empty (no PPO update has fired yet).
+/// Write a limb-pool's training-step history to `<stem>_<pool>_training_stats.csv`.
+/// No-op when the history is empty.
 fn write_limb_training_stats(
     main_path:  &std::path::Path,
     pool_label: &str,
@@ -409,10 +334,8 @@ fn write_limb_training_stats(
     info!("limb-pool training stats written to {}", out_path.display());
 }
 
-/// Write a single limb-pool snapshot to its own `<stem>_<pool>.csv`
-/// side-car. One row per organism currently enrolled in the pool,
-/// with state from the `Organism` component + per-dim `log_std` from
-/// the saved actor weights. Silent no-op if the pool is empty.
+/// Write a limb-pool snapshot to `<stem>_<pool>.csv`: one row per enrolled
+/// organism with `Organism` state + per-dim actor `log_std`. No-op if empty.
 fn write_limb_pool_csv(
     main_path:    &std::path::Path,
     pool_label:   &str,
@@ -441,10 +364,8 @@ fn write_limb_pool_csv(
     };
     let mut w = BufWriter::new(file);
 
-    // Header. Tier 0 instrumentation adds the BASE body's linear and
-    // angular velocity (so we can see whether Avian's integrator is
-    // doing anything at all) plus the max torque magnitude commanded
-    // by the PD controller across all body parts this tick.
+    // Header. Includes the BASE body's lin/ang velocity + max commanded
+    // torque magnitude across all body parts this tick.
     let _ = writeln!(
         &mut w,
         "entity;t_virtual;slot;x;y;z;energy;energy_norm;predations;reproductions;\
@@ -458,12 +379,11 @@ fn write_limb_pool_csv(
          base_speed_xz;max_torque_norm"
     );
 
-    // For each organism enrolled in this pool, write a row.
     for (e, org, transform, _is_photo, _is_hetero, is_carn, _lineage) in query.iter() {
         let Some(&slot) = snap.map.get(&e) else { continue };
         let s = slot as usize;
 
-        // Per-dim log_std from the snapshot's flat [N * OUT] buffer.
+        // Per-dim log_std from the flat [N * OUT] buffer.
         let ls_base = s * crate::limb_ppo::OUT;
         let log_std = &snap.actor_log_std[ls_base..ls_base + crate::limb_ppo::OUT];
 
@@ -542,9 +462,7 @@ fn write_brain_probe_csv<W: Write>(
         b"entity_id;predations;group;tensor;n;mean;std;min;max;l2_norm\n",
     )?;
 
-    // Collect every Level1 + Heterotroph + !Carnivore organism that
-    // currently has a slot in the herbivore_1 pool. Others can't
-    // contribute a brain payload.
+    // Level1 + Heterotroph + !Carnivore organisms with a herbivore_1 slot.
     let mut candidates: Vec<(Entity, u32, u32)> = Vec::new();  // (entity, slot, predations)
     for (e, org, _tf, _is_photo, is_hetero, is_carn, _lr) in query.iter() {
         if !is_hetero || is_carn { continue; }
@@ -560,7 +478,7 @@ fn write_brain_probe_csv<W: Write>(
     let n = candidates.len();
     let top_k    = candidates.iter().take(10).copied().collect::<Vec<_>>();
     let bottom_k = candidates.iter().rev().take(10).copied().collect::<Vec<_>>();
-    // Random middle: skip indices that are in top or bottom.
+    // Random middle: indices not in top or bottom.
     let mut middle: Vec<(Entity, u32, u32)> = if n > 20 {
         candidates[10..n.saturating_sub(10)].to_vec()
     } else {
@@ -576,10 +494,7 @@ fn write_brain_probe_csv<W: Write>(
         ("random", &random_k),
     ];
 
-    // Post-L3-port tensor layout: a single MLP (w1, b1, w2, b2). The
-    // old 12-tensor (backbone+actor+critic) layout was retired with
-    // the architecture change. CSV column counts adjust automatically
-    // — only the rows-per-organism count changes (12 → 4).
+    // Single-MLP tensor layout: w1, b1, w2, b2.
     let tensor_names = ["w1", "b1", "w2", "b2"];
 
     let mut row = String::with_capacity(192);
@@ -636,9 +551,9 @@ fn write_training_stats_csv<W: Write>(
 }
 
 
-/// Trophic class used for both row-ordering and the `trophic_class`
-/// column. Determined from the entity's marker components, not from
-/// `Organism` content (cell counts can drift mid-consumption).
+/// Trophic class for row-ordering and the `trophic_class` column. Derived
+/// from marker components, not `Organism` content (cell counts can drift
+/// mid-consumption).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TrophicClass {
     Carnivore,
@@ -711,9 +626,8 @@ fn write_csv<W: Write>(
         // Lineage
         "parent_id", "age_secs",
         "times_reproduced_self", "child_alive_count",
-        // Brain telemetry — only populated for Level1 + Heterotroph
-        // + !Carnivore organisms (i.e. herbivore_1 pool members).
-        // Other organisms emit empty cells.
+        // Brain telemetry — only for herbivore_1 pool members
+        // (Level1 + Heterotroph + !Carnivore); others emit empty cells.
         "brain_mu_speed", "brain_mu_angle",
         "brain_log_sigma_speed", "brain_log_sigma_angle",
         "brain_value_v",
@@ -733,10 +647,7 @@ fn write_csv<W: Write>(
     header.push('\n');
     out.write_all(header.as_bytes())?;
 
-    // ── Build parent→children count map ──────────────────────
-    // One pass over the cohort: for every alive organism whose
-    // LineageRecord has a parent_id, increment the parent's count.
-    // O(n); n ~ 200, so the cost is negligible per export.
+    // Parent→children count map: one pass incrementing each parent_id.
     let mut child_count: HashMap<Entity, u32> = HashMap::with_capacity(64);
     for (_e, _o, _t, _p, _h, _c, lr) in query.iter() {
         if let Some(LineageRecord { parent_id: Some(p), .. }) = lr {
@@ -744,11 +655,8 @@ fn write_csv<W: Write>(
         }
     }
 
-    // ── Collect + sort rows ───────────────────────────────────
-    // Bevy queries iterate archetype-order which mixes the
-    // trophic classes; collect with the (TrophicClass, entity)
-    // sort key to honour the user-requested ordering
-    // (carnivores → herbivores → photoautotrophs).
+    // Collect + sort by (TrophicClass, entity) to force the row order
+    // carnivores → herbivores → photoautotrophs (queries are archetype-order).
     let mut rows: Vec<(TrophicClass, Entity, &Organism, &Transform, Option<&LineageRecord>)> = query.iter()
         .filter_map(|(e, org, tf, is_photo, is_hetero, is_carn, lr)| {
             classify(is_photo, is_hetero, is_carn).map(|tc| (tc, e, org, tf, lr))
@@ -756,13 +664,9 @@ fn write_csv<W: Write>(
         .collect();
     rows.sort_by_key(|(tc, e, _, _, _)| (tc.order(), e.index()));
 
-    // ── Per-row write ─────────────────────────────────────────
     for (tc, entity, organism, transform, lr) in rows {
         let kids = child_count.get(&entity).copied().unwrap_or(0);
-        // Brain telemetry lookup: pool maps `entity` → slot, slot
-        // indexes into the precomputed `telemetry` Vec. None means
-        // the organism isn't in the herbivore_1 pool (photo,
-        // carnivore, Level0, etc.) — writer emits empty cells.
+        // None when the organism isn't in the herbivore_1 pool → empty cells.
         let telem = pool.map.get(&entity)
             .and_then(|&slot| telemetry.get(slot as usize));
         write_row(out, tc, entity, organism, transform, lr, kids, now_secs, telem)?;
@@ -785,9 +689,8 @@ fn write_row<W: Write>(
 ) -> std::io::Result<()> {
     let pos = transform.translation;
 
-    // Build the row as a single owned String so we can write it in
-    // one syscall.  Per-cell precision is .6 (matches the .colony
-    // save format) so the file round-trips with negligible loss.
+    // Single owned String → one write syscall. .6 precision matches the
+    // .colony save format so the file round-trips with negligible loss.
     let mut row = String::with_capacity(512);
 
     macro_rules! push {
@@ -840,11 +743,8 @@ fn write_row<W: Write>(
     sep!(); push!("{:.6}", organism.climb_energy_debt);
     sep!(); push!("{:.6}", organism.cached_bounding_radius);
 
-    // Lineage. `parent_id` writes an empty cell when the organism
-    // is initial-cohort (no parent), else the parent's `Entity` as
-    // an integer index for matching with the `entity_id` column.
-    // `age_secs` is the virtual-time delta since this organism
-    // spawned, or 0 when no LineageRecord is attached.
+    // Lineage. `parent_id`: empty for initial-cohort, else parent's entity
+    // index. `age_secs`: virtual-time delta since spawn, or 0 if no record.
     sep!();
     if let Some(lr) = lineage {
         if let Some(p) = lr.parent_id { push!("{}", p.index()); }
@@ -859,10 +759,7 @@ fn write_row<W: Write>(
     sep!();
     push!("{}", child_count);
 
-    // Brain telemetry. Nine columns; written as ".6" floats when
-    // available, blank otherwise. Allows correlating each
-    // organism's policy output with its observed behaviour at
-    // snapshot time.
+    // Brain telemetry — ".6" floats when available, blank otherwise.
     let push_telem = |row: &mut String, v: Option<f32>| {
         use std::fmt::Write as _;
         row.push(';');
@@ -879,9 +776,8 @@ fn write_row<W: Write>(
     push_telem(&mut row, telem.map(|t| t.last_progress_component));
     push_telem(&mut row, telem.map(|t| t.last_oracle_component));
 
-    // DNA — exactly DNA_DIM slots, matching DNA_FIELD_NAMES order.
-    // Defend against a corrupt / partially-populated dna vector by
-    // emitting empty cells past the available length.
+    // DNA — DNA_DIM slots in DNA_FIELD_NAMES order; empty cells past
+    // the available length guard a short/corrupt dna vector.
     for i in 0..DNA_DIM {
         sep!();
         if let Some(v) = organism.dna.get(i) {

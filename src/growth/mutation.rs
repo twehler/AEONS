@@ -1,16 +1,9 @@
 // Mutation — one-step OCG growth applied to every offspring at birth.
 //
-// Each time an organism reproduces, its child inherits the parent's OCG and
-// gains exactly one new cell appended by the volumetric growth algorithm.
-// Over successive generations, organisms accumulate cells: generation N has
-// (seed_cells + N) cells.
-//
-// The new cell position is drawn randomly from the set of valid growth
-// candidates on the parent's mesh frontier. Cell type is inherited from the
-// seed entry (ocg[0].2), preserving trophic identity across generations.
-//
-// If the growth frontier is fully enclosed (no valid candidates), the child
-// is born with the parent's OCG unchanged — no panic, no infinite loop.
+// A child inherits the parent's OCG plus one new cell from the volumetric
+// growth algorithm (position random on the parent's frontier; cell type
+// inherited from ocg[0].2, preserving trophic identity). If the frontier is
+// fully enclosed, the child is born with the parent's OCG unchanged.
 
 use rand::prelude::*;
 use bevy::math::Vec3;
@@ -18,9 +11,7 @@ use crate::cell::CellType;
 use crate::volumetric_growth::{grow_ocg_one_step, grow_ocg_one_step_constrained};
 
 
-/// Return a child OCG: parent's genome extended by one cell grown via the
-/// volumetric growth algorithm. Called once per reproduction event so every
-/// child is born one cell larger than its parent.
+/// Child OCG: parent's genome extended by one volumetrically-grown cell.
 pub fn mutate_ocg(
     parent_ocg: &[(usize, Vec3, CellType)],
     rng: &mut impl Rng,
@@ -28,23 +19,17 @@ pub fn mutate_ocg(
     grow_ocg_one_step(parent_ocg, rng)
 }
 
-/// Bilateral mutation step. Grows one cell on the right half subject to
-/// `x >= 0` — i.e. the new cell may land on the midline (x = 0, shared by
-/// both halves) or anywhere on the +X side, but never crosses to the −X
-/// half. Returns the extended right OCG, or `None` if no valid candidate
-/// exists this tick (caller should reuse the parent's right OCG
-/// verbatim). The left half is the caller's responsibility:
-/// `body_part::mirror_right_to_left(&right)` after this returns Some.
+/// Bilateral mutation: grow one cell on the right half with `x >= 0` (may land
+/// on the midline x=0, never crosses to the −X half). Returns the extended right
+/// OCG, or `None` if no candidate fits this tick. Caller mirrors the left half
+/// via `body_part::mirror_right_to_left(&right)` on Some.
 pub fn mutate_bilateral(
     parent_right_ocg: &[(usize, Vec3, CellType)],
     rng:              &mut impl Rng,
 ) -> Option<Vec<(usize, Vec3, CellType)>> {
-    // min_x = 0 (with the function's built-in −1e-3 slack) admits midline
-    // candidates while still rejecting any −X (left-half) lattice slot.
+    // min_x = 0 (with built-in −1e-3 slack) admits midline candidates but
+    // rejects any −X (left-half) slot.
     let grown = grow_ocg_one_step_constrained(parent_right_ocg, rng, 0.0);
-    // grow_ocg_one_step_constrained returns the input unchanged if no
-    // candidate fits; convert that "no growth this tick" signal to `None`
-    // so the caller can decide whether to reuse the parent verbatim or to
-    // skip the birth.
+    // Unchanged length means "no growth this tick" → None.
     if grown.len() == parent_right_ocg.len() { None } else { Some(grown) }
 }

@@ -1,18 +1,17 @@
-// Movement, gravity, floor collision and world-bounds clamping.
+// Movement, gravity, floor collision and world-bounds clamping (sliding
+// organisms; limb organisms are driven by Avian).
 //
-// New architecture: organisms are made of one or more body parts, and each
-// body part has a list of grown vertex-cells. Wall collision and climb
-// queries iterate the cells of every body part rather than the old single
-// `active_cells` list. World position of a cell is
-// `transform.transform_point(body_part.local_offset + cell.local_pos)` —
-// body parts are flat children of the root entity (no per-body-part
-// rotation), so the same root Transform applies to every cell.
+// Wall/climb queries iterate every body part's cells. A cell's world position
+// is `transform.transform_point(body_part.local_offset + cell.local_pos)` —
+// body parts are flat children of the root with no per-part rotation, so the
+// root Transform applies to every cell.
 
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 
 use crate::cell::*;
 use crate::colony::*;
+use crate::environment::WaterLevel;
 use crate::organism_collision;
 use crate::world_geometry::{HeightmapSampler, MapSize, WorldMesh, WORLD_SAFETY_MARGIN};
 
@@ -23,8 +22,8 @@ use crate::simulation_settings::{GRAVITY, MAX_CLIMB_HEIGHT};
 use crate::simulation_settings::ORGANISM_DESPAWN_Y;
 
 
-/// Re-roll cadence for photoautotroph wander direction. Each spawn rolls its
-/// own initial interval in `[MIN_DIRECTION_INTERVAL, MAX_DIRECTION_INTERVAL]`.
+/// Re-roll cadence for photoautotroph wander direction (initial interval in
+/// `[MIN_DIRECTION_INTERVAL, MAX_DIRECTION_INTERVAL]`).
 #[derive(Component)]
 pub struct DirectionTimer {
     pub timer: Timer,
@@ -37,23 +36,18 @@ impl DirectionTimer {
 }
 
 
-pub struct MovementPlugin {
-    pub mode: MovementMode,
-}
-
-impl MovementPlugin {
-    pub fn with_mode(mode: MovementMode) -> Self { Self { mode } }
-}
+pub struct MovementPlugin;
 
 impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(self.mode);
         app.insert_resource(organism_collision::OrganismCollisionTimer::default());
+        // Swimmer water-plane ceiling reads `WaterLevel`. `init_resource` only
+        // seeds the default if absent, so phase-5 launcher/.colony wiring (which
+        // may run `insert_resource` earlier) is preserved.
+        app.init_resource::<WaterLevel>();
 
-        // Wall + climb queries need both the heightmap (broad-phase
-        // airborne early-out) and the triangle mesh (full SAT test). Both
-        // resources land in the world asynchronously when the .glb finishes
-        // decoding, so the system stays gated until they exist.
+        // Wall/climb queries need the heightmap (airborne early-out) + the
+        // triangle mesh (full test); both land asynchronously, so gate on them.
         app.add_systems(PostUpdate,
             apply_movement
                 .before(TransformSystems::Propagate)
@@ -64,36 +58,22 @@ impl Plugin for MovementPlugin {
         app.add_systems(PostUpdate, (
             apply_floor_collision.run_if(resource_exists::<HeightmapSampler>),
             apply_world_bounds.run_if(resource_exists::<HeightmapSampler>),
-            // Runs after Propagate so trunk-part GlobalTransforms reflect this
-            // frame's positions. Ungated: it's a pure Y test with no world
-            // dependency, and the query is empty until organisms exist.
+            // After Propagate so trunk GlobalTransforms are current. Ungated:
+            // pure Y test, query empty until organisms exist.
             despawn_fallen_organisms,
         ).chain().after(TransformSystems::Propagate));
 
         app.add_systems(Last, organism_collision::apply_organism_collision);
 
-        match self.mode {
-            MovementMode::TwoD => {
-                app.add_systems(PostUpdate, random_2d_direction.before(apply_movement));
-                app.add_systems(PostUpdate,
-                    apply_gravity
-                        .after(random_2d_direction)
-                        .before(apply_movement));
-            }
-            MovementMode::ThreeD => {
-                app.add_systems(PostUpdate, random_3d_direction.before(apply_movement));
-            }
-        }
+        // Photoautotroph wander has always been 2D (the project only ever ran
+        // the old `TwoD` mode); gravity is now applied per-organism inside
+        // `apply_gravity` (kinematic-sliding organisms only).
+        app.add_systems(PostUpdate, random_2d_direction.before(apply_movement));
+        app.add_systems(PostUpdate,
+            apply_gravity
+                .after(random_2d_direction)
+                .before(apply_movement));
     }
-}
-
-#[derive(Resource, PartialEq, Clone, Copy, Default)]
-pub enum MovementMode {
-    /// XZ-plane movement with gravity. Used by terrestrial heterotrophs.
-    #[default]
-    TwoD,
-    /// Full XYZ movement, no gravity. Used by aquatic / aerial creatures.
-    ThreeD,
 }
 
 
@@ -119,51 +99,18 @@ fn random_2d_direction(
     }
 }
 
-fn random_3d_direction(
-    time: Res<Time>,
-    mut query: Query<(&mut Organism, &mut DirectionTimer), (With<OrganismRoot>, With<Photoautotroph>)>,
-) {
-    let dt = time.delta();
-
-    for (mut organism, mut timer) in &mut query {
-        timer.timer.tick(dt);
-        if !timer.timer.just_finished() { continue; }
-
-        let theta = rand::random::<f32>() * std::f32::consts::TAU;
-        let phi   = rand::random::<f32>() * std::f32::consts::PI;
-        let dir   = Vec3::new(
-            theta.cos() * phi.sin(),
-            phi.cos(),
-            theta.sin() * phi.sin(),
-        );
-
-        organism.movement_direction = dir;
-        organism.movement_speed     = rand::random::<f32>() * 20.0;
-
-        let next = MIN_DIRECTION_INTERVAL
-            + rand::random::<f32>() * (MAX_DIRECTION_INTERVAL - MIN_DIRECTION_INTERVAL);
-        timer.timer = Timer::from_seconds(next, TimerMode::Repeating);
-    }
-}
-
 
 // ── Apply movement (wall collision via WorldMesh) ────────────────────────────
 
-/// Step every organism in its commanded direction, except where a body-part
-/// cell would intersect the world mesh.
+/// Step each sliding organism in its commanded direction, blocked where a
+/// body-part cell would intersect the world mesh.
+///   1. Broad-phase: airborne (well above heightmap) ⇒ skip triangle queries.
+///   2. Per cell, test a post-step AABB against `WorldMesh`; a hit blocks the
+///      XZ step, and the max required climb height decides scramble-up.
 ///
-/// Strategy:
-///   1. Cheap broad-phase: if every cell of the organism is well above the
-///      heightmap, skip the expensive triangle queries entirely.
-///   2. For each grown cell of every body part, build a cell-AABB at the
-///      post-step world position and test against `WorldMesh`. Any hit
-///      blocks the XZ step; the maximum required climb height across all
-///      hits decides whether the organism can scramble up.
-///
-/// The AABB's bottom face is inset by `RD_HALF_SIZE` so a settled cell
-/// reads as resting on terrain rather than wall-blocked — without that
-/// inset, a single settled cell triggers a permanent
-/// climb-vs-gravity oscillation (visible terrain jitter).
+/// The AABB bottom is inset by `RD_HALF_SIZE` so a settled cell reads as
+/// resting rather than wall-blocked — without it, a settled cell triggers a
+/// permanent climb-vs-gravity oscillation (terrain jitter).
 fn apply_movement(
     time:            Res<Time>,
     world_mesh:      Res<WorldMesh>,
@@ -175,33 +122,24 @@ fn apply_movement(
     let half_size = RD_HALF_SIZE;
 
     for (mut transform, mut organism) in &mut query {
-        // Sessile organisms never move (plant-like body plan). Brain
-        // systems may still write `movement_speed` / `movement_direction`
-        // — those writes are simply ignored here. Floor-collision and
-        // world-bounds clamping run in their own systems and continue to
-        // apply, so a sessile cell still settles onto the heightmap.
+        // Sessile organisms never move (brain writes ignored here); floor/
+        // bounds clamping still apply via their own systems.
         if organism.is_sessile { continue; }
-        // Limb-based organisms get their pose from Avian's dynamic
-        // bodies — overwriting their root transform here would fight
-        // the physics engine. Their motion happens in Avian's solver
-        // and the PD-torque application step.
-        if !organism.sliding_movement { continue; }
+        // Limb organisms get their pose from Avian — don't fight the solver.
+        // Only kinematic Sliding is processed here; LimbBasedWalking / Swimming
+        // / Flying take the dynamic path and are skipped.
+        if !organism.movement_mode.is_sliding() { continue; }
 
-        // Yaw the organism so its local +Z axis (defined as "front" by
-        // the body-plan convention) points along the XZ projection of
-        // its movement direction. Body never pitches or rolls — Y-axis
-        // rotation only — which keeps mesh-vs-world AABB tests in the
-        // axis-aligned regime they were tuned for. Snap (no slerp) is
-        // intentional: brains can change heading at any tick rate, and
-        // a smoothing layer would just lag the visual behind the
-        // collision geometry that already follows the new heading.
+        // Yaw so local +Z ("front") points along the XZ movement direction.
+        // Y-axis only (no pitch/roll) keeps the AABB tests axis-aligned. Snap
+        // (no slerp): brains can change heading any tick, and smoothing would
+        // lag the visual behind the collision geometry.
         if organism.movement_speed > 0.0 {
             let dir = organism.movement_direction;
             let dir_xz_len_sq = dir.x * dir.x + dir.z * dir.z;
             if dir_xz_len_sq > 1e-6 {
-                // For a Y-axis yaw θ: local +Z maps to world
-                // (sin θ, 0, cos θ). Solving for θ that aligns this
-                // with (dir.x, 0, dir.z) gives θ = atan2(dir.x, dir.z).
+                // Y-axis yaw θ maps local +Z to world (sin θ, 0, cos θ);
+                // aligning with dir gives θ = atan2(dir.x, dir.z).
                 let yaw = dir.x.atan2(dir.z);
                 transform.rotation = Quat::from_rotation_y(yaw);
             }
@@ -222,12 +160,8 @@ fn apply_movement(
         let mut climb_needed = 0.0_f32;
 
         if move_vector.x != 0.0 || move_vector.z != 0.0 {
-            // Iterate every cell of every body part. AABB-vs-mesh test per
-            // cell — same scheme as before, but indexed via body parts so
-            // multi-part organisms pay collision cost proportional to their
-            // total grown cell count. We don't early-exit on first hit
-            // because the climb-height decision needs the *worst* required
-            // climb across all blocking cells.
+            // AABB-vs-mesh test per cell of every body part. No early-exit:
+            // the climb decision needs the WORST required climb across all hits.
             for body_part in &organism.body_parts {
                 for cell in &body_part.cells {
                     let local_pos = body_part.local_offset + cell.local_pos;
@@ -272,16 +206,33 @@ fn apply_movement(
 
 // ── Gravity ──────────────────────────────────────────────────────────────────
 
+/// Manual gravity for KINEMATIC (sliding) organisms, gated by
+/// `Organism::ground_based`:
+///   * ground-based (sliders/walkers) — gravity always applies (unchanged);
+///   * WATER-BASED (floating phototrophs) — gravity applies ONLY while the
+///     root is ABOVE the water surface (it falls back in); submerged it
+///     holds its depth — neither sinking to the bottom nor surfacing.
+/// Cost: one extra compare per organism per frame (the water level is read
+/// once); no per-cell work.
 fn apply_gravity(
-    mode: Res<MovementMode>,
-    time: Res<Time>,
+    time:  Res<Time>,
+    water: Res<WaterLevel>,
     mut query: Query<(&mut Transform, &mut Organism), With<OrganismRoot>>,
 ) {
-    if *mode == MovementMode::ThreeD { return; }
-
     let dt = time.delta_secs();
+    let water_y = water.0;
 
     for (mut transform, mut organism) in &mut query {
+        // Kinematic-sliding only: LimbBasedWalking / Swimming / Flying are all
+        // dynamic bodies and get gravity (or not) from rapier, not Organism.velocity.
+        if !organism.movement_mode.is_sliding() { continue; }
+        // Water-based + submerged → neutral buoyancy: zero any residual
+        // vertical velocity (e.g. from the fall that brought it under) and
+        // skip the gravity integration entirely.
+        if !organism.ground_based && transform.translation.y <= water_y {
+            if organism.velocity.y != 0.0 { organism.velocity.y = 0.0; }
+            continue;
+        }
         if !organism.is_climbing {
             organism.velocity.y += -GRAVITY * dt;
             transform.translation.y += organism.velocity.y * dt;
@@ -292,10 +243,8 @@ fn apply_gravity(
 
 // ── Floor collision ──────────────────────────────────────────────────────────
 
-/// Lift the organism until no grown cell penetrates the heightmap. Body
-/// parts are flat children of the root, so their world-space cell positions
-/// are computed directly from the root transform (no per-body-part global
-/// transform query is needed any more).
+/// Lift the organism until no grown cell penetrates the heightmap (cell world
+/// positions come directly from the root transform).
 fn apply_floor_collision(
     heightmap: Res<HeightmapSampler>,
     mut query: Query<(&mut Transform, &mut Organism), With<OrganismRoot>>,
@@ -329,12 +278,9 @@ fn apply_world_bounds(
     map_size:  Res<MapSize>,
     mut query: Query<&mut Transform, With<OrganismRoot>>,
 ) {
-    // Operative bounds are the user-defined map area inset by
-    // WORLD_SAFETY_MARGIN on each edge. The underlying terrain mesh
-    // is normalised to be ≥ MapSize, so this clamp is always inside
-    // the world geometry; the margin then keeps organisms from
-    // wandering all the way to the visible edge (e.g. falling off
-    // border cliffs or sticking to the world AABB).
+    // Bounds = map area inset by WORLD_SAFETY_MARGIN per edge. The terrain is
+    // normalised ≥ MapSize, so this clamp stays inside the geometry; the
+    // margin keeps organisms off border cliffs / the world AABB.
     let min_x = WORLD_SAFETY_MARGIN;
     let max_x = (map_size.x - WORLD_SAFETY_MARGIN).max(WORLD_SAFETY_MARGIN);
     let min_z = WORLD_SAFETY_MARGIN;
@@ -349,56 +295,33 @@ fn apply_world_bounds(
 
 // ── Kill-floor ─────────────────────────────────────────────────────────────────
 
-/// Despawn any organism that has fallen below `ORGANISM_DESPAWN_Y`. An
-/// organism that slips off the map edge or through a mesh gap falls forever
-/// under gravity, wasting brain + physics cycles on an entity that can never
-/// recover.
+/// Despawn organisms fallen below `ORGANISM_DESPAWN_Y` (slipped off the edge /
+/// through a mesh gap — they'd fall forever, wasting cycles).
 ///
-/// Position source is Avian's **`Position`** component (authoritative
-/// world-space physics position), NOT `GlobalTransform`. On some worlds the
-/// organisms' `GlobalTransform` is unreliable (observed reading a large
-/// constant Y offset from the true position while Avian `Position` stayed
-/// correct), which previously made this system despawn the entire healthy
-/// colony. `Position` is the physics truth that the rest of the simulation
-/// already trusts, so we key off it directly.
+/// Keys off Avian's `Position` (authoritative), NOT `GlobalTransform`, which
+/// has been observed reading a large constant Y offset and wrongly despawning
+/// the whole colony. Two cases by movement mode:
+///   * Sliding/sessile: kinematic `RigidBody` on the root → root has `Position`.
+///   * Limb: no root rigid body → read the trunk part's (`BodyPartIndex(0)`).
 ///
-/// Two cases, because the rigid body lives in a different place per movement
-/// mode:
-///   * Sliding / sessile organisms have a `RigidBody` (kinematic) on the
-///     `OrganismRoot`, so the root itself carries a `Position`.
-///   * Limb organisms have no root rigid body — each body part is its own
-///     `RigidBody::Dynamic` — so the root has no `Position`; we read the trunk
-///     part's (`BodyPartIndex(0)`) `Position` instead.
-///
-/// Despawning the root cascades to its body-part children and removes the
-/// `Heterotroph` / `BrainSlot*` components, so the brain-pool free-lists and
-/// auto-spawn logic reclaim the slot exactly as they do on starvation death.
+/// Despawning the root cascades to children and frees the brain slot exactly
+/// as a starvation death does.
 fn despawn_fallen_organisms(
     mut commands: Commands,
-    roots:       Query<(Entity, Option<&avian3d::prelude::Position>), With<OrganismRoot>>,
-    // Only limb body parts carry an Avian `Position` (sliding/sessile parts
-    // are plain transform children), so requiring `&Position` here naturally
-    // restricts the map to limb organisms — exactly the roots that lack their
-    // own `Position` above.
-    limb_trunks: Query<(&ChildOf, &BodyPartIndex, &avian3d::prelude::Position)>,
+    // Only sliding/sessile organisms are kill-floored here. LIMB organisms are
+    // kept alive deliberately: on a tunnel-proof floor they can't fall away, and
+    // a stumble during STANDING training must NOT delete the learner — the policy
+    // has to recover the stance, not get one shot and vanish.
+    // Phototrophs are excluded: they're the prey food source, kept alive on the
+    // terrain by `maintain_prey_near_herbivores` (the loaded field sits above the
+    // flat world and would otherwise gravity-fall through to the kill-floor and
+    // vanish, starving the herbivores of anything to eat).
+    roots: Query<(Entity, &GlobalTransform, &crate::colony::Organism),
+                 (With<OrganismRoot>, Without<crate::colony::Photoautotroph>)>,
 ) {
-    use std::collections::HashMap;
-    let mut trunk_y: HashMap<Entity, f32> = HashMap::new();
-    for (child_of, idx, pos) in &limb_trunks {
-        if idx.0 == 0 {
-            trunk_y.insert(child_of.parent(), pos.y);
-        }
-    }
-
-    for (root, root_pos) in &roots {
-        let y = match root_pos {
-            Some(p) => p.y,                          // sliding / sessile: root rigid body
-            None => match trunk_y.get(&root) {       // limb: read the trunk part
-                Some(&y) => y,
-                None     => continue,                // not yet physics-initialised
-            },
-        };
-        if y < ORGANISM_DESPAWN_Y {
+    for (root, gt, org) in &roots {
+        if !org.movement_mode.is_sliding() { continue; }
+        if gt.translation().y < ORGANISM_DESPAWN_Y {
             commands.entity(root).despawn();
         }
     }

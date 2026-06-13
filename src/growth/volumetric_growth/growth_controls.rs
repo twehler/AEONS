@@ -2,30 +2,18 @@ use bevy::prelude::{Resource, Vec3};
 
 // ── Connection geometry ───────────────────────────────────────────────────────
 
-/// Radius of the virtual sphere (in world units) used to determine which
-/// vertices of the new cell and the existing mesh are connected at each
-/// attachment. Larger values create a wider "neck" between cells.
-///
-/// Rule of thumb for dodecahedra (EDGE_LEN = 1):
-///   0.6  – roughly equivalent to the old single-triangle prism bridge
-///   1.2  – captures most junction-side vertices of both cells
-///   2.0+ – merges large regions; open-face count drops quickly
+/// Radius (world units) of the sphere deciding which new-cell and existing-mesh
+/// vertices connect at an attachment; larger = wider "neck" between cells.
 pub const CONNECTION_RADIUS: f32 = 1.2;
 
-/// When `true`, a new cell is only accepted if its centre's Y coordinate is
-/// ≥ the parent cell's Y coordinate, producing upward / horizontal growth
-/// (useful for plant-like structures). Horizontal branching (same Y) is
-/// allowed. Set to `false` to restore omnidirectional growth.
+/// When `true`, a new cell needs centre.y ≥ parent.y, giving upward/horizontal
+/// (plant-like) growth. `false` restores omnidirectional growth.
 pub const GROW_ONLY_UPWARDS: bool = true;
 
 // ── Public view of a single growth candidate ─────────────────────────────────
 
 #[allow(dead_code)]
-/// All geometric information available to a growth strategy when choosing
-/// which candidate to grow next.
-///
-/// Extend this struct whenever a new strategy needs additional context
-/// (e.g. surface curvature, depth from seed, chemical gradient, …).
+/// Geometric context a growth strategy uses to choose the next candidate.
 #[derive(Clone)]
 pub struct CandidateInfo {
     /// Index into the internal `open_faces` list — passed back to the engine.
@@ -40,12 +28,8 @@ pub struct CandidateInfo {
 
 // ── Strategy trait ────────────────────────────────────────────────────────────
 
-/// Decides which candidate to grow next each tick.
-///
-/// Implement this trait to plug in custom growth logic — procedural rules,
-/// gradient descent, a neural-network policy, or anything else.
-///
-/// `select` returns `Some(index into candidates)` or `None` to skip this tick.
+/// Decides which candidate to grow next each tick. `select` returns
+/// `Some(index into candidates)` or `None` to skip this tick.
 pub trait GrowthStrategy: Send + Sync {
     fn select(&mut self, candidates: &[CandidateInfo], rng: &mut u64) -> Option<usize>;
 }
@@ -66,10 +50,7 @@ impl GrowthStrategy for RandomStrategy {
 
 // ── Controller resource ───────────────────────────────────────────────────────
 
-/// Bevy resource that owns the active growth strategy.
-///
-/// To swap strategies at runtime, replace `controller.strategy` with a
-/// `Box<dyn GrowthStrategy>` of your choice.
+/// Owns the active growth strategy; swap at runtime via `controller.strategy`.
 #[derive(Resource)]
 pub struct GrowthController {
     pub strategy: Box<dyn GrowthStrategy>,
@@ -83,8 +64,7 @@ impl Default for GrowthController {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// LCG step — mirrors `VolumetricState::next_rand` so strategies that need
-/// random numbers share the same quality and can be reproduced.
+/// LCG step — mirrors `VolumetricState::next_rand` so strategy RNG is reproducible.
 pub fn lcg_next(state: &mut u64) -> u64 {
     *state = state
         .wrapping_mul(6_364_136_223_846_793_005)

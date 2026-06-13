@@ -1,21 +1,10 @@
-// Species editor — Cell-Deletion Mode.
-//
-// A red "Cell-Deletion Mode" toggle button sits beside the Clear/New button.
-// While the mode is active:
-//   * the cell the cursor hovers over is highlighted deep-red (a single-cell
-//     overlay mesh placed over it),
-//   * a left-click on a highlighted cell removes it from the organism.
-//
-// Cell picking mirrors `placement::update_preview_cell`: each RENDERED cell's
-// world position is projected to the viewport and the one nearest the cursor
-// (within a pixel radius) wins. For Bilateral bodies the rendered set includes
-// the mirrored left half, so a hovered combined-index is mapped back to its
-// right-half OCG entry (`combined_index % part.ocg.len()`); deleting it removes
-// the cell and its mirror together, keeping the body symmetric.
-//
-// Placement (preview + click-to-place) is suppressed while deletion mode is on
-// (see `placement.rs`), and `placement::update_preview_cell` bootstraps a seed
-// candidate from an empty OCG so a fully-deleted body can be rebuilt by hand.
+// Species editor — Cell-Deletion Mode. While active, the hovered cell is
+// highlighted deep-red and a left-click removes it. Picking mirrors
+// `placement::update_preview_cell` (nearest RENDERED cell to the cursor within a
+// pixel radius). For Bilateral the rendered set includes the mirrored left half,
+// so a combined-index maps back via `combined_index % part.ocg.len()` and
+// deleting removes the cell and its mirror together. Placement is suppressed
+// while this mode is on (see `placement.rs`).
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
@@ -46,8 +35,8 @@ const DEL_BTN_HOVER:   Color = Color::srgb(0.68, 0.20, 0.20);
 /// Deep-red overlay colour painted over the hovered cell.
 const DELETION_HILITE: Color = Color::srgb(0.80, 0.04, 0.04);
 
-/// Max pixel distance from cursor to a cell's screen projection for it to be
-/// considered "hovered" (and thus deletable).
+/// Max pixel distance from cursor to a cell's screen projection to count as
+/// hovered (deletable).
 const PICK_RADIUS_PX:  f32 = 45.0;
 
 
@@ -70,8 +59,7 @@ pub struct DeletionTarget {
 
 // ── Button spawn ──────────────────────────────────────────────────────────────
 
-/// Spawn the "Cell-Deletion Mode" button, anchored just left of the Clear/New
-/// button. Called from `mod.rs::spawn_overlay_panels`.
+/// Spawn the "Cell-Deletion Mode" button, just left of Clear/New.
 pub fn spawn_cell_deletion_button(parent: &mut ChildSpawnerCommands) {
     parent
         .spawn((
@@ -159,9 +147,8 @@ pub fn update_deletion_hover(
     };
     let inv_scale = viewport_node.inverse_scale_factor;
 
-    // Nearest RENDERED cell to the cursor. `combined_ocg` includes the
-    // mirrored left half for Bilateral; `ci % n` maps the rendered index back
-    // to the right-half OCG entry the deletion will remove.
+    // Nearest RENDERED cell to the cursor. `ci % n` maps the combined (mirrored)
+    // index back to the right-half OCG entry the deletion removes.
     let mut best: Option<(f32, usize, usize, Vec3)> = None; // (d², part, ocg_index, world)
     for (pi, part) in session.body_parts.iter().enumerate() {
         if part.ocg.is_empty() { continue; }
@@ -191,9 +178,8 @@ pub fn update_deletion_hover(
                 t.translation = world;
                 *v = Visibility::Inherited;
             } else {
-                // Single-cell overlay, scaled up slightly to fully cover the
-                // underlying cell (avoids z-fighting) and unlit so the deep
-                // red reads cleanly.
+                // Single-cell overlay, scaled up slightly to cover the
+                // underlying cell (avoids z-fighting), unlit for clean red.
                 let mesh = meshes.add(build_uncolored_mesh_from_ocg(&[(0, Vec3::ZERO, CellType::NonPhoto)]));
                 let mat  = materials.add(StandardMaterial {
                     base_color: DELETION_HILITE,
@@ -237,8 +223,7 @@ pub fn handle_deletion_click(
     if oi >= part.ocg.len() { return; }
 
     part.ocg.remove(oi);
-    // Re-number remaining cells to a contiguous 0..N ledger (the growth /
-    // bilateral pipelines expect that).
+    // Re-number to contiguous 0..N (the growth / bilateral pipelines require it).
     for (i, e) in part.ocg.iter_mut().enumerate() { e.0 = i; }
     session.dirty = true;
 }

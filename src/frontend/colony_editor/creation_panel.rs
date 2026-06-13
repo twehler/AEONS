@@ -1,15 +1,6 @@
-// Bottom UI strip — placement hint.
-//
-// The four trait cyclers (Metabolism / Intelligence / Symmetry /
-// Form) that used to live here were retired when placement became
-// species-driven: the user picks a `.species` file in the left-side
-// Species Navigator and every spawn (left-click on the map or the
-// Bulk-Spawn button) instantiates that species's full OCG + body
-// plan. The cyclers no longer drove anything reachable from the UI,
-// so they've been removed. This panel now only carries the placement
-// hint text — kept at the original `BOTTOM_PANEL_HEIGHT_PX` so the
-// camera's UI-rect test, the species panel's bottom inset, and the
-// inventory panel's bottom inset don't need recalibration.
+// Bottom UI strip — placement hint only (placement is species-driven).
+// Kept at the original `BOTTOM_PANEL_HEIGHT_PX` so the camera UI-rect
+// test and the side panels' bottom insets need no recalibration.
 
 use bevy::prelude::*;
 
@@ -37,9 +28,8 @@ pub struct CreationPanelPlugin;
 
 impl Plugin for CreationPanelPlugin {
     fn build(&self, _app: &mut App) {
-        // No systems — the panel is purely informational now. The
-        // plugin still exists so the editor-mod registration site
-        // doesn't need to change.
+        // No systems — purely informational. Plugin kept so the
+        // registration site needn't change.
     }
 }
 
@@ -50,12 +40,8 @@ pub fn spawn(parent: &mut ChildSpawnerCommands, draft: DraftOrganism) {
     spawn_with_offset(parent, draft, 0.0);
 }
 
-/// Same as `spawn` but `top_offset_px` reserves vertical space at the
-/// top of the screen — kept for parity with the other panel spawn
-/// signatures even though this panel anchors to the bottom and the
-/// parameter is structurally inert. `_draft` is also accepted (and
-/// ignored) so reproduction-style callers don't need to drop the
-/// argument.
+/// Like `spawn`; `_draft` / `_top_offset_px` are inert here (this panel
+/// anchors to the bottom) but kept for signature parity with the others.
 pub fn spawn_with_offset(parent: &mut ChildSpawnerCommands, _draft: DraftOrganism, _top_offset_px: f32) {
     parent.spawn((
         CreationPanel,

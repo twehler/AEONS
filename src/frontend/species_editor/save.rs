@@ -25,38 +25,34 @@ use std::path::Path;
 
 use crate::cell::CellType;
 use crate::colony::{IntelligenceLevel, Symmetry};
+use crate::organism::MovementMode;
 
-use super::session::{Classification, Metabolism, SpeciesMovement, SpeciesSession};
+use super::session::{Classification, Metabolism, SpeciesSession};
 
-/// v3 appends an optional brain block immediately after the OCG
-/// entries: one byte `brain_present`, and if 1 the same payload
-/// `colony.rs` writes for `AEONS004` colony files (the shared
-/// helpers in `intelligence_level_herbivore_1_sliding::{encode,decode}_brain_restore`).
-/// The species editor itself always writes `brain_present = 0`
-/// (random init is regenerated at spawn time, not baked into the
-/// file); the "export trained organism as a species" workflow in
-/// the Individuum Navigator writes `brain_present = 1` with the
-/// organism's live brain snapshotted from the pool.
-///
-/// v2 introduced the `classification` byte (Herbivore / Carnivore)
-/// after `is_sessile`. v1 files are still accepted by
-/// `load_species` and default to `Classification::Herbivore`.
-/// v5 adds a per-part `u8 is_limb` byte AFTER the name (and before the
-/// OCG count). Limb-flagged appendages spawn as `BodyPartKind::Limb`
-/// and visually rotate around their first cell in the running sim.
-/// Everything else matches v4.
-///
-/// v4 stores MULTIPLE body parts, each with a UTF-8 name. After the 6
-/// metadata bytes it writes `u32 body_part_count`, then per part:
-/// `u32 name_len`, name bytes, `u32 ocg_count`, then the OCG entries.
-/// The base body is part 0; later parts are appendages. The optional
-/// brain block follows the last part. v1–v3 stored a single OCG; the
-/// loader wraps those as a single "Base Body" part.
-/// v6 appends a single `u8 sliding` byte at the end of the metadata
-/// header (after `classification`, before `body_part_count`). 1 =
-/// sliding (legacy), 0 = limb-based. Pre-v6 files default this flag
-/// to `true` on load (matches the simulation default before the
-/// physics + PPO pipeline existed).
+/// Version deltas (loader accepts v1–v8; older versions default the
+/// missing fields as noted):
+///   v2: `classification` byte after `is_sessile` (v1 → Herbivore).
+///   v3: optional brain block after the OCG: `u8 brain_present`, then if 1
+///       the `intelligence_level_herbivore_1_sliding::{en,de}code_brain_restore`
+///       payload. Editor saves write 0; the Individuum Navigator's "export
+///       trained" workflow writes 1 with a live pool snapshot.
+///   v4: MULTIPLE body parts — `u32 body_part_count`, then per part
+///       `u32 name_len`/name/`u32 ocg_count`/OCG. Part 0 = base body.
+///       v1–v3 (single OCG) load as one "Base Body" part.
+///   v5: per-part `u8 is_limb` after the name (limbs rotate about their
+///       first cell at runtime). v1–v4 → false.
+///   v6: `u8 sliding` after `classification` (1 = sliding, 0 = limb).
+///       Pre-v6 → true (the pre-PPO default).
+///   v7: per-part `u32 parent` after `is_limb` (0 = base; another limb = sub-limb).
+///   v8: the movement byte widens to the 4-way `MovementMode` mapping —
+///       {0=>LimbBasedWalking, 1=>Sliding, 2=>Swimming, 3=>Flying}. v6/v7 keep
+///       the 2-way {0=>LimbBasedWalking, 1=>Sliding}; the 0/1 encoding is
+///       preserved so v6/v7 sliding & limb files load identically.
+///   v9: `u8 ground_based` after the movement byte (1 = ground-based, 0 =
+///       water-based — floating phototrophs). Pre-v9 derives it from the
+///       movement mode (`default_ground_based()`).
+const MAGIC_V9:     &[u8; 8] = b"AEONSS09";
+const MAGIC_V8:     &[u8; 8] = b"AEONSS08";
 const MAGIC_V7:     &[u8; 8] = b"AEONSS07";
 const MAGIC_V6:     &[u8; 8] = b"AEONSS06";
 const MAGIC_V5:     &[u8; 8] = b"AEONSS05";
@@ -64,7 +60,7 @@ const MAGIC_V4:     &[u8; 8] = b"AEONSS04";
 const MAGIC_V3:     &[u8; 8] = b"AEONSS03";
 const MAGIC_V2:     &[u8; 8] = b"AEONSS02";
 const MAGIC_V1:     &[u8; 8] = b"AEONSS01";
-const MAGIC: &[u8; 8] = MAGIC_V7;
+const MAGIC: &[u8; 8] = MAGIC_V9;
 
 
 pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
@@ -115,11 +111,8 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
         IntelligenceLevel::Level3 => 3,
     };
     let var_byte: u8     = if session.draft.form.as_bool() { 1 } else { 0 };
-    // is_sessile now comes from the explicit Mobility cycler, not
-    // derived from `form`. Variable-form organisms in the simulation
-    // are also sessile by invariant, but the editor lets the user
-    // pick them independently — the simulation will enforce its
-    // invariant when the species is later imported and spawned.
+    // is_sessile comes from the Mobility cycler; the editor lets form and
+    // sessility be picked independently — spawn enforces the invariant.
     let sessile_byte: u8 = if session.draft.mobility.is_sessile() { 1 } else { 0 };
 
     let classification_byte: u8 = match session.draft.classification {
@@ -133,15 +126,20 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     buf.push(var_byte);
     buf.push(sessile_byte);
     buf.push(classification_byte);
-    // v6: movement paradigm byte (1 = sliding, 0 = limb-based).
-    let sliding_byte: u8 = if session.draft.movement.is_sliding() { 1 } else { 0 };
-    buf.push(sliding_byte);
+    // v8: movement paradigm byte. Preserves the v6/v7 0/1 encoding
+    // (LimbBasedWalking=0, Sliding=1) and extends it (Swimming=2, Flying=3).
+    // NOTE: this is DELIBERATELY the inverse of the .colony format's tag
+    // (Sliding=0, LimbBasedWalking=1 — see colony_save_load.rs), forced by
+    // .species v6/v7 back-compat. Do NOT "align" the two — it breaks round-trips.
+    buf.push(movement_byte(session.draft.movement));
+    // v9: ground- vs water-based. The EFFECTIVE value (phototroph cycler
+    // choice, heterotroph movement-derived) so the byte equals the spawned
+    // organism's `Organism::ground_based`.
+    buf.push(session.draft.effective_ground_based() as u8);
 
-    // v5+: multi-part body with per-part `is_limb` flag. Skip empty parts
-    // (e.g. an appendage that was begun but never given a cell). Because
-    // filtering drops parts, the per-part `parent` index (into the FULL
-    // list) must be REMAPPED to the index within the filtered list, or a
-    // dropped part before a referenced one would shift every later parent.
+    // Skip empty parts (appendage begun but never given a cell). Filtering
+    // shifts indices, so each part's `parent` (index into the FULL list) must
+    // be REMAPPED to its index in the filtered list.
     let kept: Vec<usize> = session.body_parts.iter().enumerate()
         .filter(|(_, p)| !p.ocg.is_empty()).map(|(i, _)| i).collect();
     let mut remap = vec![0usize; session.body_parts.len()];
@@ -149,18 +147,27 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     buf.extend_from_slice(&(kept.len() as u32).to_le_bytes());
     for &full_i in &kept {
         let part = &session.body_parts[full_i];
-        // A part's parent always has cells (contact-derived), so it's a kept
-        // part; `remap` gives its filtered index (defaults to 0 = base).
+        // A parent always has cells (contact-derived) → kept; defaults to 0 = base.
         let parent_filtered = remap.get(part.parent).copied().unwrap_or(0);
         write_body_part(&mut buf, &part.name, part.is_limb, parent_filtered, &part.ocg);
     }
 
-    // Brain block — editor saves write `brain_present = 0`. Weights are
-    // regenerated as fresh random init at spawn. Only the "export
-    // trained" workflow writes a non-zero brain block, via
-    // `encode_species_with_brain`.
+    // Brain block — editor saves write 0 (weights regenerated at spawn).
+    // Only `encode_species_with_brain` writes a non-zero block.
     buf.push(0);
     buf
+}
+
+/// Movement-byte encoding for the v8 `.species` format. Preserves the v6/v7
+/// 0/1 mapping (LimbBasedWalking=0, Sliding=1) and extends it (Swimming=2,
+/// Flying=3) so old sliding/limb files round-trip unchanged.
+fn movement_byte(m: MovementMode) -> u8 {
+    match m {
+        MovementMode::LimbBasedWalking => 0,
+        MovementMode::Sliding          => 1,
+        MovementMode::Swimming         => 2,
+        MovementMode::Flying           => 3,
+    }
 }
 
 /// Write one body part: `u32 name_len`, name bytes, `u8 is_limb`,
@@ -184,21 +191,17 @@ fn write_body_part(buf: &mut Vec<u8>, name: &str, is_limb: bool, parent: usize, 
             CellType::NonPhoto    => 1,
             CellType::Placeholder => 2,
             CellType::SubLimb     => 3,
+            CellType::YellowCell  => 4,
+            CellType::OrangeCell  => 5,
+            CellType::BrownCell   => 6,
         });
     }
 }
 
 
-/// Variant of `encode_species` that ALSO carries a saved brain
-/// payload. Used by the per-row "export trained organism as a
-/// species" button in the Individuum Navigator: the snapshot is
-/// taken from the running pool at click time, and the .species
-/// file becomes a genuine trained template that any later import
-/// will spawn copies of.
-///
-/// Builds the same metadata header as `encode_species` but writes
-/// `brain_present = 1` and serialises the supplied
-/// `BrainRestoreHerbivore1` via the shared helper.
+/// `encode_species` plus a saved brain payload — the Individuum Navigator's
+/// "export trained organism" button, snapshotting the live pool brain. Same
+/// header but `brain_present = 1` + the `BrainRestoreHerbivore1` payload.
 pub fn encode_species_with_brain(
     metabolism:        Metabolism,
     symmetry:          Symmetry,
@@ -238,8 +241,10 @@ pub fn encode_species_with_brain(
     buf.push(var_byte);
     buf.push(sessile_byte);
     buf.push(classification_byte);
-    // v6: trained exports come from the sliding herbivore_1 brain, so
-    // sliding = true.
+    // Trained exports come from the sliding herbivore_1 brain, so the
+    // movement byte is Sliding (1 in both the v6/v7 and v8 mappings).
+    buf.push(1);
+    // v9: Sliding ⇒ ground-based.
     buf.push(1);
     // v5: a trained export is a single "Base Body" part (never a limb).
     buf.extend_from_slice(&1u32.to_le_bytes());
@@ -250,8 +255,8 @@ pub fn encode_species_with_brain(
 }
 
 
-/// Parse a `.species` file. Public for the (later) import path. Errors
-/// on magic mismatch / truncated record / unknown enum tag.
+/// Parse a `.species` file (v1–v8). Public for the (later) import path.
+/// Errors on magic mismatch / truncated record / unknown enum tag.
 #[allow(dead_code)]
 pub fn load_species(path: &Path) -> std::io::Result<LoadedSpecies> {
     let bytes = std::fs::read(path)?;
@@ -284,10 +289,14 @@ pub struct LoadedSpecies {
     pub is_sessile:        bool,
     /// v1 files default this to `Herbivore`; v2 reads it from disk.
     pub classification:    Classification,
-    /// Movement paradigm. v1–v5 files default to `Sliding`; v6+ reads
-    /// the byte. Mapped directly to `Organism::sliding_movement` at
-    /// spawn (`Sliding → true`).
-    pub movement:          SpeciesMovement,
+    /// Movement paradigm. v1–v5 files default to `Sliding`; v6/v7 read the
+    /// 2-way byte; v8+ reads the 4-way `MovementMode` byte. Mapped directly
+    /// into `Organism::movement_mode` at spawn.
+    pub movement:          MovementMode,
+    /// Ground- vs water-based (v9+; older files derive it from `movement`).
+    /// `false` for floating phototrophs and all fluid movement modes. Mapped
+    /// directly into `Organism::ground_based` at spawn.
+    pub ground_based:      bool,
     /// All body parts (index 0 = base body). v1–v3 files yield a single
     /// "Base Body" part.
     pub body_parts:        Vec<LoadedBodyPart>,
@@ -305,6 +314,8 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     fn err(msg: &str) -> Error { Error::new(ErrorKind::InvalidData, msg.to_string()) }
 
     if bytes.len() < 8 + 5 + 4 { return Err(err("species file too short for header")); }
+    let is_v9 = &bytes[..8] == MAGIC_V9;
+    let is_v8 = &bytes[..8] == MAGIC_V8;
     let is_v7 = &bytes[..8] == MAGIC_V7;
     let is_v6 = &bytes[..8] == MAGIC_V6;
     let is_v5 = &bytes[..8] == MAGIC_V5;
@@ -312,8 +323,8 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let is_v3 = &bytes[..8] == MAGIC_V3;
     let is_v2 = &bytes[..8] == MAGIC_V2;
     let is_v1 = &bytes[..8] == MAGIC_V1;
-    if !is_v7 && !is_v6 && !is_v5 && !is_v4 && !is_v3 && !is_v2 && !is_v1 {
-        return Err(err("species magic mismatch (expected AEONSS01..AEONSS07)"));
+    if !is_v9 && !is_v8 && !is_v7 && !is_v6 && !is_v5 && !is_v4 && !is_v3 && !is_v2 && !is_v1 {
+        return Err(err("species magic mismatch (expected AEONSS01..AEONSS09)"));
     }
 
     let mut c = 8usize;
@@ -322,7 +333,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let intel_byte   = bytes[c]; c += 1;
     let var_byte     = bytes[c]; c += 1;
     let sessile_byte = bytes[c]; c += 1;
-    let classification = if is_v2 || is_v3 || is_v4 || is_v5 || is_v6 || is_v7 {
+    let classification = if is_v2 || is_v3 || is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 {
         let b = bytes[c]; c += 1;
         match b {
             0 => Classification::Herbivore,
@@ -330,22 +341,39 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
             _ => return Err(err("unknown classification tag")),
         }
     } else {
-        // v1 didn't store a classification — default to Herbivore so
-        // old saves load as the more common case.
-        Classification::Herbivore
+        Classification::Herbivore   // v1 default
     };
-    // v6 introduced the movement-paradigm byte right after
-    // classification. Older versions default to Sliding (legacy
-    // behaviour, before physics + PPO existed).
-    let movement = if is_v6 || is_v7 {
+    // Movement byte after classification. v8+ uses the 4-way MovementMode
+    // mapping {0=>LimbBasedWalking,1=>Sliding,2=>Swimming,3=>Flying}; v6/v7 keep
+    // the 2-way {0=>LimbBasedWalking,1=>Sliding}; older files default Sliding.
+    let movement = if is_v8 || is_v9 {
         let b = bytes[c]; c += 1;
         match b {
-            0 => SpeciesMovement::LimbMovement,
-            1 => SpeciesMovement::Sliding,
+            0 => MovementMode::LimbBasedWalking,
+            1 => MovementMode::Sliding,
+            2 => MovementMode::Swimming,
+            3 => MovementMode::Flying,
+            _ => return Err(err("unknown movement tag")),
+        }
+    } else if is_v6 || is_v7 {
+        let b = bytes[c]; c += 1;
+        match b {
+            0 => MovementMode::LimbBasedWalking,
+            1 => MovementMode::Sliding,
             _ => return Err(err("unknown movement tag")),
         }
     } else {
-        SpeciesMovement::Sliding
+        MovementMode::Sliding
+    };
+
+    // v9: ground- vs water-based byte after movement; older files derive it
+    // from the movement mode. Clamped so a fluid movement mode can never
+    // claim ground-based (same invariant as `spawn_organism`).
+    let ground_based = if is_v9 {
+        let b = bytes[c]; c += 1;
+        (b != 0) && movement.default_ground_based()
+    } else {
+        movement.default_ground_based()
     };
 
     let metabolism = match kind_byte {
@@ -370,12 +398,12 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
 
     // Body parts. v4/v5/v6 store a count + named parts; v1–v3 store a single
     // OCG which we wrap as one "Base Body" part.
-    let body_parts: Vec<LoadedBodyPart> = if is_v4 || is_v5 || is_v6 || is_v7 {
+    let body_parts: Vec<LoadedBodyPart> = if is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 {
         if bytes.len() < c + 4 { return Err(err("missing body_part_count")); }
         let count = u32::from_le_bytes(bytes[c..c+4].try_into().unwrap()) as usize; c += 4;
         let mut parts = Vec::with_capacity(count);
         for _ in 0..count {
-            parts.push(read_species_body_part(bytes, &mut c, is_v5 || is_v6 || is_v7, is_v7)?);
+            parts.push(read_species_body_part(bytes, &mut c, is_v5 || is_v6 || is_v7 || is_v8 || is_v9, is_v7 || is_v8 || is_v9)?);
         }
         parts
     } else {
@@ -387,7 +415,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
 
     // Brain block (v3+). Layout: u8 brain_present, and if 1 the shared
     // BrainRestoreHerbivore1 payload. v1/v2 carry none.
-    let brain = if is_v3 || is_v4 || is_v5 || is_v6 || is_v7 {
+    let brain = if is_v3 || is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 {
         if c >= bytes.len() {
             None
         } else {
@@ -406,7 +434,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
 
     Ok(LoadedSpecies {
         metabolism, symmetry, intelligence, has_variable_form, is_sessile,
-        classification, movement, body_parts, brain,
+        classification, movement, ground_based, body_parts, brain,
     })
 }
 
@@ -454,6 +482,9 @@ fn read_species_ocg(bytes: &[u8], c: &mut usize, count: usize) -> std::io::Resul
             1 => CellType::NonPhoto,
             2 => CellType::Placeholder,
             3 => CellType::SubLimb,
+            4 => CellType::YellowCell,
+            5 => CellType::OrangeCell,
+            6 => CellType::BrownCell,
             _ => return Err(err("unknown cell_type tag")),
         };
         ocg.push((idx, Vec3::new(x, y, z), ct));

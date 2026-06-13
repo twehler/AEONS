@@ -1,47 +1,31 @@
 // Intelligence Level 3 — Predator REINFORCE pool (Monte-Carlo
-// rollouts, no value head).
+// rollouts, no value head). Sliding-movement variant.
 //
-// Complete rewrite of the previous A2C variant. The brain is the
-// smallest thing that still teaches a heterotroph to hunt:
+// SHARED-POLICY (per-SPECIES) variant: every organism of a species shares
+// ONE network — all members' experience trains the SAME weights, so the
+// population learns as a single agent with ~N× the data. Different species
+// hold different weights (so behaviour diverges by species); same-species
+// individuality is preserved only as momentary exploration noise, not as
+// distinct learned weights. Mirrors the swimming pool's structure but keeps
+// REINFORCE (Monte-Carlo policy gradient + per-SPECIES EMA baseline).
 //
-//   * Network: 17 inputs → 32 hidden ReLU → 3 outputs (tanh).
-//   * Inputs (17): normalised energy + 16-dim world model (K = 4
-//     nearest neighbours, each (rel_x_norm, rel_z_norm, is_photo,
-//     is_hetero)).
-//   * Outputs (3): `(speed_a, heading_x, heading_y)`. Speed maps via
-//     `max(0, speed_a) * MAX_SPEED` so the lower half of action
-//     space is "stand still". Heading is the cos/sin pair, renormalised
-//     to a unit vector on the XZ plane before being applied — angles
-//     never wrap, every direction is reachable.
+// Network/IO layout is documented on the architecture constants below.
 //
 // Reward (every brain tick, attributed to the previous action):
+//   r =  K_EAT       per predation event (predation-count delta)
+//      + K_REPRO     per reproduction event
+//      + LAMBDA · min(0, ΔE)   penalty for energy spent
+//      + K_CURIOSITY · (speed_norm − 0.5)   gradient away from standing still
+//      + K_PROGRESS · distance closed to the locked target
+// `K_EAT < K_REPRO` so reproduction is the strongest pull.
 //
-//   r =  K_EAT       on a predation contact (detected via energy
-//                    spike — heterotrophs only gain energy by eating)
-//      + K_REPRO     on a reproduction event (detected via
-//                    `Organism::reproductions` increment)
-//      + LAMBDA · min(0, ΔE)   when energy went DOWN (movement
-//                    drain, passive starvation — punishment for
-//                    expended energy)
-//      + K_CURIOSITY · normalized_speed   curiosity / aggression
-//                    bonus — turns wandering into a net-positive
-//                    baseline so the policy doesn't collapse into
-//                    "stand still = minimise energy cost = local
-//                    optimum". Empirically the dominant failure
-//                    mode of the previous formulation.
-//
-// `K_EAT < K_REPRO` so reproduction is the strongest pull; a
-// successful eat is large enough that the agent learns "chase the
-// green dots" within minutes of wall-clock once it's moving at all.
-//
-// Algorithm: pure Monte Carlo REINFORCE with a per-slot EMA baseline.
-// Every brain tick fills the previous action's reward, samples a new
-// action, and stores both in a per-slot ring buffer of length
-// `ROLLOUT_LEN = 32`. Every 32 ticks the whole pool trains in one
-// batched forward + backward — discounted returns `G_t = Σ γ^(i-t)·r_i`
-// distribute sparse jackpots (eat / reproduce) back over the
-// trajectory of actions that produced them, giving real credit
-// assignment without the bug surface of an actor-critic value head.
+// Algorithm: Monte Carlo REINFORCE with a per-SPECIES EMA baseline. Each tick
+// fills the previous action's reward, samples a new action, and stores both
+// in a per-slot ring buffer of length `ROLLOUT_LEN`. Every `ROLLOUT_LEN`
+// ticks the pool trains: active slots are GROUPED by species and each
+// species' transitions are pooled into one batched forward+backward;
+// discounted returns `G_t = Σ γ^(i-t)·r_i` credit sparse eat/reproduce
+// jackpots back over the trajectory that produced them.
 
 use bevy::prelude::*;
 use burn::module::{Initializer, Module, Param};
@@ -51,7 +35,9 @@ use burn_cuda::CudaDevice;
 use std::collections::HashMap;
 
 use crate::colony::{IntelligenceLevel, Organism, Heterotroph, Carnivore};
-use crate::rl_helpers::{BrainInheritance, BrainRestore, MyBackend, PoolSnapshot, gaussian_noise};
+use crate::rl_helpers::{
+    BrainInheritance, BrainRestore, MyBackend, PoolSnapshot, SpeciesWeights, gaussian_noise,
+};
 use crate::simulation_settings::{
     OrganismPoolSize,
     L1_SIGMA_RANGE,
@@ -60,7 +46,6 @@ use crate::simulation_settings::{
     L1_LAMBDA_ENERGY_RANGE,
     L1_K_CURIOSITY_RANGE,
     L1_K_PROGRESS_RANGE,
-    L1_GENE_MUTATION_REL_STDDEV,
     L1_TARGET_LOCK_SECS,
     L1_TARGET_SWITCH_MARGIN,
     L1_SPEED_MOMENTUM_ALPHA,
@@ -143,7 +128,7 @@ const LR:          f64   = 1e-3;
 
 /// Discount for the Monte Carlo return.
 const GAMMA:           f32 = 0.95;
-/// EMA decay rate for the per-slot baseline (mean of recent returns).
+/// EMA decay rate for the per-species baseline (mean of recent returns).
 const BASELINE_ALPHA:  f32 = 0.05;
 
 
@@ -155,10 +140,12 @@ const BASELINE_ALPHA:  f32 = 0.05;
 // with small Gaussian mutation. Selection on those traits emerges
 // from differential reproduction.
 
-/// Sigma value used inside `warmup()` for kernel-compilation only.
-/// The runtime per-slot σ tensor takes over from the first real
-/// training step, so this value never affects gameplay.
-const WARMUP_SIGMA: f32 = 0.5;
+/// Sentinel species key for organisms not yet classified by the speciation
+/// system (real `species_id`s start at 1). All unclassified L3 heterotrophs
+/// share this one transitional net until the ~1 Hz speciation tick assigns
+/// them; the next apply tick then re-points them at their real species' net
+/// automatically (the per-tick species lookup makes reclassification a no-op).
+pub const UNCLASSIFIED: u32 = 0;
 
 
 /// Uniform sample within `(min, max)`.
@@ -168,14 +155,6 @@ fn sample_range(range: (f32, f32), rng: &mut impl rand::Rng) -> f32 {
     lo + (hi - lo) * rng.random::<f32>()
 }
 
-/// Mutate `value` by Gaussian noise of `L1_GENE_MUTATION_REL_STDDEV ×
-/// (max − min)`, clamped back into `range`.
-fn mutate_in_range(value: f32, range: (f32, f32), rng: &mut impl rand::Rng) -> f32 {
-    let (lo, hi) = range;
-    let stddev = L1_GENE_MUTATION_REL_STDDEV * (hi - lo);
-    (value + stddev * crate::rl_helpers::gaussian_noise(rng)).clamp(lo, hi)
-}
-
 
 // ── Slot marker ─────────────────────────────────────────────────────────────
 
@@ -183,55 +162,28 @@ fn mutate_in_range(value: f32, range: (f32, f32), rng: &mut impl rand::Rng) -> f
 pub struct BrainSlotL3(pub u32);
 
 
-// ── Per-organism MLP ────────────────────────────────────────────────────────
+// ── Shared (per-species) MLP ──────────────────────────────────────────────────
 //
-// Per-organism weights packed as `[N, ...]` tensors so a single
-// matmul evaluates every slot's MLP in parallel on the GPU.
+// 2-D weights (`[IN, HIDDEN]`, `[HIDDEN, OUT]`); biases `[1, ·]` so a forward
+// over a batch of `M` observations is a plain `[M, IN] · [IN, HIDDEN]` matmul
+// with broadcast bias. The same `forward` serves both inference (one row per
+// active organism of a species) and the REINFORCE update (all of a species'
+// pooled transitions as one batch).
 
 #[derive(Module, Debug)]
 pub struct PoolMlpL3<B: Backend> {
-    w1: Param<Tensor<B, 3>>,  // [N, IN, HIDDEN]
-    b1: Param<Tensor<B, 2>>,  // [N, HIDDEN]
-    w2: Param<Tensor<B, 3>>,  // [N, HIDDEN, OUT]
-    b2: Param<Tensor<B, 2>>,  // [N, OUT]
+    w1: Param<Tensor<B, 2>>,  // [IN, HIDDEN]
+    b1: Param<Tensor<B, 2>>,  // [1, HIDDEN]
+    w2: Param<Tensor<B, 2>>,  // [HIDDEN, OUT]
+    b2: Param<Tensor<B, 2>>,  // [1, OUT]
 }
 
 impl<B: Backend> PoolMlpL3<B> {
-    fn new(device: &B::Device, n: usize) -> Self {
-        let w = Initializer::Uniform { min: -0.5, max: 0.5 };
-        let z = Initializer::Zeros;
-        Self {
-            w1: w.init([n, IN, HIDDEN], device),
-            b1: z.init([n, HIDDEN], device),
-            w2: w.init([n, HIDDEN, OUT], device),
-            b2: z.init([n, OUT], device),
-        }
-    }
-
-    /// Inference forward `[N, IN] → [N, OUT]`. Called once per brain
-    /// tick to sample fresh actions.
+    /// Forward `[M, IN] → [M, OUT]` (shared weights, broadcast bias). Serves
+    /// both inference and the REINFORCE replay (the pooled `[M, IN]` batch).
     fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let h = x.unsqueeze_dim::<3>(1).matmul(self.w1.val()).squeeze::<2>() + self.b1.val();
-        let h = burn::tensor::activation::relu(h);
-        let mu_pre = h.unsqueeze_dim::<3>(1).matmul(self.w2.val()).squeeze::<2>() + self.b2.val();
-        burn::tensor::activation::tanh(mu_pre)
-    }
-
-    /// Rollout forward `[N, T, IN] → [N, T, OUT]`. Called once per
-    /// training event to replay the buffered trajectory through the
-    /// (slightly newer) policy weights for the gradient computation.
-    /// Uses batched matmul so every slot's MLP processes all T
-    /// timesteps in a single GPU op.
-    fn forward_rollout(&self, states: Tensor<B, 3>) -> Tensor<B, 3> {
-        // states: [N, T, IN] @ w1 [N, IN, HIDDEN] = [N, T, HIDDEN]
-        let h_pre = states.matmul(self.w1.val());
-        // b1 is [N, HIDDEN]; unsqueeze to [N, 1, HIDDEN] so it
-        // broadcasts across the time axis when added.
-        let b1_b = self.b1.val().unsqueeze_dim::<3>(1);
-        let h = burn::tensor::activation::relu(h_pre + b1_b);
-        let mu_pre = h.matmul(self.w2.val());
-        let b2_b = self.b2.val().unsqueeze_dim::<3>(1);
-        burn::tensor::activation::tanh(mu_pre + b2_b)
+        let h = burn::tensor::activation::relu(x.matmul(self.w1.val()) + self.b1.val());
+        burn::tensor::activation::tanh(h.matmul(self.w2.val()) + self.b2.val())
     }
 }
 
@@ -257,11 +209,47 @@ impl<O: Optimizer<PoolMlpL3<MyBackend>, MyBackend>> BrainOptL3 for O {
 }
 
 
+/// One species' shared net + its optimiser + its REINFORCE EMA baseline.
+/// Created lazily by `new_species_brain` (fresh-init weights — sliding has no
+/// oscillatory warm-start). `tick` counts apply ticks for this species (not
+/// used in learning math, kept for parity with the swim pool's `training_step`).
+pub struct SpeciesBrain {
+    pub model:    PoolMlpL3<MyBackend>,
+    pub opt:      Box<dyn BrainOptL3>,
+    /// Per-species REINFORCE baseline (EMA over mean rollout return).
+    /// Subtracted from the return to produce the advantage that scales the
+    /// policy loss for every member of this species.
+    pub baseline: f32,
+    pub tick:     u64,
+}
+
+/// Build one freshly-initialised species brain. Weights uniform in [-0.5,0.5]
+/// (the original sliding init), biases zero. No oscillatory warm-start (that
+/// is swimmer-specific). Each new species gets its OWN fresh net.
+pub fn new_species_brain(device: &CudaDevice) -> SpeciesBrain {
+    let w = Initializer::Uniform { min: -0.5, max: 0.5 };
+    let z = Initializer::Zeros;
+    let model = PoolMlpL3::<MyBackend> {
+        w1: w.init([IN, HIDDEN], device),
+        b1: z.init([1, HIDDEN],  device),
+        w2: w.init([HIDDEN, OUT], device),
+        b2: z.init([1, OUT],     device),
+    };
+    let opt: Box<dyn BrainOptL3> = Box::new(AdamConfig::new().init());
+    SpeciesBrain { model, opt, baseline: 0.0, tick: 0 }
+}
+
+
 // ── Pool resource ───────────────────────────────────────────────────────────
 
 pub struct BrainPoolL3 {
-    model:      PoolMlpL3<MyBackend>,
-    opt:        Box<dyn BrainOptL3>,
+    /// Per-species shared nets (model + optimiser + baseline). Keyed by
+    /// `Organism::species_id` (`UNCLASSIFIED` until first classification);
+    /// created lazily by `ensure_species`.
+    species:    HashMap<u32, SpeciesBrain>,
+    /// Per-slot species key as of the last apply tick. Lets `train` group
+    /// slots by species without an organism query.
+    slot_species: Vec<u32>,
     free:       Vec<u32>,
     map:        HashMap<Entity, u32>,
 
@@ -336,11 +324,6 @@ pub struct BrainPoolL3 {
     /// the world sees a low-jerk trajectory.
     applied_speed_a:    Vec<f32>,
 
-    /// Per-slot baseline (EMA over mean rollout return). Subtracted
-    /// from the return to produce the advantage that scales the
-    /// policy loss.
-    baseline:    Vec<f32>,
-
     /// Per-slot reward-shaping + exploration hyperparameters (one
     /// entry per slot). Sampled uniformly from `L1_*_RANGE` on initial
     /// assignment; inherited-with-mutation on reproduction. Each
@@ -366,8 +349,8 @@ pub struct BrainPoolL3 {
 impl BrainPoolL3 {
     fn new(device: CudaDevice, n: usize) -> Self {
         Self {
-            model:              PoolMlpL3::<MyBackend>::new(&device, n),
-            opt:                Box::new(AdamConfig::new().init()),
+            species:            HashMap::new(),
+            slot_species:       vec![UNCLASSIFIED; n],
             free:               (0..n as u32).rev().collect(),
             map:                HashMap::with_capacity(n),
             buf_states:         vec![0.0; n * ROLLOUT_LEN * IN],
@@ -391,8 +374,7 @@ impl BrainPoolL3 {
             blacklist_ticks_remaining: vec![0; n],
             applied_speed_a:         vec![0.0; n],
 
-            baseline:           vec![0.0; n],
-            sigma:              vec![WARMUP_SIGMA; n],
+            sigma:              vec![0.0; n],
             k_eat:              vec![0.0; n],
             k_repro:            vec![0.0; n],
             lambda_energy:      vec![0.0; n],
@@ -405,52 +387,66 @@ impl BrainPoolL3 {
 
     fn n(&self) -> usize { self.buf_count.len() }
 
-    /// Copy one row out of the parent's weights into the child's
-    /// slot. Mirrors the pattern in `intelligence_level_1_photo`.
-    fn inherit_row(&mut self, parent: usize, child: usize) {
-        let p = self.model.w1.val().slice([parent..parent+1, 0..IN, 0..HIDDEN]);
-        self.model.w1 = self.model.w1.clone().map(|t| {
-            t.slice_assign([child..child+1, 0..IN, 0..HIDDEN], p)
-        });
-        let p = self.model.b1.val().slice([parent..parent+1, 0..HIDDEN]);
-        self.model.b1 = self.model.b1.clone().map(|t| {
-            t.slice_assign([child..child+1, 0..HIDDEN], p)
-        });
-        let p = self.model.w2.val().slice([parent..parent+1, 0..HIDDEN, 0..OUT]);
-        self.model.w2 = self.model.w2.clone().map(|t| {
-            t.slice_assign([child..child+1, 0..HIDDEN, 0..OUT], p)
-        });
-        let p = self.model.b2.val().slice([parent..parent+1, 0..OUT]);
-        self.model.b2 = self.model.b2.clone().map(|t| {
-            t.slice_assign([child..child+1, 0..OUT], p)
-        });
+    /// Lazily create a species' shared brain (fresh-init) on first sighting.
+    /// Idempotent. New species fork off existing ones via the speciation
+    /// system; their net simply starts fresh.
+    pub fn ensure_species(&mut self, key: u32) {
+        if !self.species.contains_key(&key) {
+            let brain = new_species_brain(&self.device);
+            self.species.insert(key, brain);
+        }
     }
 
-    /// Snapshot every slot's weights + REINFORCE state for the
-    /// `.colony` save format. Layout matches what `colony.rs`
-    /// expects (`PoolSnapshot` from `rl_helpers.rs`).
+    /// Drop the shared nets of species with no enrolled member left (extinct or
+    /// fully reclassified away). Without this the per-species map — and its GPU
+    /// tensors + Adam state — grows unbounded over a long run, since `species_id`s
+    /// are monotonic and never reused. `UNCLASSIFIED` is always kept.
+    fn prune_species(&mut self) {
+        let mut live: std::collections::HashSet<u32> =
+            self.map.values().map(|&s| self.slot_species[s as usize]).collect();
+        live.insert(UNCLASSIFIED);
+        self.species.retain(|k, _| live.contains(k));
+    }
+
+    /// Snapshot every live species' shared weights + per-slot REINFORCE
+    /// prev_* state for the `.colony` save format (`PoolSnapshot` from
+    /// `rl_helpers.rs`). One GPU→CPU pull per live species.
     pub fn snapshot(&self) -> PoolSnapshot {
+        let mut species: HashMap<u32, SpeciesWeights> = HashMap::new();
+        for (&key, brain) in &self.species {
+            species.insert(key, SpeciesWeights {
+                w1: brain.model.w1.val().into_data().into_vec::<f32>().expect("w1 to vec"),
+                b1: brain.model.b1.val().into_data().into_vec::<f32>().expect("b1 to vec"),
+                w2: brain.model.w2.val().into_data().into_vec::<f32>().expect("w2 to vec"),
+                b2: brain.model.b2.val().into_data().into_vec::<f32>().expect("b2 to vec"),
+                baseline: brain.baseline,
+            });
+        }
+        // Entity → species key (via slot → slot_species).
+        let mut entity_species: HashMap<Entity, u32> = HashMap::with_capacity(self.map.len());
+        for (&e, &slot) in &self.map {
+            entity_species.insert(e, self.slot_species[slot as usize]);
+        }
         PoolSnapshot {
-            w1:          self.model.w1.val().into_data().into_vec::<f32>().expect("w1 to vec"),
-            b1:          self.model.b1.val().into_data().into_vec::<f32>().expect("b1 to vec"),
-            w2:          self.model.w2.val().into_data().into_vec::<f32>().expect("w2 to vec"),
-            b2:          self.model.b2.val().into_data().into_vec::<f32>().expect("b2 to vec"),
+            species,
+            entity_species,
             map:         self.map.clone(),
             prev_state:  self.prev_state.clone(),
             prev_action: self.prev_action.clone(),
             prev_energy: self.prev_energy.clone(),
             has_prev:    self.has_prev.clone(),
-            baseline:    self.baseline.clone(),
             in_dim:      IN,
             hidden_dim:  HIDDEN,
             out_dim:     OUT,
         }
     }
 
-    /// Restore weights + REINFORCE state into the given slot from a
-    /// saved `BrainRestore`. Mismatched dims → graceful failure (the
-    /// caller will log and fall back to recycled / default weights).
-    pub fn restore_slot(&mut self, slot: usize, r: &BrainRestore) -> Result<(), String> {
+    /// Build / overwrite a species' shared net from a saved `BrainRestore`.
+    /// Mismatched dims → graceful failure (caller logs and the species keeps
+    /// / falls back to a fresh net). Also seeds the species baseline from the
+    /// restore payload. Does NOT touch per-slot prev_* (the per-level
+    /// `assign_*` writes those directly from the same `BrainRestore`).
+    pub fn restore_species(&mut self, key: u32, r: &BrainRestore) -> Result<(), String> {
         if r.w1.len() != IN * HIDDEN  { return Err(format!("w1 size {} != {}", r.w1.len(), IN * HIDDEN)); }
         if r.b1.len() != HIDDEN       { return Err(format!("b1 size {} != {}", r.b1.len(), HIDDEN)); }
         if r.w2.len() != HIDDEN * OUT { return Err(format!("w2 size {} != {}", r.w2.len(), HIDDEN * OUT)); }
@@ -458,50 +454,21 @@ impl BrainPoolL3 {
         if r.prev_state.len()  != IN  { return Err(format!("prev_state {} != {}", r.prev_state.len(), IN)); }
         if r.prev_action.len() != OUT { return Err(format!("prev_action {} != {}", r.prev_action.len(), OUT)); }
 
-        let device = &self.device;
-        let w1_t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(r.w1.clone(), [1, IN, HIDDEN]), device);
-        self.model.w1 = self.model.w1.clone().map(|t| {
-            t.slice_assign([slot..slot + 1, 0..IN, 0..HIDDEN], w1_t)
-        });
-        let b1_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(r.b1.clone(), [1, HIDDEN]), device);
-        self.model.b1 = self.model.b1.clone().map(|t| {
-            t.slice_assign([slot..slot + 1, 0..HIDDEN], b1_t)
-        });
-        let w2_t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(r.w2.clone(), [1, HIDDEN, OUT]), device);
-        self.model.w2 = self.model.w2.clone().map(|t| {
-            t.slice_assign([slot..slot + 1, 0..HIDDEN, 0..OUT], w2_t)
-        });
-        let b2_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(r.b2.clone(), [1, OUT]), device);
-        self.model.b2 = self.model.b2.clone().map(|t| {
-            t.slice_assign([slot..slot + 1, 0..OUT], b2_t)
-        });
-
-        let in_off  = slot * IN;
-        let out_off = slot * OUT;
-        self.prev_state [in_off  .. in_off + IN ].copy_from_slice(&r.prev_state);
-        self.prev_action[out_off .. out_off + OUT].copy_from_slice(&r.prev_action);
-        self.prev_energy[slot]   = r.prev_energy;
-        self.baseline[slot]      = r.baseline;
-        self.has_prev[slot]      = r.has_prev;
-        // Rollout buffer is transient training state — not part of
-        // the save format. Start the restored slot with an empty
-        // rollout window.
-        self.buf_count[slot]            = 0;
-        self.prev_reproductions[slot]   = 0;
-        self.prev_predations[slot]      = 0;
-        self.target_entity[slot]        = None;
-        self.lock_ticks_remaining[slot] = 0;
-        self.prev_distance_to_target[slot] = 0.0;
-        self.prev_target_entity[slot]   = None;
-        self.min_dist_to_target[slot]   = f32::INFINITY;
-        self.ticks_since_progress[slot] = 0;
-        self.blacklisted_target[slot]      = None;
-        self.blacklist_ticks_remaining[slot] = 0;
-        self.applied_speed_a[slot]      = 0.0;
+        self.ensure_species(key);
+        let device = self.device.clone();
+        let model = PoolMlpL3::<MyBackend> {
+            w1: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(
+                TensorData::new(r.w1.clone(), [IN, HIDDEN]), &device)),
+            b1: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(
+                TensorData::new(r.b1.clone(), [1, HIDDEN]), &device)),
+            w2: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(
+                TensorData::new(r.w2.clone(), [HIDDEN, OUT]), &device)),
+            b2: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(
+                TensorData::new(r.b2.clone(), [1, OUT]), &device)),
+        };
+        let brain = self.species.get_mut(&key).expect("species ensured above");
+        brain.model    = model;
+        brain.baseline = r.baseline;
         Ok(())
     }
 }
@@ -513,7 +480,7 @@ impl FromWorld for BrainPoolL3 {
             .map(|r| r.0.max(1))
             .unwrap_or(1);
         let device = CudaDevice::default();
-        warmup(&device, n);
+        warmup(&device);
         Self::new(device, n)
     }
 }
@@ -521,27 +488,28 @@ impl FromWorld for BrainPoolL3 {
 
 /// Force-compile every kernel the steady-state apply tick + training
 /// step will use, so the user's first real frame doesn't pay the JIT
-/// cost. Mirrors the runtime tensor shapes exactly.
-fn warmup(device: &CudaDevice, n: usize) {
-    let m = PoolMlpL3::<MyBackend>::new(device, n);
+/// cost. Mirrors the runtime tensor shapes (shared 2-D net, pooled batch).
+fn warmup(device: &CudaDevice) {
+    const WARMUP_SIGMA: f32 = 0.5;
+    const M: usize = ROLLOUT_LEN;   // representative pooled batch size
+    let m = new_species_brain(device);
     let mut o: Box<dyn BrainOptL3> = Box::new(AdamConfig::new().init());
 
-    // ── Inference forward (every tick).
-    let i = Tensor::<MyBackend, 2>::zeros([n, IN], device);
-    let _ = m.forward(i);
+    // ── Inference forward (every tick): a small batch of active rows.
+    let i = Tensor::<MyBackend, 2>::zeros([4, IN], device);
+    let _ = m.model.forward(i);
 
-    // ── Training forward + backward (every ROLLOUT_LEN ticks).
-    let states  = Tensor::<MyBackend, 3>::zeros([n, ROLLOUT_LEN, IN],  device);
-    let actions = Tensor::<MyBackend, 3>::zeros([n, ROLLOUT_LEN, OUT], device);
-    let mask    = Tensor::<MyBackend, 3>::zeros([n, ROLLOUT_LEN, 1],   device);
-    let adv     = Tensor::<MyBackend, 3>::zeros([n, ROLLOUT_LEN, 1],   device);
-    let mu      = m.forward_rollout(states);
+    // ── Training forward + backward (every ROLLOUT_LEN ticks): pooled [M, ·].
+    let states  = Tensor::<MyBackend, 2>::zeros([M, IN],  device);
+    let actions = Tensor::<MyBackend, 2>::zeros([M, OUT], device);
+    let adv     = Tensor::<MyBackend, 2>::zeros([M, 1],   device);
+    let mu      = m.model.forward(states);
     let diff    = actions - mu;
-    let sum_sq  = diff.powf_scalar(2.0).sum_dim(2);
+    let sum_sq  = diff.powf_scalar(2.0).sum_dim(1);
     let scale   = 0.5_f32 / (WARMUP_SIGMA * WARMUP_SIGMA);
-    let loss    = (sum_sq * adv * mask).sum().mul_scalar(scale).div_scalar(1.0_f32);
-    let g = GradientsParams::from_grads(loss.backward(), &m);
-    let _ = o.step(LR, m, g);
+    let loss    = (sum_sq * adv).sum().mul_scalar(scale).div_scalar(1.0_f32);
+    let g = GradientsParams::from_grads(loss.backward(), &m.model);
+    let _ = o.step(LR, m.model, g);
 }
 
 
@@ -556,66 +524,58 @@ pub fn assign_brains_l3(
     mut commands: Commands,
 ) {
     let mut rng = rand::rng();
-    for (e, organism, inheritance, restore) in new.iter() {
-        // Enrol only Level3 heterotrophs. See the matching comment in
-        // `assign_brains_l2` — the previous `Level1` check produced a
-        // triple-enrolment with `assign_brains_herbivore_1` and
-        // `assign_brains_l2` that silently overwrote the herbivore
-        // brain on every tick.
+    for (e, organism, _inheritance, restore) in new.iter() {
+        // Enrol only Level3 heterotrophs — strict per-level dispatch. A wrong
+        // level check here would double-enrol with the other pools, chaining
+        // multiple apply systems that overwrite each other's movement command.
         if !matches!(organism.intelligence_level, IntelligenceLevel::Level3) { continue; }
         // Sliding pool — limb-based organisms enrol in the parallel
         // limb-based L3 pool instead (see `behaviour/limb_based_movement/`).
-        if !organism.sliding_movement { continue; }
+        if !organism.movement_mode.is_sliding() { continue; }
 
         let Some(slot) = pool.free.pop() else { continue };
         let s = slot as usize;
 
-        // Priority order (same as L1 photo):
-        //   1. BrainRestore (loaded colony save) — overwrite both
-        //      weights AND REINFORCE prev_*.
-        //   2. BrainInheritance — copy parent's weights row, reset
-        //      prev_*.
-        //   3. Neither — keep recycled-slot weights, reset prev_*.
+        // Per-species shared policy. A new occupant inherits its SPECIES net
+        // automatically (every member uses the same weights), so:
+        //   * BrainRestore (loaded colony save) → rebuild this entity's
+        //     species net + restore its per-individual REINFORCE prev_*.
+        //   * BrainInheritance → NO-OP (same-species newborns already share
+        //     the trained species net); the marker is dropped below.
         let mut restored = false;
-        let mut inherited_genes_from: Option<usize> = None;
         if let Some(r) = restore {
-            match pool.restore_slot(s, r) {
-                Ok(())   => { restored = true; }
-                Err(err) => error!("L1 hetero brain restore failed for {e:?}: {err} — using fresh slot"),
-            }
-        } else if let Some(BrainInheritance(parent)) = inheritance {
-            if let Some(&parent_slot) = pool.map.get(parent) {
-                pool.inherit_row(parent_slot as usize, s);
-                inherited_genes_from = Some(parent_slot as usize);
+            let key = organism.species_id.unwrap_or(UNCLASSIFIED);
+            match pool.restore_species(key, r) {
+                Ok(()) => {
+                    restored = true;
+                    let in_off  = s * IN;
+                    let out_off = s * OUT;
+                    pool.prev_state [in_off  .. in_off + IN ].copy_from_slice(&r.prev_state);
+                    pool.prev_action[out_off .. out_off + OUT].copy_from_slice(&r.prev_action);
+                    pool.prev_energy[s] = r.prev_energy;
+                    pool.has_prev[s]    = r.has_prev;
+                }
+                Err(err) => error!("L3 hetero brain restore failed for {e:?}: {err} — using fresh slot"),
             }
         }
 
         // ── Hyperparameter genes ─────────────────────────────────
-        // Restored slots: resample (save format doesn't yet carry the
-        // genes — TODO: extend `PoolSnapshot` if breeding lineages
-        // need to survive save/load).
-        // Inherited slots: copy parent's genes + Gaussian mutation.
-        // Fresh slots: uniform sample within each range.
-        if let Some(parent_slot) = inherited_genes_from {
-            pool.sigma[s]         = mutate_in_range(pool.sigma[parent_slot],         L1_SIGMA_RANGE,         &mut rng);
-            pool.k_eat[s]         = mutate_in_range(pool.k_eat[parent_slot],         L1_K_EAT_RANGE,         &mut rng);
-            pool.k_repro[s]       = mutate_in_range(pool.k_repro[parent_slot],       L1_K_REPRO_RANGE,       &mut rng);
-            pool.lambda_energy[s] = mutate_in_range(pool.lambda_energy[parent_slot], L1_LAMBDA_ENERGY_RANGE, &mut rng);
-            pool.k_curiosity[s]   = mutate_in_range(pool.k_curiosity[parent_slot],   L1_K_CURIOSITY_RANGE,   &mut rng);
-            pool.k_progress[s]    = mutate_in_range(pool.k_progress[parent_slot],    L1_K_PROGRESS_RANGE,    &mut rng);
-        } else {
-            pool.sigma[s]         = sample_range(L1_SIGMA_RANGE,         &mut rng);
-            pool.k_eat[s]         = sample_range(L1_K_EAT_RANGE,         &mut rng);
-            pool.k_repro[s]       = sample_range(L1_K_REPRO_RANGE,       &mut rng);
-            pool.lambda_energy[s] = sample_range(L1_LAMBDA_ENERGY_RANGE, &mut rng);
-            pool.k_curiosity[s]   = sample_range(L1_K_CURIOSITY_RANGE,   &mut rng);
-            pool.k_progress[s]    = sample_range(L1_K_PROGRESS_RANGE,    &mut rng);
-        }
+        // Fresh slots: uniform sample within each range. (Inheritance of
+        // genes via the recycled slot's predecessor would require a parent
+        // slot; under the shared policy the parent's WEIGHTS are already
+        // shared via the species net, and genes resample like the swim pool's
+        // per-organism exploration — keeping selection on differential
+        // reproduction through the species net's learning, not gene copying.)
+        pool.sigma[s]         = sample_range(L1_SIGMA_RANGE,         &mut rng);
+        pool.k_eat[s]         = sample_range(L1_K_EAT_RANGE,         &mut rng);
+        pool.k_repro[s]       = sample_range(L1_K_REPRO_RANGE,       &mut rng);
+        pool.lambda_energy[s] = sample_range(L1_LAMBDA_ENERGY_RANGE, &mut rng);
+        pool.k_curiosity[s]   = sample_range(L1_K_CURIOSITY_RANGE,   &mut rng);
+        pool.k_progress[s]    = sample_range(L1_K_PROGRESS_RANGE,    &mut rng);
 
         // Reset transient target-lock + momentum state for the new
-        // tenant. Weights, prev_action, baseline can survive recycling
-        // (already handled below); these fields cannot — a stale
-        // target_entity could point at a despawned organism.
+        // tenant. A stale target_entity could point at a despawned organism.
+        pool.slot_species[s]            = organism.species_id.unwrap_or(UNCLASSIFIED);
         pool.target_entity[s]           = None;
         pool.lock_ticks_remaining[s]    = 0;
         pool.prev_distance_to_target[s] = 0.0;
@@ -626,20 +586,15 @@ pub fn assign_brains_l3(
         pool.blacklist_ticks_remaining[s] = 0;
         pool.applied_speed_a[s]         = 0.0;
         pool.prev_predations[s]         = organism.predations;
+        pool.buf_count[s]               = 0;
 
         if !restored {
             pool.has_prev[s]           = false;
-            pool.baseline[s]           = 0.0;
             pool.prev_energy[s]        = organism.energy;
-            pool.prev_reproductions[s] = organism.reproductions;
-            pool.buf_count[s]          = 0;
-        } else {
-            // Restored slot — make `prev_reproductions` match the
-            // restored organism so the first tick doesn't fire a
-            // spurious `+K_REPRO` against a stale baseline.
-            pool.prev_reproductions[s] = organism.reproductions;
-            pool.buf_count[s]          = 0;
         }
+        // `prev_reproductions` matches the organism either way so the first
+        // tick doesn't fire a spurious `+K_REPRO` against a stale baseline.
+        pool.prev_reproductions[s] = organism.reproductions;
 
         pool.map.insert(e, slot);
         commands.entity(e).try_insert(BrainSlotL3(slot));
@@ -657,6 +612,7 @@ pub fn free_brains_l3(
             let s = slot as usize;
             pool.has_prev[s]             = false;
             pool.buf_count[s]            = 0;
+            pool.slot_species[s]         = UNCLASSIFIED;
             pool.target_entity[s]        = None;
             pool.lock_ticks_remaining[s] = 0;
             pool.prev_target_entity[s]   = None;
@@ -694,7 +650,6 @@ pub fn apply_intelligence_level_3(
     struct Active {
         entity:        Entity,
         slot:          u32,
-        pos:           Vec3,
         energy_now:    f32,
         reproductions: u8,
         predations:    u8,
@@ -702,6 +657,8 @@ pub fn apply_intelligence_level_3(
         neighbours:    [Option<crate::world_model::Neighbour>; WORLD_MODEL_K],
     }
     let mut active: Vec<Active> = Vec::new();
+    // Active slots grouped by species, for the batched forward below.
+    let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
 
     for (e, organism, transform, slot, carn) in heteros.iter() {
         let s = slot.0 as usize;
@@ -732,8 +689,15 @@ pub fn apply_intelligence_level_3(
         let flag_off = pa_off + PREV_ACTION_DIMS;
         input_buf[flag_off] = if pool.target_entity[s].is_some() { 1.0 } else { 0.0 };
 
+        // Record the organism's CURRENT species (read fresh every tick, so a
+        // reclassification by the speciation system needs no special handling)
+        // into `slot_species` for `train`, and group for the batched forward.
+        let key = organism.species_id.unwrap_or(UNCLASSIFIED);
+        pool.slot_species[s] = key;
+        groups.entry(key).or_default().push(s);
+
         active.push(Active {
-            entity: e, slot: slot.0, pos,
+            entity: e, slot: slot.0,
             energy_now: organism.energy,
             reproductions: organism.reproductions,
             predations: organism.predations,
@@ -746,13 +710,26 @@ pub fn apply_intelligence_level_3(
         return;
     }
 
-    // ── Step 2: forward inference. ──────────────────────────────
-    let cur_t = Tensor::<MyBackend, 2>::from_data(
-        TensorData::new(input_buf.clone(), [n, IN]),
-        &pool.device,
-    );
-    let mu_cur  = pool.model.forward(cur_t);
-    let mu_data = mu_cur.into_data().into_vec::<f32>().expect("forward output");
+    // ── Step 2: forward inference — ONE batched forward PER SPECIES through
+    //            that species' shared net; results scatter back into a
+    //            per-slot `mu_data` arena so the sampling/reward loop below
+    //            is identical to the single-net case. ──
+    let device = pool.device.clone();
+    let mut mu_data = vec![0.0_f32; n * OUT];
+    for (key, slots) in &groups {
+        pool.ensure_species(*key);
+        let brain = pool.species.get(key).expect("species ensured above");
+        let cnt = slots.len();
+        let mut rows = vec![0.0_f32; cnt * IN];
+        for (i, &s) in slots.iter().enumerate() {
+            rows[i * IN .. i * IN + IN].copy_from_slice(&input_buf[s * IN .. s * IN + IN]);
+        }
+        let obs_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(rows, [cnt, IN]), &device);
+        let mu = brain.model.forward(obs_t).into_data().into_vec::<f32>().expect("forward output");
+        for (i, &s) in slots.iter().enumerate() {
+            mu_data[s * OUT .. s * OUT + OUT].copy_from_slice(&mu[i * OUT .. i * OUT + OUT]);
+        }
+    }
 
     let mut rng = rand::rng();
 
@@ -777,25 +754,12 @@ pub fn apply_intelligence_level_3(
                 pool.lambda_energy[s] * energy_delta
             } else { 0.0 };
 
-            // Curiosity / aggression — speed-dependent reward with an
-            // explicit penalty for standing still. Formula:
-            //   r = K_CURIOSITY · (applied_speed_norm − 0.5)
-            // so stillness produces NEGATIVE reward (−0.5·K_CURIOSITY)
-            // and full speed produces +0.5·K_CURIOSITY. The earlier
-            // formulation (just K_CURIOSITY · speed.max(0)) left
-            // standing still as a zero-reward plateau, which is
-            // attractive to a risk-averse Gaussian policy versus the
-            // higher-variance "move" trajectory. The new formula
-            // gives the policy an explicit gradient AWAY from
-            // stillness regardless of energy / progress signals, so
-            // saturated "do-nothing" policies get pushed back into
-            // the moving regime where K_PROGRESS and K_EAT can
-            // compound and pin them.
-            //
-            // `applied_speed_a` is the EMA-smoothed value actually
-            // written to `Organism::movement_speed` last tick — this
-            // is what the world saw, so this is what the reward
-            // should reference.
+            // Curiosity / aggression: `K_CURIOSITY · (speed_norm − 0.5)`, so
+            // stillness is NEGATIVE and full speed positive — an explicit
+            // gradient away from the "do-nothing" optimum regardless of energy
+            // / progress signals. References `applied_speed_a` (the EMA-smoothed
+            // value actually written to `movement_speed` last tick — what the
+            // world saw).
             let prev_speed_norm = pool.applied_speed_a[s].max(0.0);
             let r_curiosity = pool.k_curiosity[s] * (prev_speed_norm - 0.5);
 
@@ -874,20 +838,13 @@ pub fn apply_intelligence_level_3(
                 pool.min_dist_to_target[s] = d;
                 pool.ticks_since_progress[s] = 0;
             } else if d > L1_APPROACH_RADIUS {
-                // Only count as "stuck" when OUTSIDE the brake zone.
-                // Inside the brake zone the brake scales per-tick travel
-                // proportional to `d`, so legitimate controlled approach
-                // produces displacements smaller than
-                // `L1_STUCK_PROGRESS_EPS` and would otherwise be flagged
-                // as failure-to-progress — causing the lock to drop, the
-                // prey to be blacklisted, and the agent to turn away
-                // from food it was about to eat ("shy heterotroph"
-                // pattern). The brake guarantees geometric decay to
-                // d → 0, so contact fires before any reasonable timeout
-                // even without stuck-protection here. The stuck
-                // detector still fires correctly for its original use
-                // case: genuinely blocked approach in the cruising
-                // zone (d > L1_APPROACH_RADIUS).
+                // Only count as "stuck" OUTSIDE the brake zone. Inside it the
+                // brake scales travel ∝ d, so legitimate controlled approach
+                // produces sub-`L1_STUCK_PROGRESS_EPS` steps that would be
+                // mis-flagged as failure-to-progress (dropping/blacklisting prey
+                // the agent was about to eat). The brake guarantees d → 0 so
+                // contact fires anyway; the detector still catches genuinely
+                // blocked approach in the cruising zone.
                 pool.ticks_since_progress[s] = pool.ticks_since_progress[s].saturating_add(1);
             }
         }
@@ -1013,19 +970,13 @@ pub fn apply_intelligence_level_3(
             }
             None => L1_NO_TARGET_SPEED_SCALE,
         };
-        // Hard floor on world-facing speed: even if the policy outputs
-        // negative speed_a or the EMA is deeply negative, the world
-        // sees at least `L1_MIN_APPLIED_SPEED · MAX_SPEED · brake_scale`.
-        // This makes the standstill phenotype structurally impossible
-        // — the curiosity reward already pushes the gradient AWAY from
-        // stillness, but the per-slot EMA baseline tends to absorb
-        // constant offsets over time, so policy-level pressure alone
-        // proved insufficient. This clamp is the environment-side
-        // safeguard.
-        //
-        // `pool.applied_speed_a` still stores the unclamped EMA value
-        // because that's what the policy gradient references — keeping
-        // those consistent preserves the Gaussian log-prob math.
+        // Hard floor on world-facing speed: the world sees at least
+        // `L1_MIN_APPLIED_SPEED · MAX_SPEED · brake_scale` even on negative
+        // speed_a — an environment-side safeguard making the standstill
+        // phenotype structurally impossible (the curiosity reward alone is
+        // insufficient since the EMA baseline absorbs constant offsets).
+        // `applied_speed_a` keeps the unclamped EMA so the policy gradient's
+        // Gaussian log-prob math stays consistent.
         let applied_floored = smoothed.max(L1_MIN_APPLIED_SPEED);
         org.movement_speed = applied_floored * MAX_SPEED * brake_scale;
 
@@ -1129,92 +1080,104 @@ pub fn apply_intelligence_level_3(
 }
 
 
-/// Run one Monte Carlo REINFORCE update over the current contents of
-/// every slot's rollout buffer. Slots with `buf_count == 0` (just
-/// assigned, no rewards yet) contribute zero to the loss via the
-/// mask. After the update, every slot's buffer is reset.
+/// Run one Monte Carlo REINFORCE update PER SPECIES over the current contents
+/// of every slot's rollout buffer. Active slots (with buffered steps) are
+/// grouped by their CURRENT species; for each species we compute discounted
+/// returns, update that species' EMA baseline, pool the transitions into one
+/// flat `[M, ·]` batch, and run one Gaussian-log-prob REINFORCE step on that
+/// species' net. Slots with `buf_count == 0` contribute nothing. After the
+/// update, every slot's buffer is reset.
 fn train(pool: &mut BrainPoolL3) {
+    pool.prune_species();
     let n = pool.n();
 
-    // CPU-side: compute discounted returns + advantages per slot,
-    // populate adv_buf + mask_buf flat tensors.
-    let mut adv_buf  = vec![0.0_f32; n * ROLLOUT_LEN];
-    let mut mask_buf = vec![0.0_f32; n * ROLLOUT_LEN];
-    let mut total_count = 0.0_f32;
-
+    // Group active slots (non-empty rollout) by their current species.
+    let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
     for s in 0..n {
-        let count = pool.buf_count[s];
-        if count == 0 { continue; }
-
-        // Discounted returns, computed backwards from the end of the
-        // valid window: G_t = r_t + γ · G_{t+1}.
-        let mut returns = vec![0.0_f32; count];
-        let mut g = 0.0_f32;
-        for t in (0..count).rev() {
-            let r = pool.buf_rewards[s * ROLLOUT_LEN + t];
-            g = r + GAMMA * g;
-            returns[t] = g;
-        }
-
-        // Per-slot baseline: EMA of mean return. Cheap variance
-        // reduction with no extra network.
-        let mean_g: f32 = returns.iter().sum::<f32>() / count as f32;
-        pool.baseline[s] = (1.0 - BASELINE_ALPHA) * pool.baseline[s]
-                         + BASELINE_ALPHA * mean_g;
-
-        for t in 0..count {
-            adv_buf [s * ROLLOUT_LEN + t] = returns[t] - pool.baseline[s];
-            mask_buf[s * ROLLOUT_LEN + t] = 1.0;
-            total_count += 1.0;
+        if pool.buf_count[s] > 0 {
+            groups.entry(pool.slot_species[s]).or_default().push(s);
         }
     }
+    let device = pool.device.clone();
 
-    if total_count < 1.0 {
-        // Nothing accumulated yet — clear buffers and bail.
-        for s in 0..n { pool.buf_count[s] = 0; }
-        return;
+    for (key, slots) in groups {
+        pool.ensure_species(key);
+
+        // ── Per-slot discounted returns + per-SPECIES EMA baseline update. ──
+        // First compute returns for every contributing slot and accumulate
+        // the mean-of-mean-returns across this species, then update the
+        // species baseline once and form advantages.
+        struct SlotRet { slot: usize, count: usize, returns: Vec<f32> }
+        let mut slot_rets: Vec<SlotRet> = Vec::with_capacity(slots.len());
+        let mut mean_g_sum = 0.0_f32;
+        for &s in &slots {
+            let count = pool.buf_count[s];
+            if count == 0 { continue; }
+            // G_t = r_t + γ · G_{t+1}.
+            let mut returns = vec![0.0_f32; count];
+            let mut g = 0.0_f32;
+            for t in (0..count).rev() {
+                let r = pool.buf_rewards[s * ROLLOUT_LEN + t];
+                g = r + GAMMA * g;
+                returns[t] = g;
+            }
+            let mean_g: f32 = returns.iter().sum::<f32>() / count as f32;
+            mean_g_sum += mean_g;
+            slot_rets.push(SlotRet { slot: s, count, returns });
+        }
+        if slot_rets.is_empty() { continue; }
+
+        // Per-species baseline: EMA of the species' mean rollout return.
+        let species_mean_g = mean_g_sum / slot_rets.len() as f32;
+        {
+            let brain = pool.species.get_mut(&key).expect("species ensured above");
+            brain.baseline = (1.0 - BASELINE_ALPHA) * brain.baseline
+                           + BASELINE_ALPHA * species_mean_g;
+        }
+        let baseline = pool.species.get(&key).expect("species ensured above").baseline;
+
+        // ── Pool this species' transitions into flat [M, ·] buffers. ──
+        // Per-slot σ scaling is preserved: the loss for each transition is
+        // `0.5/σ_s² · Σ(a−μ)² · A`, so we fold σ into the per-transition
+        // advantage (adv_scaled = adv · 0.5/σ²) before the GPU reduction.
+        let mut states:  Vec<f32> = Vec::new();
+        let mut actions: Vec<f32> = Vec::new();
+        let mut adv:     Vec<f32> = Vec::new();
+        let mut total_count = 0.0_f32;
+        for sr in &slot_rets {
+            let s = sr.slot;
+            let sigma = pool.sigma[s].max(1e-3);
+            let scale = 0.5_f32 / (sigma * sigma);
+            for t in 0..sr.count {
+                let buf_in_off  = s * ROLLOUT_LEN * IN + t * IN;
+                let buf_out_off = s * ROLLOUT_LEN * OUT + t * OUT;
+                states.extend_from_slice(&pool.buf_states [buf_in_off  .. buf_in_off  + IN ]);
+                actions.extend_from_slice(&pool.buf_actions[buf_out_off .. buf_out_off + OUT]);
+                adv.push((sr.returns[t] - baseline) * scale);
+                total_count += 1.0;
+            }
+        }
+        let m = adv.len();
+        if m == 0 || total_count < 1.0 { continue; }
+
+        // ── GPU tensors ([M, ·]). ──
+        let states_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(states,  [m, IN]),  &device);
+        let actions_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(actions, [m, OUT]), &device);
+        let adv_t     = Tensor::<MyBackend, 2>::from_data(TensorData::new(adv,     [m, 1]),   &device);
+
+        // ── REINFORCE step on THIS species' net. ──
+        let brain = pool.species.get_mut(&key).expect("species ensured above");
+        let mu = brain.model.forward(states_t);                 // [M, OUT]
+        let diff = actions_t - mu;
+        let sum_sq = diff.powf_scalar(2.0).sum_dim(1);          // [M, 1]
+        // `adv_t` already carries the 0.5/σ² per-transition scale.
+        let loss = (sum_sq * adv_t).sum().div_scalar(total_count);
+
+        let cm = brain.model.clone();
+        let gp = GradientsParams::from_grads(loss.backward(), &brain.model);
+        brain.model = brain.opt.step(LR, cm, gp);
+        brain.tick = brain.tick.wrapping_add(1);
     }
-
-    // Build the GPU tensors.
-    let states_t = Tensor::<MyBackend, 3>::from_data(
-        TensorData::new(pool.buf_states.clone(),  [n, ROLLOUT_LEN, IN]),
-        &pool.device,
-    );
-    let actions_t = Tensor::<MyBackend, 3>::from_data(
-        TensorData::new(pool.buf_actions.clone(), [n, ROLLOUT_LEN, OUT]),
-        &pool.device,
-    );
-    let adv_t = Tensor::<MyBackend, 3>::from_data(
-        TensorData::new(adv_buf, [n, ROLLOUT_LEN, 1]),
-        &pool.device,
-    );
-    let mask_t = Tensor::<MyBackend, 3>::from_data(
-        TensorData::new(mask_buf, [n, ROLLOUT_LEN, 1]),
-        &pool.device,
-    );
-
-    // Per-slot loss scale = 0.5 / σ_s². Built as `[N, 1, 1]` so it
-    // broadcasts over the time + per-step axes when multiplied into
-    // the per-slot sum-of-squares.
-    let mut scale_buf = vec![0.0_f32; n];
-    for s in 0..n {
-        let sigma = pool.sigma[s].max(1e-3);
-        scale_buf[s] = 0.5 / (sigma * sigma);
-    }
-    let scale_t = Tensor::<MyBackend, 3>::from_data(
-        TensorData::new(scale_buf, [n, 1, 1]),
-        &pool.device,
-    );
-
-    let mu = pool.model.forward_rollout(states_t);          // [N, T, OUT]
-    let diff = actions_t - mu;
-    let sum_sq = diff.powf_scalar(2.0).sum_dim(2);          // [N, T, 1]
-    let loss = (sum_sq * adv_t * mask_t * scale_t).sum()
-                  .div_scalar(total_count);
-
-    let cm = pool.model.clone();
-    let gp = GradientsParams::from_grads(loss.backward(), &pool.model);
-    pool.model = pool.opt.step(LR, cm, gp);
 
     // Reset per-slot buffers for the next rollout window.
     for s in 0..n { pool.buf_count[s] = 0; }

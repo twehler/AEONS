@@ -1,12 +1,6 @@
-// Statistics panel — the bottom UI strip.
-//
-// FPS counter and live cell-count on the left, photo/hetero population graph
-// in the centre, current photo/hetero counts on the right. Built once during
-// `frontend::setup_panes` via `spawn_panel`, then driven by the systems
-// declared at the bottom of this file (registered by `FrontendPlugin`).
-//
-// The panel's vertical extent is owned by `frontend.rs::divider_drag` —
-// dragging the divider above this panel shrinks/grows it.
+// Statistics panel — the bottom UI strip. Built once via
+// `frontend::setup_panes::spawn_panel`, driven by the systems at the
+// bottom of this file. Vertical extent owned by `frontend.rs::divider_drag`.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -47,11 +41,9 @@ const GRAPH_Y_MIN_RANGE: f32 = 10.0;
 const VERTICAL_LINE_WIDTH:  f32 = 2.0;
 const VERTICAL_LINE_COLOR:  Color = Color::srgb(0.35, 0.35, 0.35);
 
-/// Symmetric gap (logical px) above AND below the Start/Stop button. The
-/// distance from the divider to the button's top equals this; the
-/// distance from the button's bottom to the graph equals this too — the
-/// graph "reaches up" until it sits the same small inset below the
-/// button as the button sits below the grey separator.
+/// Symmetric gap (logical px) above AND below the Start/Stop button; the
+/// graph's top inset below the button mirrors the button's inset below the
+/// grey separator.
 const BUTTON_GAP_PX: f32 = 8.0;
 
 /// Start/Stop button styling.
@@ -64,14 +56,13 @@ const BUTTON_COLOR_HOVER:     Color = Color::srgb(0.30, 0.30, 0.30);
 /// Save button styling — sits in the bottom-right of the panel.
 const BUTTON_COLOR_SAVE:      Color = Color::srgb(0.20, 0.40, 0.65); // calm blue
 
-/// Speed-input visual constants. Two background colours so the user
-/// can immediately see when the field is editable.
+/// Speed-input visual constants. Two background colours signal when the
+/// field is editable.
 const SPEED_INPUT_WIDTH_PX:   f32   = 88.0;
 const SPEED_INPUT_HEIGHT_PX:  f32   = 26.0;
 const SPEED_INPUT_BG_IDLE:    Color = Color::srgb(0.20, 0.20, 0.22);
 const SPEED_INPUT_BG_FOCUSED: Color = Color::srgb(0.32, 0.30, 0.18);
-/// Maximum length of the editable buffer. Bounded so the user can't
-/// paste in an arbitrary long string and clog formatting.
+/// Max editable-buffer length; bounds paste length so formatting can't clog.
 const SPEED_BUFFER_MAX_LEN:   usize = 8;
 
 /// Max-organisms input field — same widget pattern as the speed input.
@@ -81,8 +72,7 @@ const MAX_PHOTO_BG_IDLE:         Color = Color::srgb(0.20, 0.20, 0.22);
 const MAX_PHOTO_BG_FOCUSED:      Color = Color::srgb(0.32, 0.30, 0.18);
 const MAX_PHOTO_BUFFER_MAX_LEN:  usize = 8;
 
-/// Font size for the photo / hetero count texts. Lowered from 20.0 to
-/// make room for the "Max Phototrophic Organisms:" input row above them.
+/// Font size for the photo / hetero count texts.
 const COUNT_FONT_SIZE:         f32 = 14.0;
 
 /// Spacing between the Max-Organisms input row and the counters below.
@@ -109,10 +99,8 @@ pub struct OrganismCounts {
 
 /// Live-graph state. `samples[0]` is the most recent sample (rendered at
 /// x=0); the deque caps at `GRAPH_SAMPLE_CAP` and `pop_back` drops samples
-/// older than `GRAPH_DURATION_SECS` seconds. `dirty` is set both on tick
-/// and on resize; the redraw system clears it after rasterising. Keeping
-/// the dirty flag means we don't touch the GPU texture in frames where
-/// nothing has changed.
+/// older than `GRAPH_DURATION_SECS`. `dirty` (set on tick + resize, cleared
+/// after rasterising) avoids touching the GPU texture on idle frames.
 #[derive(Resource)]
 pub struct GraphState {
     samples:    VecDeque<(i32, i32)>,
@@ -142,56 +130,47 @@ impl GraphState {
 #[derive(Component)]
 pub struct StatisticsPanel;
 
-// Marker structs are `pub` because the systems registered by
-// `FrontendPlugin` (defined in this file) reference them in their `Query`
-// signatures. Rust's `private_interfaces` lint rejects pub-fn / private-type
-// mismatches even when the type is never consumed outside the crate.
+// Marker structs are `pub` because the pub systems below reference them in
+// `Query` signatures — `private_interfaces` rejects pub-fn / private-type
+// mismatches even when the type is crate-internal.
 #[derive(Component)]
 pub struct FpsText { timer: Timer }
 
 #[derive(Component)]
 pub struct CellCountText { timer: Timer }
 
-/// Marker on the camera-coordinate text directly beneath the FPS counter.
-/// No timer: its update system is driven purely by `Changed<Transform>` on
-/// the `FlyCam`, so it does zero work on frames where the camera is idle.
+/// Marker on the camera-coordinate text beneath the FPS counter. No timer:
+/// updated purely on `Changed<Transform>` of the `FlyCam`.
 #[derive(Component)]
 pub struct CameraCoordsText;
 
-/// Marker on the simulation-clock text that sits between the vertical
-/// separator and the population graph. Reads `Time<Virtual>` so it
-/// pauses automatically with the simulation. The internal timer just
-/// throttles the formatting work to twice a second — the value only
-/// changes once per simulation second anyway.
+/// Marker on the simulation-clock text. Reads `Time<Virtual>` so it pauses
+/// with the sim; the timer throttles formatting to 2 Hz.
 #[derive(Component)]
 pub struct SimTimerText { timer: Timer }
 
-/// Marker on the clickable speed-input box (the outer Node + Button).
-/// `apply_time_speed_input` queries on this to detect "click on the
-/// input" vs "click outside".
+/// Marker on the clickable speed-input box (outer Node + Button); used to
+/// detect "click on input" vs "click outside".
 #[derive(Component)]
 pub struct TimeSpeedInput;
 
-/// Marker on the Text child inside the speed-input box. Updated by
-/// `update_time_speed_text` to reflect either the committed value
-/// or the in-progress edit buffer.
+/// Marker on the Text child inside the speed-input box (shows the committed
+/// value or the in-progress edit buffer).
 #[derive(Component)]
 pub struct TimeSpeedText;
 
-/// Marker on the orange "(Be careful with this!)" warning text that
-/// sits below the speed-input field. Hidden by default; revealed only
-/// while the user is actively editing the speed value.
+/// Marker on the orange "(Be careful with this!)" warning below the
+/// speed-input field. Hidden unless the field is being edited.
 #[derive(Component)]
 pub struct TimeSpeedWarning;
 
-/// Edit-state for the speed-input field. Lives outside the Node so
-/// the focused state can be inspected by sibling systems.
+/// Edit-state for the speed-input field. A resource (not on the Node) so
+/// sibling systems can inspect `focused`.
 #[derive(Resource, Default)]
 pub struct TimeSpeedEditState {
-    /// Live edit buffer (only meaningful when `focused == true`).
+    /// Live edit buffer (only meaningful when `focused`).
     pub buffer:  String,
-    /// True while the user is actively typing into the field.
-    /// Click-on-input → true; Enter/Escape/click-outside → false.
+    /// True while typing. Click-on-input → true; Enter/Escape/click-outside → false.
     pub focused: bool,
 }
 
@@ -209,9 +188,7 @@ pub struct MaxPhotoautotrophsInput;
 #[derive(Component)]
 pub struct MaxPhotoautotrophsText;
 
-/// Edit-state for the Max-Organisms input. Same model as
-/// `TimeSpeedEditState` — `focused` is true while the user is actively
-/// typing; `buffer` holds the in-progress digits.
+/// Edit-state for the Max-Organisms input. Same model as `TimeSpeedEditState`.
 #[derive(Resource, Default)]
 pub struct MaxPhotoautotrophsEditState {
     pub buffer:  String,
@@ -219,7 +196,7 @@ pub struct MaxPhotoautotrophsEditState {
 }
 
 /// Marker on the orange cull-notification Text node. Hidden by default;
-/// `update_cull_message` flips Display::Flex while the message is live.
+/// `update_cull_message` flips Display while the message is live.
 #[derive(Component)]
 pub struct CullMessageText;
 
@@ -243,9 +220,7 @@ pub struct MaxHerbivoresInput;
 #[derive(Component)]
 pub struct MaxHerbivoresText;
 
-/// Edit-state for the Max-Herbivores input — mirrors
-/// `MaxPhotoautotrophsEditState`. `focused` is true while the user is
-/// actively typing; `buffer` holds the in-progress digits.
+/// Edit-state for the Max-Herbivores input — mirrors `MaxPhotoautotrophsEditState`.
 #[derive(Resource, Default)]
 pub struct MaxHerbivoresEditState {
     pub buffer:  String,
@@ -253,17 +228,14 @@ pub struct MaxHerbivoresEditState {
 }
 
 /// Notification state for the random-cull toast. Set by
-/// `apply_max_phototrophs_cull` when the soft cap drops below the current
-/// population; auto-cleared after `CULL_MSG_VISIBLE_SECS` seconds.
+/// `apply_max_phototrophs_cull`; auto-cleared after `CULL_MSG_VISIBLE_SECS`.
 #[derive(Resource, Default)]
 pub struct CullMessage {
-    /// True while the message should be visible. Cleared by the
-    /// auto-hide timer or overwritten by a later cull event.
+    /// True while the message should be visible.
     pub active: bool,
     /// Most recent cull count; used to format the message.
     pub count:  usize,
-    /// Counts up from 0 each frame `active` is true; flips back to
-    /// inactive once `CULL_MSG_VISIBLE_SECS` has elapsed.
+    /// Counts up while `active`; flips inactive at `CULL_MSG_VISIBLE_SECS`.
     pub elapsed: f32,
 }
 
@@ -274,8 +246,7 @@ pub struct GraphImage;
 #[derive(Component)]
 pub struct StartStopButton;
 
-/// Marker on the Text entity inside the Start/Stop button so the label
-/// update system can find it without re-traversing children.
+/// Marker on the Text entity inside the Start/Stop button.
 #[derive(Component)]
 pub struct StartStopButtonText;
 
@@ -294,9 +265,7 @@ pub struct ExportDatasetButton;
 // ── Spawning ─────────────────────────────────────────────────────────────────
 
 /// Append the statistics-panel UI subtree as a child of the layout root.
-/// Called from `frontend::setup_panes`; expects to be invoked inside the
-/// `with_children` closure for the root node. Returns the panel's height in
-/// logical pixels for use by other systems if needed (currently unused).
+/// Must be invoked inside the root node's `with_children` closure.
 pub fn spawn_panel(
     root:                   &mut ChildSpawnerCommands,
     images:                 &mut Assets<Image>,
@@ -304,10 +273,9 @@ pub fn spawn_panel(
     initial_panel_logical:  f32,
 ) {
     // Graph texture. Same sRGB-view trick as the viewport: storage is
-    // Rgba8Unorm but the sampler treats bytes as already-sRGB, so the
-    // colour bytes we write match what the user sees on a sRGB swapchain.
-    // 1×1 placeholder; `graph_redraw` resizes to the node's real pixel
-    // size on the first frame after layout.
+    // Rgba8Unorm but the sampler treats bytes as already-sRGB, so written
+    // colour bytes match what's seen on a sRGB swapchain. 1×1 placeholder;
+    // `graph_redraw` resizes to the node's real pixel size after layout.
     let graph_image = images.add(Image::new_target_texture(
         1, 1,
         TextureFormat::Rgba8Unorm,
@@ -344,21 +312,15 @@ pub fn spawn_panel(
             })
             .with_children(|left| {
                 left.spawn((
-                    // Updated every 0.1 s of REAL time (see
-                    // `update_fps_text`); the value itself comes from
-                    // Bevy's `FrameTimeDiagnosticsPlugin`, which
-                    // measures real frames per real second, so neither
-                    // the cadence nor the reading scales with
-                    // `TimeSpeed`.
+                    // Updated every 0.1 s of REAL time (see `update_fps_text`);
+                    // neither cadence nor reading scales with `TimeSpeed`.
                     Text::new("FPS: 0.0"),
                     TextFont { font_size: 20.0, ..default() },
                     TextColor(Color::WHITE),
                     FpsText { timer: Timer::from_seconds(0.1, TimerMode::Repeating) },
                 ));
                 left.spawn((
-                    // Camera position, directly beneath the FPS counter.
-                    // Refreshed only when the FlyCam transform changes
-                    // (`update_camera_coords_text`) — idle frames cost nothing.
+                    // Camera position; refreshed only on FlyCam transform change.
                     Text::new("Cam: -, -, -"),
                     TextFont { font_size: 14.0, ..default() },
                     TextColor(Color::srgb(0.7, 0.7, 0.7)),
@@ -383,11 +345,8 @@ pub fn spawn_panel(
             BackgroundColor(VERTICAL_LINE_COLOR),
         ));
 
-        // ── Simulation clock (DD:HH:MM:SS).
-        // Lives between the vertical separator and the spacer so it
-        // sits to the LEFT of the absolutely-positioned graph (which
-        // starts at 25 vw). Width is fixed so this column never
-        // overflows into the graph area.
+        // ── Simulation clock. Sits left of the absolutely-positioned graph
+        //    (which starts at 25vw); fixed width so it never overflows into it.
         panel
             .spawn(Node {
                 flex_direction: FlexDirection::Column,
@@ -448,9 +407,8 @@ pub fn spawn_panel(
                     Text::new("(Be careful with this!)"),
                     TextFont { font_size: 11.0, ..default() },
                     TextColor(Color::srgb(0.95, 0.55, 0.15)),
-                    // Starts hidden — `update_time_speed_text` flips
-                    // `Display` to `Flex` whenever the user is inside
-                    // the speed field (`TimeSpeedEditState.focused`).
+                    // Starts hidden — `update_time_speed_text` shows it while
+                    // the speed field is focused.
                     Node {
                         margin:  UiRect::top(Val::Px(2.0)),
                         display: Display::None,
@@ -547,12 +505,9 @@ pub fn spawn_panel(
                 ));
             });
 
-        // ── Graph (absolute). The top edge sits BUTTON_GAP_PX below the
-        //    button — the same pixel inset the button itself uses
-        //    against the grey divider above the panel — so the graph's
-        //    distance to the button mirrors the button's distance to
-        //    the separator. The graph fills downward to the panel
-        //    bottom via `bottom: Px(0)`.
+        // ── Graph (absolute). Top edge sits BUTTON_GAP_PX below the button,
+        //    mirroring the button's inset below the separator; fills down to
+        //    the panel bottom via `bottom: Px(0)`.
         panel.spawn((
             GraphImage,
             ImageNode::new(graph_image.clone()),
@@ -567,12 +522,9 @@ pub fn spawn_panel(
             Pickable::IGNORE,
         ));
 
-        // ── Right-of-graph control stack (absolute). Holds the
-        //    "AI-training mode" checkbox on top and the "Max
-        //    Herbivores" integer field directly beneath it. Anchored
-        //    at the graph's right edge (`left = 75vw`) so neither
-        //    control collides with the Save button (bottom-right of
-        //    the panel).
+        // ── Right-of-graph control stack (absolute): AI-training checkbox +
+        //    Max-Herbivores field. Anchored at the graph's right edge
+        //    (`left = 75vw`) to avoid the bottom-right Save button.
         const AI_CHECKBOX_SIZE_PX: f32 = 16.0;
         panel
             .spawn(Node {
@@ -629,12 +581,9 @@ pub fn spawn_panel(
                         ));
                     });
 
-                // ── "Max Herbivores: [N]" integer-input row ─────────
-                // Same widget pattern as Max Organisms (click-to-edit,
-                // digits-only, Enter commit / Escape cancel) but
-                // unclamped on the upper side — the value gates
-                // reproduction in `reproduction_system`, no GPU
-                // batch dim involved.
+                // ── "Max Herbivores: [N]" integer-input row. Same widget as
+                //    Max Organisms but unclamped on the upper side — gates
+                //    reproduction, no GPU batch dim involved.
                 stack
                     .spawn(Node {
                         flex_direction: FlexDirection::Row,
@@ -711,9 +660,8 @@ pub fn spawn_panel(
                 Node {
                     position_type: PositionType::Absolute,
                     top:    Val::Px(BUTTON_GAP_PX),
-                    // Centre horizontally: pull the left edge to the
-                    // window's mid-point, then offset by half the
-                    // button's width via a negative margin.
+                    // Centre horizontally: left edge at mid-point, offset
+                    // back by half the button's width via negative margin.
                     left:   Val::Vw(50.0),
                     margin: UiRect::left(Val::Px(-BUTTON_WIDTH_PX / 2.0)),
                     width:  Val::Px(BUTTON_WIDTH_PX),
@@ -734,13 +682,10 @@ pub fn spawn_panel(
                 ));
             });
 
-        // ── "Export Simulation Dataset" button (absolute, top strip,
-        //    sits to the right of the Start/Stop button). The
-        //    Start/Stop button is centred on `Vw(50.0)` with a
-        //    negative half-width margin; placing this one at the same
-        //    Vw anchor with a positive `BUTTON_WIDTH_PX / 2 + gap` left
-        //    margin lands it exactly one gap past Start/Stop's right
-        //    edge. Wider than Start/Stop so the full label fits.
+        // ── "Export Simulation Dataset" button (absolute, top strip). Same
+        //    Vw(50) anchor as Start/Stop but with a positive
+        //    `BUTTON_WIDTH_PX/2 + gap` margin, landing it one gap past
+        //    Start/Stop's right edge. Wider so the full label fits.
         const EXPORT_BUTTON_WIDTH_PX: f32 = 220.0;
         const EXPORT_BUTTON_COLOR:    Color = Color::srgb(0.22, 0.46, 0.46); // teal
         panel
@@ -775,10 +720,8 @@ pub fn spawn_panel(
 // ── Systems ──────────────────────────────────────────────────────────────────
 
 pub fn update_fps_text(
-    // `Time<Real>` ticks at wall-clock pace regardless of `TimeSpeed`
-    // or `SimulationRunning`. The default `Res<Time>` would resolve
-    // to `Time<Virtual>`, which would freeze the FPS counter on
-    // pause and accelerate its update cadence at high time speeds.
+    // `Time<Real>` (not the default `Time<Virtual>`) so the counter keeps
+    // ticking at wall-clock pace through pause and high `TimeSpeed`.
     time:        Res<Time<bevy::time::Real>>,
     diagnostics: Res<DiagnosticsStore>,
     mut query:   Query<(&mut Text, &mut FpsText)>,
@@ -788,8 +731,7 @@ pub fn update_fps_text(
         if fps_marker.timer.just_finished() {
             if let Some(fps_diag) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) {
                 if let Some(fps_value) = fps_diag.smoothed() {
-                    // `text.0.clear() + write!` reuses the existing String
-                    // buffer instead of allocating a new one each tick.
+                    // clear + write! reuses the buffer (no per-tick alloc).
                     text.0.clear();
                     let _ = write!(text.0, "FPS: {:.1}", fps_value);
                 }
@@ -799,14 +741,9 @@ pub fn update_fps_text(
 }
 
 
-/// Refresh the camera-coordinate readout beneath the FPS counter.
-///
-/// Driven entirely by Bevy change detection: the `Changed<Transform>` filter
-/// makes the camera query yield a row ONLY on frames where the `FlyCam`
-/// transform actually moved (plus once at spawn, when it counts as added). On
-/// every idle frame the query is empty and the system returns immediately
-/// after a per-archetype change-tick check — effectively zero cost. The text
-/// buffer is cleared-and-rewritten in place, so a refresh allocates nothing.
+/// Refresh the camera-coordinate readout beneath the FPS counter. Driven by
+/// `Changed<Transform>` on the `FlyCam`, so idle frames are ~free; the text
+/// buffer is rewritten in place (no alloc).
 pub fn update_camera_coords_text(
     camera: Query<&Transform, (With<crate::player_plugin::FlyCam>, Changed<Transform>)>,
     mut query: Query<&mut Text, With<CameraCoordsText>>,
@@ -820,17 +757,10 @@ pub fn update_camera_coords_text(
 }
 
 
-/// Format `total_secs` as `YYY:DDD:HH:MM:SS`.
-///
-/// Day length: 86 400 s. Year length: 365 days (no leap-day
-/// correction — this is a simulation, calendars don't apply).
-///
-/// Year field width:
-///   * `< 1000` years  → `{:03}` zero-padded ("000".."999")
-///   * `≥ 1000` years  → `{:.2e}` scientific ("1.00e3", "1.23e9", …)
-/// The scientific branch widens the field by ~3 chars exactly once,
-/// at the 1000-year mark. Past that the year field stays bounded at
-/// 7 characters (worst case: `1.84e19` for u64::MAX seconds).
+/// Format `total_secs` as `YYY:DDD:HH:MM:SS`. Year = 365 days, no leap
+/// correction (simulation, not a calendar). Year field is `{:03}` below
+/// 1000, switching to `{:.2e}` scientific at/above 1000 (worst case
+/// `1.84e19` for u64::MAX, so the field stays ≤ 7 chars).
 fn format_dhms(total_secs: u64) -> String {
     const SECS_PER_DAY:  u64 = 86_400;
     const SECS_PER_YEAR: u64 = SECS_PER_DAY * 365;
@@ -862,11 +792,8 @@ pub fn update_sim_timer_text(
     mut query:    Query<(&mut Text, &mut SimTimerText)>,
 ) {
     for (mut text, mut marker) in &mut query {
-        // Tick the throttle on REAL time so the refresh keeps firing
-        // even when the simulation is paused (otherwise the displayed
-        // value would lag a tick after un-pausing). The displayed
-        // value itself uses virtual elapsed seconds, which IS frozen
-        // while paused — exactly the desired behaviour.
+        // Throttle on REAL time so the refresh keeps firing while paused;
+        // the displayed value uses virtual elapsed secs (frozen while paused).
         marker.timer.tick(real_time.delta());
         if !marker.timer.just_finished() { continue; }
         let total_secs = virtual_time.elapsed_secs() as u64;
@@ -884,10 +811,7 @@ pub fn update_cell_count_text(
     for (mut text, mut marker) in &mut query {
         marker.timer.tick(time.delta());
         if marker.timer.just_finished() {
-            // Sum the cached counts directly — `grown_cell_count`
-            // walks `body_parts.iter().filter(...).map(|bp| bp.ocg.len())`
-            // every call. With photo+non_photo cached on Organism we
-            // avoid the body-part walk entirely.
+            // Sum the cached photo+non_photo counts to avoid a body-part walk.
             let total: i64 = organisms.iter()
                 .map(|o| (o.photo_cell_count + o.non_photo_cell_count) as i64)
                 .sum();
@@ -898,22 +822,11 @@ pub fn update_cell_count_text(
 }
 
 
-/// Direct population count — the source of truth.
-///
-/// Earlier versions of this used incremental tracking via
-/// `Added<…>` + `RemovedComponents<…>`. That works in principle but
-/// drifts over multi-hour runs: `RemovedComponents` events have a
-/// bounded buffer lifetime (~2 buffer swaps) and any missed event
-/// permanently biases the counter. At high `TimeSpeed` multipliers
-/// the rate of despawns per real-time frame is high enough to
-/// occasionally lose an event, and the drift compounds invisibly
-/// until the displayed number disagrees with reality.
-///
-/// Direct counting via an archetype-iterating query is microseconds
-/// per call for a few-thousand-organism world and immune to event
-/// dropping — the count is recomputed from ground truth each frame.
-/// We still gate the resource write on a change check so
-/// `update_counter_texts` only redraws when the value moves.
+/// Direct population count — the source of truth. Recomputed from an
+/// archetype query each frame (microseconds for a few-thousand-organism
+/// world) instead of incremental `Added`/`RemovedComponents` tracking, which
+/// drifts when `RemovedComponents`' bounded buffer drops events at high
+/// `TimeSpeed`. The resource write is gated on a change check.
 pub fn track_organism_births(
     photo_q:    Query<(), With<Photoautotroph>>,
     hetero_q:   Query<(), With<Heterotroph>>,
@@ -929,38 +842,17 @@ pub fn track_organism_births(
     }
 }
 
-/// Kept as a public no-op so the `FrontendPlugin` registration site
-/// doesn't need to be edited. The work that used to live here is
-/// now handled by `track_organism_births` (renamed-but-not-renamed
-/// — the new system is a full population resync, so births and
-/// deaths are both observed by the same direct count).
+/// Public no-op kept so the `FrontendPlugin` registration site is unchanged;
+/// `track_organism_births` now resyncs the full population (births + deaths).
 pub fn track_organism_deaths() {}
 
 
-/// TEMPORARY DIAGNOSTIC — breaks the photoautotroph population
-/// down by what's actually visible. Logs once every 5 real seconds.
-///
-/// `Mesh3d` lives on child body-part entities, not the
-/// `OrganismRoot`, so the previous version of this diag (which
-/// queried `With<Photoautotroph>, With<Mesh3d>`) was structurally
-/// guaranteed to report zero meshes. The new walk descends into
-/// each photoautotroph root's `Children`, finds entries carrying
-/// `BodyPartIndex`, and checks whether they have `Mesh3d`
-/// attached. Three reduced counts are reported:
-///
-///   * `roots_with_mesh_child`: at least one direct child of the
-///     root carries both `BodyPartIndex` and `Mesh3d`. These are
-///     the plants that should be rendering normally.
-///   * `roots_no_mesh_child`: at least one `BodyPartIndex`-bearing
-///     child exists but NONE of them carry `Mesh3d`. Phantom
-///     plants — the root has body-part entities but they were
-///     either never given a mesh or had it removed.
-///   * `roots_no_bp_child`: the root has no `BodyPartIndex`-bearing
-///     child at all. Children were never spawned (or got despawned)
-///     while the root survives.
-///
-/// Total photoautotroph organism count is logged as the leading
-/// number so the breakdown can be checked against the panel.
+/// TEMPORARY DIAGNOSTIC — breaks the photoautotroph population down by what's
+/// visible, logged every 5 real seconds. Note `Mesh3d` lives on child
+/// body-part entities (carrying `BodyPartIndex`), not the `OrganismRoot`, so
+/// this walks each root's children. Reported buckets: root with a
+/// mesh-bearing body-part child (rendering normally); root with body-part
+/// children but no mesh (phantom plant); root with no body-part child at all.
 pub fn diag_photo_breakdown(
     real_time:           Res<Time<bevy::time::Real>>,
     mut timer:           Local<Option<Timer>>,
@@ -1039,9 +931,8 @@ pub fn update_counter_texts(
 }
 
 
-/// 1 Hz: capture a snapshot of `OrganismCounts`, push it onto the front of
-/// the ring buffer, drop the oldest sample once we exceed `GRAPH_DURATION_SECS`
-/// seconds. Marks the graph dirty so the redraw system rasterises this frame.
+/// 1 Hz: push an `OrganismCounts` snapshot onto the front of the ring buffer,
+/// drop samples beyond `GRAPH_DURATION_SECS`, mark the graph dirty.
 pub fn graph_tick(
     time:      Res<Time>,
     counts:    Res<OrganismCounts>,
@@ -1056,11 +947,8 @@ pub fn graph_tick(
     graph.dirty = true;
 }
 
-/// CPU-side rasteriser. Touches the GPU only when (a) the node's pixel size
-/// changed (resize → reallocate texture buffer, redraw) or (b) `graph_tick`
-/// pushed a new sample (1 Hz redraw at most). In all other frames this
-/// system returns after a single `==` check on UVec2 — no allocation, no
-/// upload.
+/// CPU-side rasteriser. Touches the GPU only on resize or after `graph_tick`
+/// dirties the graph (≤ 1 Hz); otherwise returns after a UVec2 size check.
 pub fn graph_redraw(
     mut images: ResMut<Assets<Image>>,
     mut graph:  ResMut<GraphState>,
@@ -1093,9 +981,8 @@ pub fn graph_redraw(
 
 // ── Rasteriser ───────────────────────────────────────────────────────────────
 
-/// Pure pixel-twiddling routine. ~ (w * h * 4) bytes for the background
-/// fill plus ~60 Bresenham segments per line, called at most once per
-/// second (or on resize). No allocations.
+/// Pure pixel-twiddling routine (background fill + Bresenham segments). No
+/// allocations; called at most once per second (or on resize).
 fn rasterise_graph(buf: &mut [u8], w: i32, h: i32, samples: &VecDeque<(i32, i32)>) {
     // Background.
     for chunk in buf.chunks_exact_mut(4) {
@@ -1142,10 +1029,8 @@ fn put_pixel(buf: &mut [u8], w: i32, h: i32, x: i32, y: i32, color: [u8; 4]) {
 // ── Start/Stop button systems ────────────────────────────────────────────────
 
 /// Click + hover handler for the Start/Stop button. On `Pressed`, toggles
-/// `SimulationRunning` and the matching `Time<Virtual>` pause state.
-/// Hover state colour is applied here too so the visuals are in one
-/// place. Player controls (capture state) are independent of pause —
-/// the user can fly around a frozen world to inspect it.
+/// `SimulationRunning` and the matching `Time<Virtual>` pause state. Player
+/// controls are independent of pause (fly around a frozen world to inspect).
 pub fn handle_start_stop_button(
     mut interactions:  Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<StartStopButton>)>,
     mut sim_running:   ResMut<SimulationRunning>,
@@ -1177,15 +1062,10 @@ pub fn handle_start_stop_button(
     }
 }
 
-/// Click handler for the Save button. On `Pressed`, pauses the
-/// simulation, opens a native "Save As" dialog (rfd), and stores the
-/// chosen path in `SaveRequested(Some(path))` so
-/// `colony.rs::save_colony_system` writes there on the next Update
-/// tick. If the user cancels the dialog the save is skipped (and the
-/// simulation stays paused — the user can resume manually).
-///
-/// rfd's `save_file()` is blocking; the simulation effectively stalls
-/// for the duration of the dialog. Fine for an interactive save flow.
+/// Click handler for the Save button. On `Pressed`, pauses the sim, opens a
+/// native "Save As" dialog (rfd), and stores the path in `SaveRequested` for
+/// `colony.rs::save_colony_system` to write next tick (cancel = no write, sim
+/// stays paused). rfd's `save_file()` blocks, stalling the sim for the dialog.
 pub fn handle_save_button(
     mut interactions:   Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<SaveButton>)>,
     mut sim_running:    ResMut<SimulationRunning>,
@@ -1223,12 +1103,9 @@ pub fn handle_save_button(
 }
 
 
-/// Sync the button's text label AND background colour with the current
-/// simulation state. Runs every frame; cheap because it only writes
-/// when `SimulationRunning` has changed (which on the very first tick
-/// covers the resource being newly inserted, so the spawn-time defaults
-/// in `spawn_panel` are guaranteed to be overwritten before the user
-/// sees the panel).
+/// Sync the button label + background colour with `SimulationRunning`. Writes
+/// only on change; the first tick (resource newly inserted) overwrites the
+/// spawn-time defaults before the panel is shown.
 pub fn update_start_stop_label(
     sim_running:  Res<SimulationRunning>,
     mut texts:    Query<&mut Text, With<StartStopButtonText>>,
@@ -1249,20 +1126,12 @@ pub fn update_start_stop_label(
 // ── Time-speed input handlers ───────────────────────────────────────────────
 
 /// Click + keyboard router for the speed-input field.
-///
-///   * LMB on the input box → focus the field, prefill the buffer
-///     with the current committed value.
-///   * LMB elsewhere while focused → commit the buffer (parse +
-///     apply, or discard if unparseable) and unfocus.
-///   * While focused, KeyboardInput events:
-///       Enter / NumpadEnter   → commit + unfocus
-///       Escape                → cancel + unfocus (no commit)
-///       Backspace             → drop trailing buffer char
-///       digit / '.'           → append (bounded by SPEED_BUFFER_MAX_LEN)
-///
-/// The committed value writes through to the `TimeSpeed` resource;
-/// `apply_time_speed` then mirrors it onto `Time<Virtual>` and the
-/// scaling propagates to every system reading `Res<Time>`.
+///   * LMB on box → focus, prefill buffer with committed value.
+///   * LMB outside while focused → commit (or discard) and unfocus.
+///   * Focused keys: Enter → commit; Escape → cancel; Backspace → del;
+///     digit/'.' → append (bounded by SPEED_BUFFER_MAX_LEN).
+/// Commit writes `TimeSpeed`; `apply_time_speed` mirrors it onto
+/// `Time<Virtual>`, propagating to every `Res<Time>` reader.
 pub fn handle_time_speed_input(
     mouse:           Res<ButtonInput<MouseButton>>,
     mut keyboard:    MessageReader<KeyboardInput>,
@@ -1281,9 +1150,8 @@ pub fn handle_time_speed_input(
         let _ = write!(state.buffer, "{:.2}", speed.0);
     }
 
-    // ── Commit on click-outside. Always drains keyboard regardless
-    //    so events don't pile up; consumed events get dropped when
-    //    the field isn't focused. ────────────────────────────────
+    // ── Commit on click-outside. Keyboard is always drained below so
+    //    events don't pile up while unfocused.
     if click_outside && state.focused {
         commit_time_speed(&mut state, &mut speed);
     }
@@ -1336,9 +1204,8 @@ fn commit_time_speed(state: &mut TimeSpeedEditState, speed: &mut TimeSpeed) {
     state.buffer.clear();
 }
 
-/// Sync the input box's text + background colour with the current
-/// committed `TimeSpeed` and edit state. Runs every frame; the early
-/// return on `!is_changed()` keeps it free in steady state.
+/// Sync the input box's text + background colour with `TimeSpeed` and edit
+/// state. Early-returns on `!is_changed()`.
 pub fn update_time_speed_text(
     state:      Res<TimeSpeedEditState>,
     speed:      Res<TimeSpeed>,
@@ -1363,18 +1230,15 @@ pub fn update_time_speed_text(
         if b.0 != bg { *b = BackgroundColor(bg); }
     }
 
-    // Warning visibility tracks the focused flag — only show the
-    // "(Be careful with this!)" copy while the user has the field
-    // open for editing.
+    // Warning shown only while the field is focused for editing.
     let want = if state.focused { Display::Flex } else { Display::None };
     for mut node in &mut warn_q {
         if node.display != want { node.display = want; }
     }
 }
 
-/// Mirror `TimeSpeed` onto `Time<Virtual>::set_relative_speed`. Runs
-/// any frame the resource is changed (including the first frame after
-/// `init_resource`, which seeds 1.0 onto virtual time — harmless).
+/// Mirror `TimeSpeed` onto `Time<Virtual>::set_relative_speed` on change
+/// (incl. the first frame, which seeds 1.0 — harmless).
 pub fn apply_time_speed(
     speed:           Res<TimeSpeed>,
     mut virtual_time: ResMut<Time<Virtual>>,
@@ -1387,16 +1251,11 @@ pub fn apply_time_speed(
 
 // ── Max-Organisms input handlers ────────────────────────────────────────────
 
-/// Click + keyboard router for the Max-Organisms integer-input field.
-/// Mirrors the `handle_time_speed_input` design, but accepts digits only
-/// (no decimal point) and commits a `usize` into `MaxPhotoautotrophs`. The
-/// value is *not* clamped to `OrganismPoolSize` — the user is free to
-/// raise the soft cap above the GPU brain-pool batch dim chosen at
-/// startup. Organisms spawned past the pool size will simply not
-/// receive a brain slot (the `assign_brains_*` systems silently skip
-/// them when `pool.free` is empty), which is harmless: those
-/// organisms behave as if their last brain output is still in effect
-/// until they die or are recycled into a freed slot.
+/// Click + keyboard router for the Max-Organisms field. Like
+/// `handle_time_speed_input` but digits-only, committing a `usize` into
+/// `MaxPhotoautotrophs`. Intentionally NOT clamped to `OrganismPoolSize`:
+/// organisms spawned past the pool size just get no brain slot (harmless —
+/// they keep their last brain output until recycled into a freed slot).
 pub fn handle_max_phototrophs_input(
     mouse:            Res<ButtonInput<MouseButton>>,
     mut keyboard:     MessageReader<KeyboardInput>,
@@ -1450,12 +1309,8 @@ pub fn handle_max_phototrophs_input(
     }
 }
 
-/// Parse the buffer as `usize` and write into the resource. No clamp
-/// — the user can set the soft cap freely above or below the GPU
-/// brain-pool batch dim (`OrganismPoolSize`, fixed at startup); when
-/// the cap exceeds the pool size, new organisms simply spawn without
-/// brain slots until a slot frees up. Always unfocus + clear the
-/// buffer.
+/// Parse the buffer as `usize` and write into the resource (no clamp; see
+/// `handle_max_phototrophs_input`). Always unfocus + clear the buffer.
 fn commit_max_phototrophs(state: &mut MaxPhotoautotrophsEditState, max_photo: &mut MaxPhotoautotrophs) {
     if let Ok(v) = state.buffer.parse::<usize>() {
         if max_photo.0 != v {
@@ -1494,45 +1349,51 @@ pub fn update_max_phototrophs_text(
 
 // ── Max-Phototrophs enforcement (random cull of photoautotrophs only) ──────
 
-/// When `MaxPhotoautotrophs` changes downward below the current
-/// photoautotroph count, randomly sample `(count - max)` photo entities
-/// in a single pass and despawn them. Heterotrophs are NOT touched —
-/// they have their own independent cap (`MaxHerbivores`). The orange
-/// notification text is populated for `update_cull_message` to surface.
-///
-/// Selection: partial Fisher–Yates shuffle on the entity vector — O(n)
-/// memory, O(k) random swaps where k = entities to remove. No per-tick
-/// allocation in steady state because the system early-returns unless
-/// the resource changed *and* the photo population exceeds the cap.
+/// Randomly despawn `(count - max)` photoautotrophs whenever the live count
+/// exceeds `MaxPhotoautotrophs`. Heterotrophs are untouched (own `MaxHerbivores`
+/// cap). Selection is a partial Fisher–Yates over the entity vector (O(k) swaps).
+/// Populates the orange notification for `update_cull_message`.
 pub fn apply_max_phototrophs_cull(
     mut commands:   Commands,
     max_photo:      Res<MaxPhotoautotrophs>,
-    photos:         Query<Entity, (With<OrganismRoot>, With<Photoautotroph>)>,
+    photos:         Query<(Entity, Option<&crate::lineages::species::ImportedSpeciesOrigin>),
+                          (With<OrganismRoot>, With<Photoautotroph>)>,
     mut message:    ResMut<CullMessage>,
 ) {
-    // Enforce the cap whenever the live photoautotroph count exceeds it — NOT
-    // only when the cap RESOURCE changes. A colony loaded from disk spawns the
-    // raw saved population, which can be far above the cap (e.g. 1000+ photos);
-    // the old `is_changed`-only guard let that over-cap population persist for
-    // the whole run (reproduction is suppressed above the cap, but the existing
-    // excess was never trimmed) — a major, silent FPS sink. Cheap under the
-    // cap: a count + early return, no allocation.
+    // Enforce on the live count, NOT only on resource change: a disk-loaded
+    // colony can spawn far above the cap, and an `is_changed`-only guard would
+    // leave that excess (never trimmed by reproduction) as a silent FPS sink.
+    // Cheap under the cap: count + early return.
     let cap = max_photo.0;
-    if photos.iter().count() <= cap { return; }
-    let mut roots: Vec<Entity> = photos.iter().collect();
+    let total = photos.iter().count();
+    if total <= cap { return; }
 
-    let to_remove = roots.len() - cap;
+    // NEVER cull the auto-spawned `ball_plankton` FLOOR. `auto_spawn_plankton`
+    // keeps a minimum of these as the prey field; if the random cull despawned
+    // them, the count would drop below the floor, the floor would respawn the
+    // deficit, that would push back over the cap, and the cull would fire
+    // again — the perpetual plankton spawn/despawn/respawn churn. Only the
+    // non-floor phototrophs (other species + untagged reproduced plankton
+    // descendants) are cullable. With a sane cap (≥ the floor) the total still
+    // trims exactly to the cap; if the cap is set BELOW the floor the floor
+    // wins (and the loop still terminates — nothing respawns over the cap).
+    let mut cullable: Vec<Entity> = photos.iter()
+        .filter(|(_, origin)| !origin.is_some_and(|o| o.name == "ball_plankton"))
+        .map(|(e, _)| e)
+        .collect();
+
+    let to_remove = (total - cap).min(cullable.len());
+    if to_remove == 0 { return; }
     let mut rng = rand::rng();
 
-    // Partial Fisher–Yates: for i in 0..to_remove, swap roots[i] with a
-    // random element from roots[i..]. After the loop, the first
-    // `to_remove` entries are a uniform random subset.
-    let n = roots.len();
+    // Partial Fisher–Yates: the first `to_remove` entries become a uniform
+    // random subset of the cullable phototrophs.
+    let n = cullable.len();
     for i in 0..to_remove {
         let j = rng.random_range(i..n);
-        roots.swap(i, j);
+        cullable.swap(i, j);
     }
-    for &entity in &roots[..to_remove] {
+    for &entity in &cullable[..to_remove] {
         commands.entity(entity).despawn();
     }
 
@@ -1541,18 +1402,16 @@ pub fn apply_max_phototrophs_cull(
     message.elapsed = 0.0;
 }
 
-/// Drives the orange notification: ticks the visibility timer on real
-/// time (so the message clears even while the simulation is paused),
-/// hides the Text node after `CULL_MSG_VISIBLE_SECS`, and refreshes the
-/// formatted string whenever `CullMessage` is freshly populated.
+/// Drives the orange notification: ticks visibility on real time (so it
+/// clears even while paused), hides the node after `CULL_MSG_VISIBLE_SECS`,
+/// and reformats the string when `CullMessage` is freshly populated.
 pub fn update_cull_message(
     real_time:    Res<Time>,
     mut message:  ResMut<CullMessage>,
     mut node_q:   Query<&mut Node, With<CullMessageText>>,
     mut text_q:   Query<&mut Text, With<CullMessageText>>,
 ) {
-    // Tick first so a brand-new message (elapsed = 0) gets shown this
-    // frame and the formatter below runs on the freshly-activated state.
+    // Tick first so a brand-new message (elapsed = 0) is shown this frame.
     let was_active = message.active;
     if message.active {
         message.elapsed += real_time.delta_secs();
@@ -1561,9 +1420,7 @@ pub fn update_cull_message(
         }
     }
 
-    // Update the Text content on activation transitions (or on first
-    // frame). The fixed wording matches the spec — only the count
-    // changes per event.
+    // Update the Text content on activation transitions / first frame.
     if message.is_changed() {
         for mut text in &mut text_q {
             text.0.clear();
@@ -1575,8 +1432,8 @@ pub fn update_cull_message(
         }
     }
 
-    // Show / hide the Text node. Only touch Display when it would
-    // actually change, to avoid bumping change-detection downstream.
+    // Show / hide the node; only touch Display on actual change to avoid
+    // bumping downstream change-detection.
     let want = if message.active { Display::Flex } else { Display::None };
     let need_node_update = message.is_changed() || (was_active && !message.active);
     if need_node_update {
@@ -1634,11 +1491,8 @@ pub fn update_ai_training_checkbox_mark(
 
 // ── Max-Herbivores integer-input field ─────────────────────────────────────
 //
-// Click-to-edit, digits-only, Enter commits and Escape cancels —
-// the same pattern used by the Max-Organisms field. Differs in two
-// places: (a) no upper clamp (the field gates reproduction, not the
-// GPU brain-pool batch dim), and (b) the committed value lands in
-// `MaxHerbivores` instead of `MaxPhotoautotrophs`.
+// Same widget as Max-Organisms, but commits into `MaxHerbivores` (gates
+// reproduction, no GPU batch dim) and is never upper-clamped.
 
 pub fn handle_max_herbivores_input(
     mouse:         Res<ButtonInput<MouseButton>>,
@@ -1732,17 +1586,14 @@ pub fn update_max_herbivores_text(
 
 // ── Export Simulation Dataset button ────────────────────────────────────────
 
-/// Idle / hover backgrounds for the Export-Dataset button. Kept local
-/// to the handler since they're only referenced here.
+/// Idle / hover backgrounds for the Export-Dataset button.
 const EXPORT_BUTTON_BG_IDLE:  Color = Color::srgb(0.22, 0.46, 0.46);
 const EXPORT_BUTTON_BG_HOVER: Color = Color::srgb(0.30, 0.30, 0.30);
 
-/// Click handler for the Export-Dataset button. Mirrors
-/// `handle_save_button`: on `Pressed`, pauses the simulation, opens a
-/// blocking native save dialog (rfd), and writes the chosen path into
-/// `ExportDatasetRequested` so `dataset_export::export_dataset_system`
-/// performs the actual CSV write on the next Update tick. Cancel
-/// leaves the sim paused but does no write.
+/// Click handler for the Export-Dataset button. Like `handle_save_button`:
+/// pauses the sim, opens a blocking rfd dialog, and writes the path into
+/// `ExportDatasetRequested` for `dataset_export::export_dataset_system` to
+/// write the CSV next tick. Cancel = no write, sim stays paused.
 pub fn handle_export_dataset_button(
     mut interactions: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<ExportDatasetButton>)>,
     mut sim_running:  ResMut<SimulationRunning>,

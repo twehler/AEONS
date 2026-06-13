@@ -1,38 +1,41 @@
 // Editor → .colony writer.
 //
-// We re-implement the v007 layout (described in `colony.rs`'s save
-// header comment) here so the editor stays self-contained — we
-// can't call into `save_colony_system` because that wants live
-// `Organism` components and brain pools, neither of which exist in
-// the editor. brain_present is always 0; the loader will assign
-// default brain weights to every organism. Likewise the v007 limb-
-// brain block is always emitted as kind=0 — the matching limb pool's
-// `assign_brains_*_limb` system will install fresh-init weights for
-// each loaded organism's slot on the next PreUpdate.
+// Re-implements the layout from `colony.rs`'s save header (must stay
+// byte-compatible) so the editor stays self-contained — it can't call
+// `save_colony_system`, which needs live `Organism` + brain pools. Both
+// the sliding-brain and limb-brain blocks are emitted as "absent"; the
+// loader's `assign_brains_*` systems install fresh weights on load.
 
 use std::io::Write;
 
 use bevy::prelude::*;
 
 use crate::cell::{BodyPartKind, CellType};
-use crate::organism::{IntelligenceLevel, Symmetry};
+use crate::organism::{IntelligenceLevel, MovementMode, Symmetry};
 use crate::colony_editor::template::{Metabolism, OrganismTemplate};
 use crate::energy::MAX_ENERGY_PER_CELL;
 
 
-const SAVE_MAGIC: &[u8; 8] = b"AEONS008";
+const SAVE_MAGIC: &[u8; 8] = b"AEONS010";
 
 
-/// Write every organism in `templates` to `path` in the v008 .colony
-/// format. The file is overwritten on each call.
-pub fn write_colony(path: &str, templates: &[OrganismTemplate]) -> std::io::Result<()> {
+/// Write every organism in `templates` to `path` in the v010 .colony
+/// format. The file is overwritten on each call. Must stay byte-identical
+/// to `colony_save_load::save_colony_system`'s header + per-organism layout.
+/// `water_level` is the global water surface Y stored in the v009+ header.
+pub fn write_colony(
+    path: &str,
+    templates: &[OrganismTemplate],
+    water_level: f32,
+) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     buf.extend_from_slice(SAVE_MAGIC);
-    // v008 time notation (hours, minutes, seconds). An editor-authored
-    // colony has no elapsed virtual time, so it resumes at t=0.
+    // Elapsed time (h, m, s) — editor-authored colonies resume at t=0.
     put_u32(&mut buf, 0);
     put_u32(&mut buf, 0);
     put_u32(&mut buf, 0);
+    // v009 global water level — after the time block, before the count.
+    put_f32(&mut buf, water_level);
     put_u32(&mut buf, templates.len() as u32);
 
     for tpl in templates {
@@ -46,21 +49,16 @@ pub fn write_colony(path: &str, templates: &[OrganismTemplate]) -> std::io::Resu
 }
 
 
-/// One body part as it will appear in the saved record. Mirrors the
-/// runtime `BodyPart` shape closely enough to feed the v007 writer
-/// without dragging in `Cell` / `BodyPart` allocation paths.
+/// One body part as written to disk, without dragging in `Cell`/`BodyPart`
+/// allocation paths.
 struct WireBodyPart {
     kind:         BodyPartKind,
-    /// `None` for the root body; `Some((parent_idx, origin_local))`
-    /// for appendages. The runtime stores a `rotation` too but the
-    /// editor always serialises identity.
+    /// `None` for root; `Some((parent_idx, origin_local))` for appendages.
+    /// Rotation is always serialised as identity.
     attachment:   Option<(u32, Vec3)>,
-    /// Cell `local_pos` values — for Limb parts these are rebased
-    /// relative to the pivot (first cell); for non-Limb parts they
-    /// equal the raw OCG positions.
+    /// Cell `local_pos` (rebased to the first-cell pivot for Limb parts).
     cells:        Vec<(Vec3, CellType)>,
-    /// OCG list as written to disk. Same rebasing as `cells` for
-    /// Limb parts.
+    /// OCG list (same rebasing as `cells` for Limb parts).
     ocg:          Vec<(usize, Vec3, CellType)>,
 }
 
@@ -75,7 +73,8 @@ fn root_part(ocg: &[(usize, Vec3, CellType)]) -> WireBodyPart {
 
 fn appendage_part(ocg: &[(usize, Vec3, CellType)], is_limb: bool, parent_idx: u32) -> WireBodyPart {
     if is_limb {
-        // Rebase to first-cell pivot — mirrors `placement::limb_body_part`.
+        // Rebase to first-cell pivot — mirrors `placement::limb_body_part`
+        // so saves round-trip pixel-for-pixel.
         let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
         let shifted: Vec<(usize, Vec3, CellType)> = ocg.iter()
             .map(|(i, p, ct)| (*i, *p - pivot, *ct))
@@ -107,13 +106,11 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
     put_vec3(buf, tpl.position);
     put_quat(buf, Quat::IDENTITY);
 
-    // ── build the full body-part list (root + appendages, with
-    //    bilateral mirroring) — same shape `placement::spawn_real_organism`
-    //    constructs at runtime so saves round-trip pixel-for-pixel.
+    // Build root + appendages (with bilateral mirroring) and the same
+    // editor→runtime parent mapping as `placement::spawn_real_organism`,
+    // so saved attachment indices match what spawn builds.
     let root_ocg = tpl.build_ocg();
     let mut parts: Vec<WireBodyPart> = vec![root_part(&root_ocg)];
-    // Same editor→runtime parent mapping as `placement::spawn_real_organism`
-    // so the saved attachment indices match what spawn builds.
     match tpl.symmetry {
         Symmetry::NoSymmetry => {
             for (app_raw, is_limb, parent) in &tpl.custom_appendages {
@@ -144,7 +141,8 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
         for (_, ct) in &p.cells {
             match ct {
                 CellType::Photo                            => photo_cells     += 1,
-                CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => non_photo_cells += 1,
+                CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb
+                | CellType::YellowCell | CellType::OrangeCell | CellType::BrownCell => non_photo_cells += 1,
             }
         }
     }
@@ -169,12 +167,17 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
     });
     put_u8 (buf, tpl.is_sessile() as u8);
     put_u8 (buf, tpl.has_variable_form() as u8);
-    // v006 addition — movement paradigm. `true` = sliding (legacy),
-    // `false` = limb-based physics. Sourced from the species file via
-    // `OrganismTemplate::sliding_movement`.
-    put_u8 (buf, tpl.sliding_movement as u8);
-    // v002 addition — saved so loaded organisms keep their assigned
-    // intelligence level instead of being re-rolled.
+    // movement paradigm: v009 4-way tag (0=Sliding, 1=LimbBasedWalking,
+    // 2=Swimming, 3=Flying) — written directly from the template's MovementMode.
+    put_u8 (buf, match tpl.movement_mode {
+        MovementMode::Sliding          => 0,
+        MovementMode::LimbBasedWalking => 1,
+        MovementMode::Swimming         => 2,
+        MovementMode::Flying           => 3,
+    });
+    // v010: ground- vs water-based (floating phototrophs).
+    put_u8 (buf, tpl.ground_based as u8);
+    // intelligence level — saved so loaders don't re-roll it.
     put_u8 (buf, match tpl.intelligence {
         IntelligenceLevel::Level0 => 0,
         IntelligenceLevel::Level1 => 1,
@@ -206,9 +209,8 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
         }
 
         // ── cells ───────────────────────────────────────────────────
-        // `neighbour_count = 0` is a placeholder; the loader calls
-        // `physiology::recompute_body_parts` after rehydration which
-        // rebuilds the correct count from cell positions.
+        // `neighbour_count = 0` placeholder; the loader recomputes it
+        // via `physiology::recompute_body_parts` after rehydration.
         put_u32(buf, part.cells.len() as u32);
         for (pos, ct) in &part.cells {
             put_vec3(buf, *pos);
@@ -217,6 +219,9 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
                 CellType::NonPhoto    => 1,
                 CellType::Placeholder => 2,
                 CellType::SubLimb     => 3,
+                CellType::YellowCell  => 4,
+                CellType::OrangeCell  => 5,
+                CellType::BrownCell   => 6,
             });
             put_f32(buf, 1.0);       // cell_energy — DEFAULT_CELL_ENERGY
             put_u8 (buf, 0);         // neighbour_count — recomputed at load
@@ -232,20 +237,17 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
                 CellType::NonPhoto    => 1,
                 CellType::Placeholder => 2,
                 CellType::SubLimb     => 3,
+                CellType::YellowCell  => 4,
+                CellType::OrangeCell  => 5,
+                CellType::BrownCell   => 6,
             });
         }
     }
 
-    // ── v005 sliding brain section ──────────────────────────────────
-    // No payload — `assign_brains_herbivore_1` installs fresh weights
-    // on the next PreUpdate when it sees `Added<Heterotroph>` without
-    // a `BrainRestore` component.
+    // sliding-brain section: 0 = no payload (loader installs fresh weights).
     put_u8(buf, 0);
 
-    // ── v007 limb-brain section ─────────────────────────────────────
-    // Kind tag 0 = none. The matching limb pool's `assign_brains_*_limb`
-    // will install fresh-init weights for the loaded organism's slot
-    // on the next PreUpdate, same as for any newly-spawned limb organism.
+    // limb-brain section: kind tag 0 = none (loader installs fresh weights).
     put_u8(buf, 0);
 }
 

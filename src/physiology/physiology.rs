@@ -1,23 +1,14 @@
-// Physiology — global cell-level rules.
+// Physiology — cell-level rules, vs. the organism-level bookkeeping in `energy.rs`.
 //
-// `PhysiologyPlugin` is the home for rules that act on individual cells
-// (`Cell::cell_energy`, `Cell::neighbour_count`, `PhotosyntheticCell`), as
-// opposed to the organism-level bookkeeping in `energy.rs`. The split is
-// deliberate:
+//   * `energy.rs`: whole-organism reservoirs, metabolism, movement/climb costs,
+//     starvation despawn.
+//   * `physiology.rs`: per-cell `cell_energy` and (for photos) cached
+//     `PhotosyntheticCell`; the per-tick system credits each organism with the
+//     sum of its photo cells' cached `energy_production`.
 //
-//   * `energy.rs` runs at the whole-organism level: organism reservoirs,
-//     metabolism, movement / climbing costs, starvation despawn.
-//
-//   * `physiology.rs` runs at the cell level: each `Cell` carries its own
-//     `cell_energy` and (for photos) a cached `PhotosyntheticCell`. The
-//     plugin's per-tick system credits the organism with the sum of every
-//     photo cell's cached `energy_production`.
-//
-// Cell-level data that depends on cell composition (neighbour counts,
-// photosynthesis caches) is recomputed only when cells are added or
-// removed — never per tick. `recompute_body_parts` is the single entry
-// point spawn / reproduction / krishi callers use to bring those caches
-// in sync with the cell list they just built.
+// Composition-dependent cell data (neighbour counts, photo caches) is recomputed
+// only on add/remove, never per tick. `recompute_body_parts` is the single
+// entry point spawn/reproduction/krishi callers use to resync those caches.
 
 use bevy::prelude::*;
 
@@ -30,12 +21,10 @@ use crate::energy::PHOTO_PRODUCTION_PER_CELL;
 
 use crate::simulation_settings::PHYSIOLOGY_TICK_INTERVAL;
 
-/// Distance² window for two cells (in the same body part's local frame) to
-/// count as RD lattice neighbours. Axis-aligned RD adjacency lands at
-/// distance 4/√3 ≈ 2.309 (d² ≈ 5.33); FCC face-diagonal adjacency lands at
-/// (4/√3) · √0.5 ≈ 1.633 (d² ≈ 2.67). The lower bound (0.1) excludes the
-/// cell from being its own neighbour; the upper bound (6.0) sits safely
-/// above the axis-aligned d² with a small slack for float drift.
+/// Distance² window (same body part's local frame) for RD lattice neighbours.
+/// Axis-aligned RD adjacency d² ≈ 5.33 (dist 4/√3); FCC face-diagonal d² ≈ 2.67.
+/// Lower bound 0.1 excludes self; upper bound 6.0 sits just above the axis-aligned
+/// d² with float-drift slack.
 const NEIGHBOUR_DSQ_MIN: f32 = 0.1;
 const NEIGHBOUR_DSQ_MAX: f32 = 6.0;
 
@@ -70,11 +59,9 @@ impl Plugin for PhysiologyPlugin {
 
 // ── Public construction-time helpers ─────────────────────────────────────────
 
-/// Recompute neighbour counts and `PhotosyntheticCell` caches for every cell
-/// in every body part of `body_parts`. Call this once after assembling a
-/// cell list — at spawn, after appending a mutated cell, after building a
-/// branch — and the per-tick physiology system is then O(photo cells)
-/// instead of O(all cells × all cells).
+/// Recompute neighbour counts and `PhotosyntheticCell` caches for every cell in
+/// every body part. Call once after assembling a cell list (spawn, mutation,
+/// branch) so the per-tick system stays O(photo cells), not O(cells²).
 pub fn recompute_body_parts(body_parts: &mut [BodyPart]) {
     for bp in body_parts.iter_mut() {
         recompute_body_part(bp);
@@ -83,8 +70,7 @@ pub fn recompute_body_parts(body_parts: &mut [BodyPart]) {
 
 /// Single-body-part variant — useful when only one part has changed.
 pub fn recompute_body_part(bp: &mut BodyPart) {
-    // Snapshot positions so the inner loop reads from a stable slice while
-    // we mutate cells one by one.
+    // Snapshot positions so the inner loop reads a stable slice while mutating cells.
     let positions: Vec<Vec3> = bp.cells.iter().map(|c| c.local_pos).collect();
 
     for (i, cell) in bp.cells.iter_mut().enumerate() {
@@ -92,7 +78,8 @@ pub fn recompute_body_part(bp: &mut BodyPart) {
         cell.neighbour_count = n;
         cell.photo = match cell.cell_type {
             CellType::Photo                            => Some(PhotosyntheticCell::new(n, PHOTO_PRODUCTION_PER_CELL)),
-            CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => None,
+            CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb
+            | CellType::YellowCell | CellType::OrangeCell | CellType::BrownCell => None,
         };
     }
 }
@@ -117,14 +104,9 @@ fn count_rd_neighbours(positions: &[Vec3], me: usize) -> u8 {
 
 // ── Per-tick system ──────────────────────────────────────────────────────────
 
-/// Credit each photoautotroph with the sum of every alive photo cell's
-/// cached `PhotosyntheticCell::energy_production` per tick. Heterotrophs
-/// (and any organism with `photo_cell_count == 0`) are skipped at the
-/// cached-counter check — no inner-loop cost paid for them.
-///
-/// Energy is clamped to the organism's max storage (cell-count × per-cell
-/// capacity) by `energy.rs` on its next tick, so we don't bother clamping
-/// here.
+/// Credit each photoautotroph with the sum of its alive photo cells' cached
+/// `energy_production` per tick. Organisms with `photo_cell_count == 0` are
+/// skipped before the inner loop. `energy.rs` clamps to max storage next tick.
 fn photosynthesise(
     time:        Res<Time>,
     mut timer:   ResMut<PhysiologyTimer>,
@@ -145,9 +127,8 @@ fn photosynthesise(
             }
         }
 
-        // Shadowed photo cells produce half their nominal energy.
-        // `Organism::in_sunlight` is maintained by
-        // `photosynthesis::update_sunlight` in PreUpdate.
+        // Shadowed cells produce half. `in_sunlight` is set by
+        // photosynthesis::update_sunlight in PreUpdate.
         if !organism.in_sunlight {
             produced *= 0.5;
         }

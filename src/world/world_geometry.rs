@@ -1,32 +1,21 @@
 // World geometry: load the simulation world from a Blender-exported `.glb`.
 //
-// The world is a single (or multi-mesh) glTF asset. At load time we:
-//   1. Spawn the scene as a `SceneRoot` so it renders.
-//   2. Walk the glTF node hierarchy and accumulate per-node transforms,
-//      collecting every mesh primitive's triangles in *world space*.
-//   3. Build two collision resources from those triangles:
-//        - `HeightmapSampler`  — a 2D per-XZ-cell height grid for the fast
-//          common case (floor placement, spawning, flood ground checks).
-//        - `WorldMesh`         — the raw triangle list plus a uniform XZ
-//          spatial grid for triangle-vs-AABB queries used by wall collision.
+// At load: spawn the scene as a `SceneRoot`, walk the glTF node hierarchy
+// accumulating transforms to collect every mesh primitive's triangles in world
+// space, then build two collision resources:
+//   - `HeightmapSampler` — 2D per-XZ-cell height grid (fast common case).
+//   - `WorldMesh`        — raw triangles + XZ spatial grid for tri-vs-AABB
+//     wall-collision queries.
 //
-// Coordinate convention: glTF / Bevy are Y-up, right-handed. Blender's GLTF
-// exporter handles the Z-up → Y-up conversion automatically.
+// Coordinates: glTF/Bevy are Y-up right-handed; Blender's exporter does the
+// Z-up → Y-up conversion. `world_path` is relative to the asset root; a leading
+// `assets/` segment is stripped.
 //
-// Path resolution: `world_path` is relative to Bevy's asset root (`assets/`).
-// A leading `assets/` segment is stripped so users can pass either form.
-//
-// Normalisation: every loaded world is uniformly scaled and translated so
-// that (a) its X extent is at least `MAP_MAX_X` and its Z extent is at least
-// `MAP_MAX_Z`, and (b) the resulting AABB sits in strictly non-negative
-// coordinates with its min corner at the origin. Both the collision data
-// and the visual `SceneRoot` receive the same Transform, so the rendered
-// world and the collision triangles stay in lockstep.
-//
-// Why both axes: `colony.rs` and `reproduction.rs` spawn organisms uniformly
-// in `[0, MAP_MAX_X] x [0, MAP_MAX_Z]`. If only one axis met the bound the
-// other could place organisms off-mesh, where `apply_world_bounds` would
-// clamp them to the world edge each frame.
+// Normalisation: uniformly scale+translate so X extent ≥ map_size.x, Z extent ≥
+// map_size.z, and the AABB min corner sits at the origin (no negative coords).
+// The same Transform is applied to collision data and the visual SceneRoot so
+// they stay in lockstep. Both axes are enforced because organisms spawn
+// uniformly in `[0, x] x [0, z]`; an unmet axis would place them off-mesh.
 
 use bevy::prelude::*;
 use bevy::gltf::{Gltf, GltfMesh, GltfNode};
@@ -38,24 +27,19 @@ use std::collections::{HashMap, HashSet};
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 
-/// XZ resolution of the heightmap grid in world units. Larger values trade
-/// terrain-following precision for memory + cache locality. At 4.0 a 2048²
-/// world produces a 512² grid (~1 MB) that fits comfortably in L3, vs the
-/// 16 MB array a 1.0 cell size would require.
+/// XZ resolution of the heightmap grid (world units). Larger = less
+/// terrain-following precision but smaller/cache-friendlier grid (at 4.0 a
+/// 2048² world is ~1 MB vs 16 MB at 1.0).
 pub const HEIGHTMAP_CELL_SIZE: f32 = 4.0;
 
 /// Bucket edge length (world units) of the XZ spatial grid used to accelerate
 /// triangle queries. Smaller = fewer triangles per query but more memory.
 const TRIANGLE_GRID_BUCKET: f32 = 4.0;
 
-/// Per-axis minimum world extent enforced at load time, and the spawn-area
-/// upper bound used by `colony.rs`, `reproduction.rs`, the IL1 photo
-/// brain, and the colony editor. After normalisation the world is
-/// guaranteed to span at least `[0, MapSize::x] x [0, MapSize::z]`.
-///
-/// Runtime resource (was a `pub const` pair). Inserted by `main.rs`
-/// from the launcher's two map-size input fields, defaulted to 2048²
-/// when no launcher value is provided.
+/// Per-axis minimum world extent enforced at load, and the spawn-area upper
+/// bound used by `colony.rs`, `reproduction.rs`, the IL1 photo brain, and the
+/// colony editor. Post-normalisation the world spans at least
+/// `[0, x] x [0, z]`. Inserted by `main.rs` (launcher fields; default 2048²).
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct MapSize {
     pub x: f32,
@@ -100,10 +84,8 @@ struct PendingWorld {
 
 // ── HeightmapSampler ────────────────────────────────────────────────────────
 //
-// One Y sample per integer XZ cell of the world's bounding box. Built by
-// rasterising every triangle into the grid: each cell stores the maximum
-// Y of any triangle that overlaps it (so overhangs collapse to the upper
-// surface — the common-case behaviour for terrain organisms walk on).
+// One Y sample per integer XZ cell. Each cell stores the max Y of any
+// overlapping triangle, so overhangs collapse to the upper walkable surface.
 
 #[derive(Resource)]
 pub struct HeightmapSampler {
@@ -128,9 +110,8 @@ impl HeightmapSampler {
 
 // ── WorldMesh ───────────────────────────────────────────────────────────────
 //
-// Triangle soup of the loaded world plus a uniform XZ spatial grid that maps
-// each bucket to the indices of triangles whose XZ bounding box overlaps it.
-// Used for wall / overhang queries that the heightmap alone can't answer.
+// Triangle soup + uniform XZ spatial grid (bucket → indices of triangles whose
+// XZ bbox overlaps it). Answers wall/overhang queries the heightmap can't.
 
 #[derive(Resource)]
 pub struct WorldMesh {
@@ -148,10 +129,8 @@ impl WorldMesh {
         out.clear();
         let (kx0, kz0) = Self::key(min.x, min.z, self.bucket);
         let (kx1, kz1) = Self::key(max.x, max.z, self.bucket);
-        // Single-bucket fast path: the AABB fits entirely in one grid cell,
-        // so no duplicate triangle indices are possible — sort/dedup are
-        // wasted work. Most cell-vs-world tests at our scales hit this
-        // path because cells are ~1 unit wide and buckets are 4 units.
+        // Single-bucket fast path: AABB fits one cell, so no duplicate indices
+        // and sort/dedup can be skipped. Common case (~1u cells, 4u buckets).
         if kx0 == kx1 && kz0 == kz1 {
             if let Some(idxs) = self.grid.get(&(kx0, kz0)) {
                 out.extend_from_slice(idxs);
@@ -169,11 +148,9 @@ impl WorldMesh {
         out.dedup();
     }
 
-    /// True if any triangle of the world intersects the axis-aligned box
-    /// `[min, max]`. Uses the spatial grid as a broad phase, then a full
-    /// triangle-vs-AABB SAT test (Akenine-Möller). Caller passes a scratch
-    /// `Vec<u32>` (typically a `Local<Vec<u32>>` in a Bevy system) so the
-    /// hot wall-collision path doesn't allocate per call.
+    /// True if any world triangle intersects the AABB `[min, max]`. Spatial-grid
+    /// broad phase + Akenine-Möller SAT test. Caller passes a scratch `Vec<u32>`
+    /// so the hot wall-collision path doesn't allocate per call.
     pub fn aabb_intersects_with(&self, min: Vec3, max: Vec3, scratch: &mut Vec<u32>) -> bool {
         self.collect_nearby(min, max, scratch);
         for &ti in scratch.iter() {
@@ -246,22 +223,17 @@ fn finish_load_world(
     }
     let Some(gltf) = assets_gltf.get(&pending.handle) else { return };
 
-    // Wait until every transitively referenced GltfNode + GltfMesh + Mesh is
-    // present in its asset storage. Bevy's loader normally populates these by
-    // the time `is_loaded()` returns true, but the readiness check is cheap
-    // insurance against a partial frame where a primitive's Mesh handle has
-    // not been inserted yet — bail out and retry next tick.
+    // Gate on every referenced GltfNode/GltfMesh/Mesh being in asset storage;
+    // cheap insurance against a partial frame, retry next tick. (Async world load.)
     if !nodes_ready(gltf, &assets_node, &assets_gltf_mesh, &assets_mesh) {
         return;
     }
 
-    // From here on we commit. Setting `done` first ensures we never spawn
-    // the scene twice if something below early-returns or an exception path
-    // is added in the future.
+    // Commit. Set `done` first so we never spawn the scene twice on any
+    // future early-return below.
     pending.done = true;
 
-    // 1. Walk the node hierarchy with accumulated transforms and collect
-    //    raw world-space triangles (in the glb's own coordinate frame).
+    // 1. Walk the node hierarchy, collecting raw triangles (glb's frame).
     let mut triangles: Vec<[Vec3; 3]> = Vec::new();
     let roots = identify_roots(gltf, &assets_node);
     for root in &roots {
@@ -282,10 +254,8 @@ fn finish_load_world(
         );
     }
 
-    // 2. Compute the uniform scale + translation that pushes the world into
-    //    `[0, *) ^ 3` and forces both XZ extents to meet the map minimums.
-    //    Applied in-place to every triangle and forwarded to the SceneRoot
-    //    so visuals match the collision geometry exactly.
+    // 2. Normalisation scale+translation (into `[0, *)^3`, both XZ extents at
+    //    minimum). Applied in-place to triangles and forwarded to the SceneRoot.
     let (scale, translation) = compute_normalisation(&triangles, *map_size);
     if scale != 1.0 || translation != Vec3::ZERO {
         for tri in triangles.iter_mut() {
@@ -295,8 +265,8 @@ fn finish_load_world(
         }
     }
 
-    // 3. Spawn the visual scene with the normalisation Transform attached.
-    //    Prefer the file's default scene; otherwise fall back to the first.
+    // 3. Spawn the visual scene with the normalisation Transform.
+    //    Prefer the file's default scene, else the first.
     if let Some(scene_handle) = gltf.default_scene.as_ref().or_else(|| gltf.scenes.first()) {
         commands.spawn((
             SceneRoot(scene_handle.clone()),
@@ -367,25 +337,18 @@ fn compute_normalisation(triangles: &[[Vec3; 3]], map_size: MapSize) -> (f32, Ve
 
 // ── glTF traversal helpers ──────────────────────────────────────────────────
 
-/// Normalise a user-supplied world path into something Bevy's `AssetServer`
-/// can resolve (it expects paths relative to `assets/`). Handles three input
-/// shapes:
-///
-///   * `world.glb` / `./world.glb`            → unchanged
-///   * `assets/world.glb` / `assets\world.glb` → strips the leading `assets`
-///     segment
-///   * absolute paths like `/home/u/repo/assets/world.glb` (produced by the
-///     launcher's "Open…" file dialog) → returns the suffix after the LAST
-///     `assets/` (or `assets\`) segment
-///
-/// The launcher's file dialog returns absolute paths; without the third
-/// branch the AssetServer silently fails to load and the world never spawns.
+/// Normalise a world path to one Bevy's `AssetServer` can resolve (relative to
+/// `assets/`):
+///   * `world.glb` / `./world.glb`              → unchanged
+///   * `assets/world.glb` / `assets\world.glb`  → strip leading `assets`
+///   * absolute path (launcher "Open…" dialog)  → suffix after LAST `assets/`
+/// The third branch is required: dialog paths are absolute, and without it the
+/// AssetServer silently fails and the world never spawns.
 fn strip_assets_prefix(p: &str) -> String {
     let trimmed = p.trim_start_matches("./");
     if let Some(rest) = trimmed.strip_prefix("assets/")  { return rest.to_string(); }
     if let Some(rest) = trimmed.strip_prefix("assets\\") { return rest.to_string(); }
-    // Absolute or otherwise-prefixed path that still contains an `assets`
-    // directory somewhere — take everything after the LAST occurrence.
+    // Otherwise: take everything after the LAST `assets` segment.
     if let Some(idx) = trimmed.rfind("/assets/") {
         return trimmed[idx + "/assets/".len()..].to_string();
     }
@@ -414,8 +377,7 @@ fn nodes_ready(
 }
 
 fn identify_roots(gltf: &Gltf, assets_node: &Assets<GltfNode>) -> Vec<Handle<GltfNode>> {
-    // A "root" is any node not referenced as a child of another node. This
-    // works regardless of whether the file declared a default scene.
+    // A root is any node not referenced as a child; works without a default scene.
     let mut child_ids: HashSet<AssetId<GltfNode>> = HashSet::new();
     for nh in &gltf.nodes {
         if let Some(n) = assets_node.get(nh) {
@@ -457,10 +419,8 @@ fn walk_node(
 
 fn extract_triangles(mesh: &Mesh, global: &GlobalTransform, out: &mut Vec<[Vec3; 3]>) {
     if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
-        // Strips/fans/lines/points contribute no collision geometry. Skipping
-        // them silently is preferable to a hard error — Blender's exporter
-        // can still emit auxiliary primitives (e.g. wireframe overlays) that
-        // we do not want to treat as terrain.
+        // Skip non-triangle primitives silently — exporters emit auxiliary
+        // primitives (e.g. wireframe overlays) that aren't terrain.
         return;
     }
 
@@ -533,8 +493,7 @@ fn build_heightmap(triangles: &[[Vec3; 3]]) -> HeightmapSampler {
     let width = ((max_x - min_x) as u32).max(1);
     let depth = ((max_z - min_z) as u32).max(1);
 
-    // Initialise to NEG_INFINITY so any sample wins on first write; cells
-    // that get no triangle coverage are flattened to 0.0 at the end.
+    // NEG_INFINITY so any sample wins on first write; uncovered cells → 0.0 at end.
     let mut heights = vec![f32::NEG_INFINITY; (width * depth) as usize];
 
     let stamp = |heights: &mut Vec<f32>, xi: i32, zi: i32, y: f32| {
@@ -546,8 +505,8 @@ fn build_heightmap(triangles: &[[Vec3; 3]]) -> HeightmapSampler {
     for tri in triangles {
         let v0 = tri[0]; let v1 = tri[1]; let v2 = tri[2];
 
-        // 1. Always stamp the three vertex cells. Handles thin/oblique
-        //    triangles whose interiors miss every cell center.
+        // 1. Stamp the three vertex cells — handles thin/oblique triangles
+        //    whose interiors miss every cell center.
         for v in [v0, v1, v2] {
             stamp(&mut heights, (v.x / cell).floor() as i32 - min_x,
                                 (v.z / cell).floor() as i32 - min_z, v.y);
@@ -591,9 +550,8 @@ fn tri_xz_height_at(v0: Vec3, v1: Vec3, v2: Vec3, px: f32, pz: f32) -> Option<f3
     let a = ((v1.z - v2.z) * (px - v2.x) + (v2.x - v1.x) * (pz - v2.z)) / den;
     let b = ((v2.z - v0.z) * (px - v2.x) + (v0.x - v2.x) * (pz - v2.z)) / den;
     let c = 1.0 - a - b;
-    // Allow a small epsilon so triangle edges hit consistently from both
-    // sides — without this, the rasteriser drops thin slivers of cells that
-    // straddle a shared edge.
+    // Epsilon so shared edges hit consistently from both sides (else thin
+    // slivers of straddling cells are dropped).
     let e = 1e-4;
     if a < -e || b < -e || c < -e { return None; }
     Some(a * v0.y + b * v1.y + c * v2.y)

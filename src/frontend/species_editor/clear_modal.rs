@@ -1,28 +1,10 @@
 // Species editor — Clear/New button + unsaved-changes confirmation modal.
 //
-// Layout:
-//   * A floating "Clear/New" button anchored to the bottom-right of
-//     the editor's viewport area, just above the bottom panel. Same
-//     visibility lifecycle as the other species-editor panels (toggled
-//     via the `SpeciesEditorPanel` marker in
-//     `frontend::apply_mode_transition`).
-//   * A full-screen modal that only spawns when
-//     `SpeciesSession::show_clear_modal == true`. Two buttons, "No"
-//     highlighted as the default (brighter green + 2-px outline) and
-//     "Yes" muted-red as the destructive option. Same convention as
-//     `colony_editor::clear_modal`.
-//
-// Flow:
-//   1. User clicks "Clear/New".
-//      * If `session.dirty == false` → reset session + despawn editor
-//        visuals immediately. No modal.
-//      * If `session.dirty == true`  → set `show_clear_modal = true`.
-//   2. Modal lifecycle system spawns the modal entity on the rising
-//      edge.
-//   3. Button handler:
-//      * Yes → reset the session, despawn editor visuals, drop the
-//        flag.
-//      * No  → just drop the flag.
+// Clicking Clear/New resets immediately when not dirty, else raises
+// `show_clear_modal`. The modal lifecycle system spawns/despawns the full-screen
+// modal on that flag; "Yes" resets + despawns visuals, "No" just drops the flag.
+// "No" is the highlighted default (safe option), matching
+// `colony_editor::clear_modal`.
 
 use bevy::prelude::*;
 
@@ -77,17 +59,15 @@ struct ClearModalYesButton;
 #[derive(Component)]
 struct ClearModalNoButton;
 
-// Mute the `PANEL_BG_COLOR` import — we want the bottom-right button
-// to sit on the viewport, not on a panel background. Imported only so
-// future styling can pick it up without re-plumbing.
+// Mute the unused `PANEL_BG_COLOR` import (button sits on the viewport, not a
+// panel background).
 const _: Color = PANEL_BG_COLOR;
 
 
 // ── Spawn the floating Clear/New button ─────────────────────────────────────
 
-/// Called from `mod.rs::spawn_overlay_panels`. Anchored to the bottom-
-/// right of the screen, sitting just above the bottom panel so it
-/// doesn't overlap the cell-type tiles.
+/// Anchored bottom-right, above the bottom panel so it doesn't overlap the
+/// cell-type tiles. Called from `mod.rs::spawn_overlay_panels`.
 pub fn spawn_clear_new_button(parent: &mut ChildSpawnerCommands) {
     parent
         .spawn((
@@ -151,10 +131,8 @@ fn handle_clear_new_button(
         match *interaction {
             Interaction::Pressed => {
                 if session.dirty {
-                    // Defer to the modal.
                     session.show_clear_modal = true;
                 } else {
-                    // Nothing to lose — clear immediately.
                     perform_clear(&mut session, &mut commands, &mesh_q, &preview_q, &axis_q);
                 }
                 *bg = BackgroundColor(CLEAR_BTN_HOVER);
@@ -231,8 +209,8 @@ fn spawn_modal(commands: &mut Commands) {
                         Pickable::IGNORE,
                     ));
 
-                    // Button row. "No" first (left, highlighted) so the
-                    // safe option is the visual default.
+                    // "No" first (left, highlighted) so the safe option is the
+                    // visual default.
                     card.spawn(Node {
                         flex_direction:  FlexDirection::Row,
                         justify_content: JustifyContent::Center,
@@ -332,9 +310,7 @@ fn handle_clear_modal_buttons(
 
 // ── Shared reset path ───────────────────────────────────────────────────────
 
-/// Reset the session and despawn the 3D entities the placement systems
-/// own. Once `session.ocg` is empty, `refresh_species_mesh` and friends
-/// won't re-spawn anything until the user spawns a new first cell.
+/// Reset the session and despawn the 3D entities the placement systems own.
 fn perform_clear(
     session:   &mut SpeciesSession,
     commands:  &mut Commands,

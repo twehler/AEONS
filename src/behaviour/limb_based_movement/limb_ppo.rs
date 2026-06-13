@@ -18,7 +18,7 @@
 // This file owns the network architecture and the math primitives
 // (forward, sampling, GAE, PPO loss). Per-level files in the same folder
 // wrap this engine in their own `Resource` / `Component` newtypes,
-// supply the enrolment filter (`IntelligenceLevel` + `!sliding_movement`
+// supply the enrolment filter (`IntelligenceLevel` + `!movement_mode.is_sliding()`
 // + carnivore-vs-herbivore split), and delegate assign / free / apply
 // to the shared helpers here.
 //
@@ -73,139 +73,93 @@ use crate::rl_helpers::{MyBackend, gaussian_noise};
 /// handed to the brain so a feedforward policy can phase-lock a sustained gait
 /// oscillation — the brain still generates every joint command itself (no CPG).
 ///
-/// `OUT = MAX_LIMB_JOINTS`: one target hinge angle per limb body part, so every
-/// joint (each hip AND knee, each Bilateral mirror half) is independently
-/// controlled and an alternating gait can EMERGE. `drive_limb_motors` maps
-/// `out[i-1] → body-part i`'s hinge motor target.
+/// `OUT = MAX_LIMB_JOINTS + N_LIMB_TWIST_GROUPS`: `out[0..MAX_LIMB_JOINTS]` are
+/// per-limb hinge SWING targets (`drive_limb_motors`); the last
+/// `N_LIMB_TWIST_GROUPS` outputs are GROUPED TWIST efforts about the limbs' long
+/// axes (`drive_limb_twist`, limb i → group `(i-1) % N`). So limbs move in 3D
+/// (swing + grouped twist), not just one fore/aft plane. Twist is grouped (few
+/// outputs) because per-limb twist doubled the action space and hurt locomotion
+/// learning. (The observation echoes only the SWING half of the previous action,
+/// so `IN` is unchanged — the brain re-observes actual 3D joint rotation via
+/// `joint_sincos`, which already captures twist.)
 pub const IN:     usize = 134;
 pub const HIDDEN: usize = 128;
-pub const OUT:    usize = 8;
-
-// `OUT` is the per-joint action dimension; it MUST equal `MAX_LIMB_JOINTS`
-// (the physics-side joint bound used by `drive_limb_motors`). A mismatch would
-// silently drop or wrap joint commands.
-const _: () = assert!(OUT == crate::simulation_settings::MAX_LIMB_JOINTS);
+pub const OUT:    usize = MAX_LIMB_JOINTS + N_LIMB_TWIST_GROUPS;
 
 pub use crate::simulation_settings::{
     ROLLOUT_LEN, PPO_EPOCHS, CLIP_EPS, GAMMA, LAMBDA, LR,
     VALUE_LOSS_COEF, ENTROPY_COEF, LOG_STD_INIT, GAIT_FREQUENCY_HZ,
+    MAX_LIMB_JOINTS, N_LIMB_TWIST_GROUPS,
 };
 
 // ── Reward shaping ──
 //
-// Sparse primary signals (event-driven, same shape as the sliding pools)
-// plus dense locomotion-intrinsic terms designed to AVOID the freeze
-// local optimum that the first reward draft fell into:
+// Sparse event signals (same shape as the sliding pools) plus dense
+// locomotion-intrinsic terms designed to avoid the freeze local optimum:
 //
-//   1. Forward velocity — `lin_vel_xz · heading_xz` (signed projection
-//      onto the body's facing direction). The bootstrap version of this
-//      term rewarded speed MAGNITUDE (`|lin_vel_xz|`, any direction) to
-//      get organisms moving at all when forward velocity was ~0 under
-//      random actions. That worked — but once they moved, magnitude
-//      rewarded spinning/circling just as much as directed travel, and
-//      the policy converged to a spin-drift local optimum. Projecting
-//      onto the heading pays only for travel in the facing direction:
-//      pure spin nets ~0, backward drift is mildly penalised. Combined
-//      with `K_HEADING` (turn to face prey) this composes into directed
-//      pursuit — face the target, then move forward.
+//   1. Forward velocity — `lin_vel_xz · heading_xz` (signed projection onto
+//      the body's facing direction). Pays only for travel in the facing
+//      direction: pure spin nets ~0, backward drift mildly penalised. With
+//      `K_HEADING` this composes into directed pursuit.
 //   2. Uprightness GATED on motion — `(rot · +Y).y * min(1, speed / IDLE_THRESH)`.
-//      Bare uprightness was paying the freeze policy a constant alive
-//      bonus. Gating it on motion means standing still upright scores 0;
-//      the term only kicks in once the organism is actually locomoting.
-//   3. Idle penalty — `−K_IDLE * max(0, 1 − speed / IDLE_THRESH)`.
-//      Standing still loses reward every tick. Pushes the policy
-//      gradient *out* of the freeze basin.
-//
-// Action smoothness (`K_SMOOTH`) was removed: it's the right tool to
-// clean up jitter once a gait exists, but during bootstrap it directly
-// rewards constant outputs, which is exactly the freeze policy.
+//      Standing still upright scores 0; the term only counts while locomoting.
+//   3. Idle penalty — `−K_IDLE * max(0, 1 − speed / IDLE_THRESH)`, pushing the
+//      gradient out of the freeze basin.
 pub use crate::simulation_settings::{
     K_EAT, K_REPRO, K_FWD, K_UP, K_IDLE, K_PROGRESS, K_HEADING, K_STEP,
-    IDLE_THRESH, K_MOVE, SPEED_REWARD_CAP, K_SPIN,
+    IDLE_THRESH, K_MOVE, SPEED_REWARD_CAP, K_SPIN, GROUND_GATE_MIN_FEET, K_VERT, K_AIR, K_TWIST,
+    K_BELLY,
+    // Standing task.
+    STANDING_TASK, K_STAND, STAND_HEIGHT_TARGET, STAND_MIN_FEET, K_TILT, K_DRIFT,
+    K_TORQUE_REG, K_ACTRATE, K_ALIVE, STAND_UPRIGHT_MIN,
 };
 
 
-// ── Networks ──────────────────────────────────────────────────────────────────
+// ── Networks (SHARED PER SPECIES: one net, no per-organism batch dim) ───────────
 
-/// Actor MLP — per-organism `IN → HIDDEN → OUT` returning `μ` for the
-/// diagonal-Gaussian policy. `log_std` lives on the pool (not inside
-/// the network module) so it can be sampled / mutated by the lifecycle
-/// systems without going through Burn's autodiff path.
+/// Actor MLP — a SINGLE shared `IN → HIDDEN → OUT` net (per species) returning
+/// `μ` for the diagonal-Gaussian policy (tanh-bounded). Weights are 2-D
+/// (`[IN, HIDDEN]`, `[HIDDEN, OUT]`) and biases / `log_std` are `[1, ·]` so a
+/// forward over a batch of `B` observations is a plain `[B, IN] · [IN, HIDDEN]`
+/// matmul with broadcast bias. The same `forward` serves both inference (one row
+/// per active organism of the species) and the PPO update (all pooled
+/// transitions of the species as one batch). `log_std` is trainable.
 #[derive(Module, Debug)]
 pub struct LimbActor<B: Backend> {
-    pub w1: Param<Tensor<B, 3>>,  // [N, IN, HIDDEN]
-    pub b1: Param<Tensor<B, 2>>,  // [N, HIDDEN]
-    pub w2: Param<Tensor<B, 3>>,  // [N, HIDDEN, OUT]
-    pub b2: Param<Tensor<B, 2>>,  // [N, OUT]
-    /// Per-organism `log_std` for each action dim. Trainable.
-    pub log_std: Param<Tensor<B, 2>>,  // [N, OUT]
+    pub w1: Param<Tensor<B, 2>>,  // [IN, HIDDEN]
+    pub b1: Param<Tensor<B, 2>>,  // [1, HIDDEN]
+    pub w2: Param<Tensor<B, 2>>,  // [HIDDEN, OUT]
+    pub b2: Param<Tensor<B, 2>>,  // [1, OUT]
+    /// Shared `log_std` for each action dim. Trainable.
+    pub log_std: Param<Tensor<B, 2>>,  // [1, OUT]
 }
 
 impl<B: Backend> LimbActor<B> {
-    /// Inference forward: `obs [N, IN] → μ [N, OUT]`. One batched matmul
-    /// per layer; every organism uses its own slice of the weight
-    /// tensors. Called once per brain tick to sample fresh actions.
+    /// Forward: `obs [B, IN] → μ [B, OUT]` (shared weights, broadcast bias).
+    /// Bound the policy mean to [-1, 1] so `limb_targets` can't run away during
+    /// training. The PD controller in `rapier_setup` then scales this into a
+    /// target joint angle.
     pub fn forward(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
-        // [N, IN] → [N, 1, IN]
-        let x = obs.unsqueeze_dim::<3>(1);
-        // [N, 1, IN] · [N, IN, HIDDEN] → [N, 1, HIDDEN] → [N, HIDDEN]
-        let h = x.matmul(self.w1.val()).squeeze_dim::<2>(1) + self.b1.val();
-        let h = relu(h);
-        let h = h.unsqueeze_dim::<3>(1);
-        let mu = h.matmul(self.w2.val()).squeeze_dim::<2>(1) + self.b2.val();
-        // Bound the policy mean to [-1, 1] so `limb_targets` can't run
-        // away during training. The PD controller in `avian_setup` then
-        // scales this into a target joint angle.
-        tanh(mu)
-    }
-
-    /// Rollout forward: `states [N, T, IN] → μ [N, T, OUT]`. Called
-    /// inside the PPO train step to replay the buffered trajectories
-    /// through the (slightly newer) policy weights for the gradient
-    /// computation. Mirrors the sliding L3 brain's
-    /// `forward_rollout` pattern.
-    pub fn forward_rollout(&self, states: Tensor<B, 3>) -> Tensor<B, 3> {
-        // states: [N, T, IN] @ w1 [N, IN, HIDDEN] = [N, T, HIDDEN]
-        let h_pre = states.matmul(self.w1.val());
-        let b1_b  = self.b1.val().unsqueeze_dim::<3>(1);   // [N, 1, HIDDEN]
-        let h     = relu(h_pre + b1_b);
-        let mu_pre = h.matmul(self.w2.val());              // [N, T, OUT]
-        let b2_b   = self.b2.val().unsqueeze_dim::<3>(1);  // [N, 1, OUT]
-        // Match `forward`: tanh-bound μ so the rollout replay sees the
-        // same squashed distribution the sampler did. PPO ratio remains
-        // consistent across collection and update.
-        tanh(mu_pre + b2_b)
+        let h = relu(obs.matmul(self.w1.val()) + self.b1.val());  // [B,H] + [1,H]
+        tanh(h.matmul(self.w2.val()) + self.b2.val())             // [B,OUT] + [1,OUT]
     }
 }
 
-/// Critic MLP — per-organism `IN → HIDDEN → 1` returning `V(s)`.
+/// Critic MLP — a SINGLE shared `IN → HIDDEN → 1` net (per species) returning
+/// `V(s)`.
 #[derive(Module, Debug)]
 pub struct LimbCritic<B: Backend> {
-    pub w1: Param<Tensor<B, 3>>,  // [N, IN, HIDDEN]
-    pub b1: Param<Tensor<B, 2>>,  // [N, HIDDEN]
-    pub w2: Param<Tensor<B, 3>>,  // [N, HIDDEN, 1]
-    pub b2: Param<Tensor<B, 2>>,  // [N, 1]
+    pub w1: Param<Tensor<B, 2>>,  // [IN, HIDDEN]
+    pub b1: Param<Tensor<B, 2>>,  // [1, HIDDEN]
+    pub w2: Param<Tensor<B, 2>>,  // [HIDDEN, 1]
+    pub b2: Param<Tensor<B, 2>>,  // [1, 1]
 }
 
 impl<B: Backend> LimbCritic<B> {
-    /// Inference forward: `obs [N, IN] → V [N, 1]`.
+    /// Forward: `obs [B, IN] → V [B, 1]`.
     pub fn forward(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
-        let x = obs.unsqueeze_dim::<3>(1);
-        let h = x.matmul(self.w1.val()).squeeze_dim::<2>(1) + self.b1.val();
-        let h = relu(h);
-        let h = h.unsqueeze_dim::<3>(1);
-        let v = h.matmul(self.w2.val()).squeeze_dim::<2>(1) + self.b2.val();
-        v
-    }
-
-    /// Rollout forward: `states [N, T, IN] → V [N, T, 1]`.
-    pub fn forward_rollout(&self, states: Tensor<B, 3>) -> Tensor<B, 3> {
-        let h_pre = states.matmul(self.w1.val());
-        let b1_b  = self.b1.val().unsqueeze_dim::<3>(1);
-        let h     = relu(h_pre + b1_b);
-        let v_pre = h.matmul(self.w2.val());
-        let b2_b  = self.b2.val().unsqueeze_dim::<3>(1);
-        v_pre + b2_b
+        let h = relu(obs.matmul(self.w1.val()) + self.b1.val());  // [B,H] + [1,H]
+        h.matmul(self.w2.val()) + self.b2.val()                   // [B,1] + [1,1]
     }
 }
 
@@ -305,6 +259,11 @@ pub struct LimbObsInputs {
     /// (or the prey is directly underfoot). Used by the reward shaper
     /// to credit the body for turning its heading toward the target.
     pub nearest_prey_dir_xz: Option<Vec2>,
+    /// Base body's clearance above the terrain (`base_pos.y − heightmap`), the
+    /// height signal for the STANDING reward's tall-posture term. `f32::MAX` (a
+    /// huge sentinel) when no heightmap is available, so the height factor reads
+    /// as "fully tall" and the term is inert rather than zeroing the reward.
+    pub base_clearance: f32,
 }
 
 // Manual `Default` (the derive only supports arrays up to length 32, and
@@ -323,6 +282,7 @@ impl Default for LimbObsInputs {
             base_lin_vel:        Vec3::ZERO,
             nearest_prey_dist:   None,
             nearest_prey_dir_xz: None,
+            base_clearance:      f32::MAX,
         }
     }
 }
@@ -357,7 +317,7 @@ pub fn build_observation(
     obs[97..109].copy_from_slice(&physics.base_pose_vel);   // 6 sincos + 3 angvel + 3 linvel
     obs[109..112].copy_from_slice(&physics.base_up);        // up-vector
     obs[112..121].copy_from_slice(&physics.limb_contact);   // base + 8 limbs
-    obs[121..129].copy_from_slice(prev_action);             // OUT = 8
+    obs[121..129].copy_from_slice(&prev_action[0..MAX_LIMB_JOINTS]); // SWING half only (keeps IN=134)
 
     // Nearest-prey bearing in BODY-LOCAL frame (obs[129..132]):
     // (dir_x, dir_z, dist_norm). The stored direction is world-frame;
@@ -375,7 +335,7 @@ pub fn build_observation(
             // `world_model::encode_neighbours_body_local`.
             obs[129] = dir_world.x * cos_h - dir_world.y * sin_h;
             obs[130] = dir_world.x * sin_h + dir_world.y * cos_h;
-            obs[131] = (dist / crate::world_model::WORLD_MODEL_RADIUS).clamp(0.0, 1.0);
+            obs[131] = (dist / crate::simulation_settings::PREY_SCAN_RADIUS).clamp(0.0, 1.0);
         }
         _ => {
             obs[129] = 0.0;
@@ -418,24 +378,25 @@ pub fn gather_limb_obs_inputs(
     body_parts:  &bevy::ecs::system::Query<(
         &bevy::prelude::ChildOf,
         &crate::cell::BodyPartIndex,
-        &avian3d::prelude::Position,
-        &avian3d::prelude::Rotation,
-        &avian3d::prelude::AngularVelocity,
-        &avian3d::prelude::LinearVelocity,
-        Option<&crate::avian_setup::LimbContact>,
+        &bevy::prelude::GlobalTransform,
+        &bevy_rapier3d::prelude::Velocity,
+        Option<&crate::rapier_setup::LimbContact>,
     )>,
     world_grid:  &crate::world_model::WorldModelGrid,
+    heightmap:   Option<&crate::world_geometry::HeightmapSampler>,
 ) -> HashMap<Entity, LimbObsInputs> {
     let mut out: HashMap<Entity, LimbObsInputs> = HashMap::new();
     let mut base_rot: HashMap<Entity, Quat>     = HashMap::new();
     let mut base_pos: HashMap<Entity, Vec3>     = HashMap::new();
 
     // Pass 1: base bodies — record base pose+vel + base contact + cache
-    // rotation/position for the limb pass.
-    for (child_of, idx, pos, rot, ang_vel, lin_vel, contact) in body_parts.iter() {
+    // rotation/position for the limb pass. Pose comes from the world-space
+    // `GlobalTransform`; world-frame velocity from Rapier's `Velocity`.
+    for (child_of, idx, gt, vel, contact) in body_parts.iter() {
         if idx.0 != 0 { continue; }
         let root = child_of.parent();
-        let (rx, ry, rz) = rot.0.to_euler(bevy::math::EulerRot::XYZ);
+        let rot = gt.rotation();
+        let (rx, ry, rz) = rot.to_euler(bevy::math::EulerRot::XYZ);
         let entry = out.entry(root).or_default();
         // Orientation as sin/cos pairs (continuous across the ±π wrap).
         entry.base_pose_vel[0]  = rx.sin();
@@ -444,32 +405,32 @@ pub fn gather_limb_obs_inputs(
         entry.base_pose_vel[3]  = ry.cos();
         entry.base_pose_vel[4]  = rz.sin();
         entry.base_pose_vel[5]  = rz.cos();
-        entry.base_pose_vel[6]  = ang_vel.0.x;
-        entry.base_pose_vel[7]  = ang_vel.0.y;
-        entry.base_pose_vel[8]  = ang_vel.0.z;
-        entry.base_pose_vel[9]  = lin_vel.0.x;
-        entry.base_pose_vel[10] = lin_vel.0.y;
-        entry.base_pose_vel[11] = lin_vel.0.z;
+        entry.base_pose_vel[6]  = vel.angular.x;
+        entry.base_pose_vel[7]  = vel.angular.y;
+        entry.base_pose_vel[8]  = vel.angular.z;
+        entry.base_pose_vel[9]  = vel.linear.x;
+        entry.base_pose_vel[10] = vel.linear.y;
+        entry.base_pose_vel[11] = vel.linear.z;
         // Up-vector: where the body's +Y points in world frame.
-        let up = rot.0 * Vec3::Y;
+        let up = rot * Vec3::Y;
         entry.base_up = [up.x, up.y, up.z];
         entry.limb_contact[0] = if contact.is_some_and(|c| c.in_contact) { 1.0 } else { 0.0 };
-        entry.base_rot     = rot.0;
-        entry.base_lin_vel = lin_vel.0;
-        base_rot.insert(root, rot.0);
-        base_pos.insert(root, pos.0);
+        entry.base_rot     = rot;
+        entry.base_lin_vel = vel.linear;
+        base_rot.insert(root, rot);
+        base_pos.insert(root, gt.translation());
     }
 
     // Pass 2: limbs (idx 1..=MAX_LIMB_JOINTS). Each limb body part fills its
     // OWN joint slot (joint = idx-1), measured relative to the base rotation.
     // No pair/half collapsing — every joint is observed and controlled
     // independently, so an alternating gait can emerge.
-    for (child_of, idx, _pos, rot, ang_vel, _lin_vel, contact) in body_parts.iter() {
-        if idx.0 == 0 || idx.0 > OUT { continue; }
+    for (child_of, idx, gt, vel, contact) in body_parts.iter() {
+        if idx.0 == 0 || idx.0 > MAX_LIMB_JOINTS { continue; }
         let root = child_of.parent();
         let Some(base_r) = base_rot.get(&root) else { continue };
         let j = idx.0 - 1;   // 0-based joint slot
-        let rel = base_r.inverse() * rot.0;
+        let rel = base_r.inverse() * gt.rotation();
         let (ex, ey, ez) = rel.to_euler(bevy::math::EulerRot::XYZ);
         let entry = out.entry(root).or_default();
         let base = j * 6;
@@ -480,9 +441,9 @@ pub fn gather_limb_obs_inputs(
         entry.joint_sincos[base + 4] = ez.sin();
         entry.joint_sincos[base + 5] = ez.cos();
         let av_base = j * 3;
-        entry.joint_angvel[av_base    ] = ang_vel.0.x;
-        entry.joint_angvel[av_base + 1] = ang_vel.0.y;
-        entry.joint_angvel[av_base + 2] = ang_vel.0.z;
+        entry.joint_angvel[av_base    ] = vel.angular.x;
+        entry.joint_angvel[av_base + 1] = vel.angular.y;
+        entry.joint_angvel[av_base + 2] = vel.angular.z;
         // Contact slot: base is 0, limb idx maps to slot idx (1..=8).
         entry.limb_contact[idx.0] = if contact.is_some_and(|c| c.in_contact) { 1.0 } else { 0.0 };
     }
@@ -494,6 +455,10 @@ pub fn gather_limb_obs_inputs(
     // the reward shaper (progress toward food).
     for (root, entry) in out.iter_mut() {
         if let Some(pos) = base_pos.get(root) {
+            // Base clearance above terrain → the STANDING height-target signal.
+            if let Some(hm) = heightmap {
+                entry.base_clearance = pos.y - hm.height_at(pos.x, pos.z);
+            }
             let neighbours = crate::world_model::collect_neighbours(world_grid, *pos);
             crate::world_model::encode_neighbours_body_local(
                 &neighbours, entry.base_rot, &mut entry.world_model,
@@ -575,37 +540,89 @@ impl LimbPoolSnapshot {
 }
 
 impl BrainPoolLimb {
-    /// Pull every weight tensor off the GPU into one shared snapshot.
-    /// One sync per tensor; the per-organism `extract` step is pure CPU
-    /// indexing.
+    /// Pull every per-species weight tensor off the GPU and FAN them OUT into a
+    /// per-SLOT flat snapshot: for each occupied slot, that slot's CURRENT
+    /// species' net weights are written into the slot's row of the flat buffers.
+    /// This keeps the snapshot's flat layout (`[n * IN * HIDDEN]` etc., indexed
+    /// by slot) identical to the old per-organism pool, so the dataset exporter
+    /// (which slot-indexes `actor_log_std`) and `extract(entity)` (which slices
+    /// the entity's slot row) both work unchanged. Unoccupied slots stay zero
+    /// (never read). One GPU→CPU sync per tensor per live species.
     pub fn snapshot(&self) -> LimbPoolSnapshot {
-        LimbPoolSnapshot {
-            actor_w1:      self.actor.w1.val().clone().into_data().into_vec::<f32>().expect("actor.w1"),
-            actor_b1:      self.actor.b1.val().clone().into_data().into_vec::<f32>().expect("actor.b1"),
-            actor_w2:      self.actor.w2.val().clone().into_data().into_vec::<f32>().expect("actor.w2"),
-            actor_b2:      self.actor.b2.val().clone().into_data().into_vec::<f32>().expect("actor.b2"),
-            actor_log_std: self.actor.log_std.val().clone().into_data().into_vec::<f32>().expect("actor.log_std"),
-            critic_w1:     self.critic.w1.val().clone().into_data().into_vec::<f32>().expect("critic.w1"),
-            critic_b1:     self.critic.b1.val().clone().into_data().into_vec::<f32>().expect("critic.b1"),
-            critic_w2:     self.critic.w2.val().clone().into_data().into_vec::<f32>().expect("critic.w2"),
-            critic_b2:     self.critic.b2.val().clone().into_data().into_vec::<f32>().expect("critic.b2"),
+        let n = self.n;
+        let mut snap = LimbPoolSnapshot {
+            actor_w1:      vec![0.0; n * IN * HIDDEN],
+            actor_b1:      vec![0.0; n * HIDDEN],
+            actor_w2:      vec![0.0; n * HIDDEN * OUT],
+            actor_b2:      vec![0.0; n * OUT],
+            actor_log_std: vec![0.0; n * OUT],
+            critic_w1:     vec![0.0; n * IN * HIDDEN],
+            critic_b1:     vec![0.0; n * HIDDEN],
+            critic_w2:     vec![0.0; n * HIDDEN],
+            critic_b2:     vec![0.0; n],
             map:           self.map.clone(),
+        };
+        // Build entity→slot reverse lookup grouped by species via slot_species:
+        // for each occupied slot, write its species' flat weights into that row.
+        // Pull each species' tensors to CPU once, then scatter to all its slots.
+        let mut cache: HashMap<u32, BrainRestoreLimb> = HashMap::new();
+        for (_e, &slot) in self.map.iter() {
+            let s = slot as usize;
+            if s >= n { continue; }
+            let key = self.slot_species[s];
+            let flat = cache.entry(key).or_insert_with(|| {
+                let brain = self.species.get(&key);
+                match brain {
+                    Some(b) => BrainRestoreLimb {
+                        actor_w1:      b.actor.w1.val().clone().into_data().into_vec::<f32>().expect("actor.w1"),
+                        actor_b1:      b.actor.b1.val().clone().into_data().into_vec::<f32>().expect("actor.b1"),
+                        actor_w2:      b.actor.w2.val().clone().into_data().into_vec::<f32>().expect("actor.w2"),
+                        actor_b2:      b.actor.b2.val().clone().into_data().into_vec::<f32>().expect("actor.b2"),
+                        actor_log_std: b.actor.log_std.val().clone().into_data().into_vec::<f32>().expect("actor.log_std"),
+                        critic_w1:     b.critic.w1.val().clone().into_data().into_vec::<f32>().expect("critic.w1"),
+                        critic_b1:     b.critic.b1.val().clone().into_data().into_vec::<f32>().expect("critic.b1"),
+                        critic_w2:     b.critic.w2.val().clone().into_data().into_vec::<f32>().expect("critic.w2"),
+                        critic_b2:     b.critic.b2.val().clone().into_data().into_vec::<f32>().expect("critic.b2"),
+                    },
+                    // No net for this species yet (slot enrolled but never
+                    // applied): leave zeros (a future load degrades to fresh init).
+                    None => BrainRestoreLimb {
+                        actor_w1:      vec![0.0; IN * HIDDEN],
+                        actor_b1:      vec![0.0; HIDDEN],
+                        actor_w2:      vec![0.0; HIDDEN * OUT],
+                        actor_b2:      vec![0.0; OUT],
+                        actor_log_std: vec![0.0; OUT],
+                        critic_w1:     vec![0.0; IN * HIDDEN],
+                        critic_b1:     vec![0.0; HIDDEN],
+                        critic_w2:     vec![0.0; HIDDEN],
+                        critic_b2:     vec![0.0; 1],
+                    },
+                }
+            });
+            snap.actor_w1     [s * IN * HIDDEN .. (s + 1) * IN * HIDDEN].copy_from_slice(&flat.actor_w1);
+            snap.actor_b1     [s * HIDDEN      .. (s + 1) * HIDDEN]     .copy_from_slice(&flat.actor_b1);
+            snap.actor_w2     [s * HIDDEN * OUT .. (s + 1) * HIDDEN * OUT].copy_from_slice(&flat.actor_w2);
+            snap.actor_b2     [s * OUT         .. (s + 1) * OUT]        .copy_from_slice(&flat.actor_b2);
+            snap.actor_log_std[s * OUT         .. (s + 1) * OUT]        .copy_from_slice(&flat.actor_log_std);
+            snap.critic_w1    [s * IN * HIDDEN .. (s + 1) * IN * HIDDEN].copy_from_slice(&flat.critic_w1);
+            snap.critic_b1    [s * HIDDEN      .. (s + 1) * HIDDEN]     .copy_from_slice(&flat.critic_b1);
+            snap.critic_w2    [s * HIDDEN      .. (s + 1) * HIDDEN]     .copy_from_slice(&flat.critic_w2);
+            snap.critic_b2    [s ..= s]                                 .copy_from_slice(&flat.critic_b2);
         }
+        snap
     }
 
-    /// Write a single slot's weights into the (batched) Param tensors.
-    /// Called by `assign_brains_*_limb` when the new entity carries a
-    /// `BrainRestoreLimb` payload.
-    pub fn restore_slot(&mut self, slot: u32, r: &BrainRestoreLimb) {
-        use burn::tensor::Tensor;
-        // Architecture guard. A saved payload's tensor lengths must
-        // match the CURRENT IN/HIDDEN/OUT or `TensorData::new` below
-        // would panic on the shape/length mismatch. When they don't
-        // match (e.g. a save from before IN was bumped 61 → 64), skip
-        // restoration entirely and leave the slot's fresh-init weights
-        // — the organism trains from scratch rather than crashing the
-        // run. Only `actor_w1` / `critic_w1` depend on IN, so checking
-        // every tensor's expected length covers all dimension changes.
+    /// Overwrite a SPECIES' shared net from saved flat weights (one 2-D net's
+    /// flat layout — same as `BrainRestoreLimb`). Called by `assign_brains_*_limb`
+    /// when a loaded organism of species `key` carries a `BrainRestoreLimb`
+    /// payload. Shape-validated: on a length mismatch (e.g. a save from before
+    /// IN was bumped) the saved payload is rejected and the species is left to
+    /// lazily warm-start a fresh net — degrade, don't panic. Idempotent per save:
+    /// the first loaded member of a species writes the net; later members hit the
+    /// same (now-correct) weights and overwrite identically.
+    pub fn restore_species(&mut self, key: u32, r: &BrainRestoreLimb) {
+        // Architecture guard. Lengths must match the CURRENT IN/HIDDEN/OUT or
+        // `TensorData::new` below would panic on the shape/length mismatch.
         let shapes_ok = r.actor_w1.len()      == IN * HIDDEN
             && r.actor_b1.len()      == HIDDEN
             && r.actor_w2.len()      == HIDDEN * OUT
@@ -618,92 +635,32 @@ impl BrainPoolLimb {
         if !shapes_ok {
             warn!(
                 "limb brain restore skipped: payload shapes don't match current \
-                 architecture (IN={IN}, HIDDEN={HIDDEN}, OUT={OUT}); slot keeps \
-                 fresh-init weights"
+                 architecture (IN={IN}, HIDDEN={HIDDEN}, OUT={OUT}); species {key} \
+                 keeps / lazily warm-starts fresh weights"
             );
+            // Make sure the species at least has a (warm-start) net to use.
+            self.ensure_species(key);
             return;
         }
-        let s = slot as usize;
-        let device = &self.device;
-        // Write each saved tensor into row `s` of the batched Param via
-        // `Param::map(|t| t.slice_assign(...))`. We must use `map` and
-        // NOT `Param::from_tensor(val().slice_assign(...))`: on the
-        // `Autodiff` backend the result of `slice_assign` is a NON-LEAF
-        // tensor (it's the output of an op), and `Param::from_tensor`
-        // requires a leaf — feeding it a non-leaf panics with
-        // "Can't convert a non leaf tensor into a tracked tensor"
-        // (the load-time crash this fixes). `Param::map` rebuilds the
-        // parameter as a proper trainable leaf. Mirrors the working
-        // pattern in the sliding pools' `restore_slot`.
-
-        // Actor weights.
-        let t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(r.actor_w1.clone(), [1, IN, HIDDEN]), device,
-        );
-        self.actor.w1 = self.actor.w1.clone().map(|x| x.slice_assign([s..s + 1, 0..IN, 0..HIDDEN], t));
-
-        let t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(r.actor_b1.clone(), [1, HIDDEN]), device,
-        );
-        self.actor.b1 = self.actor.b1.clone().map(|x| x.slice_assign([s..s + 1, 0..HIDDEN], t));
-
-        let t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(r.actor_w2.clone(), [1, HIDDEN, OUT]), device,
-        );
-        self.actor.w2 = self.actor.w2.clone().map(|x| x.slice_assign([s..s + 1, 0..HIDDEN, 0..OUT], t));
-
-        let t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(r.actor_b2.clone(), [1, OUT]), device,
-        );
-        self.actor.b2 = self.actor.b2.clone().map(|x| x.slice_assign([s..s + 1, 0..OUT], t));
-
-        let t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(r.actor_log_std.clone(), [1, OUT]), device,
-        );
-        self.actor.log_std = self.actor.log_std.clone().map(|x| x.slice_assign([s..s + 1, 0..OUT], t));
-
-        // Critic weights.
-        let t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(r.critic_w1.clone(), [1, IN, HIDDEN]), device,
-        );
-        self.critic.w1 = self.critic.w1.clone().map(|x| x.slice_assign([s..s + 1, 0..IN, 0..HIDDEN], t));
-
-        let t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(r.critic_b1.clone(), [1, HIDDEN]), device,
-        );
-        self.critic.b1 = self.critic.b1.clone().map(|x| x.slice_assign([s..s + 1, 0..HIDDEN], t));
-
-        let t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(r.critic_w2.clone(), [1, HIDDEN, 1]), device,
-        );
-        self.critic.w2 = self.critic.w2.clone().map(|x| x.slice_assign([s..s + 1, 0..HIDDEN, 0..1], t));
-
-        let t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(r.critic_b2.clone(), [1, 1]), device,
-        );
-        self.critic.b2 = self.critic.b2.clone().map(|x| x.slice_assign([s..s + 1, 0..1], t));
-    }
-
-    /// Copy slot `src`'s actor + critic weight rows into slot `dst` — a fresh
-    /// occupant INHERITS a trained brain ("instinct") instead of starting from
-    /// the untrained warm-start. Used by the `assign_*_limb` systems so a newly
-    /// spawned (or reproduced) limb organism joins an already-trained population
-    /// competent — without it, a freshly placed Crawler just collapses and does
-    /// nothing until it learns from scratch. GPU-side row copy, no CPU
-    /// round-trip. Mirrors the sliding pools' inheritance path.
-    pub fn inherit_slot(&mut self, dst: u32, src: u32) {
-        use burn::tensor::Tensor as _;
-        if dst == src { return; }
-        let (d, s) = (dst as usize, src as usize);
-        self.actor.w1 = self.actor.w1.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..IN, 0..HIDDEN]); t.slice_assign([d..d+1, 0..IN, 0..HIDDEN], r) });
-        self.actor.b1 = self.actor.b1.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..HIDDEN]);       t.slice_assign([d..d+1, 0..HIDDEN], r) });
-        self.actor.w2 = self.actor.w2.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..HIDDEN, 0..OUT]); t.slice_assign([d..d+1, 0..HIDDEN, 0..OUT], r) });
-        self.actor.b2 = self.actor.b2.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..OUT]);          t.slice_assign([d..d+1, 0..OUT], r) });
-        self.actor.log_std = self.actor.log_std.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..OUT]); t.slice_assign([d..d+1, 0..OUT], r) });
-        self.critic.w1 = self.critic.w1.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..IN, 0..HIDDEN]); t.slice_assign([d..d+1, 0..IN, 0..HIDDEN], r) });
-        self.critic.b1 = self.critic.b1.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..HIDDEN]);        t.slice_assign([d..d+1, 0..HIDDEN], r) });
-        self.critic.w2 = self.critic.w2.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..HIDDEN, 0..1]);   t.slice_assign([d..d+1, 0..HIDDEN, 0..1], r) });
-        self.critic.b2 = self.critic.b2.clone().map(|t| { let r = t.clone().slice([s..s+1, 0..1]);             t.slice_assign([d..d+1, 0..1], r) });
+        let device = self.device.clone();
+        let actor = LimbActor::<MyBackend> {
+            w1:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_w1.clone(),      [IN, HIDDEN]), &device)),
+            b1:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_b1.clone(),      [1, HIDDEN]),  &device)),
+            w2:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_w2.clone(),      [HIDDEN, OUT]), &device)),
+            b2:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_b2.clone(),      [1, OUT]),     &device)),
+            log_std: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_log_std.clone(), [1, OUT]),     &device)),
+        };
+        let critic = LimbCritic::<MyBackend> {
+            w1: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.critic_w1.clone(), [IN, HIDDEN]), &device)),
+            b1: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.critic_b1.clone(), [1, HIDDEN]),  &device)),
+            w2: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.critic_w2.clone(), [HIDDEN, 1]),  &device)),
+            b2: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.critic_b2.clone(), [1, 1]),       &device)),
+        };
+        let opt_actor:  Box<dyn BrainOptActor>  = Box::new(AdamConfig::new().init());
+        let opt_critic: Box<dyn BrainOptCritic> = Box::new(AdamConfig::new().init());
+        self.species.insert(key, SpeciesBrain {
+            actor, critic, opt_actor, opt_critic, training_step: 0,
+        });
     }
 }
 
@@ -815,15 +772,13 @@ impl<O: Optimizer<LimbCritic<MyBackend>, MyBackend>> BrainOptCritic for O {
 pub struct BrainPoolLimb {
     pub n:      usize,
     pub device: CudaDevice,
-    pub actor:  LimbActor<MyBackend>,
-    pub critic: LimbCritic<MyBackend>,
-    // Optimisers are intentionally NOT stored here in Phase 3. The
-    // sliding pools dispatch through a per-pool `BrainOpt*` trait
-    // object (`Box<dyn BrainOptL3>`) so the concrete `Optimizer`
-    // generics stay local to the train function. Phase 4 will do the
-    // same for the limb pools when wiring the PPO gradient code; for
-    // now the structure compiles with no optimiser state at all,
-    // since `train_one` is a stub.
+    /// Per-species shared nets. Every organism of a species uses AND trains its
+    /// species' net; different species hold different weights, so behaviour
+    /// diverges by species while same-species individuals act alike (momentary
+    /// variation comes only from each organism's own exploration noise). Keyed
+    /// by `Organism::species_id` (`UNCLASSIFIED` until first classification);
+    /// created lazily, warm-started with the oscillatory gait prior.
+    pub species: HashMap<u32, SpeciesBrain>,
     /// Per-slot rollout buffers (length ROLLOUT_LEN once full).
     pub rollouts: Vec<VecDeque<RolloutEntry>>,
     /// Slot indices currently free for new enrolments. Pop from the
@@ -857,10 +812,10 @@ pub struct BrainPoolLimb {
     /// previous apply tick. Diffed against the current flags to count
     /// stepping transitions for the `K_STEP` reward.
     pub prev_limb_contact: Vec<[f32; 9]>,
-    /// Adam optimiser for the actor's parameters.
-    pub opt_actor:  Box<dyn BrainOptActor>,
-    /// Adam optimiser for the critic's parameters.
-    pub opt_critic: Box<dyn BrainOptCritic>,
+    /// Per-slot species key as of the last apply tick. Lets `train` group slots
+    /// by species without an organism query (written in `apply_step`), and lets
+    /// `snapshot` resolve each slot's species net.
+    pub slot_species: Vec<u32>,
     /// Apply-tick counter since the last PPO update. When this hits
     /// `ROLLOUT_LEN` the pool's `train()` runs and the counter resets.
     pub ticks_since_train: usize,
@@ -894,111 +849,137 @@ pub struct LimbTrainingStep {
 /// Cap on the in-memory training-step ring buffer.
 pub const LIMB_TRAINING_HISTORY_CAP: usize = 1024;
 
-impl BrainPoolLimb {
-    /// Allocate a fresh pool with batch dim `n`. Biases zero; per-organism
-    /// `log_std` initialised to `LOG_STD_INIT`.
-    ///
-    /// Weights use **Xavier** init, NOT the sliding pools' flat `Uniform ±0.5`.
-    /// With `IN = 134` a flat `±0.5` makes the pre-tanh activation enormous
-    /// (~134 terms × 0.5) → the actor's `μ` SATURATES at ±1 from the very first
-    /// step → every joint target is pinned at ±`LIMB_SWING_LIMIT` against its
-    /// mechanical stop → the legs are FROZEN at their extremes and never
-    /// oscillate, so no stroke, no propulsion, nothing for RL to reward
-    /// (confirmed in data: body `base_ang_vel ≈ 0` despite σ=0.5 exploration —
-    /// the legs weren't even moving). Fan-in-scaled Xavier keeps the initial
-    /// output near 0 (legs near rest), so exploration noise actually moves the
-    /// limbs and the policy can discover propulsive strokes. (The small sliding
-    /// nets, `IN = 31`, didn't saturate at ±0.5, which is why they were fine.)
-    pub fn new(n: usize, device: CudaDevice) -> Self {
-        // ~1/sqrt(fan_in) for fan_in≈IN=134 → ±0.086. Small, fan-scaled, and
-        // predictable regardless of how Burn infers fan-in on the batched
-        // [N, IN, HIDDEN] weight. Keeps initial activations unit-scale so `μ`
-        // does NOT saturate.
-        let w = Initializer::Uniform { min: -0.086, max: 0.086 };
-        let z = Initializer::Zeros;
-        let log_std_init = Initializer::Constant { value: LOG_STD_INIT as f64 };
+/// Sentinel species key for organisms not yet classified by the speciation
+/// system (real `species_id`s start at 1). All unclassified limb organisms
+/// share this one transitional net until the ~1 Hz speciation tick assigns
+/// them; the next apply tick then re-points them at their real species' net
+/// automatically (the per-tick species lookup makes reclassification a no-op).
+pub const UNCLASSIFIED: u32 = 0;
 
-        // ── Actor OSCILLATORY WARM-START ───────────────────────────────────
-        // Pure per-tick Gaussian exploration almost never stumbles onto a
-        // COHERENT periodic propulsive stroke (data: legs jitter incoherently →
-        // net-zero force → body never moves → flat reward → no gait learned).
-        // So we INITIALISE the actor so the phase-clock input (obs[132]=sin,
-        // obs[133]=cos of the gait phase) drives each joint's target as
-        // `μ_k ≈ A·sin(phase + φ_k)` — i.e. the legs rhythmically stroke out of
-        // the box, with a per-joint phase offset so they don't all bounce in
-        // unison. This is a TRAINABLE init, NOT a CPG: the weights are ordinary
-        // policy parameters, so PPO is free to reshape, redirect, or abandon the
-        // oscillation as the reward dictates — locomotion is still learned and
-        // emergent, just bootstrapped near a rhythmic prior (standard practice
-        // for learned legged gaits). Mechanism: two hidden units are biased
-        // into relu's linear region (`b1 = WARMSTART_BIAS`) and fed only the
-        // sin/cos phase inputs (gain `WARMSTART_PHASE_GAIN`), so they carry
-        // `C ± g·sin` / `C ± g·cos`; the output layer recombines them as
-        // `A·sin(phase+φ_k)` via `cos(φ_k)·sin + sin(φ_k)·cos`, and `b2` cancels
-        // the resulting constant. Every other weight stays at the small random
-        // init so the rest of the policy (steering toward prey, posture, etc.)
-        // learns normally.
-        const WARMSTART_PHASE_GAIN: f32 = 2.0;  // g: sin/cos input → carrier hidden unit
-        const WARMSTART_BIAS:       f32 = 3.0;  // C: keeps carrier units in relu's linear region (C>g)
-        // a: output amplitude gain (final swing ≈ a·g·sin). Cut 0.25 → 0.10
-        // (2026-06-03) so the legs mostly HOLD a planted weight-bearing stance
-        // and only gently modulate — a ±37° swing was lifting the feet so far
-        // each cycle that the light body dropped onto its belly (unnatural,
-        // penetrating). A small swing keeps the feet planted (natural standing
-        // posture); the policy can grow the stride from there if rewarded.
-        const WARMSTART_AMP:        f32 = 0.25;
-        use rand::RngExt as _;
-        let mut rng = rand::rng();
-        let rand_small = |rng: &mut rand::rngs::ThreadRng| rng.random_range(-0.086_f32..0.086);
-        let phi = |k: usize| (k as f32) * std::f32::consts::FRAC_PI_2; // per-joint phase offset
+/// One species' shared actor + critic + their optimisers, plus that species'
+/// own PPO step counter. Created lazily by `new_species_brain` and warm-started
+/// with the oscillatory gait prior.
+pub struct SpeciesBrain {
+    pub actor:         LimbActor<MyBackend>,
+    pub critic:        LimbCritic<MyBackend>,
+    pub opt_actor:     Box<dyn BrainOptActor>,
+    pub opt_critic:    Box<dyn BrainOptCritic>,
+    pub training_step: u64,
+}
 
-        let mut w1v = vec![0.0_f32; n * IN * HIDDEN];
-        for v in w1v.iter_mut() { *v = rand_small(&mut rng); }
-        let mut b1v = vec![0.0_f32; n * HIDDEN];
-        let mut w2v = vec![0.0_f32; n * HIDDEN * OUT];
-        for v in w2v.iter_mut() { *v = rand_small(&mut rng); }
-        let mut b2v = vec![0.0_f32; n * OUT];
-        for nn in 0..n {
-            // Hidden units 0 (sin carrier) and 1 (cos carrier): clear their
-            // input columns, then feed ONLY the phase inputs.
-            for inp in 0..IN {
-                w1v[nn * IN * HIDDEN + inp * HIDDEN + 0] = 0.0;
-                w1v[nn * IN * HIDDEN + inp * HIDDEN + 1] = 0.0;
-            }
-            w1v[nn * IN * HIDDEN + 132 * HIDDEN + 0] = WARMSTART_PHASE_GAIN; // sin → h0
-            w1v[nn * IN * HIDDEN + 133 * HIDDEN + 1] = WARMSTART_PHASE_GAIN; // cos → h1
-            b1v[nn * HIDDEN + 0] = WARMSTART_BIAS;
-            b1v[nn * HIDDEN + 1] = WARMSTART_BIAS;
-            for k in 0..OUT {
-                let (s, c) = (phi(k).sin(), phi(k).cos());
-                w2v[nn * HIDDEN * OUT + 0 * OUT + k] = WARMSTART_AMP * c; // h0 (sin) → out
-                w2v[nn * HIDDEN * OUT + 1 * OUT + k] = WARMSTART_AMP * s; // h1 (cos) → out
-                b2v[nn * OUT + k] = -WARMSTART_BIAS * WARMSTART_AMP * (c + s); // cancel constant
-            }
+/// Build one freshly-initialised species brain. Biases zero; shared `log_std`
+/// initialised to `LOG_STD_INIT`.
+///
+/// Weights use fan-in-scaled (Xavier-style) init, NOT the sliding pools'
+/// flat `Uniform ±0.5`. With `IN = 134` a flat `±0.5` saturates the actor's
+/// tanh `μ` at ±1 from step one, pinning every joint at its mechanical stop
+/// (frozen legs, no propulsion to reward). Fan-in scaling keeps the initial
+/// output near 0 so exploration noise actually moves the limbs. The OSCILLATORY
+/// WARM-START is applied (unless STANDING_TASK): two hidden carrier units fed
+/// only the phase-clock inputs make each SWING output start as
+/// `A·sin(phase + φ_k)` — a TRAINABLE rhythmic prior, not a CPG. (Each new
+/// species gets its OWN warm-started prior.)
+pub fn new_species_brain(device: &CudaDevice) -> SpeciesBrain {
+    // ~1/sqrt(fan_in) for fan_in≈IN=134 → ±0.086. Keeps initial activations
+    // unit-scale so `μ` does NOT saturate.
+    let w = Initializer::Uniform { min: -0.086, max: 0.086 };
+    let z = Initializer::Zeros;
+    let log_std_init = Initializer::Constant { value: LOG_STD_INIT as f64 };
+
+    // ── Actor OSCILLATORY WARM-START ───────────────────────────────────
+    // Pure Gaussian exploration almost never stumbles onto a coherent
+    // periodic propulsive stroke, so the actor is initialised so the
+    // phase-clock inputs (obs[132]=sin, obs[133]=cos) drive each joint as
+    // `μ_k ≈ A·sin(phase + φ_k)`, with a per-joint phase offset. This is a
+    // TRAINABLE init, NOT a CPG: the weights are ordinary policy parameters
+    // PPO can reshape or abandon — locomotion stays learned, just
+    // bootstrapped near a rhythmic prior. Mechanism: two hidden units are
+    // biased into relu's linear region (`b1 = WARMSTART_BIAS`) and fed only
+    // the sin/cos phase inputs (gain `WARMSTART_PHASE_GAIN`), carrying
+    // `C ± g·sin` / `C ± g·cos`; the output layer recombines them as
+    // `A·sin(phase+φ_k)` and `b2` cancels the constant. Every other weight
+    // stays at the small random init.
+    const WARMSTART_PHASE_GAIN: f32 = 2.0;  // g: sin/cos input → carrier hidden unit
+    const WARMSTART_BIAS:       f32 = 3.0;  // C: keeps carrier units in relu's linear region (C>g)
+    // a: output amplitude gain (final swing ≈ a·g·sin). Kept small so the
+    // legs mostly hold a planted weight-bearing stance and only gently
+    // modulate; a larger swing lifts ALL feet together and seeds the
+    // ballistic hop on the light body. Lowered to keep more organisms out of
+    // that basin from step 0. The policy grows the stride from here if rewarded.
+    const WARMSTART_AMP:        f32 = 0.15;
+    use rand::RngExt as _;
+    let mut rng = rand::rng();
+    let rand_small = |rng: &mut rand::rngs::ThreadRng| rng.random_range(-0.086_f32..0.086);
+    let phi = |k: usize| (k as f32) * std::f32::consts::FRAC_PI_2; // per-joint phase offset
+
+    // Single shared net: w1 [IN,HIDDEN], w2 [HIDDEN,OUT] (no batch dim).
+    let mut w1v = vec![0.0_f32; IN * HIDDEN];
+    for v in w1v.iter_mut() { *v = rand_small(&mut rng); }
+    let mut b1v = vec![0.0_f32; HIDDEN];
+    let mut w2v = vec![0.0_f32; HIDDEN * OUT];
+    for v in w2v.iter_mut() { *v = rand_small(&mut rng); }
+    let mut b2v = vec![0.0_f32; OUT];
+    // The STANDING task wants a STILL stance, not a gait: skip the oscillatory
+    // warm-start so μ≈0 (legs hold near-neutral). Gentler initial dynamics →
+    // far less joint separation, and no rhythmic prior fighting a static stand.
+    if !STANDING_TASK {
+        // Hidden units 0 (sin carrier) and 1 (cos carrier): clear their
+        // input columns, then feed ONLY the phase inputs.
+        for inp in 0..IN {
+            w1v[inp * HIDDEN + 0] = 0.0;
+            w1v[inp * HIDDEN + 1] = 0.0;
         }
-        let actor = LimbActor::<MyBackend> {
-            w1:      Param::from_tensor(Tensor::<MyBackend, 3>::from_data(TensorData::new(w1v, [n, IN, HIDDEN]), &device)),
-            b1:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(b1v, [n, HIDDEN]),     &device)),
-            w2:      Param::from_tensor(Tensor::<MyBackend, 3>::from_data(TensorData::new(w2v, [n, HIDDEN, OUT]), &device)),
-            b2:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(b2v, [n, OUT]),        &device)),
-            log_std: log_std_init.init([n, OUT], &device),
-        };
-        let critic = LimbCritic::<MyBackend> {
-            w1: w.init([n, IN, HIDDEN], &device),
-            b1: z.init([n, HIDDEN],     &device),
-            w2: w.init([n, HIDDEN, 1],  &device),
-            b2: z.init([n, 1],          &device),
-        };
+        w1v[132 * HIDDEN + 0] = WARMSTART_PHASE_GAIN; // sin → h0
+        w1v[133 * HIDDEN + 1] = WARMSTART_PHASE_GAIN; // cos → h1
+        b1v[0] = WARMSTART_BIAS;
+        b1v[1] = WARMSTART_BIAS;
+        // Oscillatory warm-start applies to the SWING outputs only
+        // (0..MAX_LIMB_JOINTS). The TWIST outputs (MAX_LIMB_JOINTS..OUT) keep
+        // their small random init → twist starts near zero and is learned
+        // from scratch (no rhythmic prior imposed on the new DOF).
+        for k in 0..MAX_LIMB_JOINTS {
+            let (s, c) = (phi(k).sin(), phi(k).cos());
+            w2v[0 * OUT + k] = WARMSTART_AMP * c; // h0 (sin) → out
+            w2v[1 * OUT + k] = WARMSTART_AMP * s; // h1 (cos) → out
+            b2v[k] = -WARMSTART_BIAS * WARMSTART_AMP * (c + s); // cancel constant
+        }
+    }
+    // Uniform exploration σ for all outputs (swing + twist). Twist stays
+    // controllable by keeping `MAX_LIMB_TWIST_TORQUE` low (so noise can't
+    // fling the light body) rather than by suppressing twist exploration —
+    // a low twist-σ froze the twist outputs and made the `K_TWIST` opt-in
+    // cost unable to push gratuitous twist back down.
+    let actor = LimbActor::<MyBackend> {
+        w1:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(w1v, [IN, HIDDEN]), device)),
+        b1:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(b1v, [1, HIDDEN]),  device)),
+        w2:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(w2v, [HIDDEN, OUT]), device)),
+        b2:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(b2v, [1, OUT]),     device)),
+        log_std: log_std_init.init([1, OUT], device),
+    };
+    let critic = LimbCritic::<MyBackend> {
+        w1: w.init([IN, HIDDEN], device),
+        b1: z.init([1, HIDDEN],  device),
+        w2: w.init([HIDDEN, 1],  device),
+        b2: z.init([1, 1],       device),
+    };
+    let opt_actor:  Box<dyn BrainOptActor>  = Box::new(AdamConfig::new().init());
+    let opt_critic: Box<dyn BrainOptCritic> = Box::new(AdamConfig::new().init());
+    SpeciesBrain { actor, critic, opt_actor, opt_critic, training_step: 0 }
+}
+
+impl BrainPoolLimb {
+    /// Allocate the pool. `n` sizes the per-slot bookkeeping arrays (max
+    /// concurrent limb organisms). Per-species nets are NOT built here —
+    /// they're created lazily (warm-started) by `ensure_species` as species
+    /// appear, so the pool starts with no nets and grows one per live species.
+    pub fn new(n: usize, device: CudaDevice) -> Self {
         let mut rollouts = Vec::with_capacity(n);
         for _ in 0..n { rollouts.push(VecDeque::with_capacity(ROLLOUT_LEN)); }
         let free: Vec<u32> = (0..n as u32).rev().collect();
-        let opt_actor:  Box<dyn BrainOptActor>  = Box::new(AdamConfig::new().init());
-        let opt_critic: Box<dyn BrainOptCritic> = Box::new(AdamConfig::new().init());
         Self {
             n,
             device,
-            actor,
-            critic,
+            species: HashMap::new(),
             rollouts,
             free,
             map: HashMap::new(),
@@ -1008,12 +989,32 @@ impl BrainPoolLimb {
             prev_nearest_prey_dist: vec![None; n],
             prev_heading_alignment: vec![None; n],
             prev_limb_contact:      vec![[0.0; 9]; n],
-            opt_actor,
-            opt_critic,
+            slot_species:           vec![UNCLASSIFIED; n],
             ticks_since_train: 0,
             training_step: 0,
             training_history: VecDeque::with_capacity(LIMB_TRAINING_HISTORY_CAP),
         }
+    }
+
+    /// Lazily create a species' shared brain (warm-started gait prior) on first
+    /// sighting. Idempotent. New species fork off existing ones via the
+    /// speciation system; their net simply starts fresh from the prior.
+    pub fn ensure_species(&mut self, key: u32) {
+        if !self.species.contains_key(&key) {
+            let brain = new_species_brain(&self.device);
+            self.species.insert(key, brain);
+        }
+    }
+
+    /// Drop the shared nets of species with no enrolled member left (extinct or
+    /// fully reclassified away). Without this the per-species map — and its GPU
+    /// tensors + Adam state — grows unbounded over a long run, since `species_id`s
+    /// are monotonic and never reused. `UNCLASSIFIED` is always kept.
+    fn prune_species(&mut self) {
+        let mut live: std::collections::HashSet<u32> =
+            self.map.values().map(|&s| self.slot_species[s as usize]).collect();
+        live.insert(UNCLASSIFIED);
+        self.species.retain(|k, _| live.contains(k));
     }
 
     /// Read-only accessor for the dataset exporter.
@@ -1032,6 +1033,7 @@ impl BrainPoolLimb {
         self.prev_nearest_prey_dist[s as usize] = None;
         self.prev_heading_alignment[s as usize] = None;
         self.prev_limb_contact[s as usize] = [0.0; 9];
+        self.slot_species[s as usize] = UNCLASSIFIED;
         Some(s)
     }
 
@@ -1081,18 +1083,12 @@ impl BrainPoolLimb {
     /// Per-tick apply step shared by all three limb-based brain pools.
     ///
     /// For each `(entity, &mut Organism, slot_u32)` tuple:
-    ///   * Builds an observation vector (Phase 4 fills `energy_norm` +
-    ///     `prev_action`; the remaining 48 dims are placeholder zeros
-    ///     until physics observation wiring lands in a follow-up).
-    ///   * Runs ONE batched actor forward pass for every active slot.
-    ///   * Samples an action `μ + ε * exp(LOG_STD_INIT)` per slot,
-    ///     using `gaussian_noise` for `ε`.
+    ///   * Builds an observation vector.
+    ///   * Runs ONE batched actor + critic forward pass for every active slot.
+    ///   * Samples an action `μ + ε * exp(LOG_STD_INIT)` per slot.
     ///   * Writes the action to `Organism::limb_targets`.
-    ///   * Appends a `RolloutEntry` (reward = 0 placeholder; value = 0
-    ///     until the critic forward is wired).
-    ///   * When a slot's rollout reaches `ROLLOUT_LEN`, calls
-    ///     `train_one` (currently stubbed — see Phase 4-bis) and clears
-    ///     the buffer.
+    ///   * Appends a `RolloutEntry` (reward + critic value).
+    ///   * Triggers a batched `train` every `ROLLOUT_LEN` ticks.
     pub fn apply_step<'w, 's, S: Component + Copy + LimbSlot>(
         &mut self,
         mut organisms:     Query<(Entity, &mut Organism, &S)>,
@@ -1104,9 +1100,13 @@ impl BrainPoolLimb {
         // is invariant to TimeSpeed / frame rate, matching the brain cadence.
         let phase = virtual_time_secs * std::f32::consts::TAU * GAIT_FREQUENCY_HZ;
 
-        // ── 1. Collect active slots + observations. ─────────────────
+        // ── 1. Collect active slots + observations, grouped by SPECIES. Each
+        //       organism's CURRENT species (read fresh every tick, so a
+        //       reclassification by the speciation system needs no handling) is
+        //       recorded in `slot_species` for `train`/`snapshot`. ──
         let mut input_buf: Vec<f32> = vec![0.0; self.n * IN];
         let mut active: Vec<(Entity, u32)> = Vec::new();
+        let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
         let default_phys = LimbObsInputs::default();
         for (e, organism, slot) in organisms.iter() {
             let s = slot.slot() as usize;
@@ -1116,19 +1116,35 @@ impl BrainPoolLimb {
             let obs = build_observation(&organism, &prev_action, phys, phase);
             let base = s * IN;
             input_buf[base..base + IN].copy_from_slice(&obs);
+            let key = organism.species_id.unwrap_or(UNCLASSIFIED);
+            self.slot_species[s] = key;
+            groups.entry(key).or_default().push(s);
             active.push((e, slot.slot()));
         }
         if active.is_empty() { return; }
 
-        // ── 2. Batched actor + critic forward. ──────────────────────
-        let obs_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(input_buf.clone(), [self.n, IN]),
-            &self.device,
-        );
-        let mu_t  = self.actor.forward(obs_t.clone());
-        let v_t   = self.critic.forward(obs_t);
-        let mu_buf = mu_t.into_data().into_vec::<f32>().expect("actor forward");
-        let v_buf  = v_t.into_data().into_vec::<f32>().expect("critic forward");
+        // ── 2. One batched forward PER SPECIES through that species' shared net;
+        //       results scatter back into per-slot `mu_buf`/`v_buf` so the
+        //       sampling/reward loop below is identical to the single-net case. ──
+        let device = self.device.clone();
+        let mut mu_buf = vec![0.0_f32; self.n * OUT];
+        let mut v_buf  = vec![0.0_f32; self.n];
+        for (key, slots) in &groups {
+            self.ensure_species(*key);
+            let brain = self.species.get(key).expect("species ensured above");
+            let cnt = slots.len();
+            let mut rows = vec![0.0_f32; cnt * IN];
+            for (i, &s) in slots.iter().enumerate() {
+                rows[i * IN..i * IN + IN].copy_from_slice(&input_buf[s * IN..s * IN + IN]);
+            }
+            let obs_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(rows, [cnt, IN]), &device);
+            let mu = brain.actor.forward(obs_t.clone()).into_data().into_vec::<f32>().expect("limb actor forward");
+            let v  = brain.critic.forward(obs_t).into_data().into_vec::<f32>().expect("limb critic forward");
+            for (i, &s) in slots.iter().enumerate() {
+                mu_buf[s * OUT..s * OUT + OUT].copy_from_slice(&mu[i * OUT..i * OUT + OUT]);
+                v_buf[s] = v[i];
+            }
+        }
         let sigma  = (LOG_STD_INIT as f32).exp();
 
         // ── 3. Sample + apply per slot. ─────────────────────────────
@@ -1248,14 +1264,88 @@ impl BrainPoolLimb {
             // flight/spin degenerate the data showed (which otherwise wins
             // even capped, because it racks up raw speed).
             let upright_pos = uprightness.clamp(0.0, 1.0);
-            let dense_reward = K_MOVE     * speed.min(SPEED_REWARD_CAP) * upright_pos
-                             + K_FWD      * forward_speed
+            // Ground gate ∈ [0,1]: movement only counts as locomotion when feet
+            // are planted. A ballistic hop has high XZ speed while AIRBORNE (no
+            // feet down, planted_frac→0); without this gate it out-scores a
+            // grounded crawl on raw XZ speed, so the policy learns to hop
+            // (data: net travel coincided exactly with feet leaving the ground).
+            // Gating the speed terms pays only for translating WITH feet on the
+            // ground = walking. Morphology-general: counts whatever feet exist.
+            let planted_count: f32 = phys.limb_contact[1..].iter().sum();
+            let ground_gate = (planted_count / GROUND_GATE_MIN_FEET).clamp(0.0, 1.0);
+
+            // (Swimming organisms are NOT in the limb pools — they train in
+            // their own 3D pool, `swimming_movement/swim_ppo.rs`.)
+            let dense_reward = if STANDING_TASK {
+                // ── STANDING-UPRIGHT reward (dm_control "stand" + legged_gym
+                // + quadruped fall-recovery recipe). PRIMARY term is the
+                // MULTIPLICATIVE product tall × level × feet-planted, so the
+                // policy is paid only when the base is held HIGH (forcing
+                // knee/sub-limb extension — the whole-leg requirement), LEVEL,
+                // and supported on planted legs. Penalties kill the known
+                // failure modes; the gated alive bonus rewards holding it.
+
+                // Uprightness ∈ [0,1]: world-Y of the body's local +Y axis,
+                // remapped (1 = perfectly upright, 0.5 = on its side, 0 = inverted).
+                let upright01 = (0.5 * (1.0 + phys.base_up[1])).clamp(0.0, 1.0);
+                // Tall-posture factor ∈ [0,1]: linear ramp of base clearance toward
+                // the leg-length-scaled target (sentinel f32::MAX ⇒ 1, inert).
+                let tall = (phys.base_clearance / STAND_HEIGHT_TARGET).clamp(0.0, 1.0);
+                // Whole-leg support ∈ [0,1]: planted limb segments incl. sub-limbs.
+                let foot_support = (planted_count / STAND_MIN_FEET).clamp(0.0, 1.0);
+                // Primary: scores only when tall AND level AND supported.
+                let stand = tall * upright01 * foot_support;
+
+                // Action-rate smoothness (mean |Δaction| over swing joints) and a
+                // light torque/energy regulariser (mean squared swing action).
+                let prev_a = &self.prev_action[su];
+                let mut act_rate = 0.0f32;
+                let mut torque_reg = 0.0f32;
+                for k in 0..MAX_LIMB_JOINTS {
+                    act_rate   += (action[k] - prev_a[k]).abs();
+                    torque_reg += action[k] * action[k];
+                }
+                act_rate   /= MAX_LIMB_JOINTS as f32;
+                torque_reg /= MAX_LIMB_JOINTS as f32;
+
+                let belly = phys.limb_contact[0];
+                let alive = if upright01 > STAND_UPRIGHT_MIN && belly < 0.5 { 1.0 } else { 0.0 };
+
+                  K_STAND      * stand
+                - K_BELLY      * belly                          // guiderail: no base-floor contact
+                - K_TILT       * (1.0 - upright01)              // guiderail: penalise non-horizontal base
+                - K_VERT       * phys.base_lin_vel.y.abs()      // anti-bounce/hover
+                - K_SPIN       * base_ang_speed                 // anti-tumble/wobble
+                - K_DRIFT      * speed                          // a stand is quiet, not wandering
+                - K_TORQUE_REG * torque_reg                     // energy / anti-jamming
+                - K_ACTRATE    * act_rate                       // anti-trembling smoothness
+                + K_ALIVE      * alive                          // hold the upright stance
+            } else {
+                K_MOVE     * speed.min(SPEED_REWARD_CAP) * upright_pos * ground_gate
+                             + K_FWD      * forward_speed * ground_gate
                              + K_UP       * uprightness * motion_gate
                              - K_IDLE     * (1.0 - motion_gate)
                              + K_PROGRESS * progress
                              + K_HEADING  * heading_gain
                              + K_STEP     * step_events
-                             - K_SPIN     * base_ang_speed;
+                             - K_SPIN     * base_ang_speed
+                             - K_VERT     * phys.base_lin_vel.y.max(0.0)
+                             - K_AIR      * (1.0 - planted_count).max(0.0)
+                             // STAND, don't collapse: penalise the BASE (belly)
+                             // touching the ground. Belly-resting is otherwise
+                             // "free" so the policy never learns to hold the body
+                             // UP on its legs (the user saw dogs/runners collapse).
+                             // Composes with the airborne penalty + planted-feet
+                             // gate → optimum is "feet down, belly up" = walking.
+                             - K_BELLY    * phys.limb_contact[0]
+                             // Twist is OPT-IN: a mild cost on twist magnitude so the
+                             // brain only twists when it buys enough locomotion reward
+                             // to offset it (gratuitous twist destabilises the light
+                             // body). The twist DOF stays available; it just isn't free.
+                             - K_TWIST    * (action[MAX_LIMB_JOINTS..].iter()
+                                               .map(|t| t.abs()).sum::<f32>()
+                                               / N_LIMB_TWIST_GROUPS as f32)
+            };
 
             let reward = event_reward + dense_reward;
             self.prev_predations[su]    = organism.predations;
@@ -1280,11 +1370,9 @@ impl BrainPoolLimb {
             if buf.len() >= ROLLOUT_LEN { buf.pop_front(); }
             buf.push_back(entry);
 
-            // We DON'T train per-slot here; the global counter below
-            // triggers one batched train across every slot whose buffer
-            // has anything in it, with a per-slot mask that zeroes out
-            // contributions from slots that didn't accumulate a full
-            // rollout this window.
+            // Training is not per-slot: the global counter below triggers one
+            // batched train across every non-empty slot, with a per-slot mask
+            // zeroing out slots that didn't accumulate a full rollout.
         }
 
         self.ticks_since_train += 1;
@@ -1294,261 +1382,172 @@ impl BrainPoolLimb {
         }
     }
 
-    /// Global synchronous PPO update.
+    /// PER-SPECIES PPO update.
     ///
-    /// Triggered by `apply_step` every `ROLLOUT_LEN` ticks. Builds
-    /// batched `[N, T, …]` tensors from the per-slot rollout buffers,
-    /// runs GAE per slot, normalises advantages, then loops
-    /// `PPO_EPOCHS` times over the clipped-surrogate + value-MSE +
-    /// entropy-bonus loss. Slots whose buffer didn't accumulate any
-    /// entries this window are masked out (mask = 0 for those rows ×
-    /// timesteps), so their per-row gradients vanish and their Adam
-    /// state is left effectively untouched.
-    ///
-    /// All N organisms share the optimiser step, but each one's
-    /// gradient flows only through its own row of the batched-MLP
-    /// weight tensors — `forward_rollout` does a per-row matmul, so
-    /// no cross-organism leakage.
+    /// Triggered by `apply_step` every `ROLLOUT_LEN` ticks. Groups every active
+    /// slot by its CURRENT species (`slot_species`, written each apply tick)
+    /// and, for each species, pools only THAT species' transitions into one flat
+    /// batch `[M, ·]`, computes per-trajectory GAE, normalises advantages within
+    /// the species, and runs `PPO_EPOCHS` clipped-surrogate + value-MSE +
+    /// entropy steps on that species' own actor/critic. All members of a species
+    /// update the same weights (so they converge to one policy); different
+    /// species are trained independently (so they diverge). The forward is the
+    /// plain 2-D `forward` over the pooled `[M, IN]` batch.
     pub fn train(&mut self, virtual_time_secs: f32) {
-        let n = self.n;
-        let t = ROLLOUT_LEN;
-
-        // ── 0. V(s_T) bootstrap. ─────────────────────────────────────
-        //
-        // For each slot with a non-empty rollout, forward the LATEST
-        // critic on the last observed state (`buf.back().obs`) to get
-        // a fresh value estimate. This becomes `values_tail` in
-        // `compute_gae`, replacing the earlier `0.0` bias. We batch
-        // every slot's last-obs into a single `[N, IN]` tensor and
-        // forward once — slots with empty buffers contribute a row of
-        // zeros that we never read.
-        let mut last_obs_buf: Vec<f32> = vec![0.0; n * IN];
-        for s in 0..n {
-            if let Some(last) = self.rollouts[s].back() {
-                let base = s * IN;
-                last_obs_buf[base..base + IN].copy_from_slice(&last.obs);
+        self.prune_species();
+        // Group active slots (non-empty rollout) by their current species.
+        let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+        for s in 0..self.n {
+            if !self.rollouts[s].is_empty() {
+                groups.entry(self.slot_species[s]).or_default().push(s);
             }
         }
-        let last_obs_t = Tensor::<MyBackend, 2>::from_data(
-            TensorData::new(last_obs_buf, [n, IN]),
-            &self.device,
-        );
-        let bootstrap_t = self.critic.forward(last_obs_t);   // [N, 1]
-        let bootstrap_vec = bootstrap_t.into_data().into_vec::<f32>()
-            .expect("bootstrap critic forward");
-
-        // ── 1. Per-slot GAE + flat buffers. ─────────────────────────
-        let mut states_buf:    Vec<f32> = vec![0.0; n * t * IN];
-        let mut actions_buf:   Vec<f32> = vec![0.0; n * t * OUT];
-        let mut old_lp_buf:    Vec<f32> = vec![0.0; n * t];
-        let mut adv_buf:       Vec<f32> = vec![0.0; n * t];
-        let mut returns_buf:   Vec<f32> = vec![0.0; n * t];
-        let mut mask_buf:      Vec<f32> = vec![0.0; n * t];
-        let mut total_count   = 0.0_f32;
-        // Per-slot return summaries for the training-step CSV. We need
-        // the mean and variance across all (slot × timestep) entries
-        // that actually contributed to this window.
-        let mut active_slots: u32 = 0;
-
-        for s in 0..n {
-            let buf = &self.rollouts[s];
-            let count = buf.len();
-            if count == 0 { continue; }
-            active_slots += 1;
-
-            // Per-slot bootstrap from the batched critic forward above.
-            let bootstrap = bootstrap_vec[s];
-            let (advantages, returns) = Self::compute_gae(buf, bootstrap);
-
-            // Per-slot advantage normalisation (zero-mean, unit-var)
-            // — standard PPO trick to keep the policy gradient
-            // well-scaled across slots with different reward
-            // magnitudes.
-            let mean: f32 = advantages.iter().sum::<f32>() / count as f32;
-            let var: f32 = advantages.iter()
-                .map(|a| (a - mean) * (a - mean))
-                .sum::<f32>() / count as f32;
-            let std = var.sqrt().max(1e-8);
-
-            for ti in 0..count {
-                let entry = &buf[ti];
-                let s_base = (s * t + ti) * IN;
-                states_buf[s_base..s_base + IN].copy_from_slice(&entry.obs);
-                let a_base = (s * t + ti) * OUT;
-                actions_buf[a_base..a_base + OUT].copy_from_slice(&entry.action);
-                old_lp_buf [s * t + ti] = entry.log_prob;
-                adv_buf    [s * t + ti] = (advantages[ti] - mean) / std;
-                returns_buf[s * t + ti] = returns[ti];
-                mask_buf   [s * t + ti] = 1.0;
-                total_count += 1.0;
-            }
-        }
-
-        if total_count < 1.0 {
-            // No accumulated data — skip this update window.
-            for r in &mut self.rollouts { r.clear(); }
-            return;
-        }
-
-        // ── 1-bis. Return summary (computed before the buffers move
-        //          into GPU tensors). ──────────────────────────────
-        let mut sum_r = 0.0_f64;
-        let mut sum_sq = 0.0_f64;
-        let mut count_r: u32 = 0;
-        for i in 0..(n * t) {
-            if mask_buf[i] > 0.5 {
-                let r = returns_buf[i] as f64;
-                sum_r  += r;
-                sum_sq += r * r;
-                count_r += 1;
-            }
-        }
-        let mean_return = if count_r > 0 { (sum_r / count_r as f64) as f32 } else { 0.0 };
-        let return_var  = if count_r > 0 {
-            ((sum_sq / count_r as f64) - (sum_r / count_r as f64).powi(2)) as f32
-        } else { 0.0 };
-
-        // ── 2. Build GPU tensors. ──────────────────────────────────
-        let states_t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(states_buf, [n, t, IN]),
-            &self.device,
-        );
-        let actions_t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(actions_buf, [n, t, OUT]),
-            &self.device,
-        );
-        let old_lp_t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(old_lp_buf, [n, t, 1]),
-            &self.device,
-        );
-        let adv_t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(adv_buf, [n, t, 1]),
-            &self.device,
-        );
-        let returns_t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(returns_buf, [n, t, 1]),
-            &self.device,
-        );
-        let mask_t = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(mask_buf, [n, t, 1]),
-            &self.device,
-        );
-
-        // ── 3. PPO_EPOCHS updates. Each epoch runs the policy + value
-        //       loss together → backward → Adam step on each network. ─
+        let device = self.device.clone();
         let log_2pi = (2.0_f32 * std::f32::consts::PI).ln();
-        // Entropy of `N(μ, σ)` per dim is `log σ + 0.5·ln(2πe)`. With
-        // per-organism `log_std`, total entropy per slot = sum over OUT
-        // dims of `log_std[s, d] + entropy_const`. Constant doesn't
-        // affect gradients, kept for interpretability.
+        // Entropy of `N(μ, σ)` per dim is `log σ + 0.5·ln(2πe)`. Constant
+        // doesn't affect gradients, kept for interpretability.
         let entropy_const = 0.5_f32 * (2.0_f32 * std::f32::consts::PI * std::f32::consts::E).ln();
 
-        // Scalars captured from the FINAL PPO epoch and pushed onto
-        // `training_history` after the loop completes. Default to 0
-        // so an empty rollout window still produces a sensible row.
-        let mut last_actor_loss:  f32 = 0.0;
-        let mut last_critic_loss: f32 = 0.0;
-        let mut last_entropy:     f32 = 0.0;
-        let mut last_total_loss:  f32 = 0.0;
+        for (key, slots) in groups {
+            self.ensure_species(key);
+            let cnt = slots.len();
 
-        for epoch in 0..PPO_EPOCHS {
-            // Actor forward over rollout: [N, T, OUT] μ.
-            let mu = self.actor.forward_rollout(states_t.clone());
-            // log_std: [N, OUT] → broadcast to [N, T, OUT].
-            let log_std_nt = self.actor.log_std.val()
-                .unsqueeze_dim::<3>(1);                    // [N, 1, OUT]
-            let sigma_nt = log_std_nt.clone().exp();
-            let inv_sigma_sq = sigma_nt.powf_scalar(-2.0);
-            // New log_prob per (slot, t, dim), summed over dim → [N, T, 1].
-            let diff = actions_t.clone() - mu;             // [N, T, OUT]
-            let new_lp_per_dim = (diff.clone() * diff)
-                .mul(inv_sigma_sq)
-                .mul_scalar(-0.5_f32)
-                .sub(log_std_nt.clone())
-                .sub_scalar(0.5_f32 * log_2pi);            // [N, T, OUT]
-            let new_lp = new_lp_per_dim.sum_dim(2);        // [N, T, 1]
+            // ── 0. V(s_T) bootstrap per slot (batched critic forward). ──
+            let mut last_obs_buf: Vec<f32> = vec![0.0; cnt * IN];
+            for (i, &s) in slots.iter().enumerate() {
+                if let Some(last) = self.rollouts[s].back() {
+                    last_obs_buf[i * IN..i * IN + IN].copy_from_slice(&last.obs);
+                }
+            }
+            let bootstrap_vec = {
+                let brain = self.species.get(&key).expect("species ensured above");
+                let last_obs_t = Tensor::<MyBackend, 2>::from_data(
+                    TensorData::new(last_obs_buf, [cnt, IN]), &device);
+                brain.critic.forward(last_obs_t)
+                    .into_data().into_vec::<f32>().expect("limb bootstrap critic forward")
+            };
 
-            // Ratio + clipped surrogate.
-            let ratio = (new_lp - old_lp_t.clone()).exp();
-            let surr1 = ratio.clone() * adv_t.clone();
-            let surr2 = ratio.clamp(1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_t.clone();
-            // PPO maximises the surrogate → loss is `-min(s1, s2)`.
-            let policy_loss = (surr1.min_pair(surr2)).neg();   // [N, T, 1]
+            // ── 1. Per-slot GAE → POOLED flat buffers for THIS species.
+            //       Per-slot advantage normalisation is replaced by a single
+            //       per-species normalisation (see 1-bis) — the pooled batch is
+            //       this species' whole experience window. ──
+            let mut states:  Vec<f32> = Vec::new();
+            let mut actions: Vec<f32> = Vec::new();
+            let mut old_lp:  Vec<f32> = Vec::new();
+            let mut adv:     Vec<f32> = Vec::new();
+            let mut returns: Vec<f32> = Vec::new();
+            for (i, &s) in slots.iter().enumerate() {
+                let buf = &self.rollouts[s];
+                if buf.is_empty() { continue; }
+                let (advantages, rets) = Self::compute_gae(buf, bootstrap_vec[i]);
+                for (ti, entry) in buf.iter().enumerate() {
+                    states.extend_from_slice(&entry.obs);
+                    actions.extend_from_slice(&entry.action);
+                    old_lp.push(entry.log_prob);
+                    adv.push(advantages[ti]);
+                    returns.push(rets[ti]);
+                }
+            }
+            let m = old_lp.len();
+            if m == 0 { continue; }
 
-            // Critic forward + MSE on returns (same forward used to
-            // produce a value loss whose gradient updates the critic
-            // — actor branch is independent because they share no
-            // parameters).
-            let v = self.critic.forward_rollout(states_t.clone()); // [N, T, 1]
-            let v_diff = v - returns_t.clone();
-            let value_loss = (v_diff.clone() * v_diff).mul_scalar(0.5);
+            // ── 1-bis. Per-species advantage normalisation + return summary. ──
+            let adv_mean: f32 = adv.iter().sum::<f32>() / m as f32;
+            let adv_var:  f32 = adv.iter().map(|a| (a - adv_mean) * (a - adv_mean)).sum::<f32>() / m as f32;
+            let adv_std = adv_var.sqrt().max(1e-8);
+            for a in adv.iter_mut() { *a = (*a - adv_mean) / adv_std; }
 
-            // Entropy bonus per slot: `Σ_d (log_std[s,d] + const)`.
-            let entropy_per_slot = log_std_nt
-                .add_scalar(entropy_const)
-                .sum_dim(2);                                // [N, 1, 1]
-            // Mean over slots (the rollout window is constant length
-            // per slot, so mean over N is the right normaliser).
-            let entropy_mean = entropy_per_slot.mean();
+            let ret_mean: f64 = returns.iter().map(|&r| r as f64).sum::<f64>() / m as f64;
+            let ret_var:  f64 = returns.iter().map(|&r| (r as f64 - ret_mean) * (r as f64 - ret_mean)).sum::<f64>() / m as f64;
+            let mean_return = ret_mean as f32;
+            let return_var  = ret_var as f32;
 
-            let combined = (policy_loss.clone() + value_loss.clone().mul_scalar(VALUE_LOSS_COEF))
-                * mask_t.clone();
-            let loss = combined.sum().div_scalar(total_count)
-                - entropy_mean.clone().mul_scalar(ENTROPY_COEF);
+            // ── 2. GPU tensors ([M, ·]). ──
+            let states_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(states,  [m, IN]),  &device);
+            let actions_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(actions, [m, OUT]), &device);
+            let old_lp_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(old_lp,  [m, 1]),   &device);
+            let adv_t     = Tensor::<MyBackend, 2>::from_data(TensorData::new(adv,     [m, 1]),   &device);
+            let returns_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(returns, [m, 1]),   &device);
 
-            // Telemetry: on the last epoch, pull scalars off the GPU
-            // before backward consumes them. The clones below are cheap
-            // (handle copies on Burn tensors); the actual GPU→CPU
-            // transfer is one synchronisation per scalar.
-            if epoch == PPO_EPOCHS - 1 {
-                last_actor_loss  = scalar_of(policy_loss.clone().mean());
-                last_total_loss  = scalar_of(loss.clone());
-                last_entropy     = scalar_of(entropy_mean.clone());
+            // ── 3. PPO_EPOCHS updates over THIS species' net. ──
+            let mut last_actor_loss:  f32 = 0.0;
+            let mut last_critic_loss: f32 = 0.0;
+            let mut last_entropy:     f32 = 0.0;
+            let mut last_total_loss:  f32 = 0.0;
+
+            {
+                let brain = self.species.get_mut(&key).expect("species ensured above");
+                for epoch in 0..PPO_EPOCHS {
+                    let mu = brain.actor.forward(states_t.clone());          // [M, OUT]
+                    let log_std_b = brain.actor.log_std.val();               // [1, OUT]
+                    let sigma_b   = log_std_b.clone().exp();                 // [1, OUT]
+                    let inv_sigma_sq = sigma_b.powf_scalar(-2.0);            // [1, OUT]
+                    let diff = actions_t.clone() - mu;                       // [M, OUT]
+                    let new_lp = (diff.clone() * diff)
+                        .mul(inv_sigma_sq)
+                        .mul_scalar(-0.5_f32)
+                        .sub(log_std_b.clone())
+                        .sub_scalar(0.5_f32 * log_2pi)
+                        .sum_dim(1);                                         // [M, 1]
+
+                    let ratio = (new_lp - old_lp_t.clone()).exp();           // [M, 1]
+                    let surr1 = ratio.clone() * adv_t.clone();
+                    let surr2 = ratio.clamp(1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_t.clone();
+                    let policy_loss = surr1.min_pair(surr2).neg();           // [M, 1]
+
+                    let v = brain.critic.forward(states_t.clone());          // [M, 1]
+                    let v_diff = v - returns_t.clone();
+                    let value_loss = (v_diff.clone() * v_diff).mul_scalar(0.5);
+
+                    let entropy = log_std_b.add_scalar(entropy_const).sum_dim(1).mean();
+
+                    let loss = (policy_loss.clone() + value_loss.clone().mul_scalar(VALUE_LOSS_COEF)).mean()
+                        - entropy.clone().mul_scalar(ENTROPY_COEF);
+
+                    if epoch == PPO_EPOCHS - 1 {
+                        last_actor_loss = scalar_of(policy_loss.mean());
+                        last_total_loss = scalar_of(loss.clone());
+                        last_entropy    = scalar_of(entropy);
+                    }
+
+                    let actor_clone = brain.actor.clone();
+                    let actor_grads = GradientsParams::from_grads(loss.backward(), &brain.actor);
+                    brain.actor = brain.opt_actor.step(LR, actor_clone, actor_grads);
+
+                    // Critic: fresh graph (the one above was consumed by backward).
+                    let v2 = brain.critic.forward(states_t.clone());
+                    let v2_diff = v2 - returns_t.clone();
+                    let critic_loss = (v2_diff.clone() * v2_diff).mul_scalar(0.5).mean();
+                    if epoch == PPO_EPOCHS - 1 {
+                        last_critic_loss = scalar_of(critic_loss.clone());
+                    }
+                    let critic_clone = brain.critic.clone();
+                    let critic_grads = GradientsParams::from_grads(critic_loss.backward(), &brain.critic);
+                    brain.critic = brain.opt_critic.step(LR, critic_clone, critic_grads);
+                }
+                brain.training_step += 1;
             }
 
-            // Backward + Adam step on the actor. Clone is cheap (handle
-            // copies; underlying tensors are reference-counted).
-            let actor_clone = self.actor.clone();
-            let actor_grads = GradientsParams::from_grads(loss.backward(), &self.actor);
-            self.actor = self.opt_actor.step(LR, actor_clone, actor_grads);
-
-            // Critic update: re-forward to build a fresh graph (the
-            // graph from above was consumed by `loss.backward()`),
-            // then its own backward + step.
-            let v2 = self.critic.forward_rollout(states_t.clone());
-            let v2_diff = v2 - returns_t.clone();
-            let critic_loss_raw = (v2_diff.clone() * v2_diff).mul_scalar(0.5);
-            let critic_loss = (critic_loss_raw * mask_t.clone()).sum()
-                .div_scalar(total_count);
-            if epoch == PPO_EPOCHS - 1 {
-                last_critic_loss = scalar_of(critic_loss.clone());
+            // ── 4. Log this species' update. ──
+            self.training_step += 1;
+            if self.training_history.len() >= LIMB_TRAINING_HISTORY_CAP {
+                self.training_history.pop_front();
             }
-            let critic_clone = self.critic.clone();
-            let critic_grads = GradientsParams::from_grads(critic_loss.backward(), &self.critic);
-            self.critic = self.opt_critic.step(LR, critic_clone, critic_grads);
+            self.training_history.push_back(LimbTrainingStep {
+                step:               self.training_step,
+                virtual_time_secs,
+                n_active:           cnt as u32,
+                actor_loss:         last_actor_loss,
+                critic_loss:        last_critic_loss,
+                entropy:            last_entropy,
+                total_loss:         last_total_loss,
+                mean_return,
+                return_var,
+                supervised_loss:    0.0,
+            });
         }
 
-        // ── 4-bis. Push a TrainingStep row onto the ring buffer. ──
-        // `mean_return` / `return_var` were computed above (before the
-        // buffers moved into GPU tensors).
-        self.training_step += 1;
-        if self.training_history.len() >= LIMB_TRAINING_HISTORY_CAP {
-            self.training_history.pop_front();
-        }
-        self.training_history.push_back(LimbTrainingStep {
-            step:               self.training_step,
-            virtual_time_secs,
-            n_active:           active_slots,
-            actor_loss:         last_actor_loss,
-            critic_loss:        last_critic_loss,
-            entropy:            last_entropy,
-            total_loss:         last_total_loss,
-            mean_return,
-            return_var,
-            supervised_loss:    0.0,
-        });
-
-        // ── 4. Reset rollout buffers for the next window. ─────────
+        // Clear ALL rollout buffers (every active slot was consumed above).
         for r in &mut self.rollouts { r.clear(); }
     }
 }

@@ -1,38 +1,19 @@
-// Species editor — central state.
-//
-// Holds the in-progress species definition: cycler values (metabolism,
-// intelligence, symmetry, form), the cell list under construction, and
-// transient interaction state (which cell type the user has currently
-// selected from the bottom panel, whether the first cell has been
-// spawned yet, and the entity handles for the current mesh + preview
-// + bilateral-axis visuals).
-//
-// One ECS Resource — `SpeciesSession` — wraps everything. Its inner
-// state machine has three phases:
-//   1. Configuration: cyclers active, first cell not yet spawned.
-//      `ocg` is empty. The "Spawn first Cell" button gates the
-//      transition to phase 2.
-//   2. Growth: at least one cell present. The user picks a cell type
-//      from the bottom panel; the preview cell follows the cursor and
-//      snaps to lattice frontier positions. Left-click commits a cell.
-//   3. Save: the user clicks "Create Species" — opens a Save-As
-//      dialog, then `save_requested` carries the chosen path to the
-//      save system on the next Update tick.
+// Species editor — central state. One `SpeciesSession` Resource holds the
+// in-progress species: cycler values, the body parts under construction, and
+// transient interaction state.
 
 use bevy::prelude::*;
 use std::path::PathBuf;
 
 use crate::cell::CellType;
 use crate::colony::{IntelligenceLevel, Symmetry};
+use crate::organism::MovementMode;
 
 
 // ── Cycler enums ────────────────────────────────────────────────────────────
 //
-// Mirror the colony-editor cycler types but live in this module so the
-// species editor isn't coupled to the colony editor (which would make
-// removing or refactoring either one a chore). They cycle through the
-// fixed enums in the wider codebase (`Symmetry`, `IntelligenceLevel`)
-// and the two species-editor-local toggles (`Metabolism`, `Form`).
+// Local to this module (not shared with the colony editor) to avoid coupling
+// the two editors.
 
 /// Trophic strategy. Determines the starter cell type (Photo /
 /// NonPhoto) and the marker component on the final spawned organism.
@@ -52,10 +33,8 @@ impl Metabolism {
             Metabolism::Heterotroph    => "Heterotroph",
         }
     }
-    /// Cell type used for the very first cell when the user clicks
-    /// "Spawn first Cell." Subsequent cells are picked freely from the
-    /// bottom panel — the species can be mixed-type (e.g. a hetero
-    /// body with Photo "spots").
+    /// Cell type for the auto-seeded base cell. Subsequent cells are picked
+    /// freely from the bottom panel, so a species can be mixed-type.
     pub fn starter_cell_type(self) -> CellType {
         match self {
             Metabolism::Photoautotroph => CellType::Photo,
@@ -64,9 +43,7 @@ impl Metabolism {
     }
 }
 
-/// Variable-form vs fixed-form body plan, mirroring the
-/// `Organism::has_variable_form` boolean. Stored as an enum here so
-/// the cycler UI can display a string instead of a checkbox.
+/// Variable-form vs fixed-form body plan, mirroring `Organism::has_variable_form`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form { Variable, Fixed }
 
@@ -86,18 +63,11 @@ impl Form {
     pub fn as_bool(self) -> bool { matches!(self, Form::Variable) }
 }
 
-/// Heterotroph sub-classification: Herbivore (eats photoautotrophs)
-/// vs Carnivore (eats other heterotrophs). Photoautotroph species
-/// keep this set to `Herbivore` at the type level but it's ignored
-/// — the field is only meaningful when `metabolism == Heterotroph`.
-///
-/// Interactions:
-///   * Switching to Herbivore → intelligence auto-sets to `Level1`
-///     (the supervised herbivore_1 brain). User can manually
-///     upgrade to Level 2 or 3 afterwards.
-///   * Switching to Carnivore → intelligence auto-sets to `Level2`
-///     (the smaller predator pool). User can upgrade to Level 3.
-///     Levels 0 and 1 are NOT valid choices for carnivores.
+/// Heterotroph sub-classification (only meaningful when
+/// `metabolism == Heterotroph`): Herbivore eats photoautotrophs, Carnivore eats
+/// other heterotrophs. Interaction with the intelligence cycler: Herbivore
+/// auto-sets `Level1`; Carnivore auto-sets `Level2` (Levels 0/1 invalid for
+/// carnivores). User can upgrade afterwards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Classification { Herbivore, Carnivore }
 
@@ -116,13 +86,9 @@ impl Classification {
     }
 }
 
-/// Sessile vs mobile toggle, mirroring `Organism::is_sessile`. Exposed
-/// as its own cycler because the user wants explicit control AND
-/// because the choice has a documented interaction with the
-/// intelligence cycler:
-///   * Sessile → `IntelligenceLevel::Level0` (auto-set, locked).
-///   * Mobile  → auto-set to `Level1` on toggle, but freely
-///                cycleable to higher levels afterward.
+/// Sessile vs mobile toggle, mirroring `Organism::is_sessile`. Interaction with
+/// the intelligence cycler: Sessile → `Level0` (auto-set, locked); Mobile →
+/// auto-set `Level1`, freely cycleable afterward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mobility { Sessile, Mobile }
 
@@ -142,30 +108,10 @@ impl Mobility {
     pub fn is_sessile(self) -> bool { matches!(self, Mobility::Sessile) }
 }
 
-/// Movement paradigm. Maps directly to `Organism::sliding_movement`:
-///   * `Sliding`     → brain writes velocity, root translates kinematically.
-///   * `LimbMovement` → Avian physics per body part; PPO brain outputs
-///                      PD target joint angles. Limbs push the body via
-///                      friction at the ground.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpeciesMovement { Sliding, LimbMovement }
-
-impl SpeciesMovement {
-    pub fn cycle(self) -> Self {
-        match self {
-            SpeciesMovement::Sliding      => SpeciesMovement::LimbMovement,
-            SpeciesMovement::LimbMovement => SpeciesMovement::Sliding,
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            SpeciesMovement::Sliding      => "Sliding",
-            SpeciesMovement::LimbMovement => "Limb-Movement",
-        }
-    }
-    /// Inverse of `Organism::sliding_movement`'s naming.
-    pub fn is_sliding(self) -> bool { matches!(self, SpeciesMovement::Sliding) }
-}
+// Movement paradigm uses the shared `crate::organism::MovementMode` directly
+// (no editor-local enum). The author-able subset is cycled in `top_panel.rs`
+// (Sliding → LimbBasedWalking → Swimming); `Flying` is a placeholder, not
+// reachable from the cycler.
 
 // Wrappers around the shared enums to keep cycle-label helpers local.
 pub fn cycle_intelligence(level: IntelligenceLevel) -> IntelligenceLevel {
@@ -209,7 +155,25 @@ pub struct DraftSpecies {
     pub form:           Form,
     pub mobility:       Mobility,
     pub classification: Classification,
-    pub movement:       SpeciesMovement,
+    pub movement:       MovementMode,
+    /// Ground- vs water-based (the top-panel Grounding cycler). Only
+    /// editable for PHOTOTROPHS (a floating, water-based alga); heterotrophs
+    /// always derive it from `movement` — see `effective_ground_based`.
+    pub ground_based:   bool,
+}
+
+impl DraftSpecies {
+    /// The `Organism::ground_based` value this draft actually produces:
+    /// phototrophs honour the Grounding cycler (clamped by the movement
+    /// mode — a fluid mode can never be ground-based); heterotrophs always
+    /// derive it from the movement mode. Mirrors `spawn_organism`'s coercion
+    /// so the saved `.species` byte equals the spawned organism's field.
+    pub fn effective_ground_based(&self) -> bool {
+        match self.metabolism {
+            Metabolism::Photoautotroph => self.ground_based && self.movement.default_ground_based(),
+            Metabolism::Heterotroph    => self.movement.default_ground_based(),
+        }
+    }
 }
 
 impl Default for DraftSpecies {
@@ -217,17 +181,16 @@ impl Default for DraftSpecies {
         Self {
             metabolism:     Metabolism::Heterotroph,
             intelligence:   IntelligenceLevel::Level1,
-            // Heterotrophs default to Bilateral symmetry (see
-            // `default_symmetry_for`); photoautotrophs default to
-            // NoSymmetry.
             symmetry:       Symmetry::Bilateral,
             form:           Form::Fixed,
             mobility:       Mobility::Mobile,
             classification: Classification::Herbivore,
-            // Default to Sliding so new species inherit current
-            // behaviour. The toggle is the user's deliberate opt-in
-            // to physics + PPO locomotion.
-            movement:       SpeciesMovement::Sliding,
+            // Sliding is the opt-out default; limb movement is the user's
+            // deliberate opt-in to physics + PPO locomotion.
+            movement:       MovementMode::Sliding,
+            // Ground-based is the default; phototroph drafts may opt into
+            // water-based (floating algae) via the Grounding cycler.
+            ground_based:   true,
         }
     }
 }
@@ -250,19 +213,12 @@ pub struct EditorBodyPart {
     /// Right-half (Bilateral) or full (NoSymmetry) OCG, editor-local
     /// coords, sequential indices 0..N.
     pub ocg: Vec<(usize, Vec3, CellType)>,
-    /// `true` when the user marked this body part as a "Limb" in the
-    /// body-part index panel. Limbs spawn with `BodyPartKind::Limb` and
-    /// visually rotate around their FIRST cell (the attachment seed)
-    /// in the running simulation. The base body (index 0) is never a
-    /// limb. Persisted to the `.species` file (v05+).
+    /// Limb flag. Limbs spawn with `BodyPartKind::Limb` and rotate around their
+    /// FIRST cell (the attachment seed). The base body (index 0) is never a limb.
     pub is_limb: bool,
-    /// Index (into `body_parts`) of the body part this one attaches to.
-    /// `0` = the main body (a normal limb). A value pointing at another
-    /// LIMB makes this a first-grade **sub-limb** (a 2-DOF leg segment):
-    /// it gets a hinge joint to its parent limb exactly like a limb does
-    /// to the main body. Set at creation time from the active body part.
-    /// The base body (index 0) has `parent = 0` (self / ignored).
-    /// Persisted to the `.species` file (v07+).
+    /// Index (into `body_parts`) of the part this one attaches to. `0` = main
+    /// body. Pointing at another LIMB makes this a sub-limb. Base body has
+    /// `parent = 0` (self / ignored).
     pub parent: usize,
 }
 
@@ -278,10 +234,8 @@ pub struct EditorBodyPart {
 pub struct SpeciesSession {
     pub draft: DraftSpecies,
 
-    /// All body parts. Index 0 is the base body; later entries are
-    /// appendages. The base is auto-seeded with one cell on session
-    /// creation / reset (see `seed_base`), so this is never empty —
-    /// there is no longer a "spawn first cell" step.
+    /// All body parts. Index 0 is the base body (auto-seeded with one cell on
+    /// creation/reset, so this is never empty); later entries are appendages.
     pub body_parts: Vec<EditorBodyPart>,
 
     /// Index into `body_parts` of the part new cells are placed on.
@@ -291,9 +245,8 @@ pub struct SpeciesSession {
     /// cell follows the cursor — left-click is ignored.
     pub selected_cell_type: Option<CellType>,
 
-    /// Always `true` now that the base cell is auto-seeded — kept so the
-    /// bottom-panel / viewport-placement / preview systems that gate on
-    /// "growth mode" keep working unchanged. Cycler locking is driven by
+    /// Always `true` now that the base cell is auto-seeded — kept so systems
+    /// that gate on "growth mode" keep working. Cycler locking uses
     /// `has_appended_cells()` instead.
     pub first_cell_spawned: bool,
 
@@ -301,21 +254,18 @@ pub struct SpeciesSession {
     /// `.species` binary file to `path` and clears this field.
     pub save_requested: Option<PathBuf>,
 
-    /// `true` whenever the user has made changes that have not yet been
-    /// saved. Set by every mutating action (cell placement, cycler
-    /// changes, renames); cleared on successful `.species` write and on
-    /// load. Consumed by the Clear/New button and the Load confirmation.
+    /// Unsaved-changes flag. Set by every mutating action; cleared on
+    /// successful `.species` write and on load. Gates the Clear/New and Load
+    /// confirmation modals.
     pub dirty: bool,
 
-    /// Rising-edge flag toggled by the Clear/New button when the
-    /// session is dirty. The clear-modal lifecycle system spawns the
-    /// modal on `true` and despawns it on `false`.
+    /// Toggled by the Clear/New button when dirty; the modal lifecycle system
+    /// spawns/despawns the modal on this.
     pub show_clear_modal: bool,
 
-    /// Rising-edge flag toggled by the "Load Species" button when the
-    /// session is dirty. The load-modal lifecycle system spawns the
-    /// confirmation on `true` and despawns it on `false`; "Yes" then
-    /// proceeds with the file dialog + load.
+    /// Toggled by the "Load Species" button when dirty; the modal lifecycle
+    /// system spawns/despawns the confirmation, "Yes" proceeds with file dialog
+    /// + load.
     pub show_load_modal: bool,
 
     /// `true` while "Cell-Deletion Mode" is active: hovered cells are
@@ -323,9 +273,8 @@ pub struct SpeciesSession {
     /// Placement (preview + click-to-place) is suppressed while active.
     pub deletion_mode: bool,
 
-    /// Index of the body part currently being renamed in the Body-part
-    /// index panel, if any. While `Some`, keystrokes edit `rename_buffer`
-    /// instead of doing anything else.
+    /// Body part currently being renamed, if any. While `Some`, keystrokes edit
+    /// `rename_buffer` instead of anything else.
     pub renaming_body_part: Option<usize>,
 
     /// In-progress rename text. Committed to the part's `name` on Enter,
@@ -355,20 +304,15 @@ impl Default for SpeciesSession {
 }
 
 impl SpeciesSession {
-    /// Reset to a fresh state (a single auto-seeded base cell). Called by
-    /// the Clear/New flow once the user confirms (or unconditionally, if
-    /// there were no unsaved changes); `Default` covers the spawn-time case.
+    /// Reset to a fresh state (a single auto-seeded base cell).
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
-    /// (Re)create the base body with a single seed cell, coloured by the
-    /// current metabolism (Photo → green, Heterotroph → red) and positioned
-    /// for the current symmetry (origin for NoSymmetry, the right-half seed
-    /// `(MIN_X_BILATERAL, 0, 0)` for Bilateral). Called on session
-    /// creation/reset and whenever the metabolism or symmetry cycler is
-    /// flipped *before any cell has been appended* — so the base preview
-    /// tracks those two options live, but only while it's still just the base.
+    /// (Re)create the base body with a single seed cell, typed by metabolism and
+    /// positioned for symmetry (origin for NoSymmetry, `(MIN_X_BILATERAL,0,0)`
+    /// for Bilateral). Re-run when metabolism/symmetry flips *before any cell is
+    /// appended*, so the base preview tracks those options live.
     pub fn seed_base(&mut self) {
         let starter = self.draft.metabolism.starter_cell_type();
         let pos = match self.draft.symmetry {
@@ -385,10 +329,9 @@ impl SpeciesSession {
         self.first_cell_spawned = true;
     }
 
-    /// `true` once the user has appended any cell beyond the single base
-    /// seed (extra cells on the base, or any appendage). Locks the
-    /// Metabolism + Symmetry cyclers, since both reinterpret / recolour the
-    /// base in ways that can't be reconciled with an already-built body.
+    /// `true` once any cell exists beyond the single base seed. Locks the
+    /// Metabolism + Symmetry cyclers, which can't be reconciled with an
+    /// already-built body.
     pub fn has_appended_cells(&self) -> bool {
         self.body_parts.iter().map(|p| p.ocg.len()).sum::<usize>() > 1
     }

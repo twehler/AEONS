@@ -1,10 +1,8 @@
 // Combined launcher (eframe / egui).
 //
-// Two action buttons side-by-side: START AEONS and COLONY EDITOR.
-// Returns a `LaunchMode` that `main.rs` consumes to re-spawn the
-// binary with the appropriate argv (subprocess re-spawn is required
-// because winit's `EventLoop` is a singleton — we can't show this
-// eframe window and then a Bevy window in the same process).
+// Returns a `LaunchMode` that `main.rs` consumes to re-spawn the binary with
+// the chosen argv. Subprocess re-spawn is required because winit's `EventLoop`
+// is a singleton — eframe and Bevy windows can't coexist in one process.
 
 use std::env;
 use std::sync::mpsc;
@@ -16,12 +14,9 @@ use crate::simulation_settings::{
     DEFAULT_START_HETEROTROPHS, DEFAULT_START_PHOTOAUTOTROPHS,
     DEFAULT_MAP_X, DEFAULT_MAP_Z,
 };
+use crate::environment::DEFAULT_WATER_LEVEL;
 
-/// Soft practical upper bound for the launcher's "Max Phototrophic
-/// Organisms" field (and the other population-cap fields). Higher
-/// values still work, but the DragValue would feel runaway at very
-/// high magnitudes. Picked to comfortably exceed any realistic
-/// colony size.
+/// Soft upper bound for the launcher's population-cap DragValue fields.
 const LAUNCHER_POPULATION_CAP: usize = 100_000;
 
 
@@ -41,17 +36,14 @@ const OPEN_BTN_SIZE:           egui::Vec2 = egui::vec2(90.0, 32.0);
 const OPEN_MAP_BTN_POS:        egui::Pos2 = egui::pos2(650.0, 230.0);
 const OPEN_COLONY_BTN_POS:     egui::Pos2 = egui::pos2(650.0, 295.0);
 
-// AI-training-mode checkbox. Sits directly beneath the colony file
-// path field and is NOT part of the colony-dimension gate — it stays
-// editable even when a colony is loaded (training mode is orthogonal
-// to spawn-count overrides). Seeded from `--trainingmode` argv on
-// launcher start (see `LauncherApp::new`).
+// AI-training-mode checkbox. NOT part of the colony-dimension gate — stays
+// editable even with a colony loaded (orthogonal to spawn-count overrides).
+// Seeded from `--trainingmode` argv (see `LauncherApp::new`).
 const TRAININGMODE_ROW_TOP:    f32        = 332.0;
 const TRAININGMODE_POS:        egui::Pos2 = egui::pos2(60.0, TRAININGMODE_ROW_TOP);
 const TRAININGMODE_SIZE:       egui::Vec2 = egui::vec2(400.0, 24.0);
 
-// Map-size row, sits between the AI-training checkbox and the action
-// buttons. Two `DragValue` widgets (X / Z) plus a heading label.
+// Map-size row: two `DragValue` widgets (X / Z) plus a heading label.
 const MAPSIZE_ROW_TOP:         f32        = 372.0;
 const MAPSIZE_LABEL_POS:       egui::Pos2 = egui::pos2(60.0, MAPSIZE_ROW_TOP);
 const MAPSIZE_LABEL_SIZE:      egui::Vec2 = egui::vec2(130.0, 32.0);
@@ -63,74 +55,60 @@ const MAPSIZE_FIELD_SIZE:      egui::Vec2 = egui::vec2(110.0, 32.0);
 const MAPSIZE_MIN:             f32        = 50.0;
 const MAPSIZE_MAX:             f32        = 8192.0;
 
-// Max-organisms row. Single `DragValue` capped at
-// `LAUNCHER_POPULATION_CAP`. The chosen value is forwarded to the
-// child subprocess via `--max-organisms N` argv and sizes both the
-// GPU brain-pool tensors (`OrganismPoolSize`) AND the initial
-// reproduction soft cap (`MaxOrganisms`) at simulation startup.
-// Adjust-colony-dimensions checkbox. Acts as the gate over the
-// downstream spawn-control widgets (Max Organisms, AI-training mode,
-// Max Herbivores) when a colony file is loaded. The user-facing
-// contract is documented on the field in `LauncherApp`.
+// Water-level field — sits beside the map-size fields on the same row.
+// Unlike the always-editable map-size fields, it follows the spawn-control
+// enabled flag (greyed when a colony is loaded without "Adjust colony
+// dimensions"). Forwarded via `--water-level Y` into the `WaterLevel` resource.
+const WATERLEVEL_LABEL_POS:    egui::Pos2 = egui::pos2(500.0, MAPSIZE_ROW_TOP);
+const WATERLEVEL_LABEL_SIZE:   egui::Vec2 = egui::vec2(110.0, 32.0);
+const WATERLEVEL_DRAG_POS:     egui::Pos2 = egui::pos2(615.0, MAPSIZE_ROW_TOP);
+const WATERLEVEL_FIELD_SIZE:   egui::Vec2 = egui::vec2(110.0, 32.0);
+const WATERLEVEL_MIN:          f32        = -8192.0;
+const WATERLEVEL_MAX:          f32        = 8192.0;
+
+// Adjust-colony-dimensions checkbox. Gates the downstream spawn-control widgets
+// when a colony file is loaded (contract documented on the `LauncherApp` field).
 const ADJUSTCOL_ROW_TOP:       f32        = 407.0;
 const ADJUSTCOL_POS:           egui::Pos2 = egui::pos2(60.0, ADJUSTCOL_ROW_TOP);
 const ADJUSTCOL_SIZE:          egui::Vec2 = egui::vec2(400.0, 24.0);
 
-// Wider label box than the old "Max Organisms:" row because
-// "Max Phototrophic Organisms:" is ~12 characters longer; matches
-// the Start-Heterotroph-Number layout below.
-// Wider label box than the old "Max Organisms:" row because
-// "Max Phototrophic Organisms:" is ~12 characters longer; matches
-// the Start-Heterotroph-Number layout below.
+// Max-Phototrophic-Organisms row. Wide label box to fit the long label.
 const MAXPHOTO_ROW_TOP:          f32        = 442.0;
 const MAXPHOTO_LABEL_POS:        egui::Pos2 = egui::pos2(60.0, MAXPHOTO_ROW_TOP);
 const MAXPHOTO_LABEL_SIZE:       egui::Vec2 = egui::vec2(220.0, 32.0);
 const MAXPHOTO_DRAG_POS:         egui::Pos2 = egui::pos2(285.0, MAXPHOTO_ROW_TOP);
 const MAXPHOTO_FIELD_SIZE:       egui::Vec2 = egui::vec2(110.0, 32.0);
 
-// Spawn-phototrophic-organisms row. Paired directly with the
-// Max-Phototrophic-Organisms cap above so the cap+spawn for photos
-// live together. Drives the initial-cohort photo count at
-// `spawn_colony`; independent from `MaxPhotoautotrophs`, which caps
-// the running population.
+// Spawn-phototrophic-organisms row. Initial-cohort photo count at
+// `spawn_colony`; independent from `MaxPhotoautotrophs` (the running cap).
 const SPAWNPHOTO_ROW_TOP:        f32        = 477.0;
 const SPAWNPHOTO_LABEL_POS:      egui::Pos2 = egui::pos2(60.0, SPAWNPHOTO_ROW_TOP);
 const SPAWNPHOTO_LABEL_SIZE:     egui::Vec2 = egui::vec2(265.0, 32.0);
 const SPAWNPHOTO_DRAG_POS:       egui::Pos2 = egui::pos2(330.0, SPAWNPHOTO_ROW_TOP);
 const SPAWNPHOTO_FIELD_SIZE:     egui::Vec2 = egui::vec2(110.0, 32.0);
 
-// Max-herbivores row. Same layout pattern as the Max-organisms row.
-// The value seeds the `MaxHerbivores` reproduction cap at simulation
-// startup.
+// Max-herbivores row. Seeds the `MaxHerbivores` reproduction cap.
 const MAXHERB_ROW_TOP:         f32        = 512.0;
 const MAXHERB_LABEL_POS:       egui::Pos2 = egui::pos2(60.0, MAXHERB_ROW_TOP);
 const MAXHERB_LABEL_SIZE:      egui::Vec2 = egui::vec2(180.0, 32.0);
 const MAXHERB_DRAG_POS:        egui::Pos2 = egui::pos2(245.0, MAXHERB_ROW_TOP);
 const MAXHERB_FIELD_SIZE:      egui::Vec2 = egui::vec2(110.0, 32.0);
 
-// Start-heterotrophs row. Paired directly with the Max-Herbivores
-// cap above so the cap+spawn for heteros live together. Drives the
-// initial-cohort herbivore count at `spawn_colony`. Independent from
-// `MaxHerbivores`, which caps the running population.
+// Start-heterotrophs row. Initial-cohort herbivore count at `spawn_colony`;
+// independent from `MaxHerbivores` (the running cap).
 const STARTHET_ROW_TOP:        f32        = 547.0;
 const STARTHET_LABEL_POS:      egui::Pos2 = egui::pos2(60.0, STARTHET_ROW_TOP);
 const STARTHET_LABEL_SIZE:     egui::Vec2 = egui::vec2(220.0, 32.0);
 const STARTHET_DRAG_POS:       egui::Pos2 = egui::pos2(285.0, STARTHET_ROW_TOP);
 const STARTHET_FIELD_SIZE:     egui::Vec2 = egui::vec2(110.0, 32.0);
 
-// Two side-by-side buttons. "START AEONS" on the left, "COLONY EDITOR"
-// on the right — both styled the same so neither feels like a footnote.
 const ACTION_BTN_SIZE:         egui::Vec2 = egui::vec2(330.0, 90.0);
 const ACTION_ROW_TOP:          f32        = 600.0;
 const ACTION_BTN_FONT_SIZE:    f32        = 24.0;
 const START_BTN_LABEL:         &str       = "START AEONS";
-const DEFAULT_MAP_PATH:        &str       = "assets/world_superflat.glb";
-// Empty by default so the launcher opens in fresh-spawn mode: the
-// Max Organisms / Max Herbivores fields drive the initial cohort
-// directly. The user can paste or browse to a `.colony` file
-// whenever they explicitly want to load one — that flips the spawn-
-// control widgets to greyed-out (gated by "Adjust colony
-// dimensions").
+const DEFAULT_MAP_PATH:        &str       = "assets/waterworld1.glb";
+// Empty ⇒ fresh-spawn mode (spawn fields drive the cohort). Selecting a
+// `.colony` greys out the spawn widgets (gated by "Adjust colony dimensions").
 const DEFAULT_COLONY_PATH:     &str       = "";
 
 
@@ -146,25 +124,21 @@ pub enum LaunchMode {
         map_x:          f32,
         map_z:          f32,
         max_phototrophs:  usize,
-        /// Reproduction soft cap on herbivores. Forwarded to the
-        /// child as `--max-herbivores N`. Seeded from the launcher's
-        /// text field — defaults to `DEFAULT_MAX_HERBIVORES`.
+        /// Herbivore reproduction soft cap (`--max-herbivores N`).
         max_herbivores: usize,
-        /// Number of heterotrophs spawned at startup. Drives the
-        /// initial cohort in `spawn_colony`; the cap (`MaxHerbivores`)
-        /// is independent. Forwarded via `--start-heteros N`.
+        /// Startup heterotroph cohort (`--start-heteros N`); independent of `MaxHerbivores`.
         start_heterotrophs: usize,
-        /// Number of photoautotrophs spawned at startup. Drives the
-        /// initial cohort in `spawn_colony`; the cap
-        /// (`MaxPhotoautotrophs`) is independent. Forwarded via
-        /// `--start-photos N`.
+        /// Startup photoautotroph cohort (`--start-photos N`); independent of `MaxPhotoautotrophs`.
         start_photoautotrophs: usize,
-        /// Final AI-training-mode state at click-of-START — the
-        /// launcher's checkbox is the source of truth. It seeds
-        /// from `--trainingmode` if that argv flag was set when the
-        /// launcher process started, but the user may toggle it
-        /// before clicking and the toggle wins.
+        /// AI-training-mode state at click-of-START (checkbox wins over the
+        /// seeded `--trainingmode` argv).
         training_mode:  bool,
+        /// World-space Y of the global water surface (`--water-level Y`).
+        water_level:    f32,
+        /// When a colony is loaded, whether to override its saved dimensions
+        /// (currently the water level) with the launcher-chosen values
+        /// (`--adjust-colony-dimensions`).
+        adjust_colony_dimensions: bool,
     },
     /// Boot the colony editor (Bevy + minimal plugin set, no AI).
     RunEditor {
@@ -174,8 +148,7 @@ pub enum LaunchMode {
     },
 }
 
-/// Open the launcher window. Returns `Some(mode)` when the user clicked
-/// either action button, `None` if they closed the window.
+/// Open the launcher. `Some(mode)` if an action button was clicked, `None` if closed.
 pub fn run_launcher() -> Option<LaunchMode> {
     let (tx, rx) = mpsc::channel::<LaunchMode>();
 
@@ -209,30 +182,22 @@ struct LauncherApp {
     map_x:          f32,
     map_z:          f32,
     max_phototrophs:  usize,
-    /// Herbivore reproduction soft cap. Editable via the Max
-    /// Herbivores text field; forwarded to the child via
-    /// `--max-herbivores N`.
+    /// Herbivore reproduction soft cap (`--max-herbivores N`).
     max_herbivores: usize,
-    /// Initial-cohort herbivore count. Editable via the
-    /// Start Heterotroph Number text field; forwarded via
-    /// `--start-heteros N`.
+    /// Initial-cohort herbivore count (`--start-heteros N`).
     start_heterotrophs: usize,
-    /// Initial-cohort photoautotroph count. Editable via the
-    /// Spawn Phototrophic Organisms text field; forwarded via
-    /// `--start-photos N`.
+    /// Initial-cohort photoautotroph count (`--start-photos N`).
     start_photoautotrophs: usize,
-    /// AI-training-mode checkbox state. Initialised from
-    /// `--trainingmode` in argv; mutable while the launcher is open.
-    /// Whatever value is held when the user clicks START AEONS is
-    /// what the child process boots with.
+    /// AI-training-mode checkbox; seeded from `--trainingmode`, mutable. The
+    /// value held at click-of-START is what the child boots with.
     training_mode:  bool,
-    /// When a colony save is selected, the spawn-control widgets
-    /// (Max Organisms, AI-training mode, Max Herbivores) are
-    /// disabled by default so the colony loads exactly as recorded.
-    /// Checking this box re-enables those widgets so the user can
-    /// override the cap values for the loaded colony. Has no effect
-    /// when no colony is selected (the widgets are always editable
-    /// in that case).
+    /// World-space Y of the global water surface. Follows the spawn-control
+    /// enabled flag (greyed with a colony loaded unless "Adjust colony
+    /// dimensions" is ticked).
+    water_level:    f32,
+    /// When a colony is loaded, spawn-control widgets are disabled so it loads
+    /// as recorded; checking this re-enables them to override the caps. No
+    /// effect with no colony selected (widgets always editable then).
     adjust_colony_dimensions: bool,
     banner:        Option<egui::TextureHandle>,
     status:        String,
@@ -249,26 +214,12 @@ impl LauncherApp {
             wireframe,
             map_x:          DEFAULT_MAP_X,
             map_z:          DEFAULT_MAP_Z,
-            // Default seed: the global "starter" value. The user can
-            // dial it freely up to `LAUNCHER_POPULATION_CAP`; the
-            // chosen value flows through to the GPU brain-pool size.
             max_phototrophs:  DEFAULT_MAX_PHOTOAUTOTROPHS,
-            // Herbivore cap default — mirrors `MaxHerbivores::default()`.
-            // Capped at `LAUNCHER_POPULATION_CAP` from above for
-            // simplicity (the herbivore count can never exceed the
-            // overall organism cap anyway).
             max_herbivores: DEFAULT_MAX_HERBIVORES,
-            // Initial herbivore cohort default. Defaults to the same
-            // value as the cap so an out-of-the-box run with default
-            // settings still produces a visible starter cohort.
             start_heterotrophs:    DEFAULT_START_HETEROTROPHS,
-            // Photo cohort default — matches `DEFAULT_START_PHOTOAUTOTROPHS`.
             start_photoautotrophs: DEFAULT_START_PHOTOAUTOTROPHS,
             training_mode,
-            // Default OFF — if the user pre-fills a colony path,
-            // they'll see the spawn widgets greyed out until they
-            // explicitly opt in to overriding the loaded colony's
-            // dimensions.
+            water_level:    DEFAULT_WATER_LEVEL,
             adjust_colony_dimensions: false,
             banner:         load_banner(&cc.egui_ctx),
             status:         String::new(),
@@ -294,6 +245,8 @@ impl LauncherApp {
             start_heterotrophs:    self.start_heterotrophs,
             start_photoautotrophs: self.start_photoautotrophs,
             training_mode:  self.training_mode,
+            water_level:    self.water_level,
+            adjust_colony_dimensions: self.adjust_colony_dimensions,
         };
         let _ = self.tx.send(mode);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -305,9 +258,7 @@ impl LauncherApp {
             self.status = "Please enter a path to a .glb world file.".into();
             return;
         }
-        // The colony field is silently ignored in editor mode — it's a
-        // simulation-only concept. We don't error if it's set; the user
-        // may have typed it and then changed their mind.
+        // Colony field is silently ignored in editor mode (simulation-only).
         let _ = self.tx.send(LaunchMode::RunEditor {
             map_path: map.to_string(),
             map_x:    self.map_x,
@@ -369,12 +320,8 @@ impl eframe::App for LauncherApp {
                 let open_map_rect = egui::Rect::from_min_size(OPEN_MAP_BTN_POS, OPEN_BTN_SIZE);
                 if ui.put(open_map_rect, egui::Button::new("Open…")).clicked() {
                     let start = dialog_start_dir(&self.map_path);
-                    // `set_parent(frame)` ties the rfd dialog to the
-                    // launcher window so KDE Plasma / xdg-desktop-portal
-                    // can stack it above the launcher instead of behind.
-                    // Without a parent handle the portal places the
-                    // picker arbitrarily, which on Wayland tends to be
-                    // *behind* the spawning window.
+                    // `set_parent(frame)` ties the dialog to the window so the
+                    // portal stacks it in front (Wayland places it behind otherwise).
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("glTF binary (.glb)", &["glb"])
                         .add_filter("All files", &["*"])
@@ -409,13 +356,8 @@ impl eframe::App for LauncherApp {
                 }
 
                 // ── AI-training-mode checkbox ───────────────────────
-                // Placed directly beneath the colony field and OUTSIDE
-                // the colony-dimension gate below, so it stays editable
-                // whether or not a colony is loaded (training mode is
-                // orthogonal to spawn-count overrides). Seeded from
-                // `--trainingmode` argv on launcher start; whatever the
-                // user leaves it on at click-of-START is what's
-                // forwarded (last-touched-wins vs the argv flag).
+                // OUTSIDE the colony-dimension gate, so it stays editable with
+                // or without a colony loaded (orthogonal to spawn overrides).
                 let training_rect = egui::Rect::from_min_size(
                     TRAININGMODE_POS, TRAININGMODE_SIZE);
                 ui.put(
@@ -424,11 +366,8 @@ impl eframe::App for LauncherApp {
                 );
 
                 // ── Map-size row ────────────────────────────────────
-                // Two DragValue widgets that bind to the X and Z
-                // dimensions the loaded world is normalised to. The
-                // values are forwarded to the child subprocess via
-                // `--map-size X Z` argv and inserted into the `MapSize`
-                // resource at simulation / editor startup.
+                // X/Z dimensions the world is normalised to; forwarded via
+                // `--map-size X Z` into the `MapSize` resource.
                 let mapsize_label_rect = egui::Rect::from_min_size(
                     MAPSIZE_LABEL_POS, MAPSIZE_LABEL_SIZE);
                 ui.put(
@@ -467,11 +406,8 @@ impl eframe::App for LauncherApp {
                 );
 
                 // ── Adjust-colony-dimensions checkbox ───────────────
-                // Only rendered when a colony file is selected — the
-                // checkbox is meaningless otherwise (it gates the
-                // spawn-control widgets specifically for the
-                // load-a-colony case). Hiding it keeps the launcher
-                // visually quiet during fresh-spawn runs.
+                // Only rendered when a colony is selected — it's meaningless
+                // otherwise (gates the spawn widgets for the load-a-colony case).
                 let colony_loaded = !self.colony_path.trim().is_empty();
                 if colony_loaded {
                     let adjustcol_rect = egui::Rect::from_min_size(
@@ -485,23 +421,35 @@ impl eframe::App for LauncherApp {
                     );
                 }
 
-                // Editability gate for the spawn-control widgets:
-                // greyed out when a colony is loaded AND the user
-                // hasn't ticked "Adjust colony dimensions". Otherwise
-                // editable (no colony, or user has explicitly opted in
-                // to override). Reading `adjust_colony_dimensions`
-                // even when no colony is loaded is safe — its stored
-                // value is just ignored.
+                // Spawn widgets greyed out only when a colony is loaded AND
+                // "Adjust colony dimensions" is unticked; editable otherwise.
                 let spawn_widgets_enabled =
                     !colony_loaded || self.adjust_colony_dimensions;
 
+                // ── Water-level field (beside the map-size row) ─────
+                // Unlike the always-editable map-size fields, this follows the
+                // spawn-control gate (a loaded colony restores its saved water
+                // level unless "Adjust colony dimensions" is ticked).
+                let waterlevel_label_rect = egui::Rect::from_min_size(
+                    WATERLEVEL_LABEL_POS, WATERLEVEL_LABEL_SIZE);
+                ui.put(waterlevel_label_rect, egui::Label::new(
+                    egui::RichText::new("Water level:").size(TEXTFIELD_FONT_SIZE),
+                ));
+                let waterlevel_drag_rect = egui::Rect::from_min_size(
+                    WATERLEVEL_DRAG_POS, WATERLEVEL_FIELD_SIZE);
+                ui.add_enabled_ui(spawn_widgets_enabled, |ui| {
+                    ui.put(
+                        waterlevel_drag_rect,
+                        egui::DragValue::new(&mut self.water_level)
+                            .range(WATERLEVEL_MIN..=WATERLEVEL_MAX)
+                            .speed(1.0),
+                    );
+                });
+
                 ui.add_enabled_ui(spawn_widgets_enabled, |ui| {
                     // ── Max-organisms row ───────────────────────────
-                    // This value sizes the GPU brain-pool tensors at
-                    // simulation startup. After launch the
-                    // statistics-panel "Max Organisms" field can lower
-                    // this soft cap further, but never above what was
-                    // allocated here. Ignored by the editor.
+                    // Sizes the GPU brain-pool tensors at startup; the runtime
+                    // panel can lower the soft cap but never above this. Editor ignores.
                     let maxorg_label_rect = egui::Rect::from_min_size(
                         MAXPHOTO_LABEL_POS, MAXPHOTO_LABEL_SIZE);
                     ui.put(
@@ -520,10 +468,8 @@ impl eframe::App for LauncherApp {
                     );
 
                     // ── Spawn-phototrophic-organisms row ─────────────
-                    // Initial-cohort photo count, independent from the
-                    // running-population cap. Setting it below
-                    // `MaxPhotoautotrophs` leaves room for reproduction
-                    // to backfill the photo population up to the cap.
+                    // Initial-cohort photo count; below `MaxPhotoautotrophs`
+                    // leaves room for reproduction to backfill.
                     let spawnphoto_label_rect = egui::Rect::from_min_size(
                         SPAWNPHOTO_LABEL_POS, SPAWNPHOTO_LABEL_SIZE);
                     ui.put(
@@ -542,14 +488,8 @@ impl eframe::App for LauncherApp {
                     );
 
                     // ── Max-herbivores row ──────────────────────────
-                    // Seeds the `MaxHerbivores` reproduction cap. The
-                    // statistics panel exposes the same value at
-                    // runtime so the user can lower or raise it
-                    // later, but the initial-cohort sizing is
-                    // anchored here. Clamped to
-                    // `[1, LAUNCHER_POPULATION_CAP]` so the
-                    // herbivore cap can never exceed the overall
-                    // pool size.
+                    // Seeds the `MaxHerbivores` reproduction cap. Clamped to
+                    // `[1, LAUNCHER_POPULATION_CAP]` so it can't exceed pool size.
                     let maxherb_label_rect = egui::Rect::from_min_size(
                         MAXHERB_LABEL_POS, MAXHERB_LABEL_SIZE);
                     ui.put(
@@ -568,10 +508,7 @@ impl eframe::App for LauncherApp {
                     );
 
                     // ── Start-heterotrophs row ───────────────────
-                    // Initial-cohort herbivore count, independent
-                    // from the running-population cap. Defaults to
-                    // `DEFAULT_START_HETEROTROPHS = 5`. Setting it
-                    // below `MaxHerbivores` (and `MaxOrganisms`)
+                    // Initial-cohort herbivore count; below `MaxHerbivores`
                     // leaves headroom for reproduction.
                     let starthet_label_rect = egui::Rect::from_min_size(
                         STARTHET_LABEL_POS, STARTHET_LABEL_SIZE);
@@ -592,10 +529,8 @@ impl eframe::App for LauncherApp {
                 });
 
                 // ── Action button ───────────────────────────────────
-                // Single launch button now that the standalone Colony
-                // Editor entry has been removed. Editor / species-editor
-                // modes are reachable from the in-app mode bar after
-                // the simulation starts.
+                // Single launch button; editor / species-editor modes are
+                // reachable from the in-app mode bar after the sim starts.
                 let total_w  = ACTION_BTN_SIZE.x;
                 let row_left = (LAUNCHER_WINDOW_SIZE.x - total_w) * 0.5;
                 let start_pos  = egui::pos2(row_left, ACTION_ROW_TOP);

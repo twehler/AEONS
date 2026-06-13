@@ -1,44 +1,19 @@
 // Behaviour plugin — wires every brain pool, the shared world model,
 // and the photosynthesis sunlight-check into the schedule.
 //
-// One plugin instead of four because every brain runs on the same
-// 30 Hz clock and shares the same shared inputs (heterotrophs read
-// the world-model resource; photoautotrophs read the sunlight flag
-// `Organism::in_sunlight` written by `PhotosynthesisPlugin`).
-// Bundling them here keeps the wiring near the systems' execution
-// order and lets us guarantee the world-model rebuild completes
-// before any heterotroph apply system reads it.
+// One plugin because all brains share a clock and inputs (heteros read
+// the world-model resource; photos read `Organism::in_sunlight`).
 //
-// Schedule layout (per tick):
-//
-//   PreUpdate  ── photosynthesis sunlight ray-march (10 Hz, gated
-//                 inside PhotosynthesisPlugin).
-//                 ↓ assign / free systems for all four pools, chained
-//                 so all reservations land before any apply tick reads
-//                 a slot. Why PreUpdate: both `predation_system` and
-//                 `manage_energy` despawn organisms in Update; running
-//                 assign/free here keeps their inserts off dead
-//                 entities (cf. issue #10166 — try_insert is the
-//                 belt-and-braces).
-//
-//   Update     ── (gated by BRAIN_TICK_INTERVAL timer)
-//                 1. rebuild_world_model_grid
-//                    — clears + repopulates `WorldModelGrid` with
-//                    every photo + hetero position. Must run before
-//                    any hetero apply system this tick.
-//                 2. apply_intelligence_level_1_photo
-//                 3. apply_intelligence_level_1_hetero
-//                 4. apply_intelligence_level_2
-//                 5. apply_intelligence_level_3
-//                    — all four chained. They each `NonSendMut`
-//                    their own pool resource so they'd serialise on
-//                    the main thread anyway (CUDA state isn't
-//                    Send); the `.chain()` just makes the order
-//                    explicit AND ensures the world-model rebuild
-//                    completes before any reader. The photo pool
-//                    doesn't need the world model but joining the
-//                    chain costs nothing — the overall schedule is
-//                    main-thread-bound on these systems either way.
+// Schedule:
+//   PreUpdate  — photosynthesis sunlight ray-march, then assign/free
+//                for all pools (chained). PreUpdate because Update
+//                despawns organisms (predation/energy); assign/free
+//                here keeps inserts off dead entities (Bevy #10166).
+//   FixedUpdate (gated by HETERO_BRAIN_TICK_INTERVAL) — world-model
+//                rebuild → sensory → each pool's apply, chained so the
+//                grid is fresh before any reader. Pools serialise on
+//                the main thread anyway (NonSendMut CUDA state); chain
+//                just makes the order explicit.
 
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
@@ -53,13 +28,13 @@ use crate::intelligence_level_2_sliding::{
 use crate::intelligence_level_3_sliding::{
     BrainPoolL3, assign_brains_l3, free_brains_l3, apply_intelligence_level_3,
 };
-// Limb-based PPO pools (Phase 3). Mirror the three sliding pools but
-// gated on `Organism::sliding_movement == false`. Each is a separate
-// non-send resource with its own GPU-batched actor + critic. Apply
-// systems are stubs until Phase 4 wires the physics observations.
+// Limb-based PPO pools. Mirror the three sliding pools but gated on
+// `!Organism::movement_mode.is_sliding()`. Each is a separate non-send
+// resource with its own GPU-batched actor + critic.
 use crate::intelligence_level_herbivore_1_limb::{
     BrainPoolHerbivore1Limb, assign_brains_herbivore_1_limb,
     free_brains_herbivore_1_limb, apply_intelligence_level_herbivore_1_limb,
+    share_limb_policies_herbivore_1,
 };
 use crate::intelligence_level_2_limb::{
     BrainPoolL2Limb, assign_brains_l2_limb, free_brains_l2_limb,
@@ -69,25 +44,23 @@ use crate::intelligence_level_3_limb::{
     BrainPoolL3Limb, assign_brains_l3_limb, free_brains_l3_limb,
     apply_intelligence_level_3_limb,
 };
+// Swimming PPO pool (Level1 only for now) — gated on
+// `Organism::movement_mode.is_swimming()`; the limb pools exclude swimmers,
+// so the populations stay disjoint. Ball-joint 3-axis control + the 3D
+// target/rotation oracles (swimming_movement/swim_ppo.rs).
+use crate::intelligence_level_1_swimming::{
+    BrainPoolSwim1, assign_brains_swim_1, free_brains_swim_1,
+    apply_intelligence_level_swim_1,
+};
 use crate::photosynthesis::PhotosynthesisPlugin;
 use crate::world_model::{WorldModelGrid, rebuild_world_model_grid};
 
 
-/// Photoautotroph brain tick rate (30 Hz).
-///
-/// Each tick fires one batched forward + REINFORCE step per pool,
-/// evaluating every organism's private MLP in parallel on the GPU.
-/// Between ticks, organisms continue to consume their last commanded
-/// `movement_*` per frame in `apply_movement`, so the simulation
-/// stays smooth.
-///
-/// 33 ms keeps the GPU pipeline full between ticks (vs the 200 Hz
-/// earlier rate which forced 200 host→device→GPU→device→host
-/// round-trips per second per pool and produced the "low CPU + low
-/// GPU + low FPS" symptom).
-///
-/// `on_timer` ticks with `Time<Virtual>::delta()`, so brains
-/// naturally pause when the simulation is paused.
+/// Photoautotroph brain tick rate (30 Hz). One batched forward +
+/// REINFORCE step per pool per tick; between ticks organisms keep
+/// consuming their last `movement_*` in `apply_movement`. 33 ms keeps
+/// the GPU pipeline full (vs frequent host↔device round-trips). Ticks
+/// on virtual time, so brains pause with the sim.
 #[allow(unused_imports)]
 use crate::simulation_settings::PHOTO_BRAIN_TICK_INTERVAL;
 
@@ -98,80 +71,63 @@ pub struct BehaviourPlugin;
 
 impl Plugin for BehaviourPlugin {
     fn build(&self, app: &mut App) {
-        // Photoautotroph sunlight check (10 Hz, PreUpdate). Updates
-        // `Organism::in_sunlight` which the L1 photo brain reads as
-        // input.
+        // Photoautotroph sunlight check (10 Hz, PreUpdate); writes
+        // `Organism::in_sunlight`.
         app.add_plugins(PhotosynthesisPlugin);
 
-        // World model resource — populated each brain tick by
-        // `rebuild_world_model_grid`, queried by every hetero apply
-        // system. Initialised empty here so the resource exists from
-        // tick 1.
+        // World model resource — rebuilt each brain tick. Init empty so
+        // it exists from tick 1.
         app.init_resource::<WorldModelGrid>();
 
-        // ── Pool resources (non-send: CUDA state isn't Send). ───────
-        // Three active sliding pools: herbivore_1, L2, L3 (REINFORCE,
-        // predator-style; generic over carnivore vs herbivore target
-        // type).
+        // Pool resources (non-send: CUDA state isn't Send).
+        // Sliding pools (REINFORCE): herbivore_1, L2, L3.
         app.init_non_send_resource::<BrainPoolHerbivore1>();
         app.init_non_send_resource::<BrainPoolL2>();
         app.init_non_send_resource::<BrainPoolL3>();
-        // Limb-based PPO pools — three more non-send resources, sized
-        // identically to the sliding pools. Per the design choice each
-        // pool keeps its full `OrganismPoolSize` capacity (no shared
-        // weights, no batch splitting). The three pools' apply systems
-        // are stubs until Phase 4.
+        // Limb pools (PPO), each at full `OrganismPoolSize` (no shared
+        // weights, no batch splitting).
         app.init_non_send_resource::<BrainPoolHerbivore1Limb>();
         app.init_non_send_resource::<BrainPoolL2Limb>();
         app.init_non_send_resource::<BrainPoolL3Limb>();
+        // Swimming pool (PPO, ball-joint 3-axis control), Level1 only.
+        app.init_non_send_resource::<BrainPoolSwim1>();
 
-        // ── PreUpdate: assign / free for every active pool. ─────────
+        // PreUpdate: assign / free for every active pool.
         app.add_systems(PreUpdate, (assign_brains_herbivore_1, free_brains_herbivore_1).chain());
         app.add_systems(PreUpdate, (assign_brains_l2,          free_brains_l2)         .chain());
         app.add_systems(PreUpdate, (assign_brains_l3,          free_brains_l3)         .chain());
-        // Limb pools — same PreUpdate cadence; the filter inside each
-        // assign system gates on `!sliding_movement` so the two
-        // populations are disjoint.
+        // Limb pools — `!movement_mode.is_sliding()` filter keeps the two
+        // populations disjoint.
         app.add_systems(PreUpdate, (assign_brains_herbivore_1_limb, free_brains_herbivore_1_limb).chain());
+        // Social learning: periodically propagate the best walker's policy to
+        // stragglers so the WHOLE population walks (self-gated by virtual time).
+        app.add_systems(PreUpdate, share_limb_policies_herbivore_1);
         app.add_systems(PreUpdate, (assign_brains_l2_limb,          free_brains_l2_limb)         .chain());
         app.add_systems(PreUpdate, (assign_brains_l3_limb,          free_brains_l3_limb)         .chain());
+        // Swimming pool — `is_swimming()` filter keeps it disjoint from both
+        // the sliding and the limb populations.
+        app.add_systems(PreUpdate, (assign_brains_swim_1,           free_brains_swim_1)          .chain());
 
-        // ── FixedUpdate: hetero pools at ~6.7 Hz of VIRTUAL time. ───
-        // The brain decision/learning cadence runs in `FixedUpdate`
-        // (NOT `Update`) so it's driven by virtual time, not the render
-        // frame rate. In `Update`, a system runs at most once per real
-        // frame, so at high `TimeSpeed` the brain under-ticked (it
-        // "should" fire every 150 ms of virtual time but couldn't fire
-        // more than once per frame). `FixedUpdate` runs as many times
-        // per real frame as needed to consume the accumulated virtual
-        // time, so the brain fires every `HETERO_BRAIN_TICK_INTERVAL`
-        // of VIRTUAL time regardless of frame rate or `TimeSpeed` —
-        // making fast-forwarded learning equivalent to real-time
-        // learning (just more wall-clock-cheap), as long as the
-        // hardware keeps up. `on_timer` here ticks on `Time<Fixed>`
-        // (the active clock inside `FixedUpdate`), i.e. fixed-step
-        // virtual deltas.
-        //
-        // Shared world-model rebuild → sensory → each pool's apply.
-        // The chain keeps the grid fresh before any apply reads it.
+        // FixedUpdate (NOT Update) so the brain cadence is driven by
+        // virtual time, not frame rate: FixedUpdate runs as many times
+        // per frame as needed to consume accumulated virtual time, so
+        // the brain fires every HETERO_BRAIN_TICK_INTERVAL regardless of
+        // TimeSpeed (fast-forward learning == real-time learning).
+        // `on_timer` ticks on Time<Fixed>.
         app.add_systems(
             FixedUpdate,
             (
                 rebuild_world_model_grid,
-                // Sensory layer — must run AFTER the world-model
-                // rebuild (it consumes the grid) and BEFORE the
-                // herbivore brain (which reads target_distance both
-                // as an input observation and as a reward signal).
+                // Sensory — after the grid rebuild (consumes it), before
+                // the herbivore brain (reads target_distance as input + reward).
                 crate::sensory::update_target_distance,
                 apply_intelligence_level_herbivore_1,
                 apply_intelligence_level_2,
                 apply_intelligence_level_3,
-                // Limb-based apply systems. Run in the same chained
-                // block so they share the brain-tick cadence and
-                // observe the same world-model snapshot.
                 apply_intelligence_level_herbivore_1_limb,
                 apply_intelligence_level_2_limb,
                 apply_intelligence_level_3_limb,
+                apply_intelligence_level_swim_1,
             )
                 .chain()
                 .run_if(on_timer(HETERO_BRAIN_TICK_INTERVAL)),

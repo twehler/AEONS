@@ -1,19 +1,10 @@
 // Heterotroph world model.
 //
 // Every brain tick rebuilds an XZ spatial hash of every photoautotroph
-// AND heterotroph (positions + type). Each Level 1/2/3 hetero pool
-// reads from this hash to fill its per-organism input vector with the
-// top-K nearest neighbours within `WORLD_MODEL_RADIUS`. Bucket size =
-// the radius, so each query touches at most 9 buckets.
-//
-// One shared resource means the grid is built exactly once per brain
-// tick instead of three times (one per pool).
-//
-// Mirrors `world_model_old.rs` 1:1 for the grid + filter logic
-// (Photoautotroph + Heterotroph markers, two-query rebuild,
-// relative-position return from `nearest_prey`). The only addition
-// is `prey_in_radius`, used by the new L1-hetero DQN's body-frame
-// state encoder.
+// AND heterotroph (positions + type). Each hetero pool reads top-K
+// nearest neighbours within `WORLD_MODEL_RADIUS`. Bucket size = the
+// radius, so each query touches at most 9 buckets. Shared resource so
+// the grid is built once per tick, not once per pool.
 
 use bevy::prelude::*;
 use std::collections::HashMap;
@@ -62,11 +53,9 @@ pub struct WorldModelGrid {
 }
 
 
-/// Rebuild the grid from the current Photoautotroph + Heterotroph
-/// transforms + velocities. Run once per brain tick (gated on the
-/// hetero brain timer in `behaviour.rs`). Krishi entities also carry
-/// the `Heterotroph` marker (Krishi is a fixed-form heterotroph variant)
-/// so they land in the grid tagged as `Hetero`.
+/// Rebuild the grid from current Photoautotroph + Heterotroph transforms
+/// + velocities. Run once per brain tick. Krishi carries the
+/// `Heterotroph` marker so it lands in the grid tagged `Hetero`.
 pub fn rebuild_world_model_grid(
     mut grid: ResMut<WorldModelGrid>,
     photos:  Query<(Entity, &Transform, &Organism), With<Photoautotroph>>,
@@ -143,12 +132,9 @@ pub fn collect_neighbours(
 
 
 /// Count Photoautotroph grid entries within `radius` (XZ distance) of
-/// `self_pos`. Used by the herbivore reward channel to detect "how
-/// rich is this patch of the world" so the W_EAT channel can be
-/// normalised against random-walk baseline encounter rates in dense
-/// vs sparse conditions. Implementation mirrors `collect_neighbours`
-/// — scans the same 3×3 bucket window — but stops at a count rather
-/// than building a sorted list.
+/// `self_pos`. Used to normalise the herbivore W_EAT reward channel
+/// against local prey density. Same 3×3 bucket scan as
+/// `collect_neighbours`, but counts instead of sorting.
 pub fn count_local_prey(
     grid:     &WorldModelGrid,
     self_pos: Vec3,
@@ -199,16 +185,11 @@ pub fn encode_neighbours(
 }
 
 
-/// Body-frame variant of `encode_neighbours`. Rotates each neighbour's
-/// relative position and velocity by the inverse of the observer's
-/// yaw (Y-axis rotation extracted from `base_rot`) before normalising.
-/// The brain then sees "in front of me / to my left" instead of
-/// "world-X / world-Z" and doesn't have to learn the world↔body
-/// transform on top of locomotion.
-///
-/// Used only by the limb-based pools — the sliding pools chase via
-/// geometric direction (target picked by logits, direction computed by
-/// the apply system) and would gain nothing from body-frame inputs.
+/// Body-frame variant of `encode_neighbours`: rotates each neighbour's
+/// rel position + velocity by the inverse observer yaw (from `base_rot`)
+/// so the brain sees body-local "front/left" and need not learn the
+/// world↔body transform. Used only by the limb pools (sliding pools
+/// chase geometrically and gain nothing from body-frame inputs).
 pub fn encode_neighbours_body_local(
     neighbours: &[Option<Neighbour>; WORLD_MODEL_K],
     base_rot:   Quat,
@@ -251,10 +232,8 @@ pub fn encode_neighbours_body_local(
 }
 
 
-/// Convenience: fill `out` with encoded neighbours in one call.
-/// Equivalent to `encode_neighbours(&collect_neighbours(grid, self_pos), out)`
-/// but exposed so legacy single-pool callers don't need to thread the
-/// intermediate array.
+/// Convenience: `encode_neighbours(&collect_neighbours(grid, self_pos), out)`
+/// in one call, so callers needn't thread the intermediate array.
 pub fn fill_world_model(
     grid:       &WorldModelGrid,
     self_pos:   Vec3,
@@ -265,43 +244,42 @@ pub fn fill_world_model(
 }
 
 
-/// Find the nearest **photoautotroph** within `WORLD_MODEL_RADIUS` of
-/// `self_pos`. Returns `(rel_pos, distance, entity)` or `None` when
-/// no prey is in range.
-///
-/// Used by the heterotroph reward shaper to compute the per-tick
-/// "did I get closer to prey?" (progress) and "am I facing prey?"
-/// (alignment) signals. The returned `Entity` lets the caller detect
-/// when the nearest prey CHANGES between ticks: in that case the
-/// progress reward is meaningless (the delta would compare distances
-/// against two different organisms) and the caller zeroes it.
-///
-/// Same 3×3 bucket probe as `fill_world_model`; the tiny duplication
-/// is preferable to threading nearest-prey state through the latter's
-/// signature because the call sites have different mutability needs.
+/// Nearest **photoautotroph** within `WORLD_MODEL_RADIUS` of `self_pos`,
+/// as `(rel_pos, distance, entity)` or `None`. The returned `Entity`
+/// lets the reward shaper detect when nearest prey CHANGES between ticks
+/// (progress delta would then compare two different organisms — caller
+/// zeroes it). Same 3×3 bucket probe as `fill_world_model`.
 pub fn nearest_prey(grid: &WorldModelGrid, self_pos: Vec3) -> Option<(Vec3, f32, Entity)> {
+    nearest_prey_within(grid, self_pos, crate::simulation_settings::PREY_SCAN_RADIUS)
+}
+
+/// `nearest_prey` with an explicit scan radius — lets a caller use a
+/// movement-mode-specific sensory range (e.g. swimmers at
+/// `SWIM_SENSORY_RADIUS`) without changing the default `PREY_SCAN_RADIUS`
+/// the limb/sliding pools rely on.
+pub fn nearest_prey_within(grid: &WorldModelGrid, self_pos: Vec3, radius: f32) -> Option<(Vec3, f32, Entity)> {
+    // Prey perception is DECOUPLED from the neighbour-encoding radius: scan out to
+    // `radius` (≫ WORLD_MODEL_RADIUS) so the brain can steer toward food that is
+    // tens-of-units away, while the gait observation stays at the small radius. The
+    // grid is still bucketed at WORLD_MODEL_RADIUS, so probe enough bucket rings to
+    // cover the larger scan radius.
     let bucket    = WORLD_MODEL_RADIUS;
-    let radius_sq = WORLD_MODEL_RADIUS * WORLD_MODEL_RADIUS;
+    let radius_sq = radius * radius;
+    let span      = (radius / bucket).ceil() as i32;
     let kx = (self_pos.x / bucket).floor() as i32;
     let kz = (self_pos.z / bucket).floor() as i32;
 
     let mut best: Option<(f32, Vec3, Entity)> = None;
-    for dx in -1..=1 {
-        for dz in -1..=1 {
+    for dx in -span..=span {
+        for dz in -span..=span {
             if let Some(entries) = grid.grid.get(&(kx + dx, kz + dz)) {
                 for &e in entries {
                     if !matches!(e.ty, OrganismType::Photo) { continue; }
                     let rel = e.pos - self_pos;
                     let d2  = rel.length_squared();
-                    // No self-exclusion needed — the type filter above
-                    // restricts to Photoautotrophs, and the caller is
-                    // always a Heterotroph. The previous `d2 < 1e-6`
-                    // skip was a hangover from a generic version of
-                    // this function. It produced the "dance on one
-                    // spot" bug: a herbivore parked exactly on a photo
-                    // (d_root < 0.001) lost its target, fell through
-                    // to the wander branch, drifted away, re-targeted,
-                    // approached, parked, wandered — forever.
+                    // No self-exclusion: the Photo filter + Heterotroph
+                    // caller make it unnecessary, and a `d2 < 1e-6` skip
+                    // would drop a photo a herbivore is parked exactly on.
                     if d2 > radius_sq { continue; }
                     if best.map_or(true, |(b, _, _)| d2 < b) {
                         best = Some((d2, rel, e.entity));
@@ -314,13 +292,8 @@ pub fn nearest_prey(grid: &WorldModelGrid, self_pos: Vec3) -> Option<(Vec3, f32,
 }
 
 
-/// Every photoautotroph within `WORLD_MODEL_RADIUS` of `self_pos`,
-/// as `(rel_xz, distance)`. Used by the L1-hetero DQN's body-frame
-/// state encoder to fill its 8 angular bins; the caller does the
-/// bin-assignment and yaw rotation itself.
-///
-/// Self-exclusion via exact-position match, same as the other two
-/// helpers in this file.
+/// Every photoautotroph within `WORLD_MODEL_RADIUS` of `self_pos`, as
+/// `(rel_xz, distance)`. Self-excluded via exact-position match.
 pub fn prey_in_radius(grid: &WorldModelGrid, self_pos: Vec3) -> Vec<(Vec2, f32)> {
     let bucket    = WORLD_MODEL_RADIUS;
     let radius_sq = WORLD_MODEL_RADIUS * WORLD_MODEL_RADIUS;

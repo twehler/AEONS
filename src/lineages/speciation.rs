@@ -1,30 +1,18 @@
-// Speciation tick — assigns / reassigns species ids based on DNA
-// distance to species centroids.
+// Speciation tick — assigns/reassigns species ids by DNA distance to
+// centroids. Runs at ~1 Hz (must just be fast vs. reproduction cadence so
+// newborns are reclassified before they reproduce).
 //
-// Runs at ~1 Hz (`SPECIATION_TICK_SECS`) — speciation is a slow
-// process, the tick rate just has to be small compared with the
-// reproduction cadence so newly-born organisms get reclassified
-// before they themselves reproduce.
+// Three ordered sub-steps:
+//   1. `sync_dna_from_phenotype` — fill brain-gene slots (structural slots
+//      already populated by `spawn_organism`).
+//   2. `update_species_averages` — recompute each alive species' centroid as
+//      a trimmed mean (drops members > threshold from the previous mean).
+//   3. `classify_organisms` — unassigned ⇒ nearest species within threshold
+//      else new; drifted past threshold ⇒ same flow, new species' parent_id =
+//      the previous species (the forked lineage).
 //
-// Three sub-steps in order:
-//   1. `sync_dna_from_phenotype` — fills in the L1 hetero brain-gene
-//      slots of each Organism's DNA vector. The structural slots are
-//      already populated by `spawn_organism`.
-//   2. `update_species_averages` — recomputes every alive species'
-//      `avg_dna` as a trimmed mean over its members (drops any
-//      member further than `SPECIES_SEPARATION_THRESHOLD` from the previous
-//      tick's mean).
-//   3. `classify_organisms` — for each organism:
-//        * No species_id ⇒ assign nearest species within threshold,
-//          or create a new species if no fit exists.
-//        * Has species_id but DNA has drifted > threshold from its
-//          species' centroid ⇒ same flow as above; the new species'
-//          parent_id is recorded as the diverged organism's previous
-//          species_id (= the lineage we forked from).
-//
-// Extinction: any species with zero alive members at the end of a
-// tick is marked `extinct = true`. Extinct species are skipped by
-// classification but persisted for the tree-of-life view.
+// Extinction: zero-member species are flagged extinct (skipped by
+// classification, persisted for the tree view).
 
 use bevy::prelude::*;
 
@@ -38,8 +26,7 @@ use crate::organism::Organism;
 use crate::simulation_settings::SPECIES_SEPARATION_THRESHOLD;
 
 
-/// Cadence in real seconds. Speciation isn't latency-sensitive and
-/// the tick walks every organism in the world, so 1 Hz is plenty.
+/// Cadence in real seconds. 1 Hz — not latency-sensitive, walks all organisms.
 const SPECIATION_TICK_SECS: f32 = 1.0;
 
 
@@ -55,17 +42,10 @@ impl Default for SpeciationTimer {
 
 // ── DNA sync (full phenotype) ───────────────────────────────────────────────
 //
-// Runs on every organism every frame. Reads the organism's current
-// state (body parts, classification flags, intelligence level) AND
-// any per-slot brain genes from the L2 / L3 pools when applicable.
-// This is the canonical pipeline that keeps `Organism::dna` in sync
-// with everything the lineage system compares.
-//
-// The brain-gene slots only populate for organisms that actually
-// carry brain hyperparameters — currently that's L2 / L3 organisms.
-// L0 sessiles, L1 photoautotrophs, and L1 herbivores have no gene
-// vector and leave those slots at 0, so they cluster on body-plan +
-// classification features alone.
+// Runs on every organism every frame, syncing `Organism::dna` from current
+// state + L2/L3 brain genes. Brain-gene slots populate only for L2/L3; L0
+// sessiles, L1 photos, and L1 herbivores leave them 0 and cluster on body-
+// plan + classification features alone.
 
 pub fn sync_dna_from_phenotype(
     pool_l2:   Option<NonSend<BrainPoolL2>>,
@@ -79,30 +59,20 @@ pub fn sync_dna_from_phenotype(
     )>,
 ) {
     for (mut organism, is_photo, is_carnivore, slot_l2, slot_l3) in &mut q {
-        // Resize on demand — newborns spawn with `empty_dna()` of the
-        // right length, but defensive against any caller that
-        // constructed an Organism with an empty Vec.
+        // Resize on demand — defensive against an Organism built with an empty Vec.
         if organism.dna.len() != DNA_DIM {
             organism.dna = empty_dna();
         }
 
         // ── Body plan + classification + body geometry (always written) ──
-        //
-        // Split the borrow: take the mutable reference to `dna` out
-        // of the Organism via a temporary swap with an empty Vec,
-        // then pass it alongside an immutable `&Organism` to
-        // `write_phenotype_dims`. Bevy's `Mut<Organism>` exposes
-        // `into_inner()` but we want change-detection unchanged, so
-        // a swap-and-restore is the cleanest split. Allocation-free:
-        // the empty Vec lives for two statements.
+        // Swap `dna` out to split the borrow (pass &mut dna alongside
+        // &Organism to `write_phenotype_dims`), then restore — keeps change-
+        // detection intact and is allocation-free.
         let mut dna_buf = std::mem::take(&mut organism.dna);
         write_phenotype_dims(&mut dna_buf, &organism, is_photo, is_carnivore);
         organism.dna = dna_buf;
 
-        // ── Brain genes: only for organisms enrolled in L2 / L3 ──
-        // (L1 herbivore is supervised and has no gene vector; the
-        // L1 photo brain's `slot_yaw` isn't a hyperparameter we
-        // currently track in the DNA.)
+        // ── Brain genes: only for L2/L3 (L1 herbivore/photo carry none) ──
         if let (Some(slot), Some(pool)) = (slot_l2, pool_l2.as_deref()) {
             let s = slot.0 as usize;
             if s < pool.sigma.len() {
@@ -145,13 +115,9 @@ pub fn update_species_averages(
     if !timer.0.tick(time.delta()).just_finished() { return; }
     if registry.species.is_empty() { return; }
 
-    // Two-pass trimmed mean: pass 1 finds the simple mean of every
-    // assigned member, pass 2 averages only members within
-    // SPECIES_SEPARATION_THRESHOLD of that simple mean. Excludes outliers
-    // so a single drifting individual can't drag the whole centroid
-    // with it.
-    //
-    // We bucket by species_id once, then process each species.
+    // Two-pass trimmed mean: pass 1 = simple mean of all members, pass 2 =
+    // mean of only those within threshold of it (excludes outliers so a
+    // drifter can't drag the centroid). Bucket by species_id, then process.
     let mut buckets: Vec<Vec<Vec<f32>>> = vec![Vec::new(); registry.species.len()];
     let id_to_idx: std::collections::HashMap<u32, usize> =
         registry.species.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
@@ -169,22 +135,24 @@ pub fn update_species_averages(
     for (idx, dnas) in buckets.iter().enumerate() {
         let species = &mut registry.species[idx];
         if dnas.is_empty() {
-            // Last member died — preserve the historical centroid
-            // (for the tree view), flag the species extinct, and
-            // move on.
+            // Last member died — keep the historical centroid, flag extinct.
             species.member_count = 0;
             species.extinct      = true;
             continue;
         }
         species.member_count = dnas.len() as u32;
+        // A species with live members is not extinct. Without this, a species
+        // flagged extinct on a transient empty-bucket tick stays extinct even
+        // after members reappear — `classify_organisms` then skips it via
+        // `alive_iter`, stranding those members (and, now, their per-species
+        // brain) on a ghost species forever.
+        species.extinct = false;
 
         // ── Pass 1: simple mean ─────────────────────────────────
         let simple = mean_of(dnas);
 
-        // ── Pass 2: trimmed mean (only members within threshold of
-        //   simple mean count). If everyone is outside the threshold
-        //   (degenerate — shouldn't happen normally), fall back to
-        //   the simple mean so we never lose the centroid.
+        // ── Pass 2: trimmed mean (members within threshold of simple mean).
+        //   If none qualify (degenerate), fall back to the simple mean.
         let mut kept: Vec<&Vec<f32>> = dnas.iter()
             .filter(|d| distance(d, &simple) <= SPECIES_SEPARATION_THRESHOLD)
             .collect();
@@ -200,8 +168,6 @@ pub fn update_species_averages(
         let n = kept.len() as f32;
         for i in 0..DNA_DIM { acc[i] /= n; }
         species.avg_dna = acc;
-        // (`kept` only existed for the borrow lifetime; drop is
-        // implicit — explicit `.clear()` would be a no-op.)
         kept.clear();
     }
 }
@@ -227,25 +193,19 @@ pub fn classify_organisms(
     timer:        Res<SpeciationTimer>,
     ai_training:  Res<crate::simulation_settings::AiTrainingMode>,
 ) {
-    // Piggy-back on `update_species_averages`'s timer — both fire
-    // on the same tick, but classification needs the freshly-
-    // updated averages, so it runs immediately after via system
-    // ordering (`.chain()`). Use the same `just_finished` query so
-    // off-tick frames are cheap.
+    // Shares `update_species_averages`'s timer (runs right after via
+    // `.chain()`, needing the fresh averages). Same `just_finished` check
+    // keeps off-tick frames cheap.
     if !timer.0.just_finished() { return; }
 
     for (entity, mut org, imported) in &mut q {
         if org.dna.len() != DNA_DIM { continue; }
 
         // ── Imported-species short-circuit ────────────────────────
-        // If the organism was spawned from a `.species` import and
-        // hasn't been classified yet, route it into a name-keyed
-        // founder species (parent = None, so it sits in its own
-        // tree besides the main lineages). Multiple imports from the
-        // same file collapse into one species. After assignment we
-        // strip the marker so subsequent ticks run the normal drift
-        // logic on the imported organism — its descendants can fork
-        // off sub-species through the standard pipeline.
+        // Unclassified `.species` import ⇒ route into a name-keyed founder
+        // species (parent = None, own tree). Multiple imports from one file
+        // collapse into one. Strip the marker after so later ticks run normal
+        // drift logic and descendants can fork sub-species.
         if let (Some(origin), None) = (imported, org.species_id) {
             let species_id = match registry.find_alive_by_name(&origin.name) {
                 Some(s) => s.id,
@@ -265,29 +225,15 @@ pub fn classify_organisms(
 
         match org.species_id {
             None => {
-                // Unassigned — first-time classification.
-                //
-                // The user's 5% rule applies to OFFSPRING drifting
-                // away from their parent species' centroid, not to
-                // initial classification of organisms that have
-                // never had a species. Without this asymmetry the
-                // initial cohort — whose L1 brain genes are sampled
-                // uniformly from the full `L1_*_RANGE`s, so
-                // per-individual distances are already well above
-                // 5% — explodes into N singleton species, none
-                // connected to any other, because each becomes its
-                // own unparented founder.
-                //
-                // So: when nothing is classified yet, the FIRST
-                // unclassified organism founds Species 1 (no
-                // existing species to join). Every subsequent
-                // unclassified organism joins its closest existing
-                // species regardless of distance. The trimmed-mean
-                // centroid recompute next tick excludes the
-                // outliers from the centroid, and the
-                // `Some(current)` branch below then forks them off
-                // into child species with a proper `parent_id`
-                // edge.
+                // Unassigned — first-time classification. The drift
+                // threshold applies to OFFSPRING diverging from a parent
+                // centroid, NOT to initial classification: applying it here
+                // would explode the initial cohort (whose genes are sampled
+                // across the full ranges) into N unconnected singletons.
+                // So: first unclassified organism founds Species 1; every
+                // later one joins its nearest species regardless of distance.
+                // The trimmed-mean recompute then sheds outliers, and the
+                // `Some(current)` branch forks them off with proper edges.
                 match nearest_id {
                     Some(id) => org.species_id = Some(id),
                     None     => {
@@ -297,42 +243,33 @@ pub fn classify_organisms(
                 }
             }
             Some(current) => {
-                // Currently classified — check drift against own
-                // species' centroid.
+                // Classified — check drift against own species' centroid.
                 let own_dist = registry
                     .get(current)
                     .map(|s| distance(&org.dna, &s.avg_dna))
                     .unwrap_or(f32::INFINITY);
                 if own_dist <= SPECIES_SEPARATION_THRESHOLD {
-                    // Still a good fit — leave it alone.
-                    continue;
+                    continue; // still a good fit
                 }
-                // Drifted out — does another existing species fit
-                // better? If yes, hop over (no new lineage edge —
-                // the organism is just re-classified into an
-                // existing species). If no, fork a new species,
-                // recording the current species as the parent of
-                // the new branch.
+                // Drifted out — hop to a better-fitting existing species (no
+                // edge) if one is within threshold, else fork a new species
+                // with `current` as parent.
                 if nearest_dist <= SPECIES_SEPARATION_THRESHOLD && nearest_id != Some(current) {
                     org.species_id = nearest_id;
                 } else if !ai_training.0 {
                     let new_id = registry.create(org.dna.clone(), Some(current));
                     org.species_id = Some(new_id);
                 }
-                // AI-training mode (the gated branch above): no split-off into
-                // a new species — a drifted organism that fits no existing
-                // species simply stays in its current one, keeping the species
-                // set fixed for the training run.
+                // AI-training mode: no fork — a misfit drifter stays put,
+                // keeping the species set fixed for the run.
             }
         }
     }
 }
 
 
-/// Find the closest alive species to `dna`. Returns `(None,
-/// f32::INFINITY)` when the registry is empty (or only contains
-/// extinct entries) — callers interpret this as "create a brand-new
-/// founder species".
+/// Closest alive species to `dna`. `(None, INFINITY)` when no alive species
+/// exist — callers treat that as "create a new founder species".
 fn nearest_species(registry: &SpeciesRegistry, dna: &[f32]) -> (Option<u32>, f32) {
     let mut best_id:   Option<u32> = None;
     let mut best_dist: f32         = f32::INFINITY;

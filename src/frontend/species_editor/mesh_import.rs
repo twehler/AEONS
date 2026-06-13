@@ -1,32 +1,16 @@
-// Species editor — temporary `.glb` mesh import + Blender-style scaling.
+// Species editor — transient `.glb` mesh import + Blender-style scaling.
 //
-// This is a PURE, TRANSIENT Bevy mesh import. It does NOT touch any
-// simulation / persistence data structure: the imported mesh is never
-// written to a `.species` file and is not converted into cells/OCG. It
-// exists only as an in-editor visual that a future species-generation
-// process will consume as its input template.
+// PURE, TRANSIENT: the imported mesh never touches sim/persistence data —
+// it's not written to a `.species` file nor converted to cells/OCG. It is
+// an in-editor visual template for a future species-generation step.
 //
-// Workflow:
-//   1. The user clicks the "Import Mesh (.glb)" button in the top panel.
-//      If the session has unsaved cell changes, a warning modal asks for
-//      confirmation first (importing deletes the current cells).
-//   2. A native file dialog picks a `.glb`. The file is copied into
-//      `assets/imported_meshes/` (Bevy's `AssetServer` resolves paths
-//      relative to `assets/`, so an arbitrary on-disk path can't be
-//      loaded directly) and spawned as a `SceneRoot` at the species-
-//      editor origin on the editor's `RenderLayers` layer. The cell body
-//      is deleted; cell placement / preview / bilateral axis are
-//      suspended while a mesh is loaded.
-//   3. An orange dot floats at the mesh's projected centre (its origin),
-//      mirroring Blender's object-origin indicator.
-//   4. Pressing `s` begins scaling: a line is drawn from the centre dot
-//      to the cursor — the "cursor-scale-radius". The mesh scales
-//      uniformly and linearly with the radius length relative to the
-//      radius at the moment `s` was pressed, so cursor-on-dot → scale 0.
-//      `Enter` confirms the scale, `Esc` cancels back to the pre-`s` scale.
-//
-// All state lives in the `MeshImport` resource; nothing here is
-// serialised.
+// Workflow: import button (warning modal if dirty, since import deletes the
+// cell body) → file dialog → the `.glb` is copied into `assets/` (the
+// `AssetServer` roots there, so arbitrary on-disk paths can't load directly)
+// and spawned at the editor origin on the editor's `RenderLayers`. An orange
+// dot marks the mesh origin (Blender-style). `s` begins scaling along the
+// dot→cursor radius (uniform/linear vs. the radius at `s`-press; cursor-on-dot
+// → scale 0); `Enter` confirms, `Esc` reverts. All state lives in `MeshImport`.
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::gltf::GltfAssetLabel;
@@ -49,10 +33,8 @@ use super::SPECIES_EDITOR_LAYER;
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/// Sub-directory under `assets/` that imported meshes are copied into so
-/// the `AssetServer` can load them (it resolves paths relative to
-/// `assets/`). The copy is a side-effect of import; files accumulate
-/// there but are harmless.
+/// Sub-directory under `assets/` imported meshes are copied into so the
+/// `AssetServer` (rooted at `assets/`) can load them. Files accumulate harmlessly.
 const IMPORT_DIR: &str = "imported_meshes";
 
 const DOT_DIAMETER_PX:   f32 = 14.0;
@@ -72,12 +54,10 @@ const MIN_INITIAL_RADIUS_PX: f32 = 1.0;
 pub struct MeshImport {
     /// The spawned `SceneRoot` entity, if a mesh is currently loaded.
     pub root: Option<Entity>,
-    /// `true` once the loaded scene's descendants have had the editor
-    /// `RenderLayers` applied (the scene instantiates a frame or two
-    /// after spawn).
+    /// `true` once the scene's descendants have had the editor
+    /// `RenderLayers` applied (the scene instantiates a frame or two later).
     pub layers_applied: bool,
-    /// Committed uniform scale — the scale that persists between scaling
-    /// gestures (and the reference captured when `s` is pressed).
+    /// Committed uniform scale (also the reference captured at `s`-press).
     pub base_scale: f32,
     /// Live uniform scale currently applied to the mesh transform.
     pub current_scale: f32,
@@ -111,9 +91,8 @@ impl MeshImport {
 
 // ── Import (file dialog + spawn) ──────────────────────────────────────────────
 
-/// Open the file dialog, copy the chosen `.glb` into `assets/`, spawn it,
-/// and delete the editor's cell body. Shared by the direct (non-dirty)
-/// path and the warning modal's "Yes".
+/// File dialog → copy the `.glb` into `assets/` → spawn → delete the cell body.
+/// Shared by the direct (non-dirty) path and the warning modal's "Yes".
 fn begin_import(
     asset_server: &AssetServer,
     commands:     &mut Commands,
@@ -354,10 +333,8 @@ pub fn handle_warning_modal_buttons(
 
 // ── Render-layer fixup + scale application ────────────────────────────────────
 
-/// Once the loaded glb scene has instantiated, walk its descendants and
-/// put them on the species-editor `RenderLayers` so the editor camera
-/// (which renders only that layer) can see them. `RenderLayers` is not
-/// propagated to children automatically, so each descendant needs it.
+/// Put the instantiated scene's descendants on the editor `RenderLayers`
+/// (not auto-propagated to children) so the editor camera can see them.
 pub fn apply_imported_mesh_render_layers(
     mut mesh:    ResMut<MeshImport>,
     mut commands: Commands,
@@ -387,8 +364,7 @@ pub fn apply_imported_mesh_render_layers(
     mesh.layers_applied = true;
 }
 
-/// Keep the imported mesh's transform synced to the current uniform
-/// scale every frame (cheap; one entity).
+/// Keep the imported mesh's transform synced to the current uniform scale.
 pub fn apply_mesh_scale(
     mesh:  Res<MeshImport>,
     mut q: Query<&mut Transform, With<ImportedMeshRoot>>,
@@ -403,10 +379,9 @@ pub fn apply_mesh_scale(
 
 // ── Overlay entities (dot + line) ─────────────────────────────────────────────
 
-/// Ensure the centre dot + scale line exist exactly when a mesh is
-/// loaded in SpeciesEditor mode, parented under the `ViewportImage` so
-/// their `Val::Px` coordinates share the space `world_to_viewport`
-/// returns. Spawn-once / despawn-when-inactive.
+/// Spawn/despawn the centre dot + scale line with mesh-loaded state.
+/// Parented under `ViewportImage` so their `Val::Px` coords share the
+/// space `world_to_viewport` returns.
 pub fn manage_overlay_entities(
     mode:        Res<WindowMode>,
     mesh:        Res<MeshImport>,
@@ -459,9 +434,8 @@ pub fn manage_overlay_entities(
     }
 }
 
-/// Translate a window-logical cursor position into viewport-image-local
-/// logical pixels (the same space `world_to_viewport(..) * inv_scale`
-/// produces). Mirrors `colony_editor::placement::adjust_cursor_to_viewport`.
+/// Window-logical cursor → viewport-image-local logical px (same space as
+/// `world_to_viewport(..) * inv_scale`). Mirrors `colony_editor::placement`.
 fn cursor_to_viewport(cursor_window: Vec2, node: &ComputedNode, ui_xf: &UiGlobalTransform) -> Vec2 {
     let inv_scale = node.inverse_scale_factor;
     let size      = node.size() * inv_scale;
@@ -470,9 +444,8 @@ fn cursor_to_viewport(cursor_window: Vec2, node: &ComputedNode, ui_xf: &UiGlobal
     cursor_window - top_left
 }
 
-/// The interaction core: read `s` / `Enter` / `Esc`, update the uniform
-/// scale from the screen-space cursor radius, and drive the dot + line
-/// overlays. Runs every frame while a mesh is loaded.
+/// Interaction core: read `s`/`Enter`/`Esc`, update the uniform scale from
+/// the screen-space cursor radius, and drive the dot + line overlays.
 #[allow(clippy::too_many_arguments)]
 pub fn update_scale_interaction(
     mode:        Res<WindowMode>,
@@ -505,8 +478,7 @@ pub fn update_scale_interaction(
         .map(|c| cursor_to_viewport(c, vp_node, vp_xf));
 
     // ── Input: start / confirm / cancel ──
-    // Ignore keystrokes while a body-part rename is in progress (defensive
-    // — mesh mode has no body parts, but keep the gesture isolated).
+    // Ignore keystrokes during a body-part rename (defensive; gesture isolation).
     let typing = session.renaming_body_part.is_some();
     if !typing {
         if keys.just_pressed(KeyCode::KeyS) && !mesh.scaling {
@@ -556,13 +528,12 @@ pub fn update_scale_interaction(
                 let mid    = (d + c) * 0.5;
                 node.width  = Val::Px(length);
                 node.height = Val::Px(LINE_THICKNESS_PX);
-                // Centre the (unrotated, horizontal) bar on the midpoint;
-                // UI rotation pivots about the node centre.
+                // Centre the horizontal bar on the midpoint (UI rotation pivots
+                // about the node centre).
                 node.left = Val::Px(mid.x - length * 0.5);
                 node.top  = Val::Px(mid.y - LINE_THICKNESS_PX * 0.5);
-                // Screen Y is down, and `UiTransform::rotation` is clockwise,
-                // so the world-facing +X bar points along (cos θ, sin θ) for
-                // θ = atan2(Δy, Δx) — exactly the dot→cursor direction.
+                // Screen Y is down and UI rotation is clockwise, so θ =
+                // atan2(Δy, Δx) points the +X bar along the dot→cursor direction.
                 ui_xf.rotation = Rot2::radians(delta.y.atan2(delta.x));
                 *vis = Visibility::Inherited;
             }

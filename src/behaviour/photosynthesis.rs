@@ -1,14 +1,9 @@
 // Per-organism sunlight check.
 //
-// A photoautotroph is "in direct sunlight" when the line from its position
-// to the (fixed) sun is not occluded by terrain. We test this by marching a
-// ray from the organism toward the sun and querying the heightmap at each
-// step — if the terrain is above the ray's Y at any sampled (x, z), the
-// organism is in shadow.
-//
-// The check is throttled to 10 Hz: terrain doesn't move and organisms
-// wander on the order of seconds, so a fresh result every frame would just
-// burn cycles for a value that hasn't changed.
+// "In direct sunlight" = the line to the (fixed) sun isn't occluded by
+// terrain; tested by ray-marching toward the sun and sampling the
+// heightmap. Throttled to 10 Hz since terrain is static and organisms
+// move slowly.
 
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
@@ -39,21 +34,16 @@ impl Plugin for PhotosynthesisPlugin {
     }
 }
 
-/// Updates `Organism::in_sunlight` for every organism, including
-/// heterotrophs — the field is cheap to maintain and may become useful for
-/// future systems (e.g. thermoregulation). The brain only consumes it for
-/// photoautotrophs in `intelligence_level_1.rs`.
+/// Updates `Organism::in_sunlight` for every organism (heterotrophs
+/// included; only photoautotroph brains consume it).
 fn update_sunlight(
     heightmap: Res<HeightmapSampler>,
     mut query: Query<(Entity, &mut Organism, &Transform), With<OrganismRoot>>,
-    // Trunk-part (`BodyPartIndex(0)`) world transforms, keyed by their
-    // parent OrganismRoot. For LIMB-based organisms the root transform
-    // is frozen at spawn — only the per-part `RigidBody::Dynamic`
-    // children move — so the ray-march must originate from the trunk
-    // part's true world position, otherwise a walking phototroph's
-    // sun-occlusion would be evaluated at its birthplace forever. For
-    // sliding organisms the trunk sits at identity-local under a moving
-    // root, so its world position equals the root's and this is a no-op.
+    // Trunk-part (`BodyPartIndex(0)`) world transforms, keyed by parent
+    // OrganismRoot. For limb organisms the root is frozen at spawn (only
+    // per-part dynamic bodies move), so the ray-march must originate from
+    // the trunk's true world position. For sliding organisms the trunk
+    // is identity-local under a moving root, so this is a no-op.
     base_part_q: Query<(&ChildOf, &crate::cell::BodyPartIndex, &GlobalTransform)>,
 ) {
     let sun      = SUN_DIRECTION.normalize();

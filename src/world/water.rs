@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use crate::colony::*;
-use crate::environment::WATER_LEVEL;
+use crate::environment::WaterLevel;
 use crate::world_geometry::{HeightmapSampler, HEIGHTMAP_CELL_SIZE};
 use bevy::light::NotShadowCaster;
 
@@ -13,8 +13,12 @@ pub struct WaterPlane;
 pub struct WaterPlugin;
 impl Plugin for WaterPlugin {
     fn build(&self, app: &mut App) {
+        // `init_resource` is idempotent: keeps any argv-/colony-set value.
+        app.init_resource::<WaterLevel>();
         app.add_systems(Update, (
             spawn_water_plane.run_if(resource_exists::<HeightmapSampler>),
+            // Move the visible plane when a colony load (or UI) changes the level.
+            reposition_water_plane.run_if(resource_changed::<WaterLevel>),
             apply_buoyancy,
         ));
     }
@@ -25,6 +29,7 @@ fn spawn_water_plane(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     heightmap: Res<HeightmapSampler>,
+    water: Res<WaterLevel>,
     query: Query<&WaterPlane>,
     mut spawned: Local<bool>,
 ) {
@@ -32,8 +37,8 @@ fn spawn_water_plane(
     if !query.is_empty() { *spawned = true; return; }
     *spawned = true;
 
-    // Size the plane to cover the entire world. heightmap.{width,depth,min_x,min_z}
-    // are in CELL units; multiply by HEIGHTMAP_CELL_SIZE for world units.
+    // Cover the whole world. heightmap.{width,depth,min_x,min_z} are in CELL
+    // units; multiply by HEIGHTMAP_CELL_SIZE for world units.
     let world_width = heightmap.width as f32 * HEIGHTMAP_CELL_SIZE;
     let world_depth = heightmap.depth as f32 * HEIGHTMAP_CELL_SIZE;
     let center_x = heightmap.min_x as f32 * HEIGHTMAP_CELL_SIZE + world_width / 2.0;
@@ -50,36 +55,48 @@ fn spawn_water_plane(
             metallic: 0.0,
             ..default()
         })),
-        Transform::from_translation(Vec3::new(center_x, WATER_LEVEL, center_z)),
-        // The world-spanning transparent plane is a worst case for shadow-pass
-        // overdraw and cascade ortho fitting. It also doesn't meaningfully
-        // shadow anything underneath.
+        Transform::from_translation(Vec3::new(center_x, water.0, center_z)),
+        // World-spanning transparent plane: worst case for shadow overdraw and
+        // cascade fitting, and shadows nothing meaningfully.
         NotShadowCaster,
         WaterPlane,
     ));
 }
 
 
+/// Keep the visible water plane's Y in sync with the `WaterLevel` resource
+/// (a colony load or UI edit changes it). Gated by `resource_changed`.
+fn reposition_water_plane(
+    water: Res<WaterLevel>,
+    mut query: Query<&mut Transform, With<WaterPlane>>,
+) {
+    for mut transform in &mut query {
+        transform.translation.y = water.0;
+    }
+}
+
+
 fn apply_buoyancy(
     time: Res<Time>,
+    water: Res<WaterLevel>,
     mut query: Query<(&Transform, &mut Organism), With<OrganismRoot>>,
 ) {
     let dt = time.delta_secs();
 
     for (transform, mut organism) in &mut query {
-        if transform.translation.y >= WATER_LEVEL {
+        if transform.translation.y >= water.0 {
             continue;
         }
 
         let bounding = organism.bounding_radius().max(1.0);
-        let depth      = WATER_LEVEL - transform.translation.y;
+        let depth      = water.0 - transform.translation.y;
         let submersion = (depth / bounding).clamp(0.0, 1.0);
 
         // Buoyancy: upward force proportional to submersion.
         organism.velocity.y += BUOYANCY_STRENGTH * submersion * dt;
 
-        // Quadratic fluid drag (F = C_d * A * v²). Frontal area scales as
-        // weight^(2/3) by the square-cube law.
+        // Quadratic fluid drag (F = C_d·A·v²); frontal area ~ weight^(2/3) by
+        // the square-cube law.
         let weight = organism.weight();
         let area   = weight.powf(2.0 / 3.0);
 
@@ -99,7 +116,6 @@ fn apply_buoyancy(
             organism.movement_speed = (organism.movement_speed - drag_accel * dt).max(0.0);
         }
 
-        // The new architecture has only Photo and NonPhoto cell types — no
-        // FinCell — so there's no per-cell thrust bonus to apply here.
+        // No FinCell type exists, so no per-cell thrust bonus applies here.
     }
 }

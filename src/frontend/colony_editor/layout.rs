@@ -1,12 +1,6 @@
-// UI layout root for the colony editor.
-//
-// Plain absolute-positioned panels overlaying the 3D viewport
-// (which renders directly to the window — no off-screen image,
-// no flex resizing). Three side panels: bottom (creation), right
-// (inventory), left (tools).
-//
-// A 2D camera with a higher render order than the 3D camera owns
-// the UI compositing pass.
+// UI layout root for the colony editor: absolute-positioned panels
+// (bottom creation, right inventory, left species) over the 3D viewport.
+// A higher-order 2D camera owns the UI compositing pass.
 
 use bevy::prelude::*;
 
@@ -16,9 +10,8 @@ use crate::colony_editor::inventory_panel;
 use crate::colony_editor::species_panel;
 
 
-/// Shared background colour for both panels — slightly darker than
-/// the simulation's `frontend::PANEL_BG_COLOR` so the editor reads
-/// as a separate environment at a glance.
+/// Panel background — darker than `frontend::PANEL_BG_COLOR` so the
+/// editor reads as a separate environment.
 pub const PANEL_BG_COLOR: Color = Color::srgb(0.12, 0.12, 0.14);
 
 
@@ -31,8 +24,7 @@ impl Plugin for EditorLayoutPlugin {
 }
 
 fn setup_ui(mut commands: Commands, draft: Local<DraftOrganism>) {
-    // 2D camera owning the UI pass. Higher order so it composites
-    // over the 3D camera's output.
+    // 2D camera owning the UI pass; higher order composites over the 3D camera.
     commands.spawn((
         Camera2d,
         Camera { order: 1, ..default() },
@@ -49,9 +41,7 @@ fn setup_ui(mut commands: Commands, draft: Local<DraftOrganism>) {
                 height: Val::Percent(100.0),
                 ..default()
             },
-            // Crucially, we DON'T attach `Pickable::IGNORE` to the
-            // root — but its children that aren't actual buttons do
-            // ignore picking, so right-click reaches the viewport.
+            // Non-button children ignore picking so right-click reaches the viewport.
             Pickable::IGNORE,
         ))
         .with_children(|root| {

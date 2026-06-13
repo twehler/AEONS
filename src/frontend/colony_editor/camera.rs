@@ -1,23 +1,12 @@
 // Editor flycam + dual-purpose LMB.
 //
-// Controls (intentionally distinct from the simulation's player camera):
-//   * WASD          — translate horizontally on the camera's local axes.
-//   * Space / Shift — translate vertically (world up / down).
-//   * LMB tap       — fires a `ViewportClick` message used by
-//                     `placement.rs` to spawn a new organism at the
-//                     ray-vs-heightmap hit point. A tap is "press
-//                     and release without dragging more than
-//                     `LOOK_DRAG_THRESHOLD_PX` cumulative pixels".
-//   * LMB drag      — rotate (mouse motion drives yaw + pitch). The
-//                     drag has to cross the threshold first; until
-//                     it does we don't rotate, so a clean tap stays
-//                     visually still.
-//   * Mouse wheel   — adjust movement speed (×1.5 / ÷1.5).
+//   * WASD — horizontal translate; Space/Shift — vertical.
+//   * LMB tap (release without dragging past `LOOK_DRAG_THRESHOLD_PX`)
+//     fires a `ViewportClick` for `placement.rs`; LMB drag rotates.
+//   * Mouse wheel — adjust move speed (×1.5 / ÷1.5).
 //
-// Compared with `player_plugin::PlayerPlugin`, the editor never grabs
-// the OS cursor. The cursor stays visible and unconfined so the user
-// can still drag UI sliders / click panel buttons without losing their
-// pointer.
+// Unlike the player camera, the editor never grabs the OS cursor, so
+// the user keeps a visible pointer for UI panels.
 
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
@@ -28,11 +17,9 @@ use crate::colony_editor::creation_panel::BOTTOM_PANEL_HEIGHT_PX;
 use crate::colony_editor::inventory_panel::PANEL_WIDTH_PX;
 use crate::colony_editor::species_panel::TOOL_PANEL_WIDTH_PX;
 
-/// Optional resource — when present, `cursor_over_ui_panel` adds a
-/// "top strip" of `.0` logical pixels to the UI rect set so clicks on
-/// the merged-mode mode-switcher bar don't count as viewport clicks.
-/// The standalone editor never inserts this resource so the original
-/// rect set is unchanged.
+/// Optional resource: `.0` logical px reserved as a top strip so clicks
+/// on the merged-mode mode-bar aren't viewport clicks. Absent in
+/// standalone (top strip = 0).
 #[derive(Resource, Default)]
 pub struct CursorTopReservedPx(pub f32);
 
@@ -43,14 +30,10 @@ const DEFAULT_MOVE_SPEED:  f32 = 25.0;
 const MIN_MOVE_SPEED:      f32 = 1.0;
 const MAX_MOVE_SPEED:      f32 = 400.0;
 const MOUSE_SENSITIVITY:   f32 = 0.0015;
-/// Pitch is clamped just shy of straight up/down so the look matrix
-/// never goes degenerate.
+/// Clamped shy of straight up/down so the look matrix stays non-degenerate.
 const PITCH_LIMIT:         f32 = std::f32::consts::FRAC_PI_2 - 0.05;
-/// Cumulative cursor motion (logical px) the user has to exceed
-/// during a single LMB hold before we treat it as a "drag" (camera
-/// look) instead of a "tap" (place organism). 5 px is loose enough
-/// to forgive a shaky finger, tight enough that an intentional drag
-/// crosses it within the first few mouse-deltas.
+/// Cumulative LMB-hold motion (logical px) above which a hold is a
+/// drag (look) rather than a tap (place). Forgives a shaky finger.
 const LOOK_DRAG_THRESHOLD_PX: f32 = 5.0;
 
 
@@ -70,22 +53,16 @@ impl Default for EditorCamera {
 }
 
 
-/// Tracks the current LMB-press's "tap or drag" status so we can
-/// fire `ViewportClick` only on clean taps. Reset on every press
-/// down; on release, queried by the click-emit logic.
+/// Tracks the current LMB-press's tap-vs-drag status; `ViewportClick`
+/// fires only on a clean tap. Reset on each press-down.
 #[derive(Resource, Default)]
 pub struct LmbPressState {
-    /// True while LMB is held AND the user hasn't yet exceeded the
-    /// drag threshold. A press starts in this state; once enough
-    /// motion accumulates it flips to `false` and we treat the
-    /// remainder of the hold as a camera-look drag.
+    /// True until the drag threshold is exceeded, then flips to drag mode.
     tap_pending:    bool,
-    /// Cumulative motion magnitude during the current LMB hold.
+    /// Cumulative motion during the current LMB hold.
     drag_distance:  f32,
-    /// Cursor position at the moment of LMB-down — used by the
-    /// click handler so the placement raycast goes through the
-    /// pixel where the click *started*, not the (possibly slightly
-    /// shifted) pixel where the release happened.
+    /// Cursor at LMB-down; the placement raycast uses the press pixel,
+    /// not the (possibly shifted) release pixel.
     press_cursor:   Option<Vec2>,
 }
 
@@ -121,8 +98,7 @@ fn spawn_camera(mut commands: Commands) {
     let cam = EditorCamera::default();
     commands.spawn((
         Camera3d::default(),
-        // 300-unit far plane mirrors the simulation's player camera —
-        // keeps shadow cascades tight and culling cheap.
+        // Far plane mirrors the player camera (tight cascades, cheap culling).
         Projection::Perspective(PerspectiveProjection {
             fov:    std::f32::consts::FRAC_PI_3,
             near:   0.1,
@@ -150,16 +126,13 @@ pub fn handle_mouse_look(
     // Drain motion events regardless of LMB so they never pile up.
     let total: Vec2 = motion.read().fold(Vec2::ZERO, |acc, ev| acc + ev.delta);
 
-    // ── LMB-down: start a fresh press, captured tap-pending ─────
+    // LMB-down: start a fresh press.
     if mouse_buttons.just_pressed(MouseButton::Left) {
         let window = windows.single().ok();
         let cursor = window.and_then(|w| w.cursor_position());
 
-        // Suppress press tracking entirely when:
-        //   * the unsaved-work modal is open (clicks must only land
-        //     on Yes / No, never on the editor below), or
-        //   * the cursor is over a UI panel (clicks there belong to
-        //     the panel, not to world placement / camera-look).
+        // Suppress press tracking when a modal is open or the cursor is
+        // over a UI panel (those clicks belong to the panel/modal).
         let suppress = session.show_exit_modal
             || match (cursor, window) {
                 (Some(c), Some(w)) => cursor_over_ui_panel_with_top(c, w, top_strip),
@@ -177,7 +150,7 @@ pub fn handle_mouse_look(
         }
     }
 
-    // ── While LMB held, accumulate distance, possibly look ──────
+    // While LMB held: accumulate distance, possibly look.
     if mouse_buttons.pressed(MouseButton::Left) {
         if total != Vec2::ZERO {
             press_state.drag_distance += total.length();
@@ -187,8 +160,7 @@ pub fn handle_mouse_look(
         }
 
         if !press_state.tap_pending {
-            // We're in look-drag mode: rotate the camera by this
-            // frame's delta.
+            // Look-drag mode: rotate by this frame's delta.
             if total != Vec2::ZERO {
                 if let Ok((mut tf, mut cam)) = cam_q.single_mut() {
                     cam.yaw   -= total.x * MOUSE_SENSITIVITY;
@@ -201,7 +173,7 @@ pub fn handle_mouse_look(
         }
     }
 
-    // ── LMB-up: if it was a clean tap, emit a click event ──────
+    // LMB-up: emit a click event if it was a clean tap.
     if mouse_buttons.just_released(MouseButton::Left) {
         if press_state.tap_pending {
             if let Some(cursor) = press_state.press_cursor {
@@ -220,13 +192,11 @@ pub fn handle_keyboard_move(
     mut cam_q:  Query<(&mut Transform, &EditorCamera)>,
     windows:    Query<&Window, With<PrimaryWindow>>,
 ) {
-    // Suppress movement when the OS-level focus is gone — avoids
-    // ghost movement when alt-tabbing.
+    // No movement when unfocused (avoids ghost drift on alt-tab).
     if !windows.iter().any(|w| w.focused) { return; }
 
-    // Suppress movement while a Ctrl-modifier keyboard shortcut is
-    // engaged (e.g. Ctrl+S to save, Ctrl+Z to undo). Otherwise the
-    // user's S/Z key down would simultaneously drift the camera.
+    // No movement while Ctrl is held, so Ctrl+S/Ctrl+Z don't also
+    // drift the camera via the S/Z keys.
     if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
         return;
     }
@@ -263,22 +233,15 @@ pub fn handle_wheel_speed(
 }
 
 
-/// True when `cursor` (window-logical px, top-left origin) falls
-/// inside the right-side inventory panel or the bottom creation
-/// panel. Both panels are absolutely positioned with fixed
-/// dimensions, so the rects can be derived from the window size +
-/// the two panel-width / -height constants — no UI query needed.
-///
-/// `pub` so `placement.rs`'s right-click delete handler can use the
-/// same rect check (rather than re-deriving the rects).
+/// True when `cursor` (window-logical px) is over a UI panel. Rects are
+/// derived from window size + panel constants (no UI query needed).
+/// `pub` so `placement.rs`'s right-click delete shares the same test.
 pub fn cursor_over_ui_panel_for_test(cursor: Vec2, window: &Window) -> bool {
     cursor_over_ui_panel_with_top(cursor, window, 0.0)
 }
 
-/// Shared rect test used by both LMB capture and right-click delete.
-/// `top_strip_px` reserves a horizontal band at the top of the screen —
-/// non-zero in merged mode where the mode-switcher bar sits there. In
-/// standalone editor mode it stays 0 (no top bar).
+/// Shared rect test for LMB capture and right-click delete. `top_strip_px`
+/// reserves the merged-mode mode-bar band (0 in standalone).
 pub fn cursor_over_ui_panel_with_top(cursor: Vec2, window: &Window, top_strip_px: f32) -> bool {
     let w = window.width();
     let h = window.height();

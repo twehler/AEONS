@@ -1,10 +1,6 @@
-// Right-side inventory panel.
-//
-// Lists every `OrganismTemplate` the user has created. Click a row to
-// make that template the active placement target — right-click in the
-// viewport will move it. The active row is rendered in a brighter
-// colour. A "Save Colony" button at the top opens an rfd save dialog
-// and writes a v003 .colony file.
+// Right-side inventory panel. Lists every created `OrganismTemplate`;
+// clicking a row makes it the active placement target. A "Save Colony"
+// button opens an rfd save dialog and writes a .colony file.
 
 use bevy::prelude::*;
 
@@ -16,9 +12,7 @@ use crate::colony_editor::creation_panel::BOTTOM_PANEL_HEIGHT_PX;
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/// Logical-pixel width of the right-side inventory panel. `pub` so
-/// `camera.rs` can rect-test the cursor against it when deciding
-/// whether an LMB press should be a viewport click.
+/// Logical-pixel width. `pub` so `camera.rs` can rect-test the cursor.
 pub const PANEL_WIDTH_PX: f32 = 260.0;
 const PADDING_PX:      f32 = 10.0;
 const ROW_HEIGHT_PX:   f32 = 72.0;
@@ -86,10 +80,8 @@ pub fn spawn(parent: &mut ChildSpawnerCommands) {
     spawn_with_offset(parent, 0.0);
 }
 
-/// Variant that reserves `top_offset_px` for a mode-switcher bar at
-/// the top of the screen — used by the merged-mode editor overlay so
-/// the panel doesn't extend up under the bar. Standalone editor uses
-/// `spawn` (passes 0).
+/// Variant reserving `top_offset_px` for the merged-mode mode-bar.
+/// Standalone uses `spawn` (passes 0).
 pub fn spawn_with_offset(parent: &mut ChildSpawnerCommands, top_offset_px: f32) {
     parent
         .spawn((
@@ -140,8 +132,7 @@ pub fn spawn_with_offset(parent: &mut ChildSpawnerCommands, top_offset_px: f32) 
                     ));
                 });
 
-            // Return-to-Menu button — sits directly under Save so
-            // the visual flow reads "save your work, then go back".
+            // Return-to-Menu button.
             panel
                 .spawn((
                     ReturnButton,
@@ -180,10 +171,7 @@ pub fn spawn_with_offset(parent: &mut ChildSpawnerCommands, top_offset_px: f32) 
                 ScrollPosition::default(),
             ));
 
-            // ── Clear All — sits at the very bottom of the panel
-            //    below the scroll list. Destructive (dim red) so it
-            //    reads as different from the calm-blue Save above.
-            //    Wipes every template; reversible with Ctrl+Z.
+            // Clear All — wipes every template; reversible with Ctrl+Z.
             panel
                 .spawn((
                     ClearAllButton,
@@ -237,9 +225,7 @@ fn sync_rows(
         }
     }
 
-    // Recolour rows according to which is active. Only writes when
-    // the result actually differs from the current colour, so this
-    // is cheap to run every frame.
+    // Recolour the active row; write only on change.
     let active = session.active_id;
     for (_, row, mut bg) in &mut rows_q {
         let target = if Some(row.id) == active { ROW_BG_ACTIVE } else { ROW_BG_INACTIVE };
@@ -346,9 +332,7 @@ fn handle_return_button(
     for (interaction, mut bg) in &mut interactions {
         match *interaction {
             Interaction::Pressed => {
-                // Hand off to the exit-modal dispatcher; it decides
-                // whether to show the unsaved-work warning or exit
-                // immediately based on `session.dirty`.
+                // Exit-modal dispatcher decides warn-vs-exit on `dirty`.
                 session.exit_requested = true;
                 *bg = BackgroundColor(BACK_BTN_HOVER);
             }
@@ -366,11 +350,8 @@ fn handle_clear_all_button(
         match *interaction {
             Interaction::Pressed => {
                 *bg = BackgroundColor(CLEAR_BTN_HOVER);
-                // Hand off to the confirmation modal — the actual
-                // template + organism wipe lives in
-                // `clear_modal.rs::handle_clear_modal_buttons`.
-                // Idempotent: if the modal is already up, this is a
-                // no-op.
+                // Hand off to the confirmation modal (the wipe lives in
+                // `clear_modal.rs`). Idempotent if already shown.
                 session.show_clear_modal = true;
             }
             Interaction::Hovered => *bg = BackgroundColor(CLEAR_BTN_HOVER),

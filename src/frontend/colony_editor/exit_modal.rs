@@ -1,17 +1,9 @@
 // Unsaved-work modal + "exit to launcher" dispatcher.
 //
-// Flow:
-//   1. The inventory panel's "Return to Menu" button sets
-//      `EditorSession::exit_requested = true`.
-//   2. `dispatch_exit_request` consumes that flag:
-//        * clean state → call `exit_to_launcher()` immediately
-//        * dirty state → set `show_exit_modal = true`, which causes
-//          `manage_modal_visibility` to spawn the modal entity.
-//   3. The modal's Yes / No buttons resolve the choice. Yes →
-//      `exit_to_launcher()`. No → drop both flags, despawn modal.
-//
-// `exit_to_launcher()` re-spawns the binary as a launcher (no argv)
-// and terminates this process via `AppExit::Success`.
+// "Return to Menu" sets `exit_requested`; `dispatch_exit_request`
+// exits immediately if clean, or raises `show_exit_modal` if dirty.
+// The modal's Yes → `exit_to_launcher`, No → cancel. `exit_to_launcher`
+// re-spawns the binary as a launcher (no argv) and `AppExit::Success`.
 
 use std::process::Command;
 
@@ -77,7 +69,7 @@ fn dispatch_exit_request(
     session.exit_requested = false;
 
     if session.dirty {
-        // Defer the actual exit until the user resolves the modal.
+        // Defer exit until the user resolves the modal.
         session.show_exit_modal = true;
     } else {
         exit_to_launcher(&mut exit);
@@ -107,9 +99,7 @@ fn spawn_modal(commands: &mut Commands) {
     commands
         .spawn((
             ExitModalRoot,
-            // Full-screen backdrop. Picks up clicks so they don't
-            // "fall through" to the editor below; both modal buttons
-            // sit on top of it and consume their own clicks.
+            // Full-screen backdrop blocks clicks falling through to the editor.
             Node {
                 position_type: PositionType::Absolute,
                 top:    Val::Px(0.0),
@@ -121,8 +111,7 @@ fn spawn_modal(commands: &mut Commands) {
                 ..default()
             },
             BackgroundColor(MODAL_BACKDROP_COLOR),
-            // Render on top of every other UI node. 100 is well
-            // above the panels (which use the default zindex of 0).
+            // Above the panels (default zindex 0).
             GlobalZIndex(100),
         ))
         .with_children(|root| {
@@ -249,17 +238,13 @@ fn handle_modal_buttons(
 
 // ── Exit transition ─────────────────────────────────────────────────────────
 
-/// Re-spawn the binary as a fresh launcher (no argv → launcher mode)
-/// and ask Bevy to shut down the current App. The new launcher
-/// process is independent; the original `cargo run` shell sees its
-/// child exit and itself returns, but by then the user already has
-/// the new launcher window in front of them.
+/// Re-spawn the binary as a fresh launcher (no argv) and shut down the
+/// current App. The new launcher process is independent.
 fn exit_to_launcher(exit: &mut MessageWriter<AppExit>) {
     match std::env::current_exe() {
         Ok(exe) => {
-            // We deliberately don't .wait() — fire and forget. If the
-            // spawn fails we log it but still exit so the user isn't
-            // stuck staring at a frozen editor.
+            // Fire-and-forget (no .wait()); on spawn failure still exit
+            // so the user isn't left in a dead editor.
             match Command::new(exe).spawn() {
                 Ok(_)  => info!("re-spawned launcher"),
                 Err(e) => error!("failed to re-spawn launcher: {e}"),

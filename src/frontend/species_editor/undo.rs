@@ -1,16 +1,8 @@
-// Species editor — Undo (Ctrl+Z).
-//
-// Snapshot-based: a species under construction is tiny (a few body
-// parts, ≤ tens of cells each), so cloning the whole `body_parts` list
-// on each structural change is cheap and far more robust than tracking
-// per-action inverse operations. Every change to `body_parts` (cell
-// placement, "Begin New Body-Part", rename commit, Clear) pushes the
-// PRIOR state onto a stack; Ctrl+Z pops and restores it.
-//
-// `track_species_undo` watches `SpeciesSession::body_parts` for a
-// structural change and records the previous state. The `suppress`
-// flag lets `handle_species_undo_shortcut` apply a restore without it
-// being re-captured as a new edit.
+// Species editor — Undo (Ctrl+Z). Snapshot-based: a species is tiny, so cloning
+// the whole `body_parts` on each structural change is cheap and more robust than
+// per-action inverses. `track_species_undo` pushes the prior state on change;
+// Ctrl+Z pops and restores. The `suppress` flag stops a restore being recaptured
+// as a fresh edit.
 
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
@@ -45,8 +37,7 @@ pub fn track_species_undo(
     if *mode != WindowMode::SpeciesEditor { return; }
 
     if undo.suppress {
-        // The change came from an undo restore — adopt it as the new
-        // baseline without recording it.
+        // Change came from a restore — adopt as the new baseline, don't record.
         undo.last = session.body_parts.clone();
         undo.suppress = false;
         return;
@@ -62,11 +53,9 @@ pub fn track_species_undo(
 }
 
 
-/// Ctrl+Z → restore the most recent prior `body_parts` state.
-///
-/// Matches the LOGICAL "z" key (like the colony editor) so it works on
-/// non-QWERTY layouts. Suppressed while a body-part rename is in
-/// progress so the keystroke edits the name instead.
+/// Ctrl+Z → restore the most recent prior `body_parts` state. Matches the
+/// LOGICAL "z" key so it works on non-QWERTY layouts. Suppressed during a rename
+/// so the keystroke edits the name instead.
 pub fn handle_species_undo_shortcut(
     mode:        Res<WindowMode>,
     keys:        Res<ButtonInput<KeyCode>>,

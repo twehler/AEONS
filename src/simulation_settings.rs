@@ -1,58 +1,40 @@
 // Simulation settings — runtime control state.
 //
-// Holds the resources that describe whether the simulation is currently
-// running and whether the player has captured the viewport. Other modules
-// read these flags to decide whether to advance time, accept input, or
-// route mouse motion to the camera.
-//
-// The original idea of a left-side panel was scrapped; this file is now
-// the single source of truth for "live" simulation controls. Future
-// additions (time-scale slider, debug overlays, gene-pool browser bindings)
-// land here and get surfaced in the statistics panel UI.
+// Holds the resources describing whether the simulation is running and whether
+// the player has captured the viewport. Other modules read these flags to decide
+// whether to advance time, accept input, or route mouse motion to the camera.
+// This file is the single source of truth for "live" simulation controls.
 
 use bevy::prelude::*;
 use std::time::Duration;
 
-/// Default value seeded into `MaxPhotoautotrophs` when nothing else
-/// (launcher / CLI flag) sets it. This is the *running-population
-/// cap* on photoautotrophs only — heterotrophs have their own
-/// independent cap (`MaxHerbivores`). The GPU brain-pool batch dim
-/// (`OrganismPoolSize`) is derived separately from `MaxHerbivores`
-/// at startup, since only heterotrophs use brain slots.
-// Lowered 800 → 150 (2026-06-02) to protect frame rate: photo organisms
-// reproduce up to this cap, and at 800 the scene bloated (meshes + colliders
-// + photosynthesis) until FPS collapsed progressively from ~60 to <1 over a
-// few minutes. 150 keeps prey plentiful for herbivores while holding ~60 FPS.
+/// Default seeded into `MaxPhotoautotrophs` when nothing else (launcher / CLI)
+/// sets it: the running-population cap on photoautotrophs only (heterotrophs use
+/// the independent `MaxHerbivores`; the GPU brain pool sizes off that instead).
+/// 150 keeps prey plentiful for herbivores while holding ~60 FPS — higher counts
+/// bloat meshes + colliders + photosynthesis until frame rate collapses.
 pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 150;
 
-/// Launcher-side default for the herbivore reproduction cap. The
-/// reproduction system stops scheduling new herbivore births once
-/// this number is reached. Kept small by default so a fresh launch
-/// stays manageable; the launcher text field lifts it for AI-training
-/// runs.
-// Lowered 100 → 60 (2026-06-02): each limb herbivore is many dynamic bodies
-// + joints (CPU physics), so an unbounded herbivore population also crushes
-// FPS. 60 holds frame rate while leaving a healthy population to study.
+/// Launcher-side default for the herbivore reproduction cap; reproduction stops
+/// scheduling herbivore births once reached. Each limb herbivore is many dynamic
+/// bodies + joints (CPU physics), so 60 holds frame rate while leaving a healthy
+/// population to study; the launcher field lifts it for AI-training runs.
 pub const DEFAULT_MAX_HERBIVORES: usize = 60;
 
-/// Launcher-side default for the initial herbivore cohort size at
-/// `spawn_colony` (when no colony save is loaded). Independent from
-/// `DEFAULT_MAX_HERBIVORES` so the user can seed a small starter
-/// population and let reproduction grow it up to the cap.
+/// Launcher-side default for the initial herbivore cohort at `spawn_colony` (when
+/// no colony save is loaded). Independent of `DEFAULT_MAX_HERBIVORES` so the user
+/// can seed a small starter population and let reproduction grow it to the cap.
 pub const DEFAULT_START_HETEROTROPHS: usize = 100;
 
-/// Launcher-side default for the initial photoautotroph cohort size
-/// at `spawn_colony` (when no colony save is loaded). Independent
-/// from `DEFAULT_MAX_PHOTOAUTOTROPHS` so the user can seed a small
-/// starter population and let reproduction grow it up to the cap.
+/// Launcher-side default for the initial photoautotroph cohort at `spawn_colony`
+/// (when no colony save is loaded). Independent of `DEFAULT_MAX_PHOTOAUTOTROPHS`
+/// so the user can seed a small starter population and let reproduction grow it.
 pub const DEFAULT_START_PHOTOAUTOTROPHS: usize = 800;
 
 
-/// Number of heterotrophs to spawn at `spawn_colony` startup. Set
-/// from the launcher's "Start Heterotroph Number" field (or the
-/// `--start-heteros N` argv flag). Distinct from `MaxHerbivores`,
-/// which caps the running herbivore population — this resource only
-/// drives the *initial* cohort.
+/// Heterotrophs to spawn at `spawn_colony` startup (launcher field /
+/// `--start-heteros N`). Drives only the initial cohort, not the running cap
+/// (`MaxHerbivores`).
 #[derive(Resource)]
 pub struct StartHeterotrophs(pub usize);
 
@@ -60,11 +42,9 @@ impl Default for StartHeterotrophs {
     fn default() -> Self { Self(DEFAULT_START_HETEROTROPHS) }
 }
 
-/// Number of photoautotrophs to spawn at `spawn_colony` startup. Set
-/// from the launcher's "Spawn Phototrophic Organisms" field (or the
-/// `--start-photos N` argv flag). Distinct from `MaxPhotoautotrophs`,
-/// which caps the running photo population — this resource only
-/// drives the *initial* cohort.
+/// Photoautotrophs to spawn at `spawn_colony` startup (launcher field /
+/// `--start-photos N`). Drives only the initial cohort, not the running cap
+/// (`MaxPhotoautotrophs`).
 #[derive(Resource)]
 pub struct StartPhotoautotrophs(pub usize);
 
@@ -76,33 +56,35 @@ pub const DEFAULT_MAP_X:           f32        = 1000.0;
 pub const DEFAULT_MAP_Z:           f32        = 1000.0;
 
 
-/// AI-training mode toggle for the heterotroph movement-RL
-/// experiment. Runtime-editable via the "AI-training mode"
-/// checkbox in the statistics panel.
-///
-///   * `true`  → training mode active. Heterotrophs never despawn
-///               (energy still drains and clamps at 0); only the
-///               despawn step is suppressed. Reproduction is NOT
-///               gated by this flag anymore (so the +1.0 dopamine
-///               reproduction reward still fires in training mode).
-///   * `false` → normal simulation. Starved heterotrophs despawn.
-///
-/// Read by `energy.rs::manage_energy` only. Other systems no
-/// longer gate on this flag.
+/// AI-training mode toggle (statistics-panel checkbox). When `true`, heterotrophs
+/// never despawn (energy still drains/clamps at 0; only the despawn step is
+/// suppressed); when `false`, starved heterotrophs despawn. Read only by
+/// `energy.rs::manage_energy`; reproduction is not gated by this flag.
 #[derive(Resource, Default)]
 pub struct AiTrainingMode(pub bool);
 
+/// When true, a loaded `.colony` does NOT override the launcher-chosen
+/// environment dimensions (currently: the water level) — the launcher value
+/// is kept and the colony is "adjusted" into it. Default false: a loaded
+/// colony restores its own saved water level. Inserted from argv in phase 5;
+/// read by `spawn_colony` at load time.
+#[derive(Resource, Default)]
+pub struct AdjustColonyDimensions(pub bool);
 
-/// Upper bound on the live herbivore (heterotroph - carnivore) count.
-/// When the population reaches or exceeds this number,
-/// `reproduction_system` skips all reproduction events for
-/// herbivores until enough have died for the count to fall below
-/// the cap again. Runtime-editable via the "Max Herbivores" text
-/// field in the statistics panel.
-///
-/// Default `250` is a starting value; the field is intended to
-/// be tuned at runtime as the player explores the parameter space.
-/// `0` effectively disables herbivore reproduction.
+/// When true, saved limb-brain weights are honoured even under the STANDING task
+/// (`--reload-limb-brains`). Default false: standing fresh-inits because legacy
+/// colonies hold locomotion-trained, tanh-saturated brains that freeze a stand.
+/// Set true to RELOAD a colony saved after a successful standing run — the
+/// durable-success artifact, so a proven standing policy can be re-demonstrated
+/// without retraining (sidesteps the unseedable GPU RNG). Read by the
+/// `assign_brains_*_limb` lifecycle systems.
+#[derive(Resource, Default)]
+pub struct ReloadLimbBrains(pub bool);
+
+
+/// Upper bound on the live herbivore (heterotroph − carnivore) count;
+/// `reproduction_system` skips herbivore births while at/above it (`0` disables
+/// herbivore reproduction). Runtime-editable via the statistics-panel field.
 #[derive(Resource)]
 pub struct MaxHerbivores(pub usize);
 
@@ -111,26 +93,21 @@ impl Default for MaxHerbivores {
 }
 
 
-/// Top-level window-mode toggle exposed to the user via the thin top bar
-/// at the top of the frontend layout. `Simulation` is the original
-/// behaviour: stats panel + navigator + click-to-capture player camera.
-/// `EditColony` swaps in the colony-editor panels (creation / tool /
-/// inventory) and a hold-LMB-rotate flycam input mode, so the user can
-/// place organisms while the existing world keeps rendering — the
-/// simulation auto-pauses on entry so the population is frozen for
-/// edits. Switching back to Simulation does NOT auto-resume.
+/// Top-level window-mode toggle (top bar of the frontend layout). `Simulation` is
+/// the default: stats panel + navigator + click-to-capture player camera. The
+/// editor/view modes all auto-pause the simulation on entry (and do NOT auto-resume
+/// when leaving); `EditColony` keeps the world rendering for placement.
 #[derive(Resource, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum WindowMode {
     Simulation,
+    /// Colony editor: editor panels (creation / tool / inventory) + a
+    /// hold-LMB-rotate flycam, world still rendered so organisms can be placed.
     EditColony,
-    /// Tree-of-life view — pauses the simulation (like EditColony)
-    /// and renders the `SpeciesRegistry`'s ancestry tree in place
+    /// Tree-of-life view — renders the `SpeciesRegistry` ancestry tree in place
     /// of the viewport + side panels.
     Lineages,
-    /// Species editor — pauses the simulation, hides the world, and
-    /// presents a top + bottom panel UI for manually constructing
-    /// an organism's body cell-by-cell. The output is a `.species`
-    /// binary file the user can later import into a colony.
+    /// Species editor — hides the world and presents a top+bottom panel UI for
+    /// building an organism cell-by-cell, output to a `.species` binary.
     SpeciesEditor,
 }
 
@@ -139,13 +116,9 @@ impl Default for WindowMode {
 }
 
 
-/// True when the simulation is advancing (`Time<Virtual>` is unpaused) and
-/// every gameplay system that depends on virtual time is doing useful work.
-/// Toggled by the Start/Stop button in the statistics panel.
-///
-/// Initial value: `true` — the simulation auto-starts so observers see
-/// life immediately. Player controls still default to off; the user
-/// must click into the viewport to capture the camera.
+/// True when the simulation is advancing (`Time<Virtual>` unpaused) and virtual-time
+/// systems are doing work. Toggled by the Start/Stop button. Defaults to `true`
+/// (auto-start) so observers see life immediately; player controls still default off.
 #[derive(Resource)]
 pub struct SimulationRunning(pub bool);
 
@@ -154,16 +127,9 @@ impl Default for SimulationRunning {
 }
 
 
-/// True when the player has captured the viewport and WASD / mouse-look
-/// systems should consume input. Activated by a left-click inside the
-/// 3D viewport (only when the simulation is running). Deactivated by Esc.
-///
-/// Independent of `SimulationRunning`: pausing the simulation leaves
-/// player controls untouched, and releasing player controls leaves the
-/// simulation running.
-///
-/// Initial value: `false` — startup leaves the cursor visible and the
-/// player camera idle.
+/// True when the player has captured the viewport and WASD / mouse-look consume
+/// input. Activated by left-click in the 3D viewport (only while running),
+/// deactivated by Esc. Independent of `SimulationRunning`. Defaults to `false`.
 #[derive(Resource, Default)]
 pub struct PlayerControlsActive(pub bool);
 
@@ -177,76 +143,38 @@ pub struct PlayerControlsActive(pub bool);
 pub struct CinematicMode(pub bool);
 
 
-/// Compile-time switch for the speed-dependent energy costs (ground
-/// friction + fluid drag) charged to organisms every energy tick.
-///
-/// When `true`, movement costs energy linearly in speed (ground) and
-/// cubically in speed (fluid) per `energy.rs::manage_energy`.
-///
-/// When `false`, both terms are zeroed — movement is effectively
-/// "free" energetically. Per-cell upkeep and the climb-elevation
-/// cost are NOT affected (those don't depend on movement speed).
-///
-/// Why this exists: in the heterotroph RL training environment the
-/// agent kept collapsing to a "don't move" policy. After a predation
-/// event spikes energy up from 0, the next several `manage_energy`
-/// ticks drain it back to 0 via friction. During that window
-/// `energy_now − prev_energy < 0` shows up as a strong negative
-/// `W_ENERGY · ΔE` term in the shaped reward — punishing movement
-/// at exactly the moment the policy is being reinforced for the
-/// action that produced the predation. Disabling movement-cost
-/// energy lets us isolate whether that's the dominant catastrophic-
-/// forgetting source.
+/// Compile-time switch for speed-dependent energy costs (ground friction + fluid
+/// drag) charged each energy tick: `true` = movement costs energy (linear in speed
+/// on ground, cubic in fluid per `energy.rs::manage_energy`); `false` = both zeroed
+/// (free movement). Per-cell upkeep and climb-elevation cost are unaffected.
+/// Provided as an off-switch to isolate movement cost as a reward-shaping
+/// confound in RL training (it can punish movement right after a predation spike).
 pub const MOVEMENT_ENERGY_COSTS_ENABLED: bool = true;
 
 
-/// Friction coefficient applied to every limb-based body part's Avian
-/// collider (combined with the terrain's default μ = 0.5 via
-/// `CoefficientCombine::Average`, so a limb↔terrain contact resolves
-/// to μ = 0.75 — firm grip when planted).
-///
-/// Locomotion needs GRIP, not slip: to "press a foot down and back to
-/// drive the body forward" the planted foot must not slide. An earlier
-/// pass set this to 0.05 (with a `Min` combine rule) to stop limbs
-/// sticking — but that starved the organism of traction (feet slid,
-/// body never propelled). Raised to 1.0 / `Average` for grip. This does
-/// NOT prevent lifting: a foot lifted off the ground has zero normal
-/// force and therefore zero friction regardless of μ, so the
-/// lift→reposition→plant→press gait cycle works (swing is frictionless
-/// for free). Consumed by `colony::spawn_organism` /
-/// `spawn_loaded_organism`.
-// LIMB (foot) friction: HIGH, combined with `CoefficientCombine::Max` against
-// the terrain so a planted foot GRIPS (μ → 1.0) and gives the leg stroke an
-// anchor to pull the body against. Paired with a LOW-friction belly
-// (`BASE_FRICTION_COEFFICIENT`) this is the propulsion mechanism for emergent
-// crawling: data (2026-06-03) showed the creatures lie belly-down
-// (base_contact ≈ 0.91) and were friction-PINNED under the old uniform μ=0.75,
-// so no learned limb motion could translate them. Gripping feet + a slippery
-// belly let a leg stroke drag the body — the missing ground-reaction asymmetry.
+/// LIMB (foot) friction coefficient, combined with terrain via
+/// `CoefficientCombine::Max` so a planted foot GRIPS (μ → 1.0) and gives the leg
+/// stroke an anchor to drive the body against. Lifting a foot zeroes its normal
+/// force (and thus friction), so the swing phase is frictionless regardless of μ.
+/// Paired with the slippery `BASE_FRICTION_COEFFICIENT` belly, this asymmetry is
+/// the propulsion mechanism for emergent crawling. Consumed by
+/// `colony::spawn_organism` / `spawn_loaded_organism`.
 pub const LIMB_FRICTION_COEFFICIENT: f32 = 1.0;
 
-/// BASE-body (belly) friction: LOW, combined with `CoefficientCombine::Min`
-/// (μ → 0.0). The grippy LIMB feet do the propulsion (a stroke pushes off the
-/// ground); a low-friction belly lets that push slide the body forward instead
-/// of pinning it. The per-part floor (`enforce_limb_floor`) keeps every part
-/// at/above the terrain so this stays non-penetrating and natural-looking.
+/// BASE-body (belly) friction: LOW, combined via `CoefficientCombine::Min`
+/// (μ → 0.0) so the grippy feet's push slides the body forward instead of pinning
+/// it. `enforce_limb_floor` keeps every part at/above the terrain so this stays
+/// non-penetrating.
 pub const BASE_FRICTION_COEFFICIENT: f32 = 0.0;
 
 
 
-/// Global simulation-time multiplier. Drives `Time<Virtual>::set_relative_speed`,
-/// so every system reading `Res<Time>` inherits the scaled delta —
-/// energy ticks, brain ticks, photosynthesis, predation, movement,
-/// reproduction, the panel timer, all of it.
-///
-/// The player camera is not affected: it reads `Res<Time<Real>>`
-/// directly so the user can still navigate at normal speed while
-/// the simulation runs at e.g. 10x.
-///
-/// 1.0 = baseline (real-time-ish). 0.0 freezes virtual time without
-/// invoking the explicit pause path. Values past ~5–10 will start
-/// stressing the GPU brain pools (more ticks per real second) — the
-/// user is expected to dial this up empirically.
+/// Global simulation-time multiplier via `Time<Virtual>::set_relative_speed`, so
+/// every `Res<Time>` reader (energy/brain ticks, photosynthesis, predation,
+/// movement, reproduction, panel timer) inherits the scaled delta. The player
+/// camera reads `Time<Real>` directly and is unaffected. 1.0 = baseline, 0.0
+/// freezes virtual time; past ~5–10× the GPU brain pools get stressed (more ticks
+/// per real second).
 #[derive(Resource)]
 pub struct TimeSpeed(pub f32);
 
@@ -255,20 +183,12 @@ impl Default for TimeSpeed {
 }
 
 
-/// When `true`, adult organisms get their body-part meshes smoothed via
-/// the Jacobi vertex smoother in `volumetric_growth::smooth_vertices`.
-/// Smoothing happens at most once per organism — at spawn for
-/// non-variable-form organisms, on the continuous-growth tick that
-/// crosses `MAX_CELLS` for variable-form organisms.
-///
-/// When `false`, the faceted rhombic-dodecahedron mesh is used
-/// throughout the organism's life. Toggling at runtime is non-retroactive:
-/// already-smoothed meshes stay smoothed, already-faceted ones stay
-/// faceted; only future spawn / adult-transition events read the
-/// current value.
-///
-/// Initial value: `true` — preserves the most recently-implemented
-/// visual default.
+/// When `true`, adult organisms get their meshes smoothed (Jacobi smoother in
+/// `volumetric_growth::smooth_vertices`), at most once per organism (at spawn for
+/// non-variable-form; on the growth tick crossing `MAX_CELLS` for variable-form).
+/// When `false`, the faceted rhombic-dodecahedron mesh is kept. Toggling at runtime
+/// is non-retroactive — only future spawn / adult-transition events read it.
+/// Defaults to `true`.
 #[derive(Resource)]
 pub struct Smoothing(pub bool);
 
@@ -280,18 +200,10 @@ impl Default for Smoothing {
 
 
 
-/// Runtime-adjustable upper bound on the live photoautotroph count.
-///
-/// Reproduction reads this resource each tick — when the live photo
-/// count is at or above this cap, the reproduction system suppresses
-/// further photo births. When the cap is lowered below the current
-/// photo count, `apply_max_phototrophs_cull` (in
-/// `statistics_panel.rs`) despawns a random subset of photos to
-/// meet the new cap in one step.
-///
-/// Heterotrophs are NOT bounded by this resource — they have their
-/// own `MaxHerbivores` cap and their own brain-pool sizing via
-/// `OrganismPoolSize`.
+/// Runtime-adjustable upper bound on the live photoautotroph count. Reproduction
+/// suppresses photo births at/above it; lowering it below the live count makes
+/// `apply_max_phototrophs_cull` (statistics_panel.rs) despawn a random subset to
+/// meet the cap in one step. Heterotrophs use `MaxHerbivores` instead.
 #[derive(Resource)]
 pub struct MaxPhotoautotrophs(pub usize);
 
@@ -300,32 +212,21 @@ impl Default for MaxPhotoautotrophs {
 }
 
 
-/// Real-time interval between consecutive autosaves, in **minutes**.
-/// The autosave system uses `Time<Real>` so it ticks at wall-clock
-/// pace regardless of the simulation's virtual-time multiplier — saves
-/// remain on a predictable real-time cadence even at 10× sim speed.
-///
-/// Lower values produce more frequent backups at the cost of more
-/// disk churn (each save writes the entire colony state, ~tens of
-/// KB to a few MB depending on population). Higher values risk
-/// losing more progress between manual saves.
+/// Real-time interval between autosaves, in minutes. Uses `Time<Real>` so the
+/// cadence is wall-clock regardless of `TimeSpeed`. Lower → more frequent backups
+/// but more disk churn (each save is the whole colony state); higher → more
+/// progress at risk between saves.
 pub const AUTOSAVE_INTERVAL_MINUTES: f32 = 10.0;
 
 
-/// Default minimum heterotroph count enforced by `AutoSpawnHeteros`.
-/// Picked low so a fresh enable doesn't dump a huge cohort onto the
-/// map before the user has had a chance to dial the value in.
+/// Default minimum heterotroph count enforced by `AutoSpawnHeteros`. Low so a
+/// fresh enable doesn't dump a huge cohort before the user dials the value in.
 pub const DEFAULT_MIN_HETERO_COUNT: usize = 50;
 
 
-/// When `true`, the auto-spawn system tops the heterotroph population
-/// up to `MinHeteroCount` whenever a death event fires. Off by default
-/// — the user enables it via the checkbox at the bottom of the
-/// individuum-navigator panel.
-///
-/// The system itself only does work on heterotroph death events
-/// (`RemovedComponents<Heterotroph>` is empty in steady state) AND when
-/// this flag is `true`, so the off-state has zero overhead.
+/// When `true`, the auto-spawn system tops the heterotroph population up to
+/// `MinHeteroCount` on each heterotroph death event. Off by default (navigator
+/// checkbox). Only does work on death events and when enabled, so off costs nothing.
 #[derive(Resource, Default)]
 pub struct AutoSpawnHeteros(pub bool);
 
@@ -340,9 +241,8 @@ impl Default for MinHeteroCount {
 }
 
 
-/// Edit-state for the navigator panel's "Min heterotroph count" input
-/// field. Mirrors the `MaxOrganismsEditState` model: `focused` is true
-/// while the user is typing; `buffer` holds the in-progress digits.
+/// Edit-state for the navigator's "Min heterotroph count" field: `focused` while
+/// typing, `buffer` holds in-progress digits (mirrors `MaxOrganismsEditState`).
 #[derive(Resource, Default)]
 pub struct MinHeteroCountEditState {
     pub buffer:  String,
@@ -350,20 +250,12 @@ pub struct MinHeteroCountEditState {
 }
 
 
-/// Brain-pool batch dimension `N` chosen at startup, fixed for the
-/// lifetime of the process.
-///
-/// The four `BrainPool*` resources size their GPU tensors against this
-/// value during `FromWorld::from_world`. Because the CubeCL kernel
-/// cache + the burn-cuda tensor allocations are pinned to this shape,
-/// it CANNOT change at runtime. Heterotroph reproduction past this
-/// limit will skip brain-slot assignment for the extras (they exist
-/// as entities but the brain pool can't enrol them).
-///
-/// Set by `main.rs::run_simulation` from a conservative bound on the
-/// heterotroph population — typically `MaxHerbivores` plus headroom.
-/// Independent from the photo cap (`MaxPhotoautotrophs`) since
-/// photos don't have brain slots.
+/// Brain-pool batch dimension `N`, chosen at startup and fixed for the process
+/// lifetime: the `BrainPool*` resources size their GPU tensors against it in
+/// `FromWorld`, and the CubeCL kernel cache + burn-cuda allocations pin this shape
+/// (cannot change at runtime). Heterotrophs born past this limit exist as entities
+/// but get no brain slot. Set by `main.rs::run_simulation` from `MaxHerbivores`
+/// plus headroom; independent of `MaxPhotoautotrophs` (photos have no brain slots).
 #[derive(Resource)]
 pub struct OrganismPoolSize(pub usize);
 
@@ -393,15 +285,10 @@ impl Default for OrganismPoolSize {
 /// commitment to the current policy mean.
 pub const L1_SIGMA_RANGE:         (f32, f32) = (0.2, 0.8);
 
-/// Range for `K_EAT` — one-shot reward on a predation event
-/// (detected via the `Organism::predations` delta). Floor raised
-/// from 1.0 to 4.0 so the eat jackpot is large enough to dominate
-/// the per-rollout K_CURIOSITY accumulation and pin the policy
-/// gradient on "actually catch prey" rather than "wander fast."
-/// At the prior 1.0 floor the eat signal was within the noise band
-/// of the dense per-tick rewards, leaving the population stuck in
-/// the "fast wanderer" attractor rather than evolving toward the
-/// "fast hunter" attractor.
+/// Range for `K_EAT` — one-shot reward on a predation event (via the
+/// `Organism::predations` delta). Floor kept high (4.0) so the eat jackpot
+/// dominates the accumulated dense per-tick rewards, pinning the policy gradient on
+/// "catch prey" rather than the "fast wanderer" attractor.
 pub const L1_K_EAT_RANGE:         (f32, f32) = (4.0, 12.0);
 
 /// Range for `K_REPRO` — one-shot reward on reproduction
@@ -413,14 +300,10 @@ pub const L1_K_REPRO_RANGE:       (f32, f32) = (5.0, 30.0);
 pub const L1_LAMBDA_ENERGY_RANGE: (f32, f32) = (0.3, 2.0);
 
 /// Range for `K_CURIOSITY` — per-tick reward proportional to
-/// `applied_speed_norm − 0.5`, so stillness is negatively rewarded
-/// and full speed is positively rewarded by the same magnitude.
-/// Range widened to (0.4, 1.5) so the per-tick gradient between
-/// min-speed and max-speed trajectories is large enough to survive
-/// the per-slot EMA baseline absorption — the previous (0.15, 0.5)
-/// range produced gradients that the baseline tracked to zero within
-/// ~20 rollouts, killing the gradient pressure that was supposed to
-/// push the policy away from the standstill local optimum.
+/// `applied_speed_norm − 0.5` (stillness penalised, full speed rewarded equally).
+/// Wide enough (0.4, 1.5) that the min-vs-max-speed gradient survives the per-slot
+/// EMA baseline absorption that would otherwise track it to zero and let the policy
+/// settle into the standstill local optimum.
 pub const L1_K_CURIOSITY_RANGE:   (f32, f32) = (0.4, 1.5);
 
 /// Range for `K_PROGRESS` — per-tick reward proportional to the
@@ -429,19 +312,10 @@ pub const L1_K_CURIOSITY_RANGE:   (f32, f32) = (0.4, 1.5);
 /// reward never punishes a target switch).
 pub const L1_K_PROGRESS_RANGE:    (f32, f32) = (0.5, 3.0);
 
-/// Duration of the target-lock window, in **virtual seconds**. While
-/// the lock is active the policy's target-choice logits are ignored —
-/// direction stays geometric toward the locked entity. Without this,
-/// σ-noise on the choice logits flickers target choice every brain
-/// tick and the heterotroph stutters between prey it never reaches.
-///
-/// Expressed in virtual seconds (not ticks / real seconds) so the
-/// duration scales naturally with `TimeSpeed`: at 10× sim speed, a
-/// 10-second virtual lock plays out in 1 real second. The brain
-/// itself ticks on `Time<Virtual>` so the tick-counter representation
-/// (`lock_ticks_remaining` on the brain pool) is just a
-/// straightforward `secs / brain_tick_interval` conversion done at
-/// the use site.
+/// Target-lock window, in virtual seconds. While locked, the policy's target-choice
+/// logits are ignored and direction stays geometric toward the locked entity —
+/// without it, σ-noise flickers the choice each tick and the hetero stutters between
+/// prey it never reaches. In virtual seconds so it scales with `TimeSpeed`.
 pub const L1_TARGET_LOCK_SECS: f32 = 10.0;
 
 /// After the lock window expires, the network may switch targets,
@@ -452,134 +326,63 @@ pub const L1_TARGET_LOCK_SECS: f32 = 10.0;
 pub const L1_TARGET_SWITCH_MARGIN: f32 = 0.15;
 
 /// EMA factor for output-side speed momentum:
-/// `applied_speed = α · prev_applied + (1 − α) · new_sample`.
-/// 0.3 means each tick the actually-executed speed moves 70% toward
-/// the freshly sampled action — the agent reaches its commanded
-/// speed within ~2 ticks (≈ 300 ms) instead of 5. Was 0.6 originally
-/// to dampen post-eat overshoot, but with `L1_APPROACH_RADIUS = 3`
-/// the brake already guarantees no overshoot for any applied speed
-/// ≤ 1, so the high momentum was unnecessary friction that just
-/// made motion feel sluggish.
+/// `applied_speed = α · prev_applied + (1 − α) · new_sample`. At 0.3 the executed
+/// speed moves 70% toward the fresh sample each tick (commanded speed reached in
+/// ~2 ticks). Kept low because `L1_APPROACH_RADIUS` already prevents overshoot, so
+/// extra momentum only makes motion sluggish.
 pub const L1_SPEED_MOMENTUM_ALPHA: f32 = 0.3;
 
-/// XZ distance (world units) at which "arrival braking" kicks in for
-/// the L1 hetero brain. When the locked target is closer than this,
-/// the applied movement speed is scaled by
-/// `clamp(distance / L1_APPROACH_RADIUS, 0, 1)` — full speed beyond
-/// the radius, linear decel inside it, zero exactly on top of the
-/// target.
-///
-/// Sizing rationale: per-tick travel is
-/// `applied_speed_a · MAX_SPEED · TICK_SECS · brake_scale`. With
-/// `brake_scale = d / R` this becomes `applied · 3 · d / R`. For
-/// no overshoot at maximum applied (= 1), we need `3 / R ≤ 1`, so
-/// `R ≥ MAX_SPEED · TICK_SECS = 3`. Smaller radii produce
-/// rapid-fire ping-pong oscillation around the target that
-/// visually reads as "stuck in place, no motion".
-///
-/// The "agent parks outside cell-contact range" failure mode that
-/// motivated trying R = 1 is handled separately by `CELL_COLLISION_RADIUS`
-/// (cell.rs) — that controls the contact disc width and is what
-/// determines whether the bilateral V-shape actually touches prey
-/// at parking distance. Brake radius and contact radius are
-/// independent dials; tune each on its own merit.
+/// XZ distance (world units) at which L1 arrival-braking kicks in: inside it the
+/// applied speed is scaled by `clamp(distance / L1_APPROACH_RADIUS, 0, 1)` (zero on
+/// the target). Must be ≥ `MAX_SPEED · TICK_SECS = 3` to avoid per-tick overshoot;
+/// smaller radii cause ping-pong oscillation that reads as "stuck". Contact range
+/// (whether the body touches prey) is a separate dial — `CELL_COLLISION_RADIUS`.
 pub const L1_APPROACH_RADIUS: f32 = 3.0;
 
-/// Number of consecutive brain ticks the locked target can stay at
-/// the same distance (no measurable progress) before the lock is
-/// force-dropped and the brain re-picks. Solves the "stuck against
-/// a blocker" pattern where the locked photo sits past another
-/// hetero or a wall: the agent stops making distance progress, this
-/// counter fires, the lock drops, fresh argmax fires next tick.
-///
-/// At ~6.67 brain ticks per virtual second, 6 ticks ≈ 0.9 virtual
-/// seconds — long enough to ride through normal contact-bounce
-/// jitter, short enough that the agent doesn't burn its 10-second
-/// lock window on a target it can't reach.
+/// Consecutive no-progress brain ticks before the target lock is force-dropped and
+/// re-picked — escapes the "stuck behind a blocker" pattern. At ~6.67 ticks/virtual
+/// sec, 6 ≈ 0.9 s: long enough to ride out contact-bounce jitter, short enough not to
+/// waste the full lock window on an unreachable target.
 pub const L1_STUCK_TICKS: u16 = 6;
 
-/// Minimum distance-closed (world units) between two brain ticks
-/// that counts as "progress." Distance decreases below this
-/// threshold are treated as noise and count toward the stuck
-/// counter. 0.3 is just below the per-tick travel of a hetero
-/// approaching at 1/4 throttle — anything less than that and the
-/// agent isn't really converging on the target.
+/// Minimum distance-closed (world units) per brain tick that counts as "progress";
+/// anything less is noise and feeds the `L1_STUCK_TICKS` counter. 0.3 is just below
+/// the per-tick travel at 1/4 throttle — below it the agent isn't really converging.
 pub const L1_STUCK_PROGRESS_EPS: f32 = 0.3;
 
-/// XZ distance (world units) below which the L1 hetero brain
-/// freezes its commanded direction at the previous tick's value
-/// instead of recomputing `(target − self).normalize()`. At very
-/// close range the unit-vector becomes hypersensitive to tiny prey
-/// wobble — a 0.05-unit lateral perturbation at d = 0.2 produces a
-/// ~14° swing — which together with the per-tick reorient produces
-/// visible micro-oscillation.
-///
-/// Earlier the threshold was 0.5, but combined with the (then 3.0)
-/// arrival brake it created a terminal absorbing state OUTSIDE the
-/// 1.2-unit cell-contact zone — the agent parked just shy of
-/// contact and never ate. 0.1 keeps the anti-jitter behaviour while
-/// only firing once the cells are essentially overlapping
-/// (root-to-root ≪ 0.1 is deep inside the contact disc), so the
-/// agent can still apply late lateral correction during the
-/// approach.
+/// XZ distance (world units) below which the L1 brain freezes its commanded
+/// direction instead of recomputing `(target − self).normalize()`. At close range
+/// the unit-vector is hypersensitive to prey wobble (a tiny lateral nudge swings the
+/// heading several degrees), producing micro-oscillation. Kept small (0.1) so it only
+/// fires once cells essentially overlap — larger values let the agent park just shy
+/// of contact and never eat.
 pub const L1_DIRECTION_FREEZE_DIST: f32 = 0.1;
 
-/// Speed scale applied to the hetero when it has no locked target
-/// — i.e. no Photo entity in the K-nearest window. Without this, the
-/// brain's `speed_a` sample drives the agent at full `MAX_SPEED`
-/// even when there's nothing to chase, which produces high-energy
-/// blind cruising and turns any cluster of heteros in a prey-empty
-/// region into a thrashing collision-bounce mess.
-///
-/// 0.3 lets the agent still patrol the area (handy for finding the
-/// nearest photo when one wanders into range) without exerting
-/// enough force to deadlock against neighbouring heteros.
+/// Speed scale applied when the hetero has no locked target (no Photo in the
+/// K-nearest window). Without it the policy cruises at full `MAX_SPEED` with nothing
+/// to chase, turning prey-empty hetero clusters into a collision-bounce mess. 0.3
+/// lets it patrol for prey without enough force to deadlock against neighbours.
 pub const L1_NO_TARGET_SPEED_SCALE: f32 = 0.3;
 
-/// Minimum value the EMA-smoothed `applied_speed_a` is clamped to
-/// before being multiplied by `MAX_SPEED · brake_scale` for the
-/// world-facing movement command. Forces every hetero to ALWAYS
-/// move at least `L1_MIN_APPLIED_SPEED · MAX_SPEED · brake_scale`
-/// units/sec — stillness becomes structurally impossible no matter
-/// what the policy outputs.
-///
-/// This sits on top of (not instead of) the curiosity-based gradient
-/// pressure away from low speeds. The reward shaping still rewards
-/// high speed and penalises low speed; this floor exists because
-/// the per-slot EMA baseline can absorb constant offsets in the
-/// reward, eventually leaving the policy with no gradient pressure
-/// to escape a learned standstill. Hard-clamping the world-facing
-/// speed means the policy CANNOT learn its way back to true
-/// stillness, regardless of how the baseline drifts.
-///
-/// 0.5 = half of brake-adjusted max speed at minimum. Half-throttle
-/// cruise is the default for any hetero whose policy hasn't
-/// converged to a higher-speed output, so the population's baseline
-/// movement intensity is visibly aggressive rather than tentative.
-/// Brake-zone behaviour is unaffected because `brake_scale → 0` as
-/// d → 0 still scales the effective speed to zero at the target.
+/// Floor on the EMA-smoothed `applied_speed_a` before it's multiplied by
+/// `MAX_SPEED · brake_scale`, so every hetero always moves at least this fraction of
+/// brake-adjusted max speed — stillness is structurally impossible whatever the
+/// policy outputs. Backstops the curiosity gradient: the per-slot EMA baseline can
+/// absorb constant reward offsets and strand the policy in a learned standstill, and
+/// this hard clamp prevents that. Brake-zone behaviour is unaffected (`brake_scale →
+/// 0` at the target). 0.5 = half-throttle default cruise.
 pub const L1_MIN_APPLIED_SPEED: f32 = 0.5;
 
-/// Maximum per-brain-tick random rotation applied to `movement_direction`
-/// when the hetero has no locked target, in radians (≈ 8.6° at 0.15).
-/// Acts as a slow Brownian wander, breaking the case where multiple
-/// heteros without prey settle into a stable deadlock pointing at
-/// each other. Sampled uniformly from `[-L1_NO_TARGET_WANDER_ANGLE,
-/// +L1_NO_TARGET_WANDER_ANGLE]` each brain tick (≈ 6.7 Hz).
+/// Max per-tick random rotation (radians, ≈ 8.6° at 0.15) added to
+/// `movement_direction` when the hetero has no locked target — a slow Brownian
+/// wander that breaks targetless heteros out of stable mutual deadlock. Sampled
+/// uniformly from `[-this, +this]` each brain tick.
 pub const L1_NO_TARGET_WANDER_ANGLE: f32 = 0.15;
 
-/// Number of brain ticks a force-dropped target stays on the
-/// per-slot blacklist after stuck-detection fires. While
-/// blacklisted, the target-selection scan excludes that entity from
-/// argmax — the brain MUST pick a different photo (or none). After
-/// the cooldown the entity is re-eligible. Prevents the
-/// "force-drop → re-pick same unreachable target → force-drop"
-/// loop that otherwise produces visible oscillation against blockers.
-///
-/// At ~6.67 brain ticks per virtual second, 20 ≈ 3 virtual seconds —
-/// long enough for the agent to commit to a different bearing and
-/// physically move away from the blocker, short enough that a target
-/// that has just become reachable doesn't get ignored for long.
+/// Brain ticks a force-dropped target stays blacklisted (excluded from argmax) after
+/// stuck-detection fires, breaking the "drop → re-pick same unreachable target → drop"
+/// loop. At ~6.67 ticks/virtual sec, 20 ≈ 3 s: long enough to commit elsewhere and
+/// move off the blocker, short enough that a newly-reachable target isn't ignored long.
 pub const L1_TARGET_BLACKLIST_TICKS: u16 = 20;
 
 /// Mutation strength for offspring inheritance, expressed as a
@@ -593,18 +396,11 @@ pub const L1_GENE_MUTATION_REL_STDDEV: f32 = 0.05;
 
 // ── Lineages / speciation ───────────────────────────────────────────────────
 
-/// Per-component normalised "factor of difference" at which an
-/// organism is considered to belong to a NEW species relative to a
-/// candidate species' centroid. Every DNA component lives in
-/// `[0, 1]` (see `lineages::dna`), so this threshold compares
-/// directly against the mean-absolute-difference returned by
-/// `lineages::dna::distance`. 0.05 ⇒ "5% factor difference".
-///
-/// Also gates the trimmed-mean computation in
-/// `lineages::speciation::update_species_averages`: members whose
-/// DNA is further than this from the simple mean are excluded from
-/// the trimmed mean, so a single drifting individual can't drag
-/// the whole species' centroid along with it.
+/// Normalised DNA distance (mean-abs-diff, components in `[0,1]`, per
+/// `lineages::dna::distance`) above which an organism is split into a NEW species
+/// from a candidate centroid. Also gates the trimmed-mean centroid in
+/// `speciation::update_species_averages` — members beyond this from the mean are
+/// excluded, so one drifter can't drag the centroid.
 pub const SPECIES_SEPARATION_THRESHOLD: f32 = 0.10;
 
 
@@ -619,172 +415,133 @@ pub const SPECIES_SEPARATION_THRESHOLD: f32 = 0.10;
 // ════════════════════════════════════════════════════════════════════════════
 
 
-// ── Physics / Limb (avian_setup.rs, colony.rs) ──────────────────────────────
+// ── Physics / Limb (rapier_setup.rs, colony.rs) ──────────────────────────────
 
-// (avian_setup.rs)
-/// Avian XPBD substep count for the limb-based physics world. Higher
-/// substeps keep the rigid `SphericalJoint`s convergent under high PD torque,
-/// but substeps multiply the ENTIRE solver cost linearly and dominated the
-/// frame time once dozens of limb organisms (each = several dynamic bodies +
-/// joints + contacts) were alive. Lowered to 8 now that joint stability comes
-/// from the small joint compliance (`LIMB_JOINT_COMPLIANCE`), proper mass
-/// properties, and the damping splits rather than from brute-force
-/// substepping — 8 is half the cost of 16 while still well above the default.
-/// If joints visibly drift again under fast commands, nudge back up to 10–12
-/// before reaching for 16.
+// (rapier_setup.rs)
+/// Avian XPBD substep count for the limb physics world. Higher substeps keep the
+/// rigid joints convergent under high torque but multiply the whole solver cost
+/// linearly (dominant once dozens of limb organisms are alive). 8 balances cost vs
+/// stability now that joints hold via compliance + mass + damping rather than brute
+/// substepping; nudge to 10–12 if joints visibly drift under fast commands.
 pub const LIMB_SOLVER_SUBSTEPS: u32 = 8;
 
-/// "Compliance" (inverse stiffness) on every limb `SphericalJoint`.
-/// `0.0` means a perfectly rigid point-constraint: the XPBD solver fully
-/// projects the anchors back together each substep, so the joint can't
-/// drift apart under the high angular velocities the brain commands (and
-/// that future "hit"/melee behaviour will rely on) — unlike a non-zero
-/// give, which lets the limb separate when the reaction exceeds the
-/// solver's holding capacity at `LIMB_SOLVER_SUBSTEPS = 8`. The old note
-/// that `0.0` was "numerically fragile" predates the current base-damping
-/// setup; trying rigid first since it keeps full torque AND full ω.
+/// Rapier solver iteration counts (`RapierContextSimulation::integration_parameters`),
+/// set once at startup by `rapier_setup::configure_solver`. Rapier's default is 4 —
+/// far too low for CHAINED impulse-jointed legs on near-massless bodies, which
+/// separate when the solver doesn't converge (measured: joint_sep median 0.28, max
+/// 14 at the default). Rapier's own guidance: "large assemblies easily break without
+/// a large number of solver iterations" (8–12 for stacks/machinery). 16 with extra
+/// internal stabilization holds the leg chains together (verified via `joint_sep_max`
+/// telemetry — guiderail 2). Raise further if separation persists; it costs solver time.
+pub const LIMB_SOLVER_ITERATIONS: usize = 8;
+pub const LIMB_STABILIZATION_ITERATIONS: usize = 2;
+
+/// Compliance (inverse stiffness) on every limb joint. `0.0` = a perfectly rigid
+/// point-constraint: the solver fully projects the anchors together each substep so
+/// the limb can't drift apart under high commanded ω; a non-zero give would let it
+/// separate when the reaction exceeds the solver's holding capacity at
+/// `LIMB_SOLVER_SUBSTEPS`.
 pub const LIMB_JOINT_COMPLIANCE: f32 = 0.0;
 
-/// `max_torque` clamp (N·m) on each limb hinge's spring-damper
-/// `AngularMotor`. Avian clamps the motor's per-substep impulse to
-/// `max_torque · dt²`, so this bounds how hard the hinge can drive toward
-/// its target angle — the motor's "muscle strength". High enough that a
-/// planted limb commanded "into the ground" can press the body upward
-/// (`max_torque ≳ body weight × lever`); raise if limbs feel weak, lower
-/// if a stride looks too violent. (Superseded the external-PD gains
-/// `KP_TORQUE` / `KD_TORQUE` / `MAX_JOINT_ANGLE`, which were removed when
-/// the controller moved to the in-solver motor — see
-/// `LIMB_MOTOR_FREQUENCY`.)
-// EMERGENT-WALK regime (2026-06-03): the brain now drives each limb hinge's
-// target angle DIRECTLY (no CPG generating the rhythm), so the motor must have
-// enough authority to actually lift/push the body for a stride to net thrust —
-// 8 N·m was deliberately gentle/cosmetic for the old CPG-plus-pursuit design
-// and far too weak for active, learned locomotion. Raised to 25. The old
-// "explosions are self-launches at high torque" failure is now contained
-// structurally (not by starving the motor): the per-part velocity governor
-// (`MAX_LIMB_LINEAR_SPEED`/`MAX_LIMB_ANGULAR_SPEED`) bounds any launch impulse,
-// `SelfCollisionFilter` removes the constraint-conflict energy injection, and
-// `LIMB_ANGULAR_DAMPING` bleeds runaway build-up — so torque can be spent on
-// walking rather than capped to prevent flinging. Lower if data shows strides
-// look violent / bodies still launch despite the governor.
-// Scaled 25 → 6 with the 5× mass cut (2026-06-03): the spring-damper motor's
-// torque to track a target / hold the body up scales with the limb's rotational
-// inertia, so the lighter microscopic body needs proportionally less. Keeping
-// 25 on the light body would over-actuate and fling it. 6 is enough to stand
-// the body up and stroke the legs without launching it.
+/// `max_torque` clamp (N·m) on each limb hinge's spring-damper `AngularMotor` — the
+/// motor's "muscle strength" (per-substep impulse capped at `max_torque · dt²`).
+/// High enough that a planted limb can press the (light) body upward
+/// (`max_torque ≳ body weight × lever`); raise if limbs feel weak, lower if strides
+/// look violent. Scales with limb inertia, so it tracks `BODY_PART_DENSITY`. Launch
+/// is contained by the velocity governor / `SelfCollisionFilter` /
+/// `LIMB_ANGULAR_DAMPING`, not by starving this.
 pub const MAX_LIMB_TORQUE: f32 = 10.0;
 
-/// Hinge swing-angle limit on every limb `RevoluteJoint`
-/// (`with_angle_limits(-LIMB_SWING_LIMIT, +LIMB_SWING_LIMIT)`). The limb is
-/// a 1-DOF hinge (it CANNOT orbit/spin around the body — the prior 3-DOF
-/// ball joint's fragile angle-limits could be blown through; a revolute
-/// joint rigidly locks the two non-hinge axes via a bilateral constraint).
-/// This ±80° caps the in-plane swing range so the limb can't fold absurdly
-/// far through the body, while leaving a generous stride for locomotion.
+/// Hinge swing-angle limit on every limb `RevoluteJoint` (`±LIMB_SWING_LIMIT`). The
+/// limb is a 1-DOF hinge (the revolute joint rigidly locks the two non-hinge axes, so
+/// it can't orbit the body). ±80° caps the in-plane swing so the limb can't fold
+/// absurdly through the body while leaving a generous stride.
 pub const LIMB_SWING_LIMIT: f32 = 80.0 * std::f32::consts::PI / 180.0;
 
-/// "Little twist" knob for limb hinges: the compliance (inverse stiffness,
-/// N·m/rad) of the `RevoluteJoint` axis-ALIGNMENT constraint
-/// (`with_align_compliance`). `0.0` = a perfectly rigid hinge with zero
-/// twist; a non-zero value softens the two off-hinge DOF so the limb can
-/// deviate from the pure hinge plane — a real shoulder/hip twist.
-///
-/// IMPORTANT — this knob only became safe to raise once the limb motor
-/// moved into the solver: the old external PD applied torque on the
-/// off-hinge axes too, so softening this let that torque deflect the limb
-/// into the gimbal singularity (the "spastic explosion" bug at `5e-3`).
-/// The in-solver `AngularMotor` drives ONLY the hinge axis, so there is no
-/// longer any controller torque exciting the off-hinge DOF — the twist is
-/// governed solely by gravity/contact against this spring (damped by
-/// `LIMB_ANGULAR_DAMPING`) and stays bounded at any value. Raise for more
-/// twist; lower toward `0.0` for a stiffer hinge.
-///
-/// Raised 5e-3 → 3e-2 (2026-06-03) per the goal "limbs should be able to twist
-/// a little to make emergent walking easier": the primary swing stays the
-/// motorised 1-DOF hinge, but this softer alignment lets the planted foot
-/// rotate/conform a little against the ground rather than being locked to a
-/// single plane, giving the learned gait an extra passive DOF to find purchase.
-/// Still small — the hinge is the dominant DOF — so the limb cannot orbit.
+/// Twist knob: compliance (inverse stiffness) of the `RevoluteJoint`
+/// axis-ALIGNMENT constraint. `0.0` = perfectly rigid hinge, zero twist; larger
+/// softens the two off-hinge DOF so the limb can rotate OFF its single swing
+/// plane — the substrate the brain-driven twist (`ConstantLocalTorque` ∝
+/// `MAX_LIMB_TWIST_TORQUE`, see `rapier_setup::drive_limb_twist`) acts on, so limb
+/// movement is no longer confined to one axis. Raised from the old near-rigid
+/// 3e-2 to allow a usable brain-controlled twist range; the hinge swing MOTOR
+/// still dominates the primary stroke (joints never separate — the point
+/// anchor is unaffected by this).
 pub const LIMB_HINGE_ALIGN_COMPLIANCE: f32 = 3e-2;
 
-/// Spring-damper motor parameters for the limb `RevoluteJoint`s. The limb
-/// is driven by Avian's **built-in angular motor** (`MotorModel::SpringDamper`,
-/// solved inside the XPBD step) toward a target hinge angle the brain sets
-/// each tick — NOT by an external `Forces::apply_torque` PD controller.
-/// This is what finally killed the limb instability: the in-solver motor
-/// acts on the hinge axis ONLY (1-DOF, structurally cannot push off-hinge),
-/// uses implicit-Euler integration (unconditionally stable — no
-/// explicit-`−KD·ω` blow-up), and reads the true hinge angle via `atan2`
-/// (no Euler-XYZ decomposition → no gimbal singularity). All three of the
-/// old failure modes (gimbal flip, explicit-damping divergence, off-hinge
-/// drive against a soft constraint) are removed at once.
-///
-/// `frequency` (Hz) = how fast the hinge converges on its target; higher =
-/// stiffer/snappier. `damping_ratio` 1.0 = critically damped (fastest
-/// approach with no overshoot). `MAX_LIMB_TORQUE` is reused as the motor's
-/// `max_torque` clamp.
-///
-/// Raised 1.0 → 4.0 (2026-06-03): the brain re-commands each joint's target
-/// angle every brain tick (~6.7 Hz of virtual time) and the gait it must learn
-/// cycles at ~`GAIT_FREQUENCY_HZ`. A 1 Hz motor settles too slowly to track a
-/// moving setpoint — the leg would lag a full cycle behind the command and
-/// never realise the intended pose. 4 Hz lets the hinge reach the commanded
-/// angle well within a tick so the learned joint trajectory actually happens.
-///
-/// Raised 4 → 10 (2026-06-03): the motor's stiffness ∝ frequency², and the legs
-/// must be STIFF enough that the planted feet HOLD the (light) body up off the
-/// ground rather than folding under it — at freq 4 the body sank onto its belly
-/// / drove the feet through the terrain. At freq 10 the leg holds a
-/// weight-bearing stance, so the body stands on its feet (natural posture, feet
-/// resting at the surface). The implicit-Euler motor is unconditionally stable
-/// at any frequency, so this adds no instability.
+/// Max torque (about each limb's LOCAL long axis) of the brain-driven TWIST.
+/// The policy outputs a twist command in [-1,1] per limb (the second half of its
+/// action vector); `drive_limb_twist` writes `axis · cmd · MAX_LIMB_TWIST_TORQUE`
+/// into the limb's `ConstantLocalTorque`. This is the off-swing-axis "roll" DOF
+/// that lets limbs move in 3D, not just swing fore/aft. Kept modest: open-loop
+/// twist torque reacts on the near-massless base, so a large value destabilises
+/// the gait. Paired with the opt-in `K_TWIST` reward cost so the brain only
+/// twists when it pays.
+pub const MAX_LIMB_TWIST_TORQUE: f32 = 0.2;
+
+/// Opt-in cost on mean |twist command| in the limb reward. Small: makes the
+/// brain twist only when it buys enough locomotion reward to offset the cost,
+/// instead of twisting gratuitously (which destabilises the light body and
+/// regressed walking). Keeps the twist DOF available without making it free.
+pub const K_TWIST: f32 = 0.4;
+
+/// Spring-damper parameters for the limb `RevoluteJoint` motors. Avian's built-in
+/// `MotorModel::SpringDamper` (solved inside XPBD) tracks the brain's per-tick target
+/// hinge angle — no external PD controller. The in-solver motor drives the hinge axis
+/// only, is implicit-Euler (unconditionally stable at any frequency), and reads the
+/// angle via `atan2` (no gimbal singularity). `frequency` (Hz) = convergence speed /
+/// stiffness (∝ frequency²): high enough that planted feet HOLD the light body up
+/// rather than folding; `damping_ratio` 1.0 = critically damped (no overshoot).
+/// `MAX_LIMB_TORQUE` is the motor's `max_torque` clamp.
 pub const LIMB_MOTOR_FREQUENCY: f32 = 4.0;
 pub const LIMB_MOTOR_DAMPING_RATIO: f32 = 1.0;
+
+/// Rapier revolute position-motor gains for limb hinges (`rapier_setup::revolute_data`).
+/// Rapier's motor is a PD controller: `stiffness` is the proportional gain pulling the
+/// hinge toward the brain's target angle (must be high enough that planted feet HOLD the
+/// light body up rather than folding under its weight) and `damping` the derivative gain
+/// (critically-damped tracking, no overshoot/oscillation). Tuned against the very low
+/// `BODY_PART_DENSITY`; the per-step motor impulse is internally capped so even large
+/// stiffness can't explode the light bodies. Raise `LIMB_MOTOR_STIFFNESS` if legs sag
+/// under load; raise `LIMB_MOTOR_DAMPING` if hinges jitter/overshoot.
+pub const LIMB_MOTOR_STIFFNESS: f32 = 6.0;
+pub const LIMB_MOTOR_DAMPING:   f32 = 1.2;
 
 // (colony.rs)
 /// Angular damping for the BASE body of a limb-based organism. High,
 /// because the base has no PD actuator of its own — joint-constraint
 /// reaction torques from the limbs would otherwise integrate unbounded
-/// and spin the body up.
-pub const BASE_ANGULAR_DAMPING: f32 = 3.0;
+/// and spin the body up. Raised to 12: a COMPACT body (near-zero yaw inertia,
+/// e.g. the Lancer) spins on every asymmetric stroke and wanders instead of
+/// walking straight; strong yaw drag gives it the rotational stability to hold
+/// a heading. Spread-out forms have high yaw inertia and are barely affected.
+pub const BASE_ANGULAR_DAMPING: f32 = 12.0;
 
-/// Angular damping for LIMB bodies. Much lower than the base so the
-/// PD controller can produce dynamic swings — the policy can't lift
-/// the legs off the ground if every torque it commands gets drained
-/// to friction within a frame.
-// Raised 1 → 5 (2026-06-02): the limb "separations"/"explosions" are an
-// ESCALATING energy build-up on a minority of organisms (sep grows over
-// time) while stable walkers run bounded cycles. Strong angular damping
-// bleeds the runaway build-up (which is sustained high ω) without blocking
-// the brief propulsive kicks that drive walking — decoupling the otherwise
-// linked propulsion/separation. (Substeps couldn't decouple them.)
+/// Angular damping for LIMB bodies. Lower than the base so the motor can still swing
+/// the legs, but high enough to bleed the runaway sustained-high-ω build-up behind
+/// limb "explosions"/joint-separation without blocking the brief propulsive kicks
+/// that drive walking.
 pub const LIMB_ANGULAR_DAMPING: f32 = 7.0;
 
-/// Linear damping for every limb-based body part (base + limbs).
-/// Light — enough to bleed drift between actuator pulses, not enough
-/// to lock the organism in place.
+/// Linear damping for every limb-based body part (base + limbs). Light — bleeds
+/// drift between strokes without freezing the slow crawl. (Damping cannot fix
+/// the hop: ≥16 froze the crawl too, ≤1 drifted — the hop-vs-crawl distinction
+/// is a gait/control matter handled by the ground-gated movement reward.)
 pub const LIMB_LINEAR_DAMPING:  f32 = 0.6;
 
-/// Material density used when deriving the mass of **every** body part of a
-/// limb-based organism from its collider — the base body (index 0) AND every
-/// appendage limb, identically (only their angular damping differs). (Sliding
-/// organisms are kinematic, so density doesn't apply to them.) Density × volume
-/// → mass; lower density → lower mass → lower normal force at ground contacts →
-/// less friction resisting rotation, AND less body weight for the PD torques to
-/// lift/support. Lowered to 0.04 (an 80 % cut from the previous 0.2, itself
-/// down from the natural 1.0): with many cells per body part (large collider
-/// volume) the heavier mass left organisms too weak to stand or move — the
-/// fixed-magnitude PD torques couldn't overcome the body weight. Lighter mass
-/// restores the torque-to-weight ratio that lets them push up and walk.
-// MICROSCOPIC scale (2026-06-03): cut 0.04 → 0.008 (5× lighter). AEONS
-// organisms are amoeba/paramecium/ant-scale — VERY lightweight relative to
-// their volume. A light body lets gravity + Avian's per-contact resolution
-// settle the creature NATURALLY onto its feet: the legs easily hold the light
-// body up (standing posture, belly off the ground), the feet rest ON the
-// surface (no penetration), and no part is left rigidly hoisted/dangling. The
-// heavy 0.04 body collapsed belly-down and drove the feet through the terrain.
-// `MAX_LIMB_TORQUE` is scaled down with this (the spring-damper motor's needed
-// torque ∝ inertia), so the lighter body isn't flung.
+/// Material density for deriving the mass of EVERY body part of a limb organism
+/// (base + limbs identically; sliding organisms are kinematic so it doesn't apply).
+/// Density × volume → mass. Kept very low (amoeba/paramecium/ant scale) so the legs
+/// easily hold the light body up, feet rest on the surface without penetrating, and
+/// the motor torques can lift/move it; coupled with `MAX_LIMB_TORQUE` (needed torque
+/// ∝ inertia). Heavier values collapse the body belly-down and drive feet through
+/// the terrain.
+// Raised from the Avian-era 0.0012: that near-zero mass/inertia is why Rapier
+// impulse joints couldn't hold the limbs (flung 4–9u) and the multibody solver
+// NaN'd. With ACCELERATION-BASED limb motors the base-weight ÷ leg-torque ratio
+// is density-independent, so a sane density restores joint stability WITHOUT
+// changing whether the legs can hold the body up. Tune via the joint-separation
+// telemetry; lower toward 0.01 if standing needs lighter bodies.
 pub const BODY_PART_DENSITY: f32 = 0.012;
 
 
@@ -813,189 +570,418 @@ pub const LR: f64 = 3e-4;
 /// Coefficient on the value (critic) loss term.
 pub const VALUE_LOSS_COEF: f32 = 0.5;
 
-/// Coefficient on the entropy bonus term.
-///
-/// **Cut 0.03 → 0.005 after the 5-min data dive**: the limb pool's entropy
-/// was RISING over training (1.32 → 1.47) while `mean_return` FELL
-/// (−0.24 → −3.07). That is the signature of an entropy bonus larger than
-/// the (near-zero, noisy) advantage signal — PPO was maximising entropy
-/// (diffusing the policy) instead of reward. With a denser reward (below)
-/// the advantage now carries real signal; a small entropy term keeps
-/// exploration without dominating it.
-///
-/// Cut 0.005 → 0.0 (2026-06-03): across the emergent-walk runs entropy was
-/// still RISING (1.76 → 2.08) while the policy failed to lock onto any
-/// locomotion — the bonus was re-diffusing the policy faster than the (sparse,
-/// hard-won) movement advantage could concentrate it. Exploration is already
-/// supplied by the fixed sampling σ (`LOG_STD_INIT`), so the entropy bonus is
-/// redundant here and was actively preventing convergence onto a gait. Zeroing
-/// it lets any discovered propulsive stroke actually be reinforced.
+/// Coefficient on the entropy bonus term. Zeroed: with the sparse movement
+/// advantage, any positive bonus diffused the policy (entropy rose while return fell)
+/// faster than a propulsive stroke could be concentrated, preventing gait
+/// convergence. Exploration is instead supplied by the fixed sampling σ
+/// (`LOG_STD_INIT`), so this is redundant here.
 pub const ENTROPY_COEF: f32 = 0.0;
 
-/// Exploration std (as `log σ`) for the diagonal-Gaussian limb policy.
-/// The sampler uses `σ = exp(LOG_STD_INIT)` directly. `exp(-1.2) ≈ 0.30`
-/// — moderate exploration on the gait-parameter outputs.
-///
-/// **Was `0.0` (σ = 1.0), which broke locomotion**: a unit-variance noise
-/// on a `[-1, 1]` action spans the whole range, so every 150 ms tick each
-/// joint target was essentially random and the policy mean barely mattered.
-/// The brain now sets each hinge target angle directly, so the noise perturbs
-/// the joint command itself; σ ≈ 0.3 keeps exploration meaningful while still
-/// letting a coherent phase-locked gait take shape rather than thrashing.
-/// Tuning lever: raise for more exploration if learning stalls, lower if the
-/// gait is too jittery.
-///
-/// Back to −1.2 (σ ≈ 0.30, 2026-06-03): the actor now WARM-STARTS into a
-/// rhythmic leg oscillation (see `BrainPoolLimb::new`), so exploration no
-/// longer has to DISCOVER a coherent stroke from white noise — it only needs to
-/// perturb the warm-started gait so PPO can shape it. A large σ (0.5) would
-/// drown the warm-start's ±0.46 oscillation in noise; σ ≈ 0.30 explores around
-/// the rhythm without erasing it.
-pub const LOG_STD_INIT: f32 = -1.2;
+/// Exploration std as `log σ` for the diagonal-Gaussian limb policy; sampler uses
+/// `σ = exp(LOG_STD_INIT)` (`exp(-1.2) ≈ 0.30`). Moderate noise that perturbs the
+/// warm-started rhythmic gait (see `BrainPoolLimb::new`) so PPO can shape it without
+/// drowning the ±0.46 oscillation. Larger σ (≈1.0) makes each joint target essentially
+/// random and breaks locomotion; raise if learning stalls, lower if the gait jitters.
+pub const LOG_STD_INIT: f32 = -1.6;
 
 
-// ── Limb locomotion: EMERGENT, brain-driven (avian_setup::drive_limb_motors) ──
+
+// ── Limb locomotion: EMERGENT, brain-driven (rapier_setup::drive_limb_motors) ──
 //
-// Locomotion is NO LONGER generated by a built-in CPG and is NOT assisted by a
-// pursuit force. Each limb hinge's target angle is set DIRECTLY from the
-// brain's per-joint output (`Organism::limb_targets[joint] · LIMB_SWING_LIMIT`),
-// and the in-solver spring-damper motor tracks it. Walking must EMERGE from RL:
-// the brain learns, per joint, a phase-locked angle trajectory that produces
-// ground reaction → forward thrust, shaped by the reward (forward velocity,
-// progress toward prey, stepping, anti-spin). The only "rhythm aid" is a phase
-// signal handed to the brain as an OBSERVATION (sin/cos of a slow virtual-time
-// clock) — the brain still decides every joint angle; the clock merely lets a
-// feedforward policy phase-lock a sustained oscillation instead of having to
-// invent a limit cycle from a reactive map. This is a phase-conditioned policy,
-// the standard way to get genuinely learned (not scripted) legged gaits.
+// No CPG, no pursuit force. Each limb hinge's target angle is set DIRECTLY from the
+// brain's per-joint output (`Organism::limb_targets[joint] · LIMB_SWING_LIMIT`) and
+// the in-solver spring-damper motor tracks it; walking must EMERGE from RL (reward
+// shapes forward velocity / progress / anti-spin). The only rhythm aid is a phase
+// signal given as an OBSERVATION (sin/cos of a slow virtual-time clock) so a
+// feedforward policy can phase-lock a sustained oscillation — a phase-conditioned
+// policy, the standard way to get learned (not scripted) legged gaits.
 
-/// Number of limb hinge joints the brain can independently control / observe.
-/// This is the action dimension (`limb_ppo::OUT`) and the per-joint observation
-/// bound: brain output `k` drives the hinge of body-part index `k+1`. Chosen to
-/// cover the multi-segment Bilateral morphologies in `species/` (e.g. Crawler:
-/// base + 2 hips + 2 knees → 8 runtime limb parts after the mirror expansion),
-/// so every joint — left/right hip AND knee — gets its own learned command and
-/// an alternating gait can emerge. Parts beyond this wrap modulo (rare).
-/// MUST equal `limb_ppo::OUT`.
+/// Number of limb hinge joints the brain independently controls / observes — the
+/// SWING action dimension and per-joint observation bound; brain output `k` drives
+/// body-part `k+1`'s hinge. Sized (8) to cover the multi-segment Bilateral
+/// morphologies in `species/` (e.g. Crawler: base + 2 hips + 2 knees → 8 limb parts
+/// after mirror expansion) so each hip/knee gets its own command. Parts beyond this
+/// wrap modulo. `limb_ppo::OUT = MAX_LIMB_JOINTS + N_LIMB_TWIST_GROUPS`.
 pub const MAX_LIMB_JOINTS: usize = 8;
 
-/// Frequency (Hz of virtual time) of the phase-clock OBSERVATION fed to the
-/// limb brain. NOT a motor command — the brain reads `sin/cos(2π·f·t)` and
-/// learns how to map that phase onto each joint's target angle. Sets the
-/// natural cadence the learned gait tends to lock onto: ~1 Hz is a plausible
-/// stride rate for these small bodies. Invariant to `TimeSpeed`/frame rate
-/// (derived from virtual elapsed time at brain-tick time).
+/// Number of GROUPED brain-driven twist commands (the off-swing-axis DOF). Kept
+/// SMALL (2) on purpose: per-limb twist (8 outputs) doubled the policy action
+/// space and measurably degraded locomotion learning (the cost was the action
+/// dimension, not the twist torque). 2 interleaved groups (limb i → group
+/// `(i-1) % N`) still let the brain twist limbs off their single swing plane,
+/// at +2 outputs instead of +8. `drive_limb_twist` maps limbs to groups.
+pub const N_LIMB_TWIST_GROUPS: usize = 2;
+
+/// Frequency (Hz of virtual time) of the phase-clock OBSERVATION fed to the limb
+/// brain (NOT a motor command — it reads `sin/cos(2π·f·t)`). Sets the cadence the
+/// learned gait tends to lock onto; ~1 Hz is a plausible stride rate for these small
+/// bodies. Invariant to `TimeSpeed`/frame rate (from virtual elapsed time).
 pub const GAIT_FREQUENCY_HZ: f32 = 1.0;
 
-/// Hard velocity governor on every limb body part (`MaxLinearSpeed` /
-/// `MaxAngularSpeed` in Avian). The robust safety net against runaway
-/// "explosions"/joint-separation: a destabilising limb otherwise reaches huge
-/// velocity (data showed 70+ u/s linear, 90 rad/s angular while AIRBORNE) and
-/// the momentum is what the rigid point-constraint can't arrest in 8 substeps
-/// on the ultra-light bodies — so capping per-part speed keeps the joint
-/// impulse bounded (joints hold), forbids the airborne fling, and keeps motion
-/// moderate, while leaving a real walking stride (well under these) untouched.
-pub const MAX_LIMB_LINEAR_SPEED:  f32 = 9.0;  // u/s (caps fly-off; walking is far below)
-pub const MAX_LIMB_ANGULAR_SPEED: f32 = 14.0; // rad/s (caps spin-out; leg swings are below)
+/// Hard per-part velocity governor (`MaxLinearSpeed` / `MaxAngularSpeed`). Safety net
+/// against runaway "explosions"/joint-separation: a destabilising limb otherwise
+/// reaches huge velocity whose momentum the rigid constraint can't arrest in the
+/// substep budget on these ultra-light bodies. Capping keeps the joint impulse bounded
+/// (joints hold) and forbids the airborne fling; a real walking stride is well below.
+pub const MAX_LIMB_LINEAR_SPEED:  f32 = 4.0;  // u/s — tightened to clip the unstable minority that flings limbs (a static stand needs almost no body speed)
+pub const MAX_LIMB_ANGULAR_SPEED: f32 = 8.0;  // rad/s — clips spin-out while leaving room for a leg to swing into a stance
 
 
 // ── Brain reward weights (limb_ppo.rs) ──────────────────────────────────────
 
 pub const K_EAT:      f32 = 4.0;
 pub const K_REPRO:    f32 = 5.0;
-/// Reward per unit of forward (heading-projected) velocity. Signed:
-/// directed travel pays, spin nets ~0, backward drift is penalised.
-// Raised 0.1 → 0.3 (2026-06-03): once an organism translates at all, pay it
-// more for translating in its FACING direction, so the movement the brain
-// discovers is biased toward directed travel rather than undirected drift.
+/// Reward per unit of forward (heading-projected) velocity. Signed: directed travel
+/// pays, spin nets ~0, backward drift is penalised — biases discovered motion toward
+/// directed travel rather than undirected drift.
 pub const K_FWD:      f32 = 0.3;
 pub const K_UP:       f32 = 0.02;
-/// Flat idle penalty `−K_IDLE·(1−motion_gate)`. **Set to 0 after the data
-/// dive.** With the gait barely propelling most organisms, this term was
-/// the DOMINANT reward (≈ −0.04/tick, near-identical for every still
-/// organism regardless of its limb action) — a gradient-free negative
-/// plateau that made `mean_return` uniformly negative and taught nothing.
-/// It is replaced by `K_MOVE` (a positive, climbable movement gradient).
+/// Flat idle penalty `−K_IDLE·(1−motion_gate)`. Zeroed: a flat penalty is a
+/// gradient-free negative plateau (near-identical for every still organism) that
+/// taught nothing. Replaced by `K_MOVE`, a positive climbable movement gradient.
 pub const K_IDLE:     f32 = 0.0;
-/// Reward per world-unit of XZ distance closed to the nearest
-/// photoautotroph since the last brain tick. Gives a dense
-/// directional signal: any motion that nets closer-to-food is paid
-/// even before the brain has discovered locomotion. Mirrors the
-/// `K_PROGRESS` term in the sliding pools.
-pub const K_PROGRESS: f32 = 0.5;
-/// Reward per unit of improvement in heading-alignment toward the
-/// nearest photoautotroph, tick-over-tick. `alignment ∈ [-1, 1]` is
-/// `dot(body_heading_xz, prey_dir_xz)`; the reward is the RECTIFIED
-/// delta `max(0, alignment_now − alignment_prev)`, so only turning
-/// TOWARD the target is paid (turning away costs nothing — same
-/// rectified philosophy as `K_PROGRESS`). This is the limb pool's
-/// learned analogue of the sliding pool's hard-coded "rotate to face
-/// travel direction": the brain must discover which limb motions
-/// rotate the base toward prey, and gets dense credit for doing so
-/// even before net translation begins. Rewarding the ACT of turning
-/// (not static facing) avoids the alive-bonus trap.
-pub const K_HEADING: f32 = 0.3;
-/// Reward per limb-contact TRANSITION (a foot lifting off or planting
-/// down) since the last tick, summed over all limb contact flags. A
-/// walking gait cycles feet on and off the ground; rewarding the
-/// transition gives a dense gradient toward *stepping* rather than
-/// either static contact (foot dragging) or static lift (foot waving
-/// in the air). Only the LIMB contact flags are counted — the
-/// BASE contact flag is excluded (the base touching the ground is
-/// the body dragging, which we don't want to reward). Kept modest so
-/// it can't be farmed by high-frequency contact jitter — the speed /
-/// progress terms still dominate genuine locomotion. (A `feet
-/// air-time` shaping, as in legged_gym, is the natural refinement if
-/// jitter-farming shows up.)
-// DISABLED 0.1 → 0.0 (2026-06-03, data-driven): the first emergent-walk run
-// showed PPO mean_return climbing 0.65 → 4.9 over 18 updates with ZERO body
-// translation and every limb pinned at the ±swing-limit — the policy was
-// FARMING this term by flailing its feet on/off the ground (each contact
-// transition pays K_STEP) without ever locomoting. That is exactly the
-// "jitter-farming" failure this term's own doc warned about. Zeroed so the
-// only climbable rewards are the unfarmable movement terms (K_MOVE/K_FWD,
-// which are 0 at rest and require the body to actually translate). A proper
-// feet-air-time shaping could reintroduce stepping credit later without the
-// in-place-jitter exploit.
+/// Reward per world-unit of XZ distance closed to the nearest photoautotroph since
+/// the last tick — a dense directional signal paid even before locomotion is
+/// discovered. Mirrors the sliding pools' `K_PROGRESS`.
+pub const K_PROGRESS: f32 = 3.0;
+/// Reward per tick-over-tick improvement in heading-alignment toward the nearest
+/// photoautotroph. `alignment = dot(body_heading_xz, prey_dir_xz) ∈ [-1,1]`; reward
+/// is the RECTIFIED delta `max(0, now − prev)`, so only turning TOWARD the target is
+/// paid (turning away is free). Rewards the ACT of turning, not static facing, to
+/// avoid the alive-bonus trap — the limb analogue of the sliding pool's "rotate to
+/// face travel".
+pub const K_HEADING: f32 = 2.0;
+/// Reward per LIMB-contact TRANSITION (foot lifting off / planting) since the last
+/// tick — intended as a dense gradient toward stepping rather than dragging or
+/// air-waving feet (base contact excluded). Currently ZEROED: the policy farmed it by
+/// flailing feet on/off the ground in place without locomoting, so only the unfarmable
+/// movement terms (`K_MOVE`/`K_FWD`, zero at rest) remain climbable. A feet-air-time
+/// shaping (cf. legged_gym) could reintroduce stepping credit without the exploit.
 pub const K_STEP: f32 = 0.0;
 
-/// Speed (world-units/sec) at which the uprightness reward fully
-/// activates and the idle penalty bottoms out. Below this the brain
-/// is treated as "not really moving" and the alive-bonus is dimmed
-/// proportionally.
+/// Speed (world-units/sec) at which the uprightness reward fully activates and the
+/// idle penalty bottoms out. Below this the brain counts as "not really moving" and
+/// the alive-bonus is dimmed proportionally.
 pub const IDLE_THRESH: f32 = 0.5;
 
-/// Reward per (capped) world-unit/s of RAW body speed — the dense,
-/// climbable "move at all" gradient that bootstraps exploration of
-/// locomotion. The data showed 76/80 organisms stuck at ~0.1 u/s with a
-/// flat (gradient-free) reward, so PPO never found that moving the limbs
-/// can move the body. Unlike `K_FWD` (forward-projected, ≈0 until the
-/// body already travels in its facing direction), this pays ANY motion,
-/// giving a slope out of the still basin. `K_FWD` + `K_PROGRESS` +
-/// `K_HEADING` then bend that motion toward prey; `K_SPIN` keeps it from
-/// degenerating into spin/flail. The term is GATED on uprightness in
-/// `limb_ppo.rs` so a tumbling/ballistic body earns ~nothing — controlled
-/// upright translation is the only way to collect it.
-///
-/// Raised 0.4 → 0.9 (2026-06-03): with the farmable `K_STEP` removed, this is
-/// now the primary bootstrap gradient out of "flail in place" — it must be the
-/// dominant climbable reward so the policy is pulled toward genuinely moving
-/// the body (which only happens when learned joint motion nets ground thrust)
-/// rather than sitting still. Still capped (`SPEED_REWARD_CAP`) and
-/// uprightness-gated, so it cannot be won by spinning or ballistic flight.
+/// Reward per (capped) world-unit/s of RAW body speed — the primary dense, climbable
+/// "move at all" gradient that bootstraps locomotion out of the still basin. Unlike
+/// `K_FWD` (forward-projected, ~0 until the body already travels facing-wise), this
+/// pays ANY motion; `K_FWD`/`K_PROGRESS`/`K_HEADING` then bend it toward prey and
+/// `K_SPIN` discourages spin. GATED on uprightness (`limb_ppo.rs`) and capped
+/// (`SPEED_REWARD_CAP`), so it can't be won by tumbling or ballistic flight.
 pub const K_MOVE: f32 = 0.9;
 
-/// Cap (world-units/s) on the speed that `K_MOVE` rewards. Beyond this,
-/// extra speed earns nothing — so the ballistic "fling the body at 40 u/s"
-/// regime is not preferred over controlled locomotion at a sane pace.
-pub const SPEED_REWARD_CAP: f32 = 4.0;
+/// Cap (world-units/s) on the speed `K_MOVE` rewards. Set near crawl speed so the
+/// cap actually bites: above it, extra speed earns nothing, so a fast ballistic
+/// hop earns no more `K_MOVE` than a steady grounded crawl — removing the speed
+/// incentive that drove hopping (a high cap rewards the hop's raw velocity).
+pub const SPEED_REWARD_CAP: f32 = 1.2;
 
-/// Penalty per rad/s of base ANGULAR speed. The only organisms that moved
-/// in the data were a few that destabilised into high-speed spin/flight
-/// (angular speed up to ~16 rad/s). Penalising base spin steers the
-/// movement gradient toward translation rather than tumbling, without
-/// touching the (legitimate) limb-joint angular velocities.
-pub const K_SPIN: f32 = 0.03;
+/// Penalty per rad/s of base ANGULAR speed — steers the movement gradient toward
+/// translation rather than the high-speed spin/flight that an unstable body falls
+/// into, without touching the legitimate limb-joint angular velocities.
+pub const K_SPIN: f32 = 0.08;
+
+/// Number of planted feet at which the movement reward (`K_MOVE`/`K_FWD`) earns
+/// full credit; fewer scales it down linearly, zero (airborne) earns nothing.
+/// This is the ground gate that stops a ballistic hop — which has high XZ speed
+/// while airborne — from out-scoring a grounded crawl. Morphology-general: a few
+/// planted feet suffice, so it works for any limb count/form.
+pub const GROUND_GATE_MIN_FEET: f32 = 2.0;
+
+/// Penalty per (world-units/s) of UPWARD base velocity. Taxes the hop's defining
+/// feature (a launch has large +vy at take-off) while leaving the horizontal
+/// crawl (vy≈0) untouched — complements the ground gate to suppress hopping.
+pub const K_VERT: f32 = 0.6;
+
+/// Per-tick penalty while FULLY airborne (no feet planted), graded between 0 and
+/// 1 planted foot. Taxes the whole airborne GLIDE, not just take-off (`K_VERT`),
+/// so a "launch once, glide far" strategy is strictly dominated by landing —
+/// pulls the stragglers out of the ballistic local optimum into grounded walking.
+/// Only fires when ALL feet are off the ground, so a normal alternating gait
+/// (always ≥1 foot down) is never penalised. Kept moderate: stronger values just
+/// shuffled which (stochastic) stragglers stayed stuck without raising the count.
+pub const K_AIR: f32 = 0.5;
+
+/// Per-tick penalty while the BASE (belly) touches the ground. Makes the policy
+/// hold the body UP on its legs (stand/walk) instead of collapsing to a
+/// belly-drag, which is otherwise effortless and "free". Composes with `K_AIR`
+/// (don't go airborne) + the planted-feet movement gate so the optimum is
+/// "feet planted, belly off the floor" = legged walking, for any morphology.
+pub const K_BELLY: f32 = 1.2;
+
+
+// ── STANDING task reward (limb_ppo.rs) ──────────────────────────────────────
+// Goal: four-legged runners learn to STAND UPRIGHT on their whole legs (incl.
+// sub-limbs) — no directed locomotion yet. Recipe adapted from the proven
+// standing/balancing RL literature (DeepMind Control Suite walker "stand":
+// reward = mix of uprightness + minimal-torso-height; ETH legged_gym
+// projected-gravity orientation + base-height-target terms; quadruped
+// fall-recovery height-constraint as the dominant term). The PRIMARY term is
+// the MULTIPLICATIVE product tall×level×feet-planted, so the policy scores only
+// when the base is held HIGH (forcing knee/sub-limb extension — the whole-leg
+// requirement), LEVEL, and supported on planted legs. Penalties suppress the
+// known failure modes (belly-resting, tipping, hovering/bouncing, spinning,
+// trembling). When `STANDING_TASK` is false the reward reverts to locomotion.
+
+/// Master switch: when true, the limb PPO reward optimises STANDING (terms
+/// below) instead of locomotion (K_MOVE/K_FWD/K_PROGRESS/K_HEADING). Lets a run
+/// target standing first (curriculum: posture before locomotion).
+pub const STANDING_TASK: bool = false;
+
+/// Weight on the primary standing reward `stand = standing·upright·foot_support`
+/// (each factor ∈ [0,1]). Dominant term (cf. the weight-10 height constraint in
+/// quadruped fall-recovery work, and dm_control's height×upright "stand").
+pub const K_STAND: f32 = 2.5;
+
+/// Target base-clearance (world units above terrain) at which the height factor
+/// `standing` saturates to 1. Set ≈ the creature's standing leg reach so that
+/// reaching it is geometrically impossible without EXTENDING the lower
+/// sub-limb segments — this is what forces "stand on the whole leg" rather than
+/// crouching. `standing = clamp(base_clearance / target, 0, 1)` (a robust linear
+/// ramp; over/under-estimating the target only changes where it saturates, never
+/// inverts the gradient). Provisional — refine from the first run's measured
+/// `base_clearance` distribution (telemetry column).
+// DATA (2026-06-06): a standing Runner's measured base_clearance is ~5.4 (part-
+// CENTRE height; the geometric foot-to-base reach is ~4.6). At the old target 6.0
+// the `tall` factor capped at ~0.9 for a perfect stand — it could never saturate,
+// so the policy was always told its best posture was "incomplete". Set just below
+// the achieved stance so a real stand saturates the primary term. (Reward-only;
+// the saved standing policy in Runners_standing.colony is unaffected.)
+pub const STAND_HEIGHT_TARGET: f32 = 5.0;
+
+/// Planted limb-segment count at which `foot_support` saturates to 1 (fewer
+/// scales it down linearly). Counts ALL planted limb parts incl. sub-limbs, so
+/// weight-bearing on the lower segments (guiderail: whole legs) is what pays.
+pub const STAND_MIN_FEET: f32 = 3.0;
+
+/// Penalty per unit of NON-uprightness `(1 - (1+up_z)/2)` — an explicit, always-on
+/// levelness gradient on top of the multiplicative `upright` factor (guiderail:
+/// any non-horizontal base orientation is penalised).
+pub const K_TILT: f32 = 0.6;
+
+/// Penalty per (world-units/s) of horizontal base speed: a STAND should be quiet,
+/// not wander. (Lifted into locomotion phases by flipping `STANDING_TASK`.)
+pub const K_DRIFT: f32 = 0.15;
+
+/// Penalty on mean squared SWING action magnitude — a light energy/torque
+/// regulariser discouraging the policy from jamming joints at the limits or
+/// burning torque to hold a clenched pose (legged_gym/Heess control penalty).
+pub const K_TORQUE_REG: f32 = 0.08;
+
+/// Penalty on mean |action − prev_action| over the swing joints — action-rate
+/// smoothness, the standard cure for trembling/buzzing standing policies.
+pub const K_ACTRATE: f32 = 0.1;
+
+/// Small per-tick ALIVE bonus paid only while the body is upright AND its belly
+/// is off the floor — the survival signal that, with the stillness penalties,
+/// makes "hold a stable upright stance" the optimum (cf. Heess humanoid +0.02
+/// alive bonus + fall termination; we have no per-creature episode reset, so the
+/// gated bonus is the continuous analogue).
+pub const K_ALIVE: f32 = 2.5;
+
+/// Uprightness `(1+up_z)/2` threshold above which (and belly-off-floor) the alive
+/// bonus is paid and the body counts as "standing" for diagnostics.
+pub const STAND_UPRIGHT_MIN: f32 = 0.6;
+
+/// During the STANDING task, cull the loaded limb-organism cohort down to this
+/// many (one-shot, after load). The Runners are heavy multi-part creatures
+/// (~50× a Crawler), so 40 of them crater the frame rate to ~1 FPS; a handful is
+/// plenty for PPO (each organism is an independent learner) and keeps the sim
+/// near the 60-FPS target so the physics stepping stays well-conditioned.
+pub const STANDING_MAX_LIMB_ORGS: usize = 6;
+
+/// Locomotion-task limb-organism cap (cull, after load). Each limb herbivore is many
+/// dynamic bodies + joints, and rapier physics is CPU-bound, so the cohort size sets
+/// the achievable time-speed before FixedUpdate death-spirals to ~0 FPS. 8 (down from
+/// 16) halves the CPU physics load so a modest workstation (e.g. Ryzen 1700x) sustains
+/// a few × real-time without freezing; with a SHARED swim policy 8 agents pool training
+/// data as well as 16, so learning isn't hurt. A multi-part sub-limbed Swimmer (9
+/// dynamic parts) is ~2× a simple limb organism, so keep this small for swimmers.
+pub const LOCOMOTION_MAX_LIMB_ORGS: usize = 8;
+
+/// Training scaffold: suppress LIMB-herbivore reproduction under `AiTrainingMode`
+/// (read by `reproduction.rs`). Keeps the learning cohort fixed at the culled count
+/// and stops mid-run offspring from hitting the steering rotation half-initialised
+/// (which momentarily separated their joints — G2). Decoupled from `--max-herbivores`
+/// so the GPU brain-pool size (and thus FPS) is unaffected.
+pub const DISABLE_LIMB_HERBIVORE_REPRODUCTION: bool = true;
+
+/// PROXIMITY-predation radius (world units) for limb herbivores. Eating is triggered
+/// when a limb herbivore's base gets within this of a phototroph, NOT by physical
+/// collider contact — and the limb↔phototroph physical collision is filtered out. A
+/// successful seeker converges on prey; the dense limb↔prey CONTACT pile that
+/// contact-predation needs craters the frame rate (~1 FPS). Proximity eating keeps
+/// "move to prey → eat it" while letting herbivores pass through prey (no pile) → FPS.
+pub const EAT_RADIUS: f32 = 6.0;
+
+/// STANDING curriculum ("training wheels"): early in a standing run the limb
+/// bodies' gravity is scaled DOWN so the legs can easily hold the body up and the
+/// policy learns the bracing/balance pose under light load; the scale then ramps
+/// linearly to full gravity (1.0) over `STANDING_GRAVITY_FADE_SECS`, so by the end
+/// the creature maintains the learned stance under its true weight. Reduced
+/// gravity is mass-independent, so it doesn't bias which legs/poses work — it just
+/// makes the unstable tall stance learnable instead of collapsing to a belly-squat.
+pub const STANDING_GRAVITY_START:     f32 = 0.15;  // ×gravity at t=0
+pub const STANDING_GRAVITY_FADE_SECS: f32 = 450.0; // slow ramp → more learning per weight level
+
+/// STANDING fall-reset (episode reset). Standard practice in legged-robot RL: when
+/// the agent falls it is reset to the standing pose so the policy keeps
+/// experiencing the standing region and learns to RECOVER/HOLD it. AEONS has no
+/// episode boundaries, so without this a Runner that collapses to its belly stays
+/// there forever and ALL subsequent experience is belly-state — the policy can
+/// never relearn standing (the documented "stuck in the belly-squat attractor"
+/// failure). `reset_fallen_standers` (rapier_setup) teleports a fallen limb
+/// organism's parts back to their `LimbRestPose` (spawn standing pose) and zeroes
+/// velocities. A "fall" = base belly-contact AND base uprightness below
+/// `STAND_RESET_UPRIGHT`, sustained `STAND_RESET_GRACE_SECS`; after a reset, a
+/// `STAND_RESET_COOLDOWN_SECS` window lets the policy attempt the stance before it
+/// can be reset again.
+pub const STAND_RESET_UPRIGHT:        f32 = 0.6;  // base up·Y below this (≈ >53° tilt) counts as fallen
+pub const STAND_RESET_GRACE_SECS:     f32 = 1.0;  // sustained-fall time before a reset fires
+pub const STAND_RESET_COOLDOWN_SECS:  f32 = 2.5;  // post-reset standing-attempt window (snappy → more standing-region experience)
+
+
+// ── Swimming (rapier_setup.rs, colony.rs) — tune with data-analysis ──────────
+//
+// Real swimming locomotion: Swimming organisms are DYNAMIC per-part bodies (the
+// limb physics path) with neutral buoyancy. Each part generates ANISOTROPIC
+// blade-element drag as it moves through the water; the reaction force propels
+// and rotates the whole organism (emergent, not scripted). All knobs below are
+// gated on the `SwimmerBody` marker so walkers/standers stay byte-identical.
+
+/// Lumped fluid density ρ for the per-part quadratic drag model.
+pub const WATER_DENSITY: f32 = 1.0;
+/// Base drag coefficient. Anisotropy comes from the per-axis presented AREA
+/// (`LimbDragShape::area_local`), NOT from Cd — Cd is the same on all 3 axes.
+pub const SWIM_DRAG_CD: f32 = 2.0;
+/// Quadratic angular drag coefficient (`τ = −coef·|ω|·ω`).
+pub const SWIM_ANGULAR_DRAG_COEF: f32 = 0.5;
+/// Isotropic `Damping` override for swimmer parts — small, so the explicit
+/// blade-element drag dominates the linear motion.
+pub const SWIM_LINEAR_DAMPING: f32 = 0.05;
+/// Ditto, angular.
+pub const SWIM_ANGULAR_DAMPING: f32 = 0.2;
+/// Inward restoring force per unit of out-of-bounds overshoot (soft world
+/// borders on XZ). The water SURFACE needs no spring: water-based bodies get
+/// real gravity while above it (`rapier_setup::apply_water_gravity` for
+/// dynamic swimmers, `movement::apply_gravity` for kinematic floaters).
+pub const SWIM_BORDER_STIFFNESS: f32 = 30.0;
+/// Hard cap on each border restoring force. Bounds the `stiffness × overshoot`
+/// spring so a swimmer pushed far out of bounds can't receive an explosive
+/// impulse — it gets firmly but finitely pushed back instead of launched.
+pub const SWIM_CONFINE_MAX_FORCE: f32 = 50.0;
+/// Mass density for SWIMMER body parts. The terrestrial `BODY_PART_DENSITY`
+/// (0.012) is deliberately near-massless so weak motors beat ground friction —
+/// but underwater (no gravity, no friction) that tiny mass makes the quadratic
+/// drag deceleration (`F/m`) explosive: the integrator overshoots, velocity
+/// flips and grows to NaN, and Rapier's solver panics. Swimmers use a realistic
+/// ~neutral-buoyancy density (≈ WATER_DENSITY) so the dynamics are stable. (May
+/// need a matching motor-torque bump for lively strokes — that's tuning.)
+pub const SWIM_BODY_DENSITY: f32 = 1.0;
+/// Hard caps on the blade-element drag force (per axis) and angular-drag torque.
+/// Bound the v² / |ω|² terms so a velocity spike can't produce an unbounded force
+/// on a light body — belt-and-suspenders with `SWIM_BODY_DENSITY`.
+pub const SWIM_DRAG_MAX_FORCE:  f32 = 25.0;
+pub const SWIM_DRAG_MAX_TORQUE: f32 = 10.0;
+/// Swimmer-specific HINGE MOTOR gains. Making swimmer bodies ~neutral-buoyancy
+/// (SWIM_BODY_DENSITY) raised their mass ~83× over the near-massless terrestrial
+/// `BODY_PART_DENSITY`, so the terrestrial motor (stiffness 6 / damping 1.2 /
+/// max-torque 10) can no longer budge the limbs. Scaling all three gains by the
+/// same mass ratio reproduces the (working) terrestrial per-limb angular dynamics
+/// — same accelerations, same damping ratio (stable) — so the limbs actually
+/// stroke. Tune from here: raise the ratio multiplier for livelier strokes, lower
+/// it if they thrash. (`ForceBased` motor → these are real torques that propel.)
+pub const SWIM_MASS_RATIO:      f32 = SWIM_BODY_DENSITY / BODY_PART_DENSITY;
+pub const SWIM_MAX_LIMB_TORQUE: f32 = MAX_LIMB_TORQUE     * SWIM_MASS_RATIO;
+pub const SWIM_MOTOR_STIFFNESS: f32 = LIMB_MOTOR_STIFFNESS * SWIM_MASS_RATIO;
+pub const SWIM_MOTOR_DAMPING:   f32 = LIMB_MOTOR_DAMPING   * SWIM_MASS_RATIO;
+/// Vertical clearance used when placing a swimmer in the water column at spawn:
+/// kept this far below the surface and above the terrain floor so no body part
+/// breaches the water plane on the first frame (which would trigger the ceiling
+/// restoring force). If the column is too shallow, the swimmer is placed just
+/// above the floor and the (now-bounded) ceiling force settles it.
+pub const SWIM_SPAWN_CLEARANCE: f32 = 3.0;
+// ── Swimming brain reward weights (swim_ppo.rs) ──────────────────────────────
+//
+// Swimming organisms train in their OWN PPO pool (swimming_movement/), separate
+// from the limb-walking pools. Two oracles feed the policy (3D target bearing +
+// the body-rotation needed to face it); the reward mirrors them: a BIG sparse
+// eat event, a SMALL dense closing-progress term, and a rotation-toward-target
+// objective. All 3D — a swimmer has no "up", no ground gate, no uprightness.
+
+/// BIG sparse reward per prey eaten (Δ`Organism::predations`). The terminal
+/// objective ("reach prey and eat it"); raised 20→40 so the eat clearly tops a
+/// whole rollout of dense closing reward and the full approach→eat chain is
+/// reinforced.
+pub const K_SWIM_EAT: f32 = 40.0;
+/// DOMINANT dense reward per unit of CLOSING SPEED toward the nearest
+/// phototroph: `base_lin_vel · dir_to_prey` (signed — swimming away is
+/// penalised). This is the instantaneous closing rate (≈ −d(dist)/dt), used
+/// instead of a tick-to-tick distance delta because it is (a) available EVERY
+/// tick a target exists (no prev-distance bookkeeping, no first-tick gap),
+/// (b) far lower variance (reads the body's own velocity, not a noisy distance
+/// difference across a moving/relocating target), and (c) a clean per-tick
+/// gradient the critic can actually fit — the distance-delta version averaged
+/// ~0 for a wandering policy and the value fn couldn't learn it (return
+/// oscillated, 0 eats). It rewards "swim toward the target NOW", tightening the
+/// oracle→act→reward loop. Clamped to the velocity governor range in swim_ppo.
+pub const K_SWIM_PROGRESS: f32 = 3.0;
+/// Tick-over-tick facing-alignment GAIN reward. DISABLED (was 1.5): a rectified
+/// turn-toward delta is farmable (turn away free, turn back paid) and produced
+/// the "orient but never approach" policy. Facing now emerges implicitly —
+/// you can't close `K_SWIM_PROGRESS` distance efficiently without facing the
+/// target. Kept as a knob (0.0) rather than deleted.
+pub const K_SWIM_ALIGN_GAIN: f32 = 0.0;
+/// Small ABSOLUTE facing bonus (`max(0, alignment)` per tick) — non-farmable
+/// (rewards the STATE of facing, not the act of turning), a mild bootstrap so
+/// early policies orient before they can propel. Small vs `K_SWIM_PROGRESS` so
+/// it can't substitute for actually closing distance.
+pub const K_SWIM_ALIGN: f32 = 0.1;
+/// Mild penalty per rad/s of base angular speed — anti-corkscrew, keeps the
+/// rotation objective pointed at controlled turns rather than permanent spin.
+pub const K_SWIM_SPIN: f32 = 0.02;
+
+/// Prey-sensing radius (worldspace units) for SWIMMING herbivores — the range
+/// of the swim brain's target + rotation oracles, and the normaliser for the
+/// observed target distance. Decoupled from the limb/sliding `PREY_SCAN_RADIUS`
+/// (250) so swimmers can be tuned independently.
+pub const SWIM_SENSORY_RADIUS: f32 = 200.0;
+
+// ── Swimming exploration (swim_ppo.rs) ───────────────────────────────────────
+//
+// Swimmers explore limb rotation HARDER than walkers, on purpose: underwater
+// there is no falling over, no ballistic-hop basin, and no joint-fling-on-
+// ground-impact failure mode — the punishments that forced the terrestrial
+// pools' timid exploration settings. And propulsion through quadratic fluid
+// drag is only discovered by COHERENT, vigorous strokes: thrust scales with
+// stroke speed², and per-tick white jitter averages to ~zero net force.
+
+/// Sampling `log σ` for the SWIMMING policy (`σ = exp(-0.9) ≈ 0.41`, ~2× the
+/// terrestrial `LOG_STD_INIT = -1.6` ⇒ σ ≈ 0.20). Bigger exploratory joint
+/// excursions actually displace water; the per-axis joint limits + drag-force
+/// caps bound the worst case. Lower toward -1.6 if learned strokes jitter.
+pub const SWIM_LOG_STD_INIT: f32 = -0.9;
+
+/// Per-tick autocorrelation ρ of the exploration noise — variance-preserving
+/// AR(1) (discrete Ornstein–Uhlenbeck): `n_t = ρ·n_{t−1} + √(1−ρ²)·ε_t`,
+/// `ε ~ N(0,1)`, so the MARGINAL of each action stays `N(μ, σ²)` (the recorded
+/// log-prob stays the correct density) while excursions persist for
+/// ~`tick/(1−ρ)` ≈ 1 s of virtual time at ρ=0.85 — the stroke timescale
+/// (`GAIT_FREQUENCY_HZ` = 1). Exploration then looks like sustained trial
+/// strokes (which produce net thrust the reward can see) instead of 150 ms
+/// jitter (which fluid drag cancels). ρ=0 recovers plain white noise.
+pub const SWIM_NOISE_CORR: f32 = 0.85;
+
+/// Oscillatory warm-start amplitude for the swim actor (per-output
+/// `A·sin(phase+φ)`). The limb pools keep this small (0.15) because a big
+/// swing lifts all feet at once and seeds the ballistic hop; underwater there
+/// is no hop basin and thrust needs stroke speed, so swimmers start vigorous.
+/// Phases `φ` are RANDOMISED per organism and per output at pool init, so the
+/// initial population explores DIVERSE stroke patterns (linear paddles, 3D
+/// orbits, different joint orderings) instead of one shared gait.
+pub const SWIM_WARMSTART_AMP: f32 = 0.35;
 
 
 // ── Energy (energy.rs) ──────────────────────────────────────────────────────
@@ -1003,22 +989,20 @@ pub const K_SPIN: f32 = 0.03;
 pub const ENERGY_TICK_INTERVAL: f32 = 0.5;
 pub const MAX_ENERGY_PER_CELL: f32 = 10.0;
 
-/// Per-tick energy a fully-surrounded (18 RD neighbours) photo cell
-/// produces. Read by `physiology.rs::PhotosyntheticCell::new` to derive
-/// the per-cell `energy_production` cache; the photosynthesis tick itself
-/// runs in `physiology.rs`, not here.
+/// Per-tick energy a fully-surrounded (18 RD neighbours) photo cell produces. Read by
+/// `physiology.rs::PhotosyntheticCell::new` for the per-cell `energy_production`
+/// cache; the photosynthesis tick runs in `physiology.rs`, not here.
 pub const PHOTO_PRODUCTION_PER_CELL:  f32 = 4.0;
 pub const NON_PHOTO_CONSUMPTION_PER_CELL: f32 = 0.01;
 
-// Movement-cost coefficients tuned so a max-speed (20) sprint is heavily
-// punitive on heavy organisms but doesn't immediately kill them.
+// Movement-cost coefficients (ground friction linear, fluid drag cubic in speed),
+// tuned so a max-speed sprint is heavily punitive but not instantly fatal.
 pub const K_GROUND_FRICTION: f32 = 0.003;
 pub const K_FLUID_DRAG:      f32 = 0.03;
 
-/// Energy cost per metre of elevation gained — the gravitational-PE
-/// analogue. Charged on every climb step accumulated since the last energy
-/// tick and reset afterwards. Krishi is filtered out of the energy system
-/// entirely, so its accumulated debt is never drained (never spent).
+/// Energy cost per unit of elevation gained (gravitational-PE analogue), charged on
+/// the climb accumulated since the last energy tick. Krishi is excluded from the
+/// energy system, so its debt is never spent.
 pub const ELEVATION_ENERGY_PER_UNIT: f32 = 0.5;
 
 pub const DOPAMINE_DEPLETION_INTERVAL: f32 = 1.0;
@@ -1026,39 +1010,30 @@ pub const DOPAMINE_DEPLETION_INTERVAL: f32 = 1.0;
 
 // ── Physiology (physiology.rs) ──────────────────────────────────────────────
 
-/// How often the physiology tick runs. 0.5 s matches the energy tick so
-/// per-cell and per-organism updates stay roughly in phase, simplifying
-/// reasoning about which lags which.
+/// Physiology tick interval. 0.5 s matches the energy tick so per-cell and
+/// per-organism updates stay roughly in phase.
 pub const PHYSIOLOGY_TICK_INTERVAL: f32 = 0.5;
 
-/// Hard ceiling on per-cell energy. Cells never exceed this regardless of
-/// how much they would otherwise gain in one tick — keeps the value
-/// comparable across cell types and prevents overflow into pathological
-/// regimes that future rules would have to special-case.
+/// Hard ceiling on per-cell energy — cells never exceed it however much they'd gain
+/// in a tick, keeping the value comparable across cell types and bounded.
 pub const MAX_CELL_ENERGY: f32 = 1.0;
 
 
 // ── Photosynthesis (photosynthesis.rs) ──────────────────────────────────────
 
-/// Direction *toward* the sun, as a unit vector.
-///
-/// Mirrors the directional light orientation in `main.rs`:
-/// `Quat::from_euler(EulerRot::XYZ, -π/4, π/4, 0)` applied to Bevy's default
-/// directional light forward (`-Z`) yields a light pointing roughly
-/// `(-0.5, -√2/2, -0.5)`. The opposite of that — the direction *toward* the
-/// light source — is the unit vector below.
+/// Direction TOWARD the sun, as a unit vector. Must mirror the directional-light
+/// orientation in `main.rs` (the light points roughly `(-0.5, -√2/2, -0.5)`; this is
+/// its opposite).
 pub const SUN_DIRECTION: Vec3 = Vec3::new(0.5, std::f32::consts::FRAC_1_SQRT_2, 0.5);
 
 pub const SHADOW_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Step length of the shadow raymarch in world units. Chosen to match the
-/// heightmap cell size (1.0) so each step samples a fresh terrain cell.
+/// Step length of the shadow raymarch (world units). Finer than `HEIGHTMAP_CELL_SIZE`
+/// (4.0) so the ray oversamples terrain and can't skip an occluder between cell centres.
 pub const RAY_STEP_SIZE: f32 = 1.0;
 
-/// Maximum number of steps before declaring the ray escaped to the sky.
-/// With sun y-component √2/2 ≈ 0.707 and step size 1.0, 300 steps lift
-/// the ray ~210 units above its origin — comfortably above any plausible
-/// terrain peak in normalised worlds.
+/// Max raymarch steps before the ray is declared escaped to the sky. 300 steps lift
+/// it ~210 units (sun y ≈ 0.707) above its origin — above any plausible terrain peak.
 pub const MAX_RAY_STEPS: usize = 300;
 
 
@@ -1074,35 +1049,39 @@ pub const OFFSPRING_ENERGY_FRACTION: f32 = 0.5;
 pub const REPRODUCTION_ENERGY_THRESHOLD: f32 = 0.8;
 
 pub const HETEROTROPH_REPRODUCTION_CAP:    u8 = 2;
-pub const PHOTOAUTOTROPH_REPRODUCTION_CAP: u8 = 2;
+// (Phototrophs have NO per-individual reproduction cap — see reproduction.rs.
+// Their population is bounded by `MaxPhotoautotrophs` + energy/sunlight and a
+// minimum is guaranteed by the plankton auto-spawn below.)
+
+/// Plankton auto-spawn floor: `colony::auto_spawn_plankton` keeps at least this
+/// many `ball_plankton.species` organisms alive at all times (spawning the
+/// deficit from the species file), guaranteeing a reliable prey field — e.g.
+/// food for swimming heterotrophs — independent of reproduction dynamics.
+pub const MIN_PLANKTON_COUNT: usize = 20;
+/// Species file the plankton auto-spawn loads. A sessile, WATER-BASED (floating)
+/// phototroph, so it stays in the water column as reachable prey.
+pub const PLANKTON_SPECIES_PATH: &str = "species/ball_plankton.species";
 
 
 // ── Growth (volumetric_growth/mod.rs, continuous_growth.rs) ─────────────────
 
 /// Growth cap for variable-form (plant-like photoautotroph) organisms:
-/// `continuous_growth` stops adding cells once a body reaches this many.
-/// Heterotrophs don't use this — they're bounded by their body-part
-/// count instead. Lowered 60 → 30 to keep photoautotrophs more compact.
+/// `continuous_growth` stops adding cells at this count. Kept at 30 to keep
+/// photoautotrophs compact. Heterotrophs are bounded by body-part count instead.
 pub const MAX_CELLS: usize = 30;
 
-/// Effective growth cadence per organism. Each variable-form organism
-/// receives one growth tick every `CONTINUOUS_GROWTH_INTERVAL` seconds.
-/// 1.0 s gives a noticeable "growing" silhouette over ~30 seconds for
-/// a fresh seed reaching the 30-cell cap.
+/// Per-organism growth cadence: each variable-form organism gets one growth tick this
+/// often. 1.0 s gives a visible "growing" silhouette over ~30 s to reach the cap.
 pub const CONTINUOUS_GROWTH_INTERVAL: f32 = 1.0;
 
-/// Number of phase slices the per-second growth workload is sliced into.
-/// At 30, the system fires every `1/30` s ≈ 33 ms and each tick
-/// processes only the organisms whose entity-index modulo 30 matches
-/// the rotating phase counter — roughly 1/30th of the variable-form
-/// population per tick. Total work per second is unchanged; the
-/// per-tick allocator + Bevy command-buffer spike that was visible
-/// every second goes away. Aligned with the 30 Hz brain tick so both
-/// throttled subsystems share the same timing rhythm.
+/// Phase slices the per-second growth workload is spread across — each tick processes
+/// ~1/30th of the population (entity-index modulo the rotating phase). Total work is
+/// unchanged but the per-second allocator/command-buffer spike is smoothed out.
+/// Aligned with the 30 Hz brain tick.
 pub const GROWTH_PHASE_PERIOD: u32 = 30;
 
-/// Wall-clock interval between phase steps. `CONTINUOUS_GROWTH_INTERVAL
-/// / GROWTH_PHASE_PERIOD` so the per-organism cadence is preserved.
+/// Wall-clock interval between phase steps (`CONTINUOUS_GROWTH_INTERVAL /
+/// GROWTH_PHASE_PERIOD`) so the per-organism cadence is preserved.
 pub const GROWTH_PHASE_STEP_SECS: f32 =
     CONTINUOUS_GROWTH_INTERVAL / GROWTH_PHASE_PERIOD as f32;
 
@@ -1115,11 +1094,10 @@ pub const MAX_DIRECTION_INTERVAL: f32 = 10.0;
 pub const GRAVITY:          f32 = 9.8;
 pub const MAX_CLIMB_HEIGHT: f32 = 4.0;
 
-/// Global kill-floor. Any organism whose true world position falls below
-/// this Y is despawned. Organisms that slip off the map edge (or through
-/// a mesh gap) otherwise fall forever under gravity, burning brain/physics
-/// cycles on an entity that can never recover. Set well below the lowest
-/// plausible terrain so a legitimately low-lying organism is never culled.
+/// Global kill-floor: any organism below this Y is despawned, reclaiming
+/// brain/physics cycles from ones that slipped off the map edge or through a mesh gap
+/// and fall forever. Set well below the lowest plausible terrain so legitimate
+/// low-lying organisms survive.
 pub const ORGANISM_DESPAWN_Y: f32 = -500.0;
 
 
@@ -1129,18 +1107,15 @@ pub const ORGANISM_DESPAWN_Y: f32 = -500.0;
 /// further checks to run. Set generously — it's only a cheap distance test.
 pub const ORGANISM_BROAD_RADIUS: f32 = 10.0;
 
-/// Tick interval — running the full pipeline every frame is wasteful at
-/// 1100-organism scale, and contacts emerge cleanly at 10 Hz.
+/// Collision-pipeline tick interval. Running every frame is wasteful at large
+/// organism counts; contacts emerge cleanly at 10 Hz.
 pub const COLLISION_TICK: f32 = 0.1;
 
-/// Maximum positional separation applied to any single organism per
-/// collision tick (XZ plane, world units). Caps the integrated push
-/// so deeply-overlapping organisms — e.g. a 30-cell vs 30-cell pair
-/// can generate up to 900 narrow-phase contacts in one tick — don't
-/// snap apart by an absurd amount. At 10 Hz this allows a maximum
-/// separation speed of 5 world units / second, fast enough to
-/// resolve any plausible penetration within ~1 s yet slow enough
-/// that the eye reads it as a firm push rather than a teleport.
+/// Max positional separation applied to one organism per collision tick (XZ, world
+/// units). Caps the integrated push so deeply-overlapping pairs (which can generate
+/// hundreds of narrow-phase contacts) don't snap apart absurdly. At 10 Hz this is
+/// ~5 u/s — fast enough to resolve penetration in ~1 s, slow enough to read as a
+/// firm push, not a teleport.
 pub const MAX_SEPARATION_PER_TICK: f32 = 0.5;
 
 
@@ -1152,22 +1127,11 @@ pub const MAX_SEPARATION_PER_TICK: f32 = 0.5;
 #[allow(dead_code)]
 pub const PHOTO_BRAIN_TICK_INTERVAL:  Duration = Duration::from_millis(33);
 
-/// Heterotroph brain tick rate (≈ 6.7 Hz).
-///
-/// Slower than the photo brain because the heterotroph's reward
-/// signal is sparse: photos gain energy continuously from sunlight
-/// (per-tick signal), but heterotrophs lose a tiny amount per
-/// energy-plugin tick (0.5 s) and only receive a positive jump on
-/// the rare predation event. At 30 Hz the σ-noise on actions
-/// dominated displacement and rewards averaged to ~0 per tick — the
-/// brain saw mostly noise. Slowing to ~150 ms gives:
-///   * less visible direction jitter (one fresh action sample per
-///     ~150 ms instead of ~33 ms),
-///   * larger per-tick energy deltas (about 1/3 of an energy-plugin
-///     tick fits inside one brain tick), and
-///   * the reward shaper in `intelligence_level_1_hetero.rs` —
-///     progress + facing — gets a meaningful per-tick state delta
-///     to base its signal on.
+/// Heterotroph brain tick rate (≈ 6.7 Hz). Slow because the reward signal is sparse
+/// (small per-energy-tick loss + a rare predation jump): at faster rates the σ-noise
+/// dominates displacement and per-tick rewards average to ~0. 150 ms gives larger
+/// per-tick energy/progress deltas for the reward shaper and less visible direction
+/// jitter.
 pub const HETERO_BRAIN_TICK_INTERVAL: Duration = Duration::from_millis(150);
 
 
@@ -1177,19 +1141,55 @@ pub const HETERO_BRAIN_TICK_INTERVAL: Duration = Duration::from_millis(150);
 /// part of the heterotroph's world model.
 pub const WORLD_MODEL_RADIUS: f32 = 60.0;
 
-/// Velocity normalisation factor. Roughly the expected top speed in
-/// world-units / second — matches the active hetero pools'
-/// `MAX_SPEED`. A neighbour cruising at MAX_SPEED registers as `±1`
-/// on the corresponding velocity dim.
+/// Radius (world units) the limb brain scans for the NEAREST PREY (prey-direction
+/// observation + K_PROGRESS/K_HEADING reward), DECOUPLED from `WORLD_MODEL_RADIUS`.
+/// The neighbour-encoding (gait observation) stays at the small radius so the
+/// learned gait's input scale is preserved (widening it slowed gait convergence,
+/// iter8), while prey perception reaches far enough to STEER toward food that is
+/// typically 50-150u away on this map. `nearest_prey` probes the bucket range that
+/// covers this; the prey-distance obs normalises by it.
+
+/// Velocity normalisation factor — roughly expected top speed (world-units/s),
+/// matching the hetero pools' `MAX_SPEED`, so a neighbour at MAX_SPEED registers as
+/// `±1` on its velocity dim.
 pub const VELOCITY_NORM_SCALE: f32 = 20.0;
+
+/// See above — prey-perception radius for the limb brain, decoupled from the
+/// neighbour-encoding radius.
+pub const PREY_SCAN_RADIUS: f32 = 250.0;
+
+/// HEADING-STEERING ASSIST (rapier_setup::steer_base_toward_prey). The emergent
+/// limb gait produces forward crawl but the long-slab Crawler's high yaw inertia
+/// + the hard RL credit-assignment mean the brain doesn't learn to AIM that crawl
+/// at prey (data: 0/40 steer toward prey even with perception + steering reward +
+/// long training). This assist gently sets the BASE body's yaw rate toward the
+/// nearest perceived prey so the (still fully brain-driven) forward stroke carries
+/// the body to food → contact → eat. Only the heading is assisted; the leg motion
+/// stays emergent. Implemented as a sustained YAW TORQUE on the base (a one-shot
+/// velocity poke is washed out by the base angular damping + gait joint reactions),
+/// steering so the base's actual TRAVEL (velocity) direction points at prey — which
+/// is exactly `approach_align`, robust to whichever body axis the gait propels along.
+/// Coherent whole-creature yaw step per tick toward prey (`steer_base_toward_prey`):
+/// rotate base + all limbs (position, orientation, velocity) rigidly about the base
+/// so the emergent crawl's TRAVEL aims at prey while joints stay satisfied. `GAIN` =
+/// fraction of the travel-vs-prey error closed per tick (clamped to the remaining
+/// error → no overshoot); `MAX_YAW` caps the per-tick step. The gait stays emergent;
+/// only heading is assisted. (Reproduction is disabled during training so no mid-run
+/// offspring hits the rotation in a half-initialised state — that caused rare G2 spikes.)
+pub const STEER_ASSIST_GAIN:    f32 = 0.20; // fraction of travel-vs-prey error closed per tick
+pub const STEER_ASSIST_MAX_YAW: f32 = 0.08; // rad cap on the per-tick yaw step
+/// Run the steering teleport every Nth physics tick. Throttling was tested for FPS
+/// and did NOT help (the FPS sink is the limb↔prey collision pile when seekers
+/// converge on prey, not the teleport's Transform writes) and it degraded aiming, so
+/// it's left at 1 (every tick).
+pub const STEER_INTERVAL: u32 = 1;
 
 
 // ── Sensory (sensory.rs) ────────────────────────────────────────────────────
 
-/// Radius (world units) within which the sensory algorithm looks
-/// for a target photo. Anything beyond this is treated as "no
-/// target", and `Organism::target_distance` saturates at this
-/// value so the input observation stays bounded.
+/// Radius (world units) the sensory algorithm scans for a target photo; beyond it is
+/// "no target" and `Organism::target_distance` saturates here so the observation
+/// stays bounded.
 pub const SENSORY_RADIUS: f32 = 50.0;
 
 
@@ -1202,14 +1202,10 @@ pub const ENERGY_TRANSFER_RATE: f32 = 0.8;
 
 // ── World (world_geometry.rs) ───────────────────────────────────────────────
 
-/// Edge safety zone (world units). No organism may move closer to
-/// any of the four XZ map borders than this distance, and no spawn
-/// position is ever generated inside the band — together those two
-/// rules keep organisms strictly inside `[MARGIN, MapSize - MARGIN]²`
-/// on the XZ plane. The clamp is enforced by
-/// `movement::apply_world_bounds`; the spawn rule by every
-/// `rng.random_range(..)` call that produces an XZ coordinate
-/// (initial cohort, reproduction, auto-spawn).
+/// Edge safety zone (world units): organisms stay inside
+/// `[MARGIN, MapSize − MARGIN]²` on XZ. Enforced as a movement clamp
+/// (`movement::apply_world_bounds`) and as a spawn rule (every XZ-coordinate
+/// `rng.random_range(..)` — initial cohort, reproduction, auto-spawn).
 pub const WORLD_SAFETY_MARGIN: f32 = 15.0;
 
 
@@ -1221,23 +1217,15 @@ pub const TRUE_WATER_DRAG_COEF: f32 = 0.05;
 
 // ── Krishi (krishi.rs) ──────────────────────────────────────────────────────
 
-/// Pixels-of-spawn-altitude above the heightmap floor, mirroring the
-/// initial heightmap-clearance the colony uses for the procedural
-/// organisms.
+/// Spawn altitude above the heightmap floor, matching the clearance the colony uses
+/// for procedural organisms.
 pub const KRISHI_SPAWN_ALTITUDE: f32 = 1.0;
 
-/// Uniform size multiplier applied to BOTH the visual (the glb SceneRoot
-/// child Transform) AND the collision footprint (the body part's cell
-/// layout in `make_krishi_body`). Visual and collision stay locked
-/// together so a Krishi that *looks* a certain size also *touches* prey
-/// at that size.
-///
-/// Note on energy: Krishi consumption scales linearly with cell count,
-/// so a scaled Krishi spends ~7x more energy per tick than a 1-cell
-/// heterotroph. Starvation TIME is unchanged (the 0.5 starting energy
-/// fraction also scales with cell count), but the predator must eat
-/// ~7x more frequently to stay alive. Tune `KRISHI_SCALE` together with
-/// the energy constants in `energy.rs` if you change ecological pressure.
+/// Uniform size multiplier applied to BOTH the visual (glb SceneRoot child) AND the
+/// collision footprint (cell layout in `make_krishi_body`), kept locked so a Krishi
+/// touches prey at the size it looks. Consumption scales with cell count, so a scaled
+/// Krishi must eat proportionally more often (starvation time is unchanged); tune
+/// alongside the `energy.rs` constants when changing ecological pressure.
 pub const KRISHI_SCALE: f32 = 6.0;
 
 
@@ -1251,9 +1239,13 @@ pub const INITIAL_KRISHI: u32 = 1;
 /// authored `.species` files and how many of each to seed. Paths are
 /// relative to the working directory (repo root), matching the
 /// `species/` autoload convention used by the colony editor.
-pub const SPAWN_CRAWLER_PATH:  &str  = "species/Crawler.species";
-pub const SPAWN_CRAWLER_COUNT: usize = 40;
+pub const SPAWN_SWIMMER_PATH:  &str  = "species/swimmer.species";
+// = LOCOMOTION_MAX_LIMB_ORGS: every limb slot goes to a swimmer (Striders off),
+// so the cull keeps a full swimmer cohort rather than an arbitrary swimmer/walker mix.
+pub const SPAWN_SWIMMER_COUNT: usize = 16;
 pub const SPAWN_STRIDER_PATH:  &str  = "species/Strider.species";
-pub const SPAWN_STRIDER_COUNT: usize = 40;
+// Walkers disabled in the default waterworld cohort (they'd spawn stranded on the
+// seabed under deep water and compete for the limb-organism cull cap).
+pub const SPAWN_STRIDER_COUNT: usize = 0;
 pub const SPAWN_ALGAE_PATH:    &str  = "species/sessile_algae.species";
 pub const SPAWN_ALGAE_COUNT:   usize = 800;

@@ -1,22 +1,8 @@
-// Species editor — alternate `WindowMode` that lets the user build an
-// organism cell-by-cell and save the result as a `.species` binary.
-//
-// The mode lives far from the simulation world in coordinate space
-// (`SPECIES_EDITOR_ORIGIN` at world (100_000, 1000, 100_000)) so its
-// visuals never overlap the running simulation and its cells never
-// enter the world model / brain pools / predation events. The
-// simulation systems continue to run (we don't pause anything besides
-// the standard `WindowMode::is_changed` virtual-time pause).
-//
-// Subsystem layout:
-//
-//   * session.rs        — state (cyclers, OCG, selected cell type)
-//   * top_panel.rs      — 6 buttons: 4 cyclers + Spawn First + Create
-//   * bottom_panel.rs   — cell-type swatch picker
-//   * camera.rs         — orbit camera (middle-mouse drag, scroll-zoom)
-//   * placement.rs      — preview cell + snap + click-to-place +
-//                         bilateral axis + body mesh refresh
-//   * save.rs           — .species binary writer (rfd Save-As dialog)
+// Species editor — alternate `WindowMode` to build an organism cell-by-cell and
+// save a `.species` binary. Lives far from the simulation in world space
+// (`SPECIES_EDITOR_ORIGIN`) so its transforms never collide with simulation
+// systems (collision broad-phase, world-model hash, predation). Simulation
+// systems keep running aside from the standard virtual-time pause.
 
 pub mod body_part_panel;
 pub mod bottom_panel;
@@ -36,23 +22,15 @@ use bevy::prelude::*;
 
 // ── Module-wide constants ────────────────────────────────────────────────────
 
-/// World position where the species editor lives. With `RenderLayers`
-/// isolation in place (simulation entities on layer 0, species editor
-/// on `SPECIES_EDITOR_LAYER`), placement is no longer needed to hide
-/// the simulation visually — but the editor still operates in its
-/// own corner of world-space so its transforms don't accidentally
-/// collide with simulation systems (collision broad-phase, world
-/// model spatial hash, etc.).
+/// World position where the species editor lives, far from the simulation so its
+/// transforms don't collide with simulation systems (collision broad-phase,
+/// world-model hash, etc.).
 pub const SPECIES_EDITOR_ORIGIN: Vec3 = Vec3::new(100_000.0, 1_000.0, 100_000.0);
 
-/// `RenderLayers` index reserved for species-editor visuals. The
-/// shared 3D camera is switched to render only this layer while
-/// `WindowMode::SpeciesEditor` is active (and switched back to the
-/// default layer 0 otherwise), giving the editor a fully isolated
-/// view — simulation entities, terrain, water, etc. are completely
-/// invisible no matter how close the camera is parked. The
-/// directional light is dual-layered (0 + 1) so its illumination
-/// reaches species cells too.
+/// `RenderLayers` index for species-editor visuals. The shared camera renders
+/// only this layer in SpeciesEditor mode (layer 0 otherwise), fully isolating
+/// the view. The directional light is dual-layered (0 + 1) so it reaches species
+/// cells too.
 pub const SPECIES_EDITOR_LAYER: usize = 1;
 
 /// Pixel heights of the two panels.

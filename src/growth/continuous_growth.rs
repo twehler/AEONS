@@ -1,22 +1,11 @@
 // Continuous growth — periodic mutation for variable-form organisms.
 //
-// Reproduction grows offspring by exactly one cell at birth. That works for
-// motile (Bilateral) creatures that scatter their genes through reproduction
-// rounds, but plant-like (variable-form, sessile) organisms need to grow
-// IN PLACE so they can develop a recognisable canopy over their lifetime.
-//
-// `ContinuousGrowthPlugin` ticks once per second and applies one round of
-// mutation to every alive organism whose `has_variable_form == true` and
-// whose total grown-cell count is below `MAX_CELLS`. The same 80/20 split
-// reproduction uses (extend the root part vs. spawn a new branch) is
-// reused here, so a tree-shaped organism naturally develops branches over
-// time as well as a fattening trunk.
-//
-// Variable-form organisms can keep going through normal reproduction too:
-// each generation inherits the parent's body plan plus one mutation. With
-// continuous growth on top, parents become large structures whose offspring
-// scatter to new spots — the same loop that already runs for any other
-// NoSymmetry organism.
+// Reproduction grows offspring by one cell at birth, fine for motile Bilateral
+// creatures. Plant-like (variable-form, sessile) organisms instead grow IN
+// PLACE so they develop a canopy over their lifetime. `ContinuousGrowthPlugin`
+// ticks ~1 Hz, applying one mutation to each alive `has_variable_form` organism
+// below `MAX_CELLS`, using reproduction's 80/20 split (extend root vs. new
+// branch). Variable-form organisms still reproduce normally on top of this.
 
 use bevy::prelude::*;
 use rand::prelude::*;
@@ -45,12 +34,10 @@ impl Default for ContinuousGrowthTimer {
     }
 }
 
-/// Rotating phase counter (mod `GROWTH_PHASE_PERIOD`). Incremented by
-/// the system on every fired tick. An organism is processed this tick
-/// iff `entity.index() % GROWTH_PHASE_PERIOD == counter`. Using the
-/// entity index as the phase saves one byte per organism vs. storing a
-/// `growth_phase` field; the modulo of sequentially-allocated indices
-/// distributes evenly across phases at our scales.
+/// Rotating phase counter (mod `GROWTH_PHASE_PERIOD`), advanced each tick. An
+/// organism runs this tick iff `entity.index() % GROWTH_PHASE_PERIOD == counter`.
+/// Using the entity index as phase avoids storing a per-organism field; the
+/// modulo of sequential indices spreads evenly at our scales.
 #[derive(Resource, Default)]
 pub struct GrowthPhaseCounter(pub u32);
 
@@ -88,46 +75,28 @@ fn grow_variable_form_organisms(
     body_part_idx_q:     Query<&BodyPartIndex>,
     mesh3d_q:            Query<&Mesh3d>,
 ) {
-    // `materials` is kept in the signature for symmetry with other
-    // spawn sites and so that any future code path inside this
-    // system that needs to mint a one-off material has direct
-    // access. Currently every branch reuses the shared
-    // `OrganismMaterials` resource.
+    // `materials` is unused — every branch reuses the shared `OrganismMaterials`.
     let _ = materials;
 
     timer.0.tick(time.delta());
     if !timer.0.just_finished() { return; }
 
-    // Read the current phase, then advance the counter for the next
-    // tick. Every organism whose entity-index mod period equals
-    // `current_phase` will be processed this tick; all others wait
-    // for their slot in the rotation.
+    // Read current phase, then advance for next tick.
     let current_phase = phase_counter.0;
     phase_counter.0 = (phase_counter.0 + 1) % GROWTH_PHASE_PERIOD;
 
     let mut rng = rand::rng();
-    // Reuse the shared `OrganismMaterials` resource (populated by
-    // `spawn_colony`). The previous code lazily called
-    // `OrganismMaterials::new(&mut materials)` on every branch tick
-    // and that minted three fresh `StandardMaterial` assets into
-    // `Assets<StandardMaterial>` — they leaked over the simulation's
-    // lifetime because each spawned body-part held a strong handle
-    // to one of them. After tens of thousands of branch growth
-    // events the asset arena had grown enough to be the dominant
-    // VRAM driver. Reading from the Resource means three handles,
-    // ever.
+    // Reuse the shared `OrganismMaterials` (populated by `spawn_colony`) rather
+    // than minting fresh `StandardMaterial`s per branch — those leaked (each
+    // body-part holds a strong handle), growing the asset arena unbounded.
     let Some(organism_materials) = organism_mats.as_deref() else {
-        // Heightmap / colony hasn't initialised yet — skip the
-        // whole tick, the resource will be present next time.
+        // Colony not initialised yet — skip this tick.
         return;
     };
 
     for (root_entity, mut organism, is_photo, is_hetero) in &mut organisms {
-        // Phase gate: only ~1/`GROWTH_PHASE_PERIOD` of variable-form
-        // organisms run their growth step this tick. Per-organism
-        // effective rate stays at 1 / `CONTINUOUS_GROWTH_INTERVAL`
-        // because the phase counter rotates through every value over
-        // exactly that interval.
+        // Phase gate: ~1/`GROWTH_PHASE_PERIOD` of organisms run per tick; the
+        // rotation keeps each organism's effective rate at 1/CONTINUOUS_GROWTH_INTERVAL.
         if root_entity.index().index() % GROWTH_PHASE_PERIOD != current_phase { continue; }
 
         if !organism.has_variable_form { continue; }
@@ -156,16 +125,10 @@ fn grow_variable_form_organisms(
             );
         }
 
-        // Adult-transition check. Runs on whichever tick first pushes
-        // the organism over `MAX_CELLS`. Once `adult` flips, this
-        // branch never fires for that organism again — the
-        // `grown_cell_count() >= MAX_CELLS` guard above also skips it
-        // from the growth loop entirely. So the smoothing pass is
-        // strictly one-time per organism over its entire lifetime.
-        // The smoothing operation itself is gated on `Smoothing` —
-        // when the resource is `false` the `adult` flag still flips
-        // (so future smoothing-on toggles don't re-fire), but the
-        // mesh stays faceted.
+        // Adult transition: fires once, on the tick that crosses `MAX_CELLS`
+        // (the guard above then excludes the organism forever). Smoothing is
+        // gated on `Smoothing`; when off, `adult` still flips (so a later
+        // toggle-on doesn't re-fire) but the mesh stays faceted.
         if !organism.adult && organism.grown_cell_count() >= MAX_CELLS {
             organism.adult = true;
             if smoothing.0 {
@@ -179,11 +142,8 @@ fn grow_variable_form_organisms(
 }
 
 
-/// Replace every alive, regrowable body-part mesh on `organism` with
-/// the smoothed version of its OCG. Called exactly once per organism's
-/// lifetime — on the tick where its `adult` flag flips from false to
-/// true. Iterates only the body parts that have an actual mesh
-/// (`regrowable && !ocg.is_empty()`).
+/// Replace each alive, regrowable, non-empty body-part mesh with the smoothed
+/// version of its OCG. Called once per organism, when `adult` flips true.
 fn smooth_all_body_part_meshes(
     organism:        &Organism,
     root_entity:     Entity,
@@ -205,11 +165,9 @@ fn smooth_all_body_part_meshes(
 }
 
 
-/// Append a new branch body part attached to body_parts[0]. The branch
-/// starts with 1 seed cell, is grown to 2 via mutation (mirroring the
-/// reproduction-time branch path so newly-spawned branches are visibly
-/// non-trivial), gets its physiology recomputed, then is materialised
-/// as a new Bevy child entity parented to the root body-part's entity.
+/// Append a new branch body part attached to body_parts[0]: seed 1 cell, grow
+/// to 2 via mutation (matches reproduction's branch path), recompute physiology,
+/// then materialise as a new Bevy child entity.
 #[allow(clippy::too_many_arguments)]
 fn grow_new_branch(
     organism:        &mut Organism,
@@ -235,19 +193,19 @@ fn grow_new_branch(
     };
     let mut new_part = body_part::create_branch_body_part(seed_ct, attachment, outward);
 
-    // Grow 1→2 cells for visibility (matches reproduction's branch path).
+    // Grow 1→2 cells for visibility.
     let grown_ocg = crate::mutation::mutate_ocg(&new_part.ocg, rng);
     if grown_ocg.is_empty() { return; }
     new_part.cells = grown_ocg.iter().map(|(_, p, ct)| Cell::new(*p, *ct)).collect();
     new_part.ocg = grown_ocg;
     physiology::recompute_body_part(&mut new_part);
 
-    // Update the cached cell counts on the organism — composition has
-    // changed, and predation / energy / physiology read from the cache.
+    // Update cached cell counts — predation/energy/physiology read the cache.
     for cell in &new_part.cells {
         match cell.cell_type {
             CellType::Photo                            => organism.photo_cell_count    += 1,
-            CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => organism.non_photo_cell_count += 1,
+            CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb
+            | CellType::YellowCell | CellType::OrangeCell | CellType::BrownCell => organism.non_photo_cell_count += 1,
         }
     }
 
@@ -266,29 +224,22 @@ fn grow_new_branch(
         bevy::light::NotShadowCaster,
     )).id();
 
-    // Flat hierarchy — new branches are direct children of the
-    // OrganismRoot, not nested under body_parts[PARENT_IDX]'s entity.
-    // Mirrors the fix in `spawn_organism`: when branches were nested,
-    // predation-despawning body_parts[0] cascaded through recursive
-    // try_despawn and killed every branch, leaving the root entity
-    // alive with `prey_dead == false` and zero children — a phantom.
-    // body_parts[PARENT_IDX]'s transform is identity for procedural
-    // organisms, so the world position is unchanged.
+    // Flat hierarchy: branches are direct children of OrganismRoot, not nested
+    // under body_parts[PARENT_IDX]. Nesting let a predation despawn of
+    // body_parts[0] cascade-kill every branch, leaving a phantom root. Parent
+    // transform is identity for procedural organisms, so position is unchanged.
     let _ = (children_q, body_part_idx_q, PARENT_IDX);
     commands.entity(root_entity).add_child(child_entity);
 
     organism.body_parts.push(new_part);
-    // The new branch extends the cell envelope further out from the
-    // root, so the cached bounding radius needs refreshing before the
-    // next per-frame movement / floor / collision tick reads it.
-    // O(cells) — only runs at growth events.
+    // New branch extends the envelope — refresh cached bounding radius before
+    // the next movement/floor/collision tick reads it.
     organism.recompute_bounding_radius();
 }
 
 
-/// Run one mutation step on body_parts[0]'s OCG, replace the part's cells
-/// to match, recompute its physiology, and update the existing child mesh
-/// asset in-place so the visual catches up.
+/// One mutation step on body_parts[0]'s OCG: update cells, recompute physiology,
+/// update the existing child mesh asset in place.
 fn extend_root_part(
     organism:        &mut Organism,
     root_entity:     Entity,
@@ -301,9 +252,7 @@ fn extend_root_part(
     let root_part_ocg = organism.body_parts[0].ocg.clone();
     let grown_ocg = crate::mutation::mutate_ocg(&root_part_ocg, rng);
     if grown_ocg.len() <= root_part_ocg.len() {
-        // No valid growth candidate this tick — frontier might be
-        // fully enclosed for the current cell layout. Try again next
-        // tick.
+        // No valid candidate (frontier may be fully enclosed) — retry next tick.
         return;
     }
 
@@ -317,17 +266,14 @@ fn extend_root_part(
 
     match new_cell_type {
         CellType::Photo                            => organism.photo_cell_count    += 1,
-        CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb => organism.non_photo_cell_count += 1,
+        CellType::NonPhoto | CellType::Placeholder | CellType::SubLimb
+        | CellType::YellowCell | CellType::OrangeCell | CellType::BrownCell => organism.non_photo_cell_count += 1,
     }
-    // Cached bounding radius needs refreshing — the new cell may extend
-    // the envelope. Only one body part has changed; the function still
-    // walks all alive body parts but at 30 cells max it's cheap.
+    // Refresh cached bounding radius — the new cell may extend the envelope.
     organism.recompute_bounding_radius();
 
-    // Replace the existing mesh asset's contents in place. Bevy's asset
-    // change detection flags the asset, the renderer re-uploads the new
-    // vertex/index buffers, and the existing Mesh3d handle keeps
-    // pointing at the right thing — no entity churn.
+    // Replace the mesh asset's contents in place: change detection re-uploads
+    // the buffers and the Mesh3d handle stays valid — no entity churn.
     if let Some(part_entity) = find_body_part_entity(root_entity, 0, children_q, body_part_idx_q) {
         if let Ok(mesh3d) = mesh3d_q.get(part_entity) {
             if let Some(mesh) = meshes.get_mut(&mesh3d.0) {
@@ -338,10 +284,8 @@ fn extend_root_part(
 }
 
 
-/// Walk the entity tree starting at `parent` and return the first
-/// descendant whose `BodyPartIndex` matches `target_idx`. Body parts may
-/// be nested (a branch's entity is a child of its attachment-target body
-/// part's entity), so the search is recursive.
+/// First descendant of `parent` whose `BodyPartIndex` matches `target_idx`.
+/// Recursive because body parts may be nested.
 fn find_body_part_entity(
     parent:     Entity,
     target_idx: usize,

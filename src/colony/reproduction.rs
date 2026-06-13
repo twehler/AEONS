@@ -1,15 +1,8 @@
-// Reproduction.
-//
-// Each birth clones the parent's body plan and applies one mutation step:
-//   * NoSymmetry: 20% append a new branch body part, else extend the root
-//     part's OCG by one cell.
-//   * Bilateral: 20% (under MAX_BODY_PARTS) append a new appendage on the
-//     base body, else grow the base by one mirrored cell pair.
-// Cell types are inherited from the seed entry, preserving trophic identity.
-//
-// The `reproduced` boolean on `Organism` enforces a species-specific
-// reproduction cap (`reproductions` counter vs. the cap): heterotrophs
-// reproduce at most twice, photoautotrophs at most twice.
+// Reproduction. Each birth clones the parent's body plan and applies one
+// mutation step (NoSymmetry: 20% new branch / 80% extend root; Bilateral:
+// 20% new appendage pair / 80% grow base by a mirrored cell pair). Cell
+// types inherited from the seed, preserving trophic identity. The
+// `reproduced` flag enforces a per-class reproduction cap.
 
 use bevy::prelude::*;
 use rand::prelude::*;
@@ -26,7 +19,6 @@ use crate::world_geometry::{HeightmapSampler, MapSize};
 use crate::simulation_settings::{
     REPRODUCTION_CHECK_INTERVAL, OFFSPRING_ENERGY_FRACTION,
     REPRODUCTION_ENERGY_THRESHOLD, HETEROTROPH_REPRODUCTION_CAP,
-    PHOTOAUTOTROPH_REPRODUCTION_CAP,
 };
 
 
@@ -69,6 +61,7 @@ fn reproduction_system(
     materials:      ResMut<Assets<StandardMaterial>>,
     organism_mats:  Option<Res<OrganismMaterials>>,
     heightmap:      Option<Res<HeightmapSampler>>,
+    water_level:    Option<Res<crate::environment::WaterLevel>>,
     smoothing:      Res<crate::simulation_settings::Smoothing>,
     map_size:       Res<MapSize>,
     max_photoautotrophs: Res<crate::simulation_settings::MaxPhotoautotrophs>,
@@ -79,21 +72,15 @@ fn reproduction_system(
         With<OrganismRoot>,
     >,
 ) {
-    // Silence unused-mut warning on `materials` — kept in the
-    // signature for the unlikely case that a future code path inside
-    // this system needs to mint a material from scratch (e.g. user
-    // dropping in a new species at runtime). Currently every birth
-    // reuses the shared `OrganismMaterials` resource.
+    // Kept in the signature though every birth reuses the shared
+    // `OrganismMaterials` resource.
     let _ = materials;
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
-    // Per-class caps. The photoautotroph cap and the herbivore cap
-    // are INDEPENDENT — each class fills its own budget without
-    // competing for shared slots. The global brain pool size
-    // (`OrganismPoolSize`) still bounds heterotrophs implicitly: an
-    // offspring beyond pool size spawns but doesn't get a brain slot
-    // until one frees up.
+    // Independent per-class caps. `OrganismPoolSize` still bounds
+    // heterotrophs implicitly: offspring beyond it spawn but get no
+    // brain slot until one frees.
     let photo_cap  = max_photoautotrophs.0;
     let herb_cap   = max_herbivores.0;
     let live_photos = query.iter()
@@ -111,11 +98,22 @@ fn reproduction_system(
     for (parent_entity, mut organism, transform, is_photo, is_hetero, is_carn) in &mut query {
         if organism.reproduced { continue; }
 
-        // Per-class budget: skip the parent when reproducing would
-        // push the relevant class's running total at/above its cap.
-        // Carnivores are unbounded — they reproduce freely subject
-        // only to `reproduced` flag and energy threshold.
+        // Skip when reproducing would push the class at/above its cap.
+        // Carnivores are unbounded.
         let is_herbivore = is_hetero && !is_carn;
+        // Training scaffold: LIMB herbivores don't reproduce during AI training.
+        // A mid-run offspring spawned while the steering assist is rotating the
+        // cohort hit the rotation in a half-initialised state and momentarily
+        // separated its joints (G2). Suppressing limb-herbivore births keeps the
+        // learning cohort fixed and G2 clean — and is decoupled from
+        // `--max-herbivores` (which also sizes the GPU brain pool / FPS), unlike
+        // setting the cap to 0.
+        if is_herbivore && !organism.movement_mode.is_sliding()
+            && ai_training.0
+            && crate::simulation_settings::DISABLE_LIMB_HERBIVORE_REPRODUCTION
+        {
+            continue;
+        }
         if is_photo
             && (live_photos + pending_photo_births) >= photo_cap
         {
@@ -134,13 +132,17 @@ fn reproduction_system(
         let offspring_energy = max_energy * OFFSPRING_ENERGY_FRACTION;
         organism.energy      -= offspring_energy;
         organism.reproductions = organism.reproductions.saturating_add(1);
-        // RL reward: reproduction grants the maximum dopamine reward
-        // outright (the strongest evolutionary signal the agent can
-        // receive). Child starts at 0 — clean slate.
+        // RL reward: reproduction grants max dopamine. Child starts at 0.
         organism.dopamine = 1.0;
 
-        let cap = if is_photo { PHOTOAUTOTROPH_REPRODUCTION_CAP } else { HETEROTROPH_REPRODUCTION_CAP };
-        if organism.reproductions >= cap { organism.reproduced = true; }
+        // PHOTOTROPHS reproduce WITHOUT a per-individual limit: the population is
+        // bounded by `MaxPhotoautotrophs` (the reproduction gate above) + energy/
+        // sunlight, and a depleted prey field is refilled by `auto_spawn_plankton`.
+        // So never flip `reproduced` for a phototroph — it can breed every time it
+        // recharges to the energy threshold. Heterotrophs keep their per-individual cap.
+        if !is_photo && organism.reproductions >= HETEROTROPH_REPRODUCTION_CAP {
+            organism.reproduced = true;
+        }
 
         let kind = if is_photo {
             OrganismKind::Photoautotroph
@@ -150,20 +152,14 @@ fn reproduction_system(
             continue;
         };
 
-        // Build the child's body parts from the parent's plan, using the
-        // growth pipeline appropriate to the parent's symmetry. Offspring
-        // inherit the parent's symmetry verbatim.
-        //
-        // AI-training mode: mutation is OFF — offspring spawn shape-identical
-        // to the parent, so the training cohort keeps a fixed morphology.
-        // Skip the growth/branch pipeline entirely and clone the parent's
-        // body parts verbatim.
+        // Build the child's body parts via the growth pipeline for the
+        // parent's symmetry (inherited verbatim). AI-training mode: no
+        // mutation — clone the parent so the cohort keeps fixed morphology.
         let child_body_parts = if ai_training.0 {
             organism.body_parts.clone()
         } else { match organism.symmetry {
             Symmetry::NoSymmetry => {
-                // Legacy path. 20% chance: spawn a new branch body part.
-                // 80%: extend the root part's OCG by one cell.
+                // 20%: new branch body part. 80%: extend root OCG by one cell.
                 if body_part::should_branch(&mut rng) {
                     let mut parts = organism.body_parts.clone();
                     let parent_ocg = &parts[0].ocg;
@@ -179,7 +175,7 @@ fn reproduction_system(
                     let new_part = body_part::create_branch_body_part(
                         seed_ct, attachment, outward,
                     );
-                    // Grow the new part from 1 cell to 2.
+                    // Grow the new part 1 → 2 cells.
                     let grown_ocg = crate::mutation::mutate_ocg(
                         &new_part.ocg, &mut rng,
                     );
@@ -205,36 +201,25 @@ fn reproduction_system(
                 }
             }
             Symmetry::Bilateral => {
-                // Bilateral organisms have ONE base body part (index 0)
-                // whose OCG contains both halves (right cells with
-                // x > 0 plus their mirrors). On each birth, either:
-                //   * 20% (when a symmetric pair still fits under
-                //     MAX_BODY_PARTS): grow a NEW MIRRORED PAIR of
-                //     appendages on the base body — one on the +X
-                //     side, its X-mirror on the −X side. Both attach
-                //     to the base body (parent_idx = 0), never to
-                //     another appendage. Pairs keep the body plan
-                //     bilaterally symmetric, like real limbs.
-                //   * otherwise: extend the bilateral base by one
-                //     mirrored cell pair — extract the right half,
-                //     mutate it (constrained to x ≥ MIN_X_BILATERAL),
-                //     mirror, and reassemble. The combined-OCG mesh
-                //     build welds the seam and drops interior faces.
+                // Bilateral has ONE base part (index 0) whose OCG holds
+                // both halves. Each birth: 20% (if a pair fits under
+                // MAX_BODY_PARTS) grow a NEW MIRRORED PAIR of appendages
+                // on the base (both parent_idx=0, never on another
+                // appendage); else extend the base by one mirrored cell
+                // pair (mutate the right half, mirror, reassemble —
+                // the combined-OCG mesh build welds the seam).
                 let mut parts = organism.body_parts.clone();
                 if parts.is_empty() { continue; }
 
-                // A pair adds TWO parts, so only branch while two more
-                // still fit under the cap (with MAX_BODY_PARTS = 3 this
-                // means exactly when the organism has only its base).
+                // A pair adds TWO parts, so only branch while two more fit.
                 if parts.len() + 2 <= body_part::MAX_BODY_PARTS
                     && body_part::should_branch(&mut rng)
                 {
                     let base_ocg = &parts[0].ocg;
                     if base_ocg.is_empty() { continue; }
 
-                    // Pick the right-side appendage attachment from the
-                    // base's right half only, so the +X limb and its
-                    // mirror land symmetrically off each flank.
+                    // Pick the attachment from the base's right half only,
+                    // so the +X limb and its mirror land symmetrically.
                     let right_base: Vec<(usize, Vec3, CellType)> = base_ocg.iter()
                         .filter(|(_, p, _)| p.x > 0.0)
                         .enumerate()
@@ -265,11 +250,9 @@ fn reproduction_system(
                         .collect();
                     right_part.ocg = right_ocg.clone();
 
-                    // Mirror it across the YZ plane to make the left
-                    // appendage: mirror the cell ledger, the attachment
-                    // origin, and the outward seed direction. Each cell
-                    // is still emitted as a canonical outward-faced RD
-                    // by the mesh builder, so the mirrored mesh is not
+                    // Mirror across YZ for the left appendage (cell ledger,
+                    // attachment origin, outward seed direction). The mesh
+                    // builder emits canonical outward faces, so it's not
                     // inside-out.
                     let left_ocg = body_part::mirror_ocg_x(&right_ocg);
                     let origin_l = Vec3::new(-origin_r.x, origin_r.y, origin_r.z);
@@ -291,11 +274,10 @@ fn reproduction_system(
                     parts.push(left_part);
                     parts
                 } else {
-                    // Extract the right half (midline + +X cells) with
-                    // fresh sequential indices — `mutate_bilateral`
-                    // expects a contiguous [0..N) ledger as input. The
-                    // `x > -EPS` filter keeps midline cells (x = 0) while
-                    // dropping the mirrored −X (left) cells.
+                    // Extract the right half (midline + +X) with fresh
+                    // sequential indices — `mutate_bilateral` needs a
+                    // contiguous [0..N) ledger. `x > -EPS` keeps midline
+                    // cells, drops the mirrored −X cells.
                     let right_ocg: Vec<(usize, Vec3, CellType)> = parts[0].ocg.iter()
                         .filter(|(_, p, _)| p.x > -body_part::BILATERAL_MIDLINE_EPS)
                         .enumerate()
@@ -308,8 +290,7 @@ fn reproduction_system(
                         else { continue; };
                     let grown_left = body_part::mirror_right_to_left(&grown_right);
 
-                    // Reassemble both halves into a single OCG with
-                    // contiguous indices.
+                    // Reassemble both halves into one contiguous-index OCG.
                     let combined: Vec<(usize, Vec3, CellType)> = grown_right.iter()
                         .chain(grown_left.iter())
                         .enumerate()
@@ -324,8 +305,8 @@ fn reproduction_system(
             }
         } };
 
-        // Stay inside the WORLD_SAFETY_MARGIN inset — same band the
-        // initial cohort and `apply_world_bounds` agree on.
+        // Inside the WORLD_SAFETY_MARGIN inset (same band as the initial
+        // cohort and `apply_world_bounds`).
         let spawn_x = rng.random_range(
             crate::world_geometry::WORLD_SAFETY_MARGIN
                 ..(map_size.x - crate::world_geometry::WORLD_SAFETY_MARGIN),
@@ -334,12 +315,22 @@ fn reproduction_system(
             crate::world_geometry::WORLD_SAFETY_MARGIN
                 ..(map_size.z - crate::world_geometry::WORLD_SAFETY_MARGIN),
         );
-        // Spawn on the ground at the chosen XZ, with a 1.0-unit clearance
-        // mirroring the initial colony spawn (`spawn_colony`). Falling back
-        // to the parent's Y if the heightmap resource hasn't been inserted
-        // yet keeps reproduction usable in the (rare) early-tick window
-        // before the world finishes loading.
+        // Ground + 1.0 clearance (as `spawn_colony`). Fall back to the
+        // parent's Y before the heightmap resource exists (rare early tick).
+        // SWIMMER offspring instead spawn SUBMERGED above the flat floor
+        // cuboid (`submerged_spawn_y`): the walker convention `terrain + 1.0`
+        // puts them INSIDE the floor collider wherever the local terrain is
+        // below the map-centre height, and Rapier's depenetration ejects the
+        // body violently upward ("flung away on spawn").
         let spawn_y = match heightmap.as_ref() {
+            Some(hm) if organism.movement_mode.is_swimming() => {
+                let water = water_level.as_ref().map(|w| w.0).unwrap_or(0.0);
+                crate::colony::submerged_spawn_y(
+                    hm.height_at(spawn_x, spawn_z),
+                    crate::colony::limb_floor_top(hm),
+                    water,
+                )
+            }
             Some(hm) => hm.height_at(spawn_x, spawn_z) + 1.0,
             None     => transform.translation.y,
         };
@@ -353,19 +344,15 @@ fn reproduction_system(
             body_parts: child_body_parts,
             energy:     offspring_energy,
             kind,
-            // Offspring inherit the parent's symmetry, sessility,
-            // variable-form, and intelligence_level traits verbatim.
+            // Inherited verbatim from the parent.
             symmetry:           organism.symmetry,
             has_variable_form:  organism.has_variable_form,
             is_sessile:         organism.is_sessile,
-            sliding_movement:   organism.sliding_movement,
+            movement_mode:      organism.movement_mode,
+            ground_based:       organism.ground_based,
             intelligence_level: organism.intelligence_level,
-            // Captured here so the brain pool can copy parent → child
-            // weights when `assign_brains_*` runs next PreUpdate.
-            // Skip the inheritance link for Level0: the sessile
-            // organisms have no MLP rows to copy, and attaching the
-            // marker would just leak a stale Entity reference until
-            // the entity is despawned.
+            // For copying parent → child brain weights when
+            // `assign_brains_*` runs. Skipped for Level0 (no MLP rows).
             parent_for_brain_inheritance: if matches!(
                 organism.intelligence_level,
                 crate::organism::IntelligenceLevel::Level0
@@ -380,15 +367,9 @@ fn reproduction_system(
     }
 
     if pending_births.is_empty() { return; }
-    // Reuse the shared `OrganismMaterials` resource populated by
-    // `spawn_colony`. The earlier code minted three fresh
-    // `StandardMaterial` assets per reproduction tick — those
-    // assets leaked over the simulation's lifetime because
-    // `Assets<StandardMaterial>` only GC's when the LAST strong
-    // handle drops, and every spawned body part held a strong
-    // copy. Over 60 minutes of reproduction every 2 s, that's
-    // ~5400 dead-but-retained materials in VRAM. The same fix
-    // applies to `continuous_growth.rs`.
+    // Reuse the shared `OrganismMaterials` resource — minting fresh
+    // StandardMaterials per birth leaks VRAM (assets only GC when the
+    // last strong handle drops, and every body part holds one).
     let Some(organism_materials) = organism_mats.as_deref() else {
         warn!("reproduction_system: OrganismMaterials resource missing — \
                spawn_colony hasn't run yet. Skipping this tick's births.");
@@ -406,27 +387,23 @@ fn reproduction_system(
             birth.intelligence_level,
             smoothing.0,
             birth.energy,
-            birth.sliding_movement,
+            birth.movement_mode,
+            birth.ground_based,
             &mut commands,
             &mut meshes,
             organism_materials,
             &mut rng,
         );
         if let Some(parent) = birth.parent_for_brain_inheritance {
-            // The brain pool's PreUpdate `assign_brains_*` will see
-            // this component, look up the parent's slot, copy its
-            // weights into the new slot, and remove the marker. If
-            // the parent has died before that runs (rare), the
-            // lookup fails silently and the offspring just keeps
-            // the recycled slot's previous tenant's weights.
+            // `assign_brains_*` copies the parent's weights into the new
+            // slot and removes this marker. If the parent already died,
+            // the lookup fails silently (offspring keeps recycled weights).
             commands.entity(child_root)
                 .try_insert(crate::rl_helpers::BrainInheritance(parent));
         }
 
-        // Lineage record on the offspring. Attached here so the
-        // default `assign_lineage_records` (which only handles
-        // entities without a record) skips this one — we want
-        // `parent_id = Some(parent)`, not the default `None`.
+        // Lineage record with `parent_id = Some(parent)`; attaching it
+        // here makes the default `assign_lineage_records` skip this entity.
         let spawn_time = virtual_time.elapsed_secs();
         commands.entity(child_root).try_insert(
             crate::organism::LineageRecord::new_offspring(
@@ -435,12 +412,9 @@ fn reproduction_system(
             ),
         );
 
-        // Bump the parent's reproduction counter. The
-        // `LineageRecord` mutation goes through Commands so it
-        // doesn't conflict with the active `&mut Organism` query
-        // (Bevy's reproduction loop holds the parent's Organism
-        // borrow already). The closure handles the case where the
-        // parent died before this tick's command queue flushed.
+        // Bump the parent's reproduction counter via Commands (the
+        // active `&mut Organism` query already borrows the parent, so a
+        // direct mutation would conflict). Tolerates a since-dead parent.
         let parent_entity_for_queue = birth.lineage_parent;
         commands.queue(move |world: &mut World| {
             if let Ok(mut entity_ref) = world.get_entity_mut(parent_entity_for_queue) {
@@ -452,11 +426,8 @@ fn reproduction_system(
                 }
             }
         });
-        // Inherit parent's species classification — the speciation
-        // tick will re-evaluate next time it runs and split off a
-        // new lineage if the brain genes have drifted past the
-        // threshold. We patch the Organism component directly via
-        // the same commands queue.
+        // Inherit parent's species id; the next speciation tick may
+        // re-classify if brain genes have drifted past threshold.
         if let Some(sid) = birth.parent_species_id {
             commands.queue(move |world: &mut World| {
                 if let Ok(mut entity_ref) = world.get_entity_mut(child_root) {
@@ -478,30 +449,20 @@ struct PendingBirth {
     symmetry:           Symmetry,
     has_variable_form:  bool,
     is_sessile:         bool,
-    // Inherited verbatim from the parent — offspring keep their
-    // parent's movement paradigm (sliding vs limb-based).
-    sliding_movement:   bool,
-    /// Inherited verbatim from the parent — see the doc on
-    /// `IntelligenceLevel`. Initial spawn rolls this; reproduction
-    /// passes it through.
+    /// Inherited verbatim from the parent (movement paradigm).
+    movement_mode:      MovementMode,
+    /// Inherited verbatim from the parent (ground- vs water-based).
+    ground_based:       bool,
+    /// Inherited verbatim from the parent.
     intelligence_level: IntelligenceLevel,
-    /// Parent entity, captured so that after the offspring's root
-    /// entity is spawned we can attach `BrainInheritance(parent)` and
-    /// the brain pool's `assign_brains_*` system will copy parent's
-    /// row into the offspring's slot. `None` for Level0 offspring
-    /// (no pool to inherit from).
+    /// Parent entity for `BrainInheritance` (copy parent's brain row
+    /// into the offspring's slot). `None` for Level0 (no pool).
     parent_for_brain_inheritance: Option<Entity>,
-    /// Parent's species id at the moment of reproduction. Inherited
-    /// verbatim onto the offspring's `Organism::species_id` field;
-    /// the next speciation tick re-evaluates whether the child is
-    /// still close enough to that species' centroid or needs to
-    /// fork off its own. `None` if the parent hadn't been classified
-    /// yet (the very first frame after initial spawn).
+    /// Parent's species id at reproduction, inherited onto the child;
+    /// the next speciation tick may re-classify. `None` if the parent
+    /// wasn't yet classified.
     parent_species_id: Option<u32>,
-    /// Parent entity, captured unconditionally for the lineage
-    /// `parent_id` link (distinct from `parent_for_brain_inheritance`,
-    /// which is gated on intelligence level). Every offspring needs
-    /// a lineage parent regardless of whether brain weights are
-    /// inheritable.
+    /// Parent entity for the lineage `parent_id` link — always present
+    /// (distinct from `parent_for_brain_inheritance`, gated on level).
     lineage_parent: Entity,
 }

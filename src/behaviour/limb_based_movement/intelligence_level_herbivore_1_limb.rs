@@ -1,17 +1,14 @@
 // Limb-based herbivore_1 brain — PPO pool for Level1 + Heterotroph +
-// non-Carnivore organisms WHOSE `Organism::sliding_movement == false`.
+// non-Carnivore organisms with `!Organism::movement_mode.is_sliding()`.
 //
-// Mirrors `sliding_movement::intelligence_level_herbivore_1_sliding`
-// structurally (component / resource / system trio), but delegates the
-// network, rollout buffer, GAE and PPO update to the shared engine in
-// `limb_ppo.rs`. This keeps the three per-level limb brains tiny — they
-// only differ in their enrolment filter.
-//
-// Phase 3 deliverable: pool + assign / free systems + stub apply. The
-// observation/action wiring to Avian physics and the actual PPO
-// gradient code arrive in Phase 4.
+// Mirrors the sliding herbivore_1 pool structurally but delegates the
+// network, rollout buffer, GAE and PPO update to the shared `limb_ppo`
+// engine, so the three per-level limb brains differ only in their
+// enrolment filter.
 
 use bevy::prelude::*;
+
+use std::collections::HashMap;
 
 use crate::colony::{IntelligenceLevel, Organism, Heterotroph, Carnivore};
 use crate::limb_ppo::{BrainPoolLimb, BrainRestoreLimb, LimbSlot, gather_limb_obs_inputs};
@@ -32,9 +29,8 @@ impl LimbSlot for BrainSlotHerbivore1Limb {
 
 // ── Resource ──────────────────────────────────────────────────────────────────
 
-/// Per-organism PPO pool for limb-based Level1 herbivores. Held as a
-/// `NonSend` resource because the burn-cuda backend's tensors aren't
-/// `Send`. Wraps the shared engine in `limb_ppo`.
+/// Per-organism PPO pool for limb-based Level1 herbivores. `NonSend`
+/// (burn-cuda tensors aren't `Send`). Wraps the shared `limb_ppo` engine.
 pub struct BrainPoolHerbivore1Limb(pub BrainPoolLimb);
 
 impl FromWorld for BrainPoolHerbivore1Limb {
@@ -50,7 +46,7 @@ impl FromWorld for BrainPoolHerbivore1Limb {
 
 /// Enrol newly-spawned limb-based Level1 non-carnivore heterotrophs.
 /// Mirrors the gating logic of the sliding pool, with the
-/// `!sliding_movement` extra filter so the two populations are disjoint.
+/// `!movement_mode.is_sliding()` extra filter so the two populations are disjoint.
 pub fn assign_brains_herbivore_1_limb(
     mut pool:     NonSendMut<BrainPoolHerbivore1Limb>,
     new:          Query<(Entity, &Organism, Option<&BrainRestoreLimb>, Option<&crate::rl_helpers::BrainInheritance>), (
@@ -58,38 +54,45 @@ pub fn assign_brains_herbivore_1_limb(
         Without<Carnivore>,
         Without<BrainSlotHerbivore1Limb>,
     )>,
+    reload_brains: Res<crate::simulation_settings::ReloadLimbBrains>,
     mut commands: Commands,
 ) {
     for (e, organism, restore, inheritance) in new.iter() {
         if !matches!(organism.intelligence_level, IntelligenceLevel::Level1) { continue; }
-        if organism.sliding_movement { continue; }
+        if organism.movement_mode.is_sliding() { continue; }
+        // Swimmers train in their own pool (intelligence_level_1_swimming).
+        if organism.movement_mode.is_swimming() { continue; }
         let Some(s) = pool.0.enrol(e) else { continue };
-        // If the entity arrived with a saved-weights component (loaded
-        // from a `.colony` file), write its weights into the freshly-
-        // allocated row before we remove the marker.
-        if let Some(r) = restore {
-            pool.0.restore_slot(s, r);
-            commands.entity(e).try_remove::<BrainRestoreLimb>();
-        } else {
-            // No saved weights → INHERIT a trained brain so the new organism
-            // isn't born helpless (a fresh warm-start collapses until it learns
-            // from scratch). Prefer the explicit parent (reproduction); else any
-            // other occupied slot — join the already-trained population. `src`
-            // is computed (and the immutable borrow released) before the
-            // mutable `inherit_slot` call.
-            let src = inheritance.and_then(|inh| pool.0.map.get(&inh.0).copied())
-                .or_else(|| pool.0.map.iter().filter_map(|(ent, sl)| (*ent != e && *sl != s).then_some(*sl)).next());
-            if let Some(src) = src { pool.0.inherit_slot(s, src); }
+        // STANDING task: by default ignore the saved Runner brains — they are
+        // locomotion-trained and tanh-SATURATED (μ pinned at ±1 → zero actor
+        // gradient → the policy can't move, the body freezes in one pose). Keep
+        // the pool's fresh fan-in + neutral-init weights so PPO actually explores
+        // and learns to stand. EXCEPTION: `--reload-limb-brains` (set when loading
+        // a colony saved AFTER a standing run) restores the trained STANDING policy
+        // through the normal restore path below — the durable-success artifact.
+        if crate::simulation_settings::STANDING_TASK && !reload_brains.0 {
+            if restore.is_some() { commands.entity(e).try_remove::<BrainRestoreLimb>(); }
+            if inheritance.is_some() { commands.entity(e).try_remove::<crate::rl_helpers::BrainInheritance>(); }
+            commands.entity(e).try_insert(BrainSlotHerbivore1Limb(s));
+            continue;
         }
+        // Saved weights (loaded `.colony`) → overwrite this organism's SPECIES
+        // net (keyed by species_id, UNCLASSIFIED until first classified).
+        if let Some(r) = restore {
+            pool.0.restore_species(organism.species_id.unwrap_or(0), r);
+            commands.entity(e).try_remove::<BrainRestoreLimb>();
+        }
+        // SHARED policy → no per-slot weight inheritance; a newborn of an
+        // existing species already shares that species' trained net. Just clear
+        // any inheritance marker so it isn't reprocessed.
         if inheritance.is_some() { commands.entity(e).try_remove::<crate::rl_helpers::BrainInheritance>(); }
         commands.entity(e).try_insert(BrainSlotHerbivore1Limb(s));
     }
 }
 
-/// Release pool slots for organisms that have lost their
-/// `BrainSlotHerbivore1Limb` component (despawned or had the marker
-/// stripped). Uses the entity-keyed slot map on the pool to find the
-/// row index even after the component is gone.
+/// Release pool slots for organisms that lost `BrainSlotHerbivore1Limb`.
+/// Uses the pool's entity-keyed map to find the row after the component
+/// is gone.
 pub fn free_brains_herbivore_1_limb(
     mut pool:    NonSendMut<BrainPoolHerbivore1Limb>,
     mut removed: RemovedComponents<BrainSlotHerbivore1Limb>,
@@ -103,28 +106,54 @@ pub fn free_brains_herbivore_1_limb(
 }
 
 
-// ── Apply (stub) ──────────────────────────────────────────────────────────────
+// ── Social learning (population policy sharing) ───────────────────────────────
 
-/// Per-tick brain step. Delegates to the shared `apply_step` engine,
-/// which: builds observations, runs the batched actor forward,
-/// samples actions, writes them to `Organism::limb_targets`, and
-/// records `RolloutEntry`s for the per-slot PPO update. Reward and
-/// PPO gradient are currently placeholders (see `apply_step` doc).
+/// Every `SHARE_INTERVAL` of virtual time, copy the BEST walker's brain (max net
+/// base displacement over the window) into the worst non-walkers, so the WHOLE
+/// population converges to a walking policy that only a fraction of organisms
+/// discover independently (PPO stragglers stuck in still/hop local optima). Net
+/// displacement of the base body part is the "is it actually travelling" signal —
+/// a hopper/spinner racks up little. Recipients keep training, so they refine the
+/// inherited policy rather than freezing. Only shares when the best is genuinely
+/// walking, so a bad policy is never propagated.
+pub fn share_limb_policies_herbivore_1(
+    _pool:          NonSendMut<BrainPoolHerbivore1Limb>,
+    _slots:         Query<(Entity, &BrainSlotHerbivore1Limb)>,
+    _base_parts:    Query<(&bevy::prelude::ChildOf, &crate::cell::BodyPartIndex, &bevy::prelude::GlobalTransform)>,
+    _heightmap:     Option<Res<crate::world_geometry::HeightmapSampler>>,
+    _time:          Res<bevy::prelude::Time<bevy::prelude::Virtual>>,
+    _anchors:       Local<HashMap<Entity, Vec3>>,
+    _next_share:    Local<f32>,
+) {
+    // NO-OP under the per-SPECIES shared-policy model. Social policy-copy across
+    // individuals is now intrinsic: every organism of a species trains and uses
+    // the SAME net, so a "best walker"'s improvement is shared with its whole
+    // species automatically every PPO update — there is no per-slot weight to
+    // copy. (Cross-species copying would be wrong: species hold deliberately
+    // divergent policies.) The system is left registered (in `behaviour.rs`) but
+    // does nothing; the per-species PPO update is the convergence mechanism.
+}
+
+
+// ── Apply ───────────────────────────────────────────────────────────────────
+
+/// Per-tick brain step. Delegates to the shared `apply_step` engine:
+/// build observations, batched actor forward, sample actions, write to
+/// `Organism::limb_targets`, record rollout entries for the PPO update.
 pub fn apply_intelligence_level_herbivore_1_limb(
     mut pool: NonSendMut<BrainPoolHerbivore1Limb>,
     organisms: Query<(Entity, &mut Organism, &BrainSlotHerbivore1Limb)>,
     body_parts: Query<(
         &bevy::prelude::ChildOf,
         &crate::cell::BodyPartIndex,
-        &avian3d::prelude::Position,
-        &avian3d::prelude::Rotation,
-        &avian3d::prelude::AngularVelocity,
-        &avian3d::prelude::LinearVelocity,
-        Option<&crate::avian_setup::LimbContact>,
+        &bevy::prelude::GlobalTransform,
+        &bevy_rapier3d::prelude::Velocity,
+        Option<&crate::rapier_setup::LimbContact>,
     )>,
     world_grid: Res<crate::world_model::WorldModelGrid>,
+    heightmap: Option<Res<crate::world_geometry::HeightmapSampler>>,
     virtual_time: Res<bevy::prelude::Time<bevy::prelude::Virtual>>,
 ) {
-    let obs_inputs = gather_limb_obs_inputs(&body_parts, &world_grid);
+    let obs_inputs = gather_limb_obs_inputs(&body_parts, &world_grid, heightmap.as_deref());
     pool.0.apply_step(organisms, &obs_inputs, virtual_time.elapsed_secs());
 }

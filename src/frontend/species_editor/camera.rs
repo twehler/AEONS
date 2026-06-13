@@ -1,17 +1,7 @@
-// Species editor — orbit camera.
-//
-// Controls the shared `MainCamera` transform while `WindowMode ==
-// SpeciesEditor`. Middle-mouse drag rotates the camera around the
-// species-editor origin; the scroll wheel zooms (changes orbit radius).
-// LMB is intentionally NOT consumed — that's used for cell placement
-// in `placement.rs`.
-//
-// On entry to SpeciesEditor mode the camera teleports to the orbit
-// origin so the user sees the species under construction (or just
-// empty space if no cells have been spawned). On exit nothing is
-// done — the player camera systems take over again in Simulation
-// mode and will reposition the camera on the next viewport-click
-// capture.
+// Species editor — orbit camera. Drives the shared camera while
+// `WindowMode == SpeciesEditor`: middle-mouse drag orbits around the editor
+// origin, scroll zooms. LMB is NOT consumed — it's used for cell placement in
+// `placement.rs`.
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
@@ -40,9 +30,8 @@ const INITIAL_YAW:    f32 = 0.7;
 const INITIAL_PITCH:  f32 = 1.1;
 
 
-/// Per-camera orbit state. Inserted alongside `FlyCam` when the
-/// editor is first activated. Yaw + pitch are spherical-coordinate
-/// angles around `SPECIES_EDITOR_ORIGIN`.
+/// Per-camera orbit state. Yaw + pitch are spherical-coordinate angles around
+/// `SPECIES_EDITOR_ORIGIN`.
 #[derive(Component)]
 pub struct OrbitCamera {
     pub yaw:    f32,
@@ -56,26 +45,18 @@ impl Default for OrbitCamera {
     }
 }
 
-/// Stash for the `FlyCam`'s simulation-mode transform while the
-/// species editor is active. Set on entry to SpeciesEditor; consumed
-/// (and cleared) on entry to any other mode. Without this, returning
-/// from the species editor would leave the player camera parked at
-/// `SPECIES_EDITOR_ORIGIN` (≈ 100 000 units from origin) — far
-/// outside the simulation world.
+/// Stash for the `FlyCam`'s simulation-mode transform while the species editor
+/// is active. Without it, returning would leave the camera parked at
+/// `SPECIES_EDITOR_ORIGIN` (~100k units away), outside the simulation world.
 #[derive(Resource, Default)]
 pub struct StashedSimCameraTransform(pub Option<Transform>);
 
 
 // ── Systems ──────────────────────────────────────────────────────────────────
 
-/// On any mode change: swap the camera's RenderLayers so it only
-/// renders the layer matching the active mode. SpeciesEditor mode
-/// also snaps the camera to the orbit origin around the species
-/// editor scene.
-///
-/// RenderLayers cleanup is the load-bearing part — without it the
-/// camera would still render simulation entities while the species
-/// editor was active (and vice versa), defeating the isolation.
+/// On any mode change, swap the camera's RenderLayers to the active mode's layer
+/// (load-bearing for editor/simulation isolation) and, for SpeciesEditor, snap
+/// to the orbit origin.
 pub fn snap_camera_on_mode_entry(
     mode:         Res<WindowMode>,
     mut commands: Commands,
@@ -88,11 +69,9 @@ pub fn snap_camera_on_mode_entry(
 
     match *mode {
         WindowMode::SpeciesEditor => {
-            // Stash the pre-editor transform so we can put the camera
-            // back when the user returns to the simulation. Skip if
-            // the stash already holds something (defensive — we don't
-            // want to overwrite a stashed value with our own orbit
-            // position if some bug caused re-entry without restore).
+            // Stash the pre-editor transform for restore on exit. Skip if the
+            // stash is already populated (defensive against re-entry without
+            // restore — don't overwrite it with our orbit position).
             if stash.0.is_none() {
                 stash.0 = Some(*transform);
             }
@@ -107,8 +86,8 @@ pub fn snap_camera_on_mode_entry(
             };
             apply_orbit_to_transform(&orbit, &mut transform);
         }
-        // Any non-species mode: render the default world layer AND
-        // restore the simulation-time transform if one was stashed.
+        // Any non-species mode: render the default world layer and restore the
+        // stashed simulation-time transform.
         _ => {
             commands.entity(entity).insert(RenderLayers::layer(0));
             if let Some(saved) = stash.0.take() {
@@ -118,10 +97,8 @@ pub fn snap_camera_on_mode_entry(
     }
 }
 
-/// Per-frame orbit input handler. Reads middle-mouse drag for rotation
-/// and the scroll wheel for zoom. Real-time delta so the camera
-/// responds even when virtual time is paused (it always is in this
-/// mode).
+/// Orbit input: middle-mouse drag rotates, scroll wheel zooms. Uses real-time
+/// delta so it responds while virtual time is paused (always, in this mode).
 pub fn orbit_camera_input(
     mode:           Res<WindowMode>,
     mouse:          Res<ButtonInput<MouseButton>>,
@@ -131,9 +108,7 @@ pub fn orbit_camera_input(
     window_q:       Query<&Window, With<PrimaryWindow>>,
 ) {
     if *mode != WindowMode::SpeciesEditor {
-        // Drain the message readers so events don't accumulate while
-        // we're not actively listening. Otherwise the next mode entry
-        // would process a backlog of orbit motion.
+        // Drain the readers so a backlog doesn't fire on the next mode entry.
         for _ in motion.read() {}
         for _ in wheel.read()  {}
         return;
@@ -162,8 +137,7 @@ pub fn orbit_camera_input(
             changed = true;
         }
     } else {
-        // Middle button not held — drain motion so we don't accumulate
-        // a backlog that suddenly fires on the next press.
+        // Middle button not held — drain motion so no backlog fires on next press.
         for _ in motion.read() {}
     }
 

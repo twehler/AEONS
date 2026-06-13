@@ -1,31 +1,12 @@
-// Left-side "Species Navigator" panel.
+// Left-side "Species Navigator" panel. Two sections:
+//   * Species list — "Load Species" stashes an rfd-chosen `.species`
+//     path on the session (consumed by `mod.rs` next tick); the
+//     scrollable list selects `selected_species_id`.
+//   * Bulk-Spawn — count field + button; spawns N of the selected
+//     species at random heightmap points. Disabled with no selection.
 //
-// Replaces the legacy `tool_panel.rs` left panel. Two stacked sections:
-//
-//   ── Species Navigator (top) ────────────────────────────────────
-//      * "Load Species" button (blue) — opens an rfd Open-File
-//        dialog filtered to `.species` and stashes the chosen path
-//        on `EditorSession::load_species_path`. The dispatcher in
-//        `mod.rs` reads it on the next Update tick, decodes the
-//        file, bilateral-expands the OCG if needed, and appends a
-//        `LoadedSpecies` to the session.
-//      * Scrollable vertical list — one row per loaded species.
-//        Clicking a row sets `selected_species_id`. The selected
-//        row is highlighted so the user can see what bulk-spawn /
-//        single-click placement will use.
-//
-//   ── Bulk-Spawn Species (bottom) ────────────────────────────────
-//      * Count input field (digits only).
-//      * "Bulk-Spawn Species" button (green) — spawns N organisms
-//        of the currently-selected species at uniformly-random
-//        surface points on the heightmap. Disabled / greyed when
-//        no species is selected.
-//
-// Per-organism RL hyperparameter genes (curiosity, K_EAT, σ, …)
-// are NOT specified here — they're sampled fresh by the brain
-// pool's `assign_brains_l1_hetero` system from the `L1_*_RANGE`
-// constants in `simulation_settings.rs` on every spawn, so every
-// bulk-spawned organism carries its own gene set.
+// Per-organism RL hyperparameter genes are sampled fresh by the brain
+// pool from `L1_*_RANGE` on every spawn, not specified here.
 
 use bevy::prelude::*;
 use bevy::input::keyboard::KeyboardInput;
@@ -42,10 +23,7 @@ use crate::colony_editor::undo::{EditorAction, UndoStack};
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/// Logical-pixel width of the left-side panel. Re-exported under the
-/// legacy name `TOOL_PANEL_WIDTH_PX` so the editor's camera (which
-/// uses it for cursor-rect-testing) doesn't need to chase the
-/// rename.
+/// Logical-pixel width of the left-side panel.
 pub const SPECIES_PANEL_WIDTH_PX: f32 = 240.0;
 /// Backwards-compat alias for the camera click-rect check.
 pub const TOOL_PANEL_WIDTH_PX: f32 = SPECIES_PANEL_WIDTH_PX;
@@ -63,10 +41,7 @@ const SPECIES_ROW_HEIGHT: f32 = 30.0;
 const SPECIES_ROW_GAP:    f32 = 3.0;
 const SPECIES_ROW_IDLE:        Color = Color::srgb(0.20, 0.20, 0.22);
 const SPECIES_ROW_HOVER:       Color = Color::srgb(0.30, 0.30, 0.34);
-/// Blue highlight applied to the currently-selected species row so
-/// the user can see which species the next Bulk-Spawn / left-click
-/// placement will use. Chosen to read clearly against the dark
-/// panel background.
+/// Highlight for the currently-selected species row.
 const SPECIES_ROW_SELECTED:    Color = Color::srgb(0.20, 0.45, 0.85);
 
 const COUNT_FIELD_HEIGHT:   f32   = 30.0;
@@ -197,12 +172,9 @@ pub fn spawn_with_offset(parent: &mut ChildSpawnerCommands, top_offset_px: f32) 
                 ));
             });
 
-            // Scrollable species list — `Overflow::scroll_y()` enables
-            // clipping + scroll-position. Wheel handling is delegated
-            // to the navigator-list system at the panel level
-            // (`navigator_scroll` pattern in `individuum_navigator.rs`);
-            // we don't currently re-implement it here because the list
-            // is bounded at ~tens of entries and the panel is tall.
+            // Scrollable species list (`Overflow::scroll_y()`). No
+            // explicit wheel handling — the list is bounded at ~tens of
+            // entries and the panel is tall.
             panel.spawn((
                 SpeciesListContainer,
                 Node {
@@ -308,10 +280,7 @@ fn handle_load_species_button(
     }
 }
 
-/// Rebuild the rows of the scrollable list whenever the loaded-species
-/// vec changes. Edge-triggered on `session.is_changed()` to avoid a
-/// per-frame UI rebuild — the only mutations are Load Species clicks
-/// (rare) and Clear-All (rare).
+/// Rebuild the list rows on `session.is_changed()` (avoids per-frame rebuild).
 fn rebuild_species_list(
     session:       Res<EditorSession>,
     mut commands:  Commands,
@@ -321,9 +290,7 @@ fn rebuild_species_list(
     if !session.is_changed() { return; }
     let Ok(container) = container_q.single() else { return };
 
-    // Strategy: simple "despawn and rebuild" — cheap because rows are
-    // small (~20 entities at most) and rebuilds are rare. Avoids the
-    // complexity of diffing row state by id.
+    // Despawn-and-rebuild — cheap given few rows and rare rebuilds.
     for e in &existing_rows { commands.entity(e).despawn(); }
     if session.loaded_species.is_empty() { return; }
 

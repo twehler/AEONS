@@ -47,13 +47,10 @@ pub fn build_flat_mesh(verts: &[Vec3], tris: &[[u32; 3]]) -> Mesh {
     build_flat_mesh_colored(verts, tris, None)
 }
 
-/// Same as `build_flat_mesh` but additionally writes per-vertex colours
-/// to `Mesh::ATTRIBUTE_COLOR`. `tri_colors[i]` is the linear-RGBA colour
-/// applied to all three vertices of `tris[i]` — flat-shaded, so each
-/// triangle takes its source cell's colour cleanly with no blending at
-/// inter-cell boundaries. Pass `None` to skip the colour attribute (the
-/// `StandardMaterial`'s `base_color` then drives the appearance, as
-/// before).
+/// Like `build_flat_mesh` but writes per-vertex colours to
+/// `Mesh::ATTRIBUTE_COLOR`. `tri_colors[i]` is the linear-RGBA colour for all
+/// three vertices of `tris[i]` (flat-shaded, no inter-cell blending). `None`
+/// skips the attribute, letting `StandardMaterial::base_color` drive appearance.
 pub fn build_flat_mesh_colored(
     verts: &[Vec3],
     tris: &[[u32; 3]],

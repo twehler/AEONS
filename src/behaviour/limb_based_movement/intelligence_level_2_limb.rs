@@ -1,10 +1,9 @@
-// Limb-based L2 brain — PPO pool for Level2 heterotrophs (typically
-// carnivore species) WHOSE `Organism::sliding_movement == false`.
+// Limb-based L2 brain — PPO pool for Level2 heterotrophs with
+// `!Organism::movement_mode.is_sliding()`.
 //
-// Structurally identical to `intelligence_level_herbivore_1_limb` —
-// only the enrolment filter (`IntelligenceLevel::Level2`) differs. All
-// network sizes (IN/HIDDEN/OUT = 55/128/6) and PPO hyperparameters
-// come from the shared `limb_ppo` engine.
+// Structurally identical to the herbivore_1 limb pool; only the
+// enrolment filter (`IntelligenceLevel::Level2`) differs. Network sizes
+// and PPO hyperparameters come from the shared `limb_ppo` engine.
 
 use bevy::prelude::*;
 
@@ -42,18 +41,19 @@ pub fn assign_brains_l2_limb(
 ) {
     for (e, organism, restore, inheritance) in new.iter() {
         if !matches!(organism.intelligence_level, IntelligenceLevel::Level2) { continue; }
-        if organism.sliding_movement { continue; }
+        if organism.movement_mode.is_sliding() { continue; }
+        // Swimmers train in their own pool (intelligence_level_1_swimming).
+        if organism.movement_mode.is_swimming() { continue; }
         let Some(s) = pool.0.enrol(e) else { continue };
+        // Saved weights (loaded `.colony`) → overwrite this organism's SPECIES
+        // net (keyed by species_id, UNCLASSIFIED until first classified).
         if let Some(r) = restore {
-            pool.0.restore_slot(s, r);
+            pool.0.restore_species(organism.species_id.unwrap_or(0), r);
             commands.entity(e).try_remove::<BrainRestoreLimb>();
-        } else {
-            // Inherit a trained brain so the new organism isn't born helpless;
-            // prefer the explicit parent, else any other occupied slot.
-            let src = inheritance.and_then(|inh| pool.0.map.get(&inh.0).copied())
-                .or_else(|| pool.0.map.iter().filter_map(|(ent, sl)| (*ent != e && *sl != s).then_some(*sl)).next());
-            if let Some(src) = src { pool.0.inherit_slot(s, src); }
         }
+        // SHARED policy → no per-slot weight inheritance; a newborn of an
+        // existing species already shares that species' trained net. Just clear
+        // any inheritance marker so it isn't reprocessed.
         if inheritance.is_some() { commands.entity(e).try_remove::<crate::rl_helpers::BrainInheritance>(); }
         commands.entity(e).try_insert(BrainSlotL2Limb(s));
     }
@@ -79,15 +79,14 @@ pub fn apply_intelligence_level_2_limb(
     body_parts: Query<(
         &bevy::prelude::ChildOf,
         &crate::cell::BodyPartIndex,
-        &avian3d::prelude::Position,
-        &avian3d::prelude::Rotation,
-        &avian3d::prelude::AngularVelocity,
-        &avian3d::prelude::LinearVelocity,
-        Option<&crate::avian_setup::LimbContact>,
+        &bevy::prelude::GlobalTransform,
+        &bevy_rapier3d::prelude::Velocity,
+        Option<&crate::rapier_setup::LimbContact>,
     )>,
     world_grid: Res<crate::world_model::WorldModelGrid>,
+    heightmap: Option<Res<crate::world_geometry::HeightmapSampler>>,
     virtual_time: Res<bevy::prelude::Time<bevy::prelude::Virtual>>,
 ) {
-    let obs_inputs = gather_limb_obs_inputs(&body_parts, &world_grid);
+    let obs_inputs = gather_limb_obs_inputs(&body_parts, &world_grid, heightmap.as_deref());
     pool.0.apply_step(organisms, &obs_inputs, virtual_time.elapsed_secs());
 }

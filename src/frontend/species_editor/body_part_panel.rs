@@ -1,15 +1,10 @@
 // Species editor — Body-part index panel (right side).
 //
-// A vertical list of the species' body parts. Index 0 is the base body;
-// later entries are appendages added with "Begin New Body-Part". The
-// user picks which part new cells are placed on by clicking its row;
-// clicking the already-active row a second time enters rename mode
-// (type, Enter commits, Escape cancels).
-//
-// "Begin New Body-Part" appends a fresh appendage, makes it active, and
-// auto-selects the blue Placeholder cell type so the new part is built
-// out of debug-blue cells (its first cell attaches to the base body's
-// growth frontier — see `placement::update_preview_cell`).
+// Vertical list of body parts (index 0 = base body, later = appendages).
+// Click a row to make it the active placement target; click the active row
+// again to rename (Enter commits, Escape cancels). "Begin New Body-Part"
+// appends an appendage, makes it active, and selects the blue Placeholder
+// type; its first cell attaches by contact (see `placement`).
 
 use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
@@ -57,19 +52,16 @@ pub struct BodyPartList;
 #[derive(Component)]
 pub struct BeginNewBodyPartButton;
 
-/// One row in the index, carrying the body-part index it represents.
-/// The row itself is a layout Node — not a Button. Its two children
-/// (a select button and a limb toggle) carry the interactions.
+/// One row (layout Node, not a Button); its select-button + limb-toggle
+/// children carry the interactions. Holds the body-part index.
 #[derive(Component, Clone, Copy)]
 pub struct BodyPartRow(pub usize);
 
-/// Click target for selecting / renaming a body part (the name area
-/// of the row). One per row.
+/// Click target for selecting / renaming a body part. One per row.
 #[derive(Component, Clone, Copy)]
 pub struct BodyPartSelectButton(pub usize);
 
-/// Click target for the per-row "Limb" toggle (right side of the
-/// row). Hidden for the base body (index 0). One per appendage row.
+/// Per-row "Limb" toggle. Hidden for the base body (index 0).
 #[derive(Component, Clone, Copy)]
 pub struct BodyPartLimbToggle(pub usize);
 
@@ -100,7 +92,6 @@ pub fn spawn_body_part_panel(parent: &mut ChildSpawnerCommands, top_offset_px: f
             BackgroundColor(PANEL_BG_COLOR),
         ))
         .with_children(|panel| {
-            // Title.
             panel.spawn((
                 Text::new("Body part index"),
                 TextFont { font_size: 15.0, ..default() },
@@ -108,7 +99,6 @@ pub fn spawn_body_part_panel(parent: &mut ChildSpawnerCommands, top_offset_px: f
                 Pickable::IGNORE,
             ));
 
-            // "Begin New Body-Part" button.
             panel
                 .spawn((
                     BeginNewBodyPartButton,
@@ -131,7 +121,6 @@ pub fn spawn_body_part_panel(parent: &mut ChildSpawnerCommands, top_offset_px: f
                     ));
                 });
 
-            // Scrollable list of rows.
             panel.spawn((
                 BodyPartList,
                 Node {
@@ -156,17 +145,13 @@ pub fn handle_begin_new_body_part(
     if *mode != WindowMode::SpeciesEditor { return; }
 
     for (interaction, mut bg) in &mut interactions {
-        // Disabled until the base body exists.
-        let enabled = session.first_cell_spawned;
+        let enabled = session.first_cell_spawned;   // disabled until base body exists
         match *interaction {
             Interaction::Pressed if enabled => {
                 let n = session.body_parts.len();
-                // A new part has no fixed parent. It attaches to whichever
-                // existing body part its FIRST cell ends up touching —
-                // decided by contact in `placement.rs`. `parent = 0` is a
-                // placeholder until then. The user toggles "Limb" and picks
-                // the cell colour manually; there is no special sub-limb
-                // category — a limb can stick to the body or another limb.
+                // No fixed parent: it attaches to whichever part its FIRST
+                // cell touches (decided by contact in `placement.rs`);
+                // `parent = 0` is a placeholder until then.
                 session.body_parts.push(EditorBodyPart {
                     name: format!("Body Part {n}"),
                     ocg:  Vec::new(),

@@ -1,24 +1,12 @@
 // Simulation-mode "Species Navigator" — left-side panel.
 //
-// Lists the active organism categories with their live member counts.
-// Categories are derived from each `OrganismRoot`'s components:
+// Lists active organism categories + live counts, derived per `OrganismRoot`:
+// Photoautotroph (marker); Heterotroph+!Carnivore+IL ⇒ "Herbivore L<N>";
+// Heterotroph+Carnivore+IL ⇒ "Carnivore L<N>". L0 heteros fold into
+// "Herbivore L0"; zero-count rows are hidden.
 //
-//   * Photoautotroph                                — any organism with the
-//                                                     `Photoautotroph` marker.
-//   * Heterotroph + (no Carnivore)  +  IL Level N   — "Herbivore L<N>".
-//   * Heterotroph +    Carnivore    +  IL Level N   — "Carnivore L<N>".
-//
-// `Level 0` heteros are folded into "Herbivore L0" but the simulation
-// shouldn't produce any (mobile heteros default to L1+); the row is
-// hidden unless its count is > 0.
-//
-// Efficiency notes:
-//   * Six fixed rows spawn once at startup, never churn. Per-tick
-//     update just rewrites the row's count text and toggles
-//     `Display::None` for empty categories — no entity allocation.
-//   * Counting is timer-gated at 2 Hz (the panel doesn't need to
-//     animate per-frame), so an iteration over every `OrganismRoot`
-//     happens at most twice a second.
+// Fixed rows spawn once and never churn — the 2 Hz refresh just rewrites count
+// text and toggles `Display::None`, so the `OrganismRoot` walk runs ≤ 2x/sec.
 
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
@@ -31,17 +19,14 @@ use crate::simulation_settings::WindowMode;
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-/// Logical-pixel width of the panel. Mirrors the right-side
-/// individuum navigator's `NAV_INITIAL_WIDTH_PX` for visual symmetry.
+/// Panel width (logical px); mirrors `NAV_INITIAL_WIDTH_PX` for symmetry.
 pub const SPECIES_NAV_WIDTH_PX: f32 = 220.0;
 
 const PANEL_PADDING_PX:    f32 = 8.0;
 const ROW_HEIGHT_PX:       f32 = 34.0;
 const ROW_GAP_PX:          f32 = 4.0;
 const ROW_BG:              Color = Color::srgb(0.20, 0.20, 0.22);
-/// 2 Hz refresh — half-second cadence is below the visual change rate
-/// of the underlying population, well above the system's iteration
-/// cost on a 4 k-organism world.
+/// 2 Hz refresh.
 const REFRESH_INTERVAL:    Duration = Duration::from_millis(500);
 
 
@@ -72,7 +57,7 @@ impl SpeciesCategory {
         }
     }
 
-    /// All categories, in display order. Six rows total.
+    /// All categories, in display order.
     pub const ALL: [SpeciesCategory; 7] = [
         SpeciesCategory::Photoautotroph,
         SpeciesCategory::HerbivoreL0,
@@ -114,16 +99,10 @@ impl Plugin for SpeciesNavigatorPlugin {
 
 // ── Spawn ────────────────────────────────────────────────────────────────────
 
-/// Append the panel as a child of the `ViewportRow` container.
-/// Called from `frontend::setup_panes` INSIDE the row's
-/// `with_children` block, so the panel becomes a flex sibling of
-/// the viewport image (and the right-side individuum navigator).
-/// This gives it the same vertical extent as the row — i.e. it ends
-/// exactly at the horizontal divider that separates the viewport
-/// from the statistics panel, with no manual sizing needed.
-///
-/// The panel must be spawned BEFORE the viewport in the row so flex
-/// places it on the left.
+/// Append the panel as a child of the `ViewportRow` (from
+/// `frontend::setup_panes`), making it a flex sibling of the viewport image so
+/// it inherits the row's vertical extent. Must be spawned BEFORE the viewport
+/// so flex places it on the left.
 pub fn spawn_species_navigator(parent: &mut ChildSpawnerCommands) {
     parent
         .spawn((
@@ -149,9 +128,7 @@ pub fn spawn_species_navigator(parent: &mut ChildSpawnerCommands) {
                 Pickable::IGNORE,
             ));
 
-            // Scrollable list. Six fixed rows spawned now; zero-count
-            // rows are hidden via `Display::None` and revealed when
-            // organisms of that category exist.
+            // Scrollable list of fixed rows; zero-count rows hidden via `Display::None`.
             panel.spawn((
                 SpeciesNavigatorList,
                 Node {
@@ -183,8 +160,7 @@ pub fn spawn_species_navigator(parent: &mut ChildSpawnerCommands) {
                     .with_children(|row| {
                         row.spawn((
                             SpeciesRowText(cat),
-                            // Initial placeholder; populated by the
-                            // refresh system on the first tick.
+                            // Placeholder; populated by the refresh system.
                             Text::new(format!("{}: 0", cat.label())),
                             TextFont { font_size: 13.0, ..default() },
                             TextColor(Color::WHITE),
@@ -199,11 +175,8 @@ pub fn spawn_species_navigator(parent: &mut ChildSpawnerCommands) {
 
 // ── Counting + refresh system ───────────────────────────────────────────────
 
-/// Walk every `OrganismRoot` once, bucket into the seven categories,
-/// rewrite each row's text and toggle Display::None for empty
-/// categories. Runs at 2 Hz via the plugin's `on_timer`. Skipped
-/// outside Simulation mode (cheap early-return — the panel is hidden
-/// anyway).
+/// Walk every `OrganismRoot` once, bucket into categories, rewrite row text and
+/// toggle `Display::None` for empty ones. 2 Hz; skipped outside Simulation mode.
 #[allow(clippy::type_complexity)]
 fn refresh_species_navigator(
     window_mode:   Res<WindowMode>,
@@ -221,8 +194,7 @@ fn refresh_species_navigator(
 ) {
     if *window_mode != WindowMode::Simulation { return; }
 
-    // 7-bucket tally. Cheap small-array on the stack — keyed by enum
-    // discriminant order in `SpeciesCategory::ALL`.
+    // 7-bucket tally, keyed by order in `SpeciesCategory::ALL`.
     let mut counts = [0usize; 7];
 
     for (organism, is_photo, is_hetero, is_carn) in &organisms {
@@ -232,10 +204,8 @@ fn refresh_species_navigator(
             match (is_carn, organism.intelligence_level) {
                 (true,  IntelligenceLevel::Level2) => SpeciesCategory::CarnivoreL2,
                 (true,  IntelligenceLevel::Level3) => SpeciesCategory::CarnivoreL3,
-                // Carnivore at L0/L1 shouldn't be reachable through
-                // the species editor (the cycler enforces ≥ L2), but
-                // fold any stragglers into HerbivoreL? rather than
-                // dropping the count.
+                // Carnivore L0/L1 shouldn't occur (editor enforces ≥ L2);
+                // fold stragglers in rather than drop the count.
                 (true,  IntelligenceLevel::Level0) => SpeciesCategory::HerbivoreL0,
                 (true,  IntelligenceLevel::Level1) => SpeciesCategory::HerbivoreL1,
                 (false, IntelligenceLevel::Level0) => SpeciesCategory::HerbivoreL0,
@@ -249,19 +219,15 @@ fn refresh_species_navigator(
         counts[category_index(category)] += 1;
     }
 
-    // Rewrite the row texts whenever the value actually changed.
-    // Using a separate text query avoids the borrow-conflict between
-    // walking organisms and walking row entities (independent
-    // archetype sets).
+    // Rewrite row texts on change. Separate text query avoids a borrow
+    // conflict with the organism walk (independent archetype sets).
     for (marker, mut text) in &mut row_text {
         let c = counts[category_index(marker.0)];
         let new = format!("{}: {}", marker.0.label(), c);
         if text.0 != new { text.0 = new; }
     }
 
-    // Toggle row visibility — Display::Flex for non-empty,
-    // Display::None for zero. Visually compact: only categories
-    // currently represented in the population appear.
+    // Toggle row visibility — only non-empty categories appear.
     for (row, mut node) in &mut rows {
         let want = if counts[category_index(row.0)] > 0 {
             Display::Flex

@@ -1,22 +1,9 @@
 // "Clear All" confirmation modal.
 //
-// Flow:
-//   1. The inventory panel's "Clear All" button sets
-//      `EditorSession::show_clear_modal = true`.
-//   2. `manage_clear_modal_visibility` spawns the modal entity on
-//      the rising edge of that flag and despawns it on the falling
-//      edge.
-//   3. `handle_clear_modal_buttons` resolves the Yes / No choice:
-//        * Yes → drain every editor template AND despawn every live
-//          `OrganismRoot` in the simulation, then drop the flag.
-//        * No  → drop the flag, despawn the modal.
-//
-// "No" is rendered in the highlighted style (brighter colour +
-// 2-pixel border) so that an accidental Enter / glance-and-click
-// goes to the safe option. This mirrors the "default = cancel"
-// convention for destructive prompts on every modern desktop OS —
-// the user has to actively reach past the highlighted choice to
-// confirm the destruction.
+// "Clear All" sets `show_clear_modal`; visibility tracks the flag edge.
+// Yes → drain every template AND despawn every live `OrganismRoot`; No
+// → cancel. "No" is the highlighted default (default = cancel for a
+// destructive prompt), so an accidental Enter takes the safe option.
 
 use bevy::prelude::*;
 
@@ -98,10 +85,7 @@ fn spawn_modal(commands: &mut Commands) {
     commands
         .spawn((
             ClearModalRoot,
-            // Full-screen backdrop — same pattern as `exit_modal`.
-            // Both Yes/No sit on top with their own picking, so the
-            // backdrop just blocks accidental clicks reaching the
-            // editor panels behind it.
+            // Full-screen backdrop blocks clicks reaching the editor.
             Node {
                 position_type: PositionType::Absolute,
                 top:    Val::Px(0.0),
@@ -113,9 +97,7 @@ fn spawn_modal(commands: &mut Commands) {
                 ..default()
             },
             BackgroundColor(MODAL_BACKDROP_COLOR),
-            // ZIndex 110 puts this above `exit_modal` (100) just in
-            // case both flags somehow get set in the same frame —
-            // the most-recent destructive prompt wins focus.
+            // 110 > exit_modal's 100, so this wins if both flags are set.
             GlobalZIndex(110),
         ))
         .with_children(|root| {
@@ -148,9 +130,7 @@ fn spawn_modal(commands: &mut Commands) {
                         Pickable::IGNORE,
                     ));
 
-                    // Button row. No first (left, highlighted) so the
-                    // pointer's natural resting position after the
-                    // user's reflex glance lands on the safe option.
+                    // Button row; No first (highlighted, the safe default).
                     card.spawn(Node {
                         flex_direction:  FlexDirection::Row,
                         justify_content: JustifyContent::Center,
@@ -224,10 +204,8 @@ fn handle_clear_modal_buttons(
     for (interaction, mut bg) in &mut yes_q {
         match *interaction {
             Interaction::Pressed => {
-                // Drain every template — visual entities first so a
-                // half-cleared frame can't reach `sync_rows` while
-                // `session.templates` is empty and re-spawn rows for
-                // already-despawned entities.
+                // Despawn visual entities before draining templates so a
+                // half-cleared frame can't re-spawn rows for dead entities.
                 let removed: Vec<OrganismTemplate> = session.templates.drain(..).collect();
                 for t in &removed {
                     commands.entity(t.entity).despawn();
@@ -235,20 +213,14 @@ fn handle_clear_modal_buttons(
                 session.active_id = None;
                 session.dirty     = true;
 
-                // Despawn every live organism — same path as
-                // right-click delete. Recursive despawn drops body
-                // parts; RemovedComponents observers handle brain
-                // slot reclaim, statistics counters, etc.
+                // Recursive despawn of every live organism; RemovedComponents
+                // observers reclaim brain slots / update counters.
                 for e in &organisms_q {
                     commands.entity(e).despawn();
                 }
 
-                // Close the modal. Note: NO undo entry here — wiping
-                // wild organisms is not part of the editor's
-                // reversible action model (the templates path is,
-                // but mixing reversible + irreversible into one
-                // entry would be confusing), so we keep the whole
-                // op irreversible for clarity.
+                // No undo entry — wiping wild organisms is irreversible
+                // (mixing it with the reversible template path would confuse).
                 session.show_clear_modal = false;
                 *bg = BackgroundColor(YES_BTN_HOVER);
             }

@@ -1,18 +1,11 @@
 // Predation — heterotrophs eat photoautotrophs one body part at a time.
 //
-// New architecture: every `OrganismContactEvent` from `organism_collision.rs`
-// carries the body-part indices that touched on each side. When a
-// heterotroph touches a photoautotroph, the predator consumes the *single*
-// body part of the prey that made contact, takes a proportional share of
-// the prey's total energy, and the body part is soft-deleted (cells
-// cleared, `consumed = true`, child mesh entity despawned). The prey
-// organism only despawns once *all* of its body parts have been eaten.
-//
-// This makes predation gradient: a prey with many body parts can be
-// nibbled over multiple encounters, surviving long enough to spawn
-// reactions in the world (escape attempts, brain training signals, etc).
-// It also keeps the contact-event system compatible with future
-// non-fatal interactions (mating, parasitism) without further changes.
+// Each `OrganismContactEvent` carries the body-part indices that touched.
+// The predator consumes the single contacted prey body part, takes a
+// proportional share of the prey's energy, and soft-deletes the part
+// (cells cleared, `consumed = true`, child mesh despawned). The prey
+// organism despawns only once all its body parts are eaten — making
+// predation gradient (many-part prey can be nibbled over encounters).
 
 use bevy::prelude::*;
 use std::collections::HashSet;
@@ -30,10 +23,43 @@ pub struct PredationPlugin;
 impl Plugin for PredationPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<OrganismContactEvent>();
+        app.add_systems(Update, emit_proximity_predation.before(predation_system));
         app.add_systems(Update, predation_system);
     }
 }
 
+
+/// Emit a predation contact event when a LIMB herbivore gets within `EAT_RADIUS` of
+/// a phototroph — eating by PROXIMITY rather than physical collider contact (the
+/// limb↔prey physical collision is filtered in `SelfCollisionFilter`). Reaching prey
+/// then eating is preserved, but herbivores pass THROUGH prey so no dense limb↔prey
+/// contact pile forms at feeding clusters (that pile craters FPS). Reuses all the
+/// existing predation routing/logic via the same event.
+pub fn emit_proximity_predation(
+    sim_running: Res<crate::simulation_settings::SimulationRunning>,
+    grid:        Option<Res<crate::world_model::WorldModelGrid>>,
+    bases:       Query<(&bevy::prelude::ChildOf, &crate::cell::BodyPartIndex, &bevy::prelude::GlobalTransform)>,
+    orgs:        Query<&Organism>,
+    heteros:     Query<(), With<Heterotroph>>,
+    mut out:     MessageWriter<OrganismContactEvent>,
+) {
+    if !sim_running.0 { return; }
+    let Some(grid) = grid else { return };
+    let eat = crate::simulation_settings::EAT_RADIUS;
+    for (co, idx, gt) in &bases {
+        if idx.0 != 0 { continue; } // base body part
+        let root = co.parent();
+        if !heteros.contains(root) { continue; }
+        if orgs.get(root).map(|o| o.movement_mode.is_sliding()).unwrap_or(true) { continue; } // limb only
+        let pos = gt.translation();
+        if let Some((_, dist, prey)) = crate::world_model::nearest_prey(&grid, pos) {
+            if dist < eat {
+                // Eat the prey's trunk (part 0) → consumes the whole phototroph.
+                out.write(OrganismContactEvent { a: root, b: prey, body_part_a: 0, body_part_b: 0 });
+            }
+        }
+    }
+}
 
 fn predation_system(
     mut commands:           Commands,
@@ -46,13 +72,10 @@ fn predation_system(
     mut already_eaten:      Local<HashSet<(Entity, usize)>>,
     mut already_despawned:  Local<HashSet<Entity>>,
 ) {
-    // Per-frame dedup: a single body part can be the subject of more than
-    // one contact event in the same tick (multiple cell-pair contacts feed
-    // distinct events). Eating it more than once would double-credit the
-    // predator and let multiple predators "share" the same body part.
-    // `Local<HashSet>` reuses allocations across ticks instead of
-    // freshly allocating them at the top of every Update — they're just
-    // cleared.
+    // Per-frame dedup: one body part can produce multiple contact events
+    // per tick; eating it twice would double-credit the predator (or let
+    // two predators share it). `Local<HashSet>` is reused (cleared) across
+    // ticks rather than reallocated.
     already_eaten.clear();
     already_despawned.clear();
 
@@ -121,16 +144,10 @@ fn predation_system(
             let new_alive = prey_org.alive_body_part_count();
             // Bilateral organisms can't survive losing a half.
             let bilateral_collapse = matches!(prey_org.symmetry, Symmetry::Bilateral);
-            // Losing body_parts[0] (the structural root / trunk) kills
-            // the organism. For variable-form plants this matters
-            // visually: after the flat-hierarchy fix branches no
-            // longer cascade with their nominal parent body part, so
-            // eating the trunk would otherwise leave the surviving
-            // branches floating in space (and unable to grow back,
-            // since `continuous_growth` seeds from
-            // `body_parts[0].ocg`). Treating index-0 consumption as
-            // fatal restores the intuitive "plant is dead once the
-            // trunk is gone" semantics across every symmetry.
+            // Losing body_parts[0] (the structural root/trunk) is fatal:
+            // surviving branches don't cascade with it (flat hierarchy)
+            // and can't regrow (`continuous_growth` seeds from
+            // body_parts[0].ocg), so eating the trunk kills the organism.
             let trunk_lost = prey_bp_idx == 0;
             Some((share, new_alive == 0 || bilateral_collapse || trunk_lost))
         };
@@ -139,11 +156,9 @@ fn predation_system(
             let Ok(mut prey_org) = phototrophs.get_mut(prey) else { continue };
             mutate_prey(&mut prey_org, &mut commands, &mut already_despawned)
         } else {
-            // Carnivore eating a heterotroph. Same logic, different
-            // query. Predator credit (below) re-borrows heterotrophs
-            // mutably for the predator entity — that's safe because
-            // the prey borrow ends with this block, and Bevy's NLL
-            // releases the reference before the next get_mut.
+            // Carnivore eating a heterotroph — same logic, different query.
+            // Predator credit re-borrows heterotrophs mutably; safe because
+            // the prey borrow ends here (NLL releases it before get_mut).
             let Ok(mut prey_org) = heterotrophs.get_mut(prey) else { continue };
             mutate_prey(&mut prey_org, &mut commands, &mut already_despawned)
         };
@@ -152,21 +167,16 @@ fn predation_system(
         // ── Credit predator ──────────────────────────────────────────────
         if let Ok(mut pred_org) = heterotrophs.get_mut(predator) {
             pred_org.energy += energy_share * ENERGY_TRANSFER_RATE;
-            // Bump the predation counter (saturating, since u8 wraps).
-            // The active hetero pools read the per-tick delta of this
-            // field as their eat-event reward signal.
+            // Bump predation counter (saturating). Hetero pools read its
+            // per-tick delta as their eat-event reward.
             pred_org.predations = pred_org.predations.saturating_add(1);
-            // RL reward: +0.6 dopamine on every successful consumption,
-            // clamped at 1.0. The herbivore brain's REINFORCE update
-            // consumes the per-tick `Δdopamine` as its reward signal.
+            // +0.6 dopamine per eat, clamped at 1.0 (consumed as a reward).
             pred_org.dopamine = (pred_org.dopamine + 0.6).min(1.0);
         }
 
         // ── Despawn the eaten body part's child mesh entity ──────────────
-        // We don't reindex the prey's `body_parts` Vec; the slot stays in
-        // place with `consumed = true`. That keeps sibling children's
-        // `BodyPartIndex` stable and avoids walking the children list to
-        // patch components.
+        // The `body_parts` slot stays in place (`consumed = true`), not
+        // reindexed, so sibling `BodyPartIndex` values stay stable.
         if let Ok(children) = children_query.get(prey) {
             for child in children.iter() {
                 if let Ok(idx) = body_part_idx_query.get(child) {

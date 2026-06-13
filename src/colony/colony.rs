@@ -6,32 +6,18 @@ use crate::movement::DirectionTimer;
 use bevy::prelude::*;
 use rand::prelude::*;
 
-// Re-export the Organism module so existing `use crate::colony::*;` imports
-// keep finding Organism, OrganismRoot, OrganismKind, Photoautotroph, etc.
+// Re-exports so `use crate::colony::*;` resolves Organism etc. and
+// save/load items (`crate::colony::SaveRequested`).
 pub use crate::organism::*;
-
-// Re-export the binary `.colony` save/load module (split out of this file)
-// so external paths like `crate::colony::SaveRequested` keep resolving and
-// the plugin / spawn_colony can reference its items unqualified.
 pub use crate::colony_save_load::*;
-
-// Initial cohort sizes are derived at spawn-time from three
-// resources (all launcher-set, defaulting to the matching
-// `DEFAULT_*` constants):
-//   * herbivores        = StartHeterotrophs    (launcher: "Start Heterotroph Number")
-//   * photoautotrophs   = MaxOrganisms − MaxHerbivores
-// The running-population cap is `MaxOrganisms` (and herbivore-only
-// cap is `MaxHerbivores`), both editable at runtime via the
-// statistics panel. Keeping the START count decoupled from the
-// CAP lets the user seed a small starter cohort and let reproduction
-// fill the room up to the cap. See `spawn_colony`.
 
 pub use crate::simulation_settings::INITIAL_KRISHI;
 
 use crate::simulation_settings::{
-    SPAWN_CRAWLER_PATH, SPAWN_CRAWLER_COUNT,
+    SPAWN_SWIMMER_PATH, SPAWN_SWIMMER_COUNT,
     SPAWN_STRIDER_PATH, SPAWN_STRIDER_COUNT,
     SPAWN_ALGAE_PATH, SPAWN_ALGAE_COUNT,
+    SWIM_SPAWN_CLEARANCE,
 };
 
 use crate::simulation_settings::BASE_ANGULAR_DAMPING;
@@ -44,22 +30,14 @@ use crate::simulation_settings::BODY_PART_DENSITY;
 
 
 
-/// Build a SINGLE convex-hull collider for a limb-based body part from
-/// its cell cloud, replacing the old `Collider::compound` of one sphere
-/// per cell. Collider count drives Avian's narrow-phase cost (every
-/// shape-pair is tested), so collapsing ~5 spheres per part into one
-/// hull cuts the per-organism collider count ~5× and the pair count
-/// quadratically — the dominant lever for limb-organism physics
-/// performance.
-///
-/// Each cell contributes its six axis-extreme points (`center ± r` on
-/// X/Y/Z). Hulling those instead of bare centers (a) keeps the hull at
-/// roughly the true cell extent so body parts don't sink into the
-/// terrain by a cell radius, and (b) guarantees a non-degenerate 3D
-/// point set even for a 1-cell part (six points → an octahedron), so
-/// `convex_hull` never returns `None` in practice — the sphere fallback
-/// is purely defensive.
-fn limb_part_collider(cells: &[Cell]) -> Option<avian3d::prelude::Collider> {
+/// Single convex-hull collider for a limb body part from its cell cloud.
+/// One hull per part (vs. one sphere per cell) cuts narrow-phase pair
+/// count — the dominant lever for limb-organism physics performance.
+/// Each cell contributes six axis-extreme points (`center ± r`): keeps
+/// the hull at true cell extent (no terrain sinking) and guarantees a
+/// non-degenerate 3D point set even for a 1-cell part, so the sphere
+/// fallback is purely defensive.
+fn limb_part_collider(cells: &[Cell]) -> Option<bevy_rapier3d::prelude::Collider> {
     if cells.is_empty() { return None; }
     let r = crate::cell::CELL_COLLISION_RADIUS;
     let mut pts: Vec<Vec3> = Vec::with_capacity(cells.len() * 6);
@@ -70,57 +48,43 @@ fn limb_part_collider(cells: &[Cell]) -> Option<avian3d::prelude::Collider> {
         pts.push(p + Vec3::Z * r); pts.push(p - Vec3::Z * r);
     }
     Some(
-        avian3d::prelude::Collider::convex_hull(pts)
-            .unwrap_or_else(|| avian3d::prelude::Collider::sphere(r)),
+        bevy_rapier3d::prelude::Collider::convex_hull(&pts)
+            .unwrap_or_else(|| bevy_rapier3d::prelude::Collider::ball(r)),
     )
 }
 
+/// The limb's long axis in its LOCAL frame: direction from the part origin to
+/// the centroid of its cells, normalised. Used as the brain-driven TWIST (roll)
+/// axis (`rapier_setup::drive_limb_twist`). Falls back to +Y for a degenerate
+/// (single cell at origin) limb.
+fn limb_long_axis_local(cells: &[Cell]) -> Vec3 {
+    if cells.is_empty() { return Vec3::Y; }
+    let mut mean = Vec3::ZERO;
+    for c in cells { mean += c.local_pos; }
+    mean /= cells.len() as f32;
+    mean.try_normalize().unwrap_or(Vec3::Y)
+}
 
-/// Compute the (parent_anchor, limb_anchor) pair for a limb's
-/// `SphericalJoint`, placing the pivot at the FACE MIDPOINT between
-/// the parent cell adjacent to the attachment and the limb's first
-/// cell. With the limb rebased so its first cell sits at the limb's
-/// local origin, this gives:
-///
-///   * `anchor1` = `(parent_cell_pos + pivot) / 2`
-///       — point on the parent body, on the parent-cell ↔ limb-first-
-///       cell shared rhombic face.
-///   * `anchor2` = `(parent_cell_pos − pivot) / 2`
-///       — same point expressed in the limb's local frame; the limb's
-///       first cell sits at `(0, 0, 0)` and the anchor lies between
-///       the limb origin and the (offset) direction of the parent
-///       cell.
-///
-/// The two anchors coincide in world space so the cells sit on
-/// opposite sides of the joint — like a shoulder joint at the body
-/// surface rather than a rotation around the limb's own centroid.
-///
-/// "Parent cell adjacent to the attachment" is the parent cell
-/// closest to `pivot`; by construction of the species-editor's
-/// candidate-driven placement, that's exactly one RD lattice step
-/// away. Falls back to `Vec3::ZERO` when the parent body has no
-/// cells (defensive — should never happen for a valid attachment).
+
+/// Compute the (anchor1, anchor2, hinge_axis) for a limb joint. The
+/// limb is rebased so its first cell sits at its local origin, so the
+/// rotation point IS that first cell: anchor2 = ZERO (limb-local),
+/// anchor1 = pivot − parent_origin (same world point in parent frame).
+/// Pinning at the first cell means the limb can only rotate, never
+/// translate away. Defensive ZERO fallback when a body has no cells.
 fn limb_joint_anchors(
     parent_origin: Vec3,   // parent body-part entity origin, in the root frame
     limb_cells:    &[Cell],
     pivot:         Vec3,   // first-cell position in the root frame (= attach.origin_local)
 ) -> (Vec3, Vec3, Vec3) {
-    // The limb rotates/swings about the centre of its FIRST placed cell, which
-    // (cells are rebased so the first cell sits at local origin) is exactly the
-    // limb entity's origin. So:
-    //   anchor2 (limb-local)   = ZERO            — the rotation point IS the first cell
-    //   anchor1 (parent-local) = pivot − parent_origin — that same point in the parent's frame
-    // Both resolve to one world point, so the limb is pinned at its first cell
-    // and can only ROTATE about it — it can never translate away from the
-    // parent, no matter the force. (Body parts are a flat hierarchy under the
-    // root, so a part's entity origin equals its own `attachment.origin_local`,
-    // hence `parent_origin` is the parent part's attachment origin.)
+    // Body parts are a flat hierarchy under the root, so `parent_origin`
+    // is the parent part's own `attachment.origin_local`.
     let anchor1 = pivot - parent_origin;
     let anchor2 = Vec3::ZERO;
 
-    // Hinge axis: ⟂ the limb's out-direction and world-up, so the primary swing
-    // is in a vertical plane (lift/push for locomotion). `out_dir` = the limb's
-    // rest long axis (centroid of its rebased cells points along the limb).
+    // Hinge axis ⟂ limb out-direction and world-up, so the primary swing
+    // is in a vertical plane (lift/push for locomotion). `out_dir` = the
+    // limb's rest long axis (centroid of its rebased cells).
     let centroid = if limb_cells.is_empty() {
         Vec3::ZERO
     } else {
@@ -142,19 +106,269 @@ fn limb_joint_anchors(
 }
 
 
+/// Insert the SLIDING physics representation onto the organism root: a
+/// kinematic body + one compound collider over every alive cell (offset by its
+/// part's attachment origin to match world positions). `apply_movement` writes
+/// the root `Transform`; Rapier's kinematic sync follows it.
+fn insert_sliding_collider(commands: &mut Commands, root: Entity, parts: &[BodyPart]) {
+    use bevy_rapier3d::prelude::*;
+    let mut shapes: Vec<(Vec3, Quat, Collider)> = Vec::new();
+    for bp in parts {
+        if !bp.is_alive() { continue; }
+        let part_offset = bp.attachment.as_ref().map_or(Vec3::ZERO, |a| a.origin_local);
+        for cell in &bp.cells {
+            shapes.push((
+                part_offset + cell.local_pos,
+                Quat::IDENTITY,
+                Collider::ball(crate::cell::CELL_COLLISION_RADIUS),
+            ));
+        }
+    }
+    if !shapes.is_empty() {
+        commands.entity(root).insert((
+            RigidBody::KinematicPositionBased,
+            Collider::compound(shapes),
+            // DIAG/fix: ensure a dynamic limb herbivore that touches this
+            // (kinematic) prey generates a collision event the predation system
+            // can act on. ActiveCollisionTypes::all() enables KINEMATIC-DYNAMIC
+            // event generation regardless of which body carries the flag.
+            ActiveEvents::COLLISION_EVENTS,
+            ActiveCollisionTypes::all(),
+        ));
+    }
+}
+
+/// Insert the LIMB physics representation: per-body-part `RigidBody::Dynamic`
+/// connected to their attachment parent by a reduced-coordinate `MultibodyJoint`
+/// (revolute hinge + position motor). The multibody formulation makes joint
+/// separation impossible by construction (the reason for the Rapier migration).
+/// Asymmetric friction (grippy feet, slippery belly) makes leg strokes propel
+/// the body; the per-organism contact-filter hook rejects self-collisions.
+fn insert_limb_physics(
+    commands:    &mut Commands,
+    root:        Entity,
+    bp_entities: &[Entity],
+    parts:       &[BodyPart],
+    is_swimmer:  bool,
+) {
+    use bevy_rapier3d::prelude::*;
+    use crate::simulation_settings::{SWIM_LINEAR_DAMPING, SWIM_ANGULAR_DAMPING};
+    // Swimmer roots carry the ball-joint target buffer the swimming brain
+    // writes (`drive_swim_motors` reads it each step).
+    if is_swimmer {
+        commands.entity(root).insert(crate::rapier_setup::SwimJointTargets::default());
+    }
+    for (idx, bp) in parts.iter().enumerate() {
+        if !bp.is_alive() { continue; }
+        let Some(collider) = limb_part_collider(&bp.cells) else { continue; };
+        let ang_damping = if idx == 0 { BASE_ANGULAR_DAMPING } else { LIMB_ANGULAR_DAMPING };
+        let (fric_coeff, fric_rule) = if idx == 0 {
+            (crate::simulation_settings::BASE_FRICTION_COEFFICIENT, CoefficientCombineRule::Min)
+        } else {
+            (crate::simulation_settings::LIMB_FRICTION_COEFFICIENT, CoefficientCombineRule::Max)
+        };
+        // SWIMMER specialisation (gated so walkers stay byte-identical): neutral
+        // buoyancy (GravityScale 0) + small isotropic damping (the explicit
+        // blade-element drag in `rapier_setup::apply_fluid_drag` dominates).
+        let (gravity_scale, damping) = if is_swimmer {
+            (
+                GravityScale(0.0),
+                Damping { linear_damping: SWIM_LINEAR_DAMPING, angular_damping: SWIM_ANGULAR_DAMPING },
+            )
+        } else {
+            (
+                // Per-body gravity scale — the STANDING curriculum ramps this from a
+                // low value to 1.0 (`rapier_setup::fade_standing_gravity_assist`).
+                GravityScale(1.0),
+                // Base: heavy angular damping to absorb joint-reaction torques;
+                // limbs: lighter for dynamic swings.
+                Damping { linear_damping: LIMB_LINEAR_DAMPING, angular_damping: ang_damping },
+            )
+        };
+        // Walkers use a near-massless density so weak motors beat ground friction;
+        // swimmers need realistic (neutral-buoyancy) mass or the quadratic fluid
+        // drag divides by ~nothing and the integrator explodes to NaN.
+        let density = if is_swimmer {
+            crate::simulation_settings::SWIM_BODY_DENSITY
+        } else {
+            BODY_PART_DENSITY
+        };
+        commands.entity(bp_entities[idx]).insert((
+            RigidBody::Dynamic,
+            collider.clone(),
+            ColliderMassProperties::Density(density),
+            Friction { coefficient: fric_coeff, combine_rule: fric_rule },
+            // Generate collision events (→ predation) + activate the
+            // same-organism contact-filter hook.
+            ActiveEvents::COLLISION_EVENTS,
+            ActiveCollisionTypes::all(), // incl. KINEMATIC-DYNAMIC so limb↔phototroph (kinematic) contacts register
+            ActiveHooks::FILTER_CONTACT_PAIRS,
+            crate::rapier_setup::LimbContact::default(),
+            damping,
+            // Readable/writable velocity + persistent twist torque accumulator.
+            Velocity::zero(),
+            ExternalForce::default(),
+            // Never sleep: motor torque writes must always integrate.
+            Sleeping::disabled(),
+            gravity_scale,
+            crate::rapier_setup::LastAppliedTorque::default(),
+        ));
+        // Swimmer parts (incl. the base) carry the marker + their anisotropic
+        // drag footprint so the swimmer-only systems apply blade-element drag,
+        // water-plane confinement, and neutral-buoyancy curriculum exclusion.
+        if is_swimmer {
+            commands.entity(bp_entities[idx]).insert((
+                crate::rapier_setup::SwimmerBody,
+                crate::rapier_setup::drag_shape_from_cells(&bp.cells),
+            ));
+        }
+        // STANDING fall-reset: remember this part's pristine spawn-local pose (the
+        // intended standing configuration) so `reset_fallen_standers` can teleport
+        // a collapsed organism back to a fresh standing attempt. Computed exactly
+        // as the spawn child Transform (attachment origin/rotation, else identity).
+        let rest = match bp.attachment.as_ref() {
+            Some(a) => Transform { translation: a.origin_local, rotation: a.rotation, ..Default::default() },
+            None    => Transform::from_translation(Vec3::ZERO),
+        };
+        commands.entity(bp_entities[idx]).insert(crate::rapier_setup::LimbRestPose(rest));
+        if idx > 0 {
+            if let Some(parent_e) = bp.attachment.as_ref().map(|a| a.parent_idx)
+                .filter(|&p| p < bp_entities.len()).map(|p| bp_entities[p])
+            {
+                commands.entity(bp_entities[idx]).insert(crate::rapier_setup::LimbTwistDrive {
+                    organism:   root,
+                    body_part:  idx,
+                    axis_local: limb_long_axis_local(&bp.cells),
+                    parent:     parent_e,
+                });
+            }
+        }
+    }
+    // One joint per appendage, inserted as a component on the CHILD limb entity
+    // (referencing the parent body): a revolute hinge for walkers/standers, a
+    // BALL (spherical) joint for swimmers — both pivoting at the limb's first
+    // placed cell (`anchor2 = ZERO` on the rebased limb), so the joint stays at
+    // its original position relative to the parent body part.
+    for (idx, bp) in parts.iter().enumerate() {
+        if !bp.is_alive() { continue; }
+        let Some(attach) = bp.attachment.as_ref() else { continue; };
+        let pidx = attach.parent_idx;
+        if pidx >= parts.len() || !parts[pidx].is_alive() {
+            warn!("limb joint skipped: parent_idx {pidx} out of range or consumed");
+            continue;
+        }
+        let parent_e = bp_entities[pidx];
+        let child_e  = bp_entities[idx];
+        let parent_origin = parts[pidx].attachment.as_ref().map_or(Vec3::ZERO, |a| a.origin_local);
+        let (anchor1, anchor2, hinge_axis) =
+            limb_joint_anchors(parent_origin, &parts[idx].cells, attach.origin_local);
+        let drive = crate::rapier_setup::LimbJointDrive {
+            organism:    root,
+            body_part:   idx,
+            limb_entity: child_e,
+            parent:      parent_e,
+            anchor1,
+            anchor2,
+            axis:        hinge_axis,
+        };
+        // Deferred: the real MultibodyJoint is attached by
+        // `rapier_setup::attach_pending_limb_joints` once BOTH bodies are
+        // registered in Rapier — adding it the same frame the bodies spawn
+        // panics the solver (unknown parent body handle).
+        commands.entity(child_e).insert((
+            crate::rapier_setup::PendingLimbJoint(drive),
+            drive,
+        ));
+    }
+}
+
+
+/// Keep the (sparse, FPS-capped, non-respawning) prey field PERCEIVABLE: relocate
+/// any phototroph farther than `MAINTAIN_RANGE` from every limb herbivore to near a
+/// random herbivore. Without this, herbivores disperse into permanently prey-empty
+/// space (prey don't respawn — only heteros auto-spawn — and the cull only trims to
+/// cap), so the steering assist loses its target (`prey_found` froze in the data).
+/// Relocation (not respawn) keeps the prey COUNT fixed → FPS-neutral. XZ only (Y kept
+/// → no floor re-clamp needed on the flat training world). Throttled per tick.
+/// Locomotion-only (skipped during the standing task).
+pub fn maintain_prey_near_herbivores(
+    sim_running: Res<crate::simulation_settings::SimulationRunning>,
+    heightmap:   Option<Res<HeightmapSampler>>,
+    bases:       Query<(&bevy::prelude::ChildOf, &crate::cell::BodyPartIndex, &GlobalTransform)>,
+    orgs:        Query<&Organism>,
+    heteros:     Query<(), With<Heterotroph>>,
+    mut photos:  Query<(&mut Transform, &Organism), (With<Photoautotroph>, With<OrganismRoot>)>,
+) {
+    if crate::simulation_settings::STANDING_TASK || !sim_running.0 { return; }
+    let Some(heightmap) = heightmap else { return };
+    const MAINTAIN_RANGE: f32 = 220.0; // XZ dist from all herbivores beyond which a prey is relocated
+    const MOVE_PER_TICK:  usize = 6;   // throttle relocations to avoid transform spikes
+    const PREY_Y_OFFSET:  f32 = 0.5;   // sit just on the terrain
+    use rand::Rng;
+
+    // Limb-herbivore base (body-part 0) world positions = where prey must stay near.
+    let mut hp: Vec<Vec2> = Vec::new();
+    for (co, idx, gt) in &bases {
+        if idx.0 != 0 { continue; }
+        let root = co.parent();
+        if !heteros.contains(root) { continue; }
+        if orgs.get(root).map(|o| o.movement_mode.is_sliding()).unwrap_or(true) { continue; }
+        let t = gt.translation();
+        hp.push(Vec2::new(t.x, t.z));
+    }
+    if hp.is_empty() { return; }
+
+    let mut rng = rand::rng();
+    let r2 = MAINTAIN_RANGE * MAINTAIN_RANGE;
+    let mut moved = 0;
+    for (mut tf, org) in &mut photos {
+        // Relocate prey that drifted (or loaded) far from every herbivore to near a
+        // random one, throttled. Prey don't respawn + the loaded field is sparse, so
+        // without this herbivores disperse into permanently prey-empty space.
+        let pxz = Vec2::new(tf.translation.x, tf.translation.z);
+        let mut best = f32::MAX;
+        for h in &hp { best = best.min(pxz.distance_squared(*h)); }
+        if best > r2 && moved < MOVE_PER_TICK {
+            let h = hp[rng.random_range(0..hp.len())];
+            let ang = rng.random_range(0.0..std::f32::consts::TAU);
+            // Spread prey out (within the 250u sensing range but NOT piled on the
+            // herbivore): a dense local prey cluster created a huge herbivore↔prey
+            // contact count that craters FPS when seekers converge.
+            let r = rng.random_range(120.0..210.0);
+            tf.translation.x = h.x + r * ang.cos();
+            tf.translation.z = h.y + r * ang.sin();
+            moved += 1;
+        }
+        // CLAMP GROUND-BASED prey to the terrain surface. The loaded phototrophs sit
+        // ABOVE the (superflat) terrain and gravity-fall (apply_movement) to y<-500,
+        // where the kill-floor despawns them — the whole prey field vanished in ~30 s.
+        // Pinning their Y to the heightmap keeps them a stable, reachable food source.
+        // WATER-BASED prey (floating algae) are EXCLUDED: water-gated gravity already
+        // holds them at their depth (neither sinking nor surfacing), and clamping them
+        // to the terrain is exactly the bug that made them sink to the bottom.
+        if org.ground_based {
+            let surf = heightmap.height_at(tf.translation.x, tf.translation.z);
+            tf.translation.y = surf + PREY_Y_OFFSET;
+        }
+    }
+}
+
+
 pub struct ColonyPlugin;
 
 impl Plugin for ColonyPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SaveRequested>();
-        // `init_resource` is idempotent — it only inserts when no
-        // resource of this type already exists. main.rs sets the load
-        // path BEFORE add_plugins runs, so this is just the no-load
-        // fallback for callers that wire ColonyPlugin without setting
-        // a path. Using `insert_resource` here would unconditionally
-        // overwrite main.rs's value.
+        // `init_resource` (not `insert_resource`) preserves the load path
+        // main.rs sets before add_plugins; this is the no-load fallback.
         app.init_resource::<ColonyLoadPath>();
         app.init_resource::<crate::simulation_settings::AutoSpawnHeteros>();
+        // Default false; phase 5 inserts the real value from argv. `init_resource`
+        // (not insert) preserves any argv-set value that ran before the plugin.
+        app.init_resource::<crate::simulation_settings::AdjustColonyDimensions>();
+        // WaterLevel may be inserted from argv before this plugin; init (not
+        // insert) keeps that value while guaranteeing presence for `spawn_colony`.
+        app.init_resource::<crate::environment::WaterLevel>();
         app.init_resource::<crate::simulation_settings::StartHeterotrophs>();
         app.init_resource::<crate::simulation_settings::StartPhotoautotrophs>();
         app.init_resource::<crate::simulation_settings::MinHeteroCount>();
@@ -162,41 +376,46 @@ impl Plugin for ColonyPlugin {
         app.init_resource::<AutosaveTimer>();
         app.init_resource::<crate::dataset_export::ExportDatasetRequested>();
         app.init_resource::<crate::dataset_export::AutoExportSchedule>();
-        // Rotate prior-run dataset artefacts ONCE at process start,
-        // before any auto-export fires (the earliest milestone is
-        // 5 virtual minutes, so the Startup schedule has all the
-        // time it needs).
+        // Rotate prior-run dataset artefacts once at process start,
+        // before any auto-export fires.
         app.add_systems(Startup, |_w: &mut World| {
             crate::dataset_export::rotate_existing_datasets();
         });
         app.init_resource::<crate::time_series_log::TimeSeriesLogger>();
         app.init_resource::<crate::limb_time_series_log::LimbTimeSeriesLogger>();
+        app.init_resource::<crate::limb_force_probe::LimbForceProbe>();
         app.add_systems(Update, spawn_colony.run_if(resource_exists::<HeightmapSampler>));
+        // Swimmer spawn-Y safety net: PreUpdate, so a frame-N spawn is
+        // re-seated out of the floor cuboid BEFORE its first physics step.
+        app.add_systems(PreUpdate, reseat_new_swimmers);
+        app.add_systems(Update, cull_excess_limb_organisms_for_standing);
+        // PostUpdate so the prey Y-clamp is the LAST write each frame (apply_movement
+        // gravity-falls sliding prey in Update; clamping after pins them to terrain).
+        app.add_systems(PostUpdate, maintain_prey_near_herbivores);
         app.add_systems(Update, animate_limbs);
         app.add_systems(Update, save_colony_system);
         app.add_systems(Update, autosave_system);
         app.add_systems(Update, auto_spawn_heteros);
+        // Always-present prey floor: top plankton up to MIN_PLANKTON_COUNT,
+        // throttled to ~1 Hz (count-and-spawn isn't needed per frame).
+        app.add_systems(Update, auto_spawn_plankton
+            .run_if(bevy::time::common_conditions::on_timer(std::time::Duration::from_secs(1))));
         app.add_systems(Update, crate::dataset_export::tick_auto_export_schedule);
         app.add_systems(Update, crate::dataset_export::export_dataset_system);
         app.add_systems(Update, crate::time_series_log::tick_time_series_logger);
         app.add_systems(Update, crate::limb_time_series_log::tick_limb_time_series_logger);
-        // Default lineage record attachment. Fires once per organism
-        // — on the tick AFTER spawn (Added<OrganismRoot> filter).
-        // Offspring of reproduction already get a LineageRecord
-        // explicitly inserted by `reproduction.rs` (with `parent_id`
-        // populated), so the `Without<LineageRecord>` filter skips
-        // them here.
+        app.add_systems(Update, crate::limb_force_probe::tick_limb_force_probe);
+        // Default lineage record, one per organism on the tick after spawn.
+        // Reproduction offspring already carry one (with `parent_id`), so
+        // the `Without<LineageRecord>` filter skips them.
         app.add_systems(Update, assign_lineage_records);
     }
 }
 
 
-/// Default attach: every OrganismRoot that doesn't already have a
-/// `LineageRecord` gets one minted as `new_initial` (parent_id =
-/// None, spawn_time = current virtual time). Covers initial cohort,
-/// auto-spawn, editor placement, and loaded organisms. Reproduction
-/// offspring already carry a `new_offspring` record by the time
-/// this runs.
+/// Mint a `new_initial` LineageRecord for any OrganismRoot lacking one
+/// (initial cohort, auto-spawn, editor, loaded). Reproduction offspring
+/// already carry a `new_offspring` record.
 fn assign_lineage_records(
     mut commands:  Commands,
     virtual_time:  Res<Time<Virtual>>,
@@ -209,25 +428,19 @@ fn assign_lineage_records(
 }
 
 
-/// Optional path to a `.colony` file. When `Some(path)`, the very first
-/// `spawn_colony` invocation reads that file and spawns the saved
-/// organisms instead of generating a fresh colony. When `None`, the
-/// fresh-colony path runs as before. Set by `main.rs` from the second
-/// positional CLI argument; defaults to `None` (`Option::default()`)
-/// when no caller provides a value.
+/// Optional `.colony` file path. When `Some`, the first `spawn_colony`
+/// loads it instead of generating a fresh colony. Set by `main.rs` from
+/// the second positional CLI argument; defaults to `None`.
 #[derive(Resource, Default)]
 pub struct ColonyLoadPath(pub Option<String>);
 
 
 
 
-/// Materialise a loaded organism record. Mirrors `spawn_organism`'s entity
-/// hierarchy construction (root + body-part children, branches parented
-/// to their attachment-target body part) but uses the saved Transform
-/// and the fully-populated Organism component AS-IS — no fresh randomised
-/// movement direction, no rebuilt cell-count caches, no `recompute_body_parts`
-/// call (the saved cells already carry their neighbour counts and the
-/// photo cache was reconstructed during decoding).
+/// Materialise a loaded organism record. Mirrors `spawn_organism`'s
+/// hierarchy build but uses the saved Transform and Organism AS-IS — no
+/// fresh movement direction, no `recompute_body_parts` (saved cells
+/// already carry neighbour counts; photo cache rebuilt during decode).
 fn spawn_loaded_organism(
     record:    LoadedRecord,
     smoothing: bool,
@@ -238,18 +451,15 @@ fn spawn_loaded_organism(
 ) -> Entity {
     let LoadedRecord { pos, rotation, kind, organism, brain, brain_limb } = record;
     if organism.body_parts.is_empty() {
-        // Defensive — skip organisms with no body parts (should never
-        // happen on a valid save).
+        // Defensive — should never happen on a valid save.
         return commands.spawn_empty().id();
     }
 
     let body_parts_snapshot = organism.body_parts.clone();
-    // Capture intelligence level + adult flag + movement paradigm
-    // before `organism` is moved into the spawn bundle. The Avian
-    // physics block below needs `sliding_movement`.
+    // Capture before `organism` is moved into the spawn bundle.
     let intelligence_level = organism.intelligence_level;
     let adult              = organism.adult;
-    let sliding_movement   = organism.sliding_movement;
+    let movement_mode      = organism.movement_mode;
     let direction_interval = 1.0 + rng.random::<f32>() * 9.0;
 
     let mut root_cmd = commands.spawn((
@@ -271,19 +481,15 @@ fn spawn_loaded_organism(
         | IntelligenceLevel::Level2
         | IntelligenceLevel::Level3 => {}
     }
-    // Attach the saved brain weights (if any) so the matching pool's
-    // `assign_brains_*` writes them into the slot it picks. Skipped
-    // for Level 0 (no pool) and for v001/v002 saves (no brain bytes).
+    // Attach saved brain weights so the matching pool's `assign_brains_*`
+    // restores them. Skipped for Level 0 (no pool).
     if let Some(b) = brain {
         if !matches!(intelligence_level, IntelligenceLevel::Level0) {
             root_cmd.insert(b);
         }
     }
-    // v007 limb-brain payload: attached as a component so the matching
-    // limb pool's `assign_brains_*_limb` writes the weights into the
-    // freshly-allocated row. Routing is implicit — each pool's assign
-    // filter (`intelligence_level + !sliding_movement`) picks exactly
-    // one consumer.
+    // Limb-brain payload: each limb pool's assign filter
+    // (`intelligence_level + !movement_mode.is_sliding()`) picks exactly one consumer.
     if let Some(b) = brain_limb {
         root_cmd.insert(b);
     }
@@ -291,10 +497,7 @@ fn spawn_loaded_organism(
 
     let mut bp_entities: Vec<Entity> = Vec::with_capacity(body_parts_snapshot.len());
     for (idx, bp) in body_parts_snapshot.iter().enumerate() {
-        // Adult-at-load → use the smoothed mesh, but only when
-        // `smoothing` is on; otherwise the faceted build that
-        // `continuous_growth` will eventually re-smooth (or leave
-        // faceted, depending on the flag at that future tick).
+        // Adult + smoothing on → smoothed mesh, else faceted.
         let mesh_handle = if bp.regrowable && !bp.ocg.is_empty() {
             let mesh = if adult && smoothing {
                 build_smoothed_mesh_from_ocg(&bp.ocg)
@@ -327,60 +530,29 @@ fn spawn_loaded_organism(
                 Mesh3d(mh),
                 MeshMaterial3d(mat),
                 OrganismMesh,
-                // Per-organism meshes don't cast shadows: the shadow
-                // pass would otherwise re-extract every body-part
-                // entity per cascade per frame, dominating render cost.
-                // Terrain still casts shadows; organism shadows are
-                // negligible at our cell scale.
+                // No shadow cast: the shadow pass would re-extract every
+                // body-part entity per cascade per frame, dominating render
+                // cost; organism shadows are negligible at cell scale.
                 bevy::light::NotShadowCaster,
             ));
         }
         let child = child_cmd.id();
 
-        // Flat hierarchy — see the matching block in `spawn_organism`
-        // for the rationale (phantom-organism fix on body-part despawn
-        // cascade).
+        // Flat hierarchy — see `spawn_organism` for the phantom-organism
+        // despawn-cascade rationale.
         let _ = &bp.attachment;
         commands.entity(root).add_child(child);
 
         bp_entities.push(child);
     }
 
-    // ── Avian3d physics + LimbAnimation (same code path as
-    //   `spawn_organism`). Without this, loaded limb-based organisms
-    //   would have body-part entities but no rigid bodies, no joints,
-    //   no contact flags, no animation — the brain runs but the PD
-    //   torque step has nothing to torque, so the organism freezes
-    //   at its saved pose and looks "limbless / unmoving" compared
-    //   to its fresh-spawned counterpart. Sliding organisms also
-    //   need their kinematic compound collider so other physics
-    //   bodies can collide with them.
-    if sliding_movement {
-        // Single compound on the root.
-        let mut shapes: Vec<(avian3d::prelude::Position, avian3d::prelude::Rotation, avian3d::prelude::Collider)> = Vec::new();
-        for bp in &body_parts_snapshot {
-            if !bp.is_alive() { continue; }
-            let part_offset = bp.attachment.as_ref()
-                .map_or(Vec3::ZERO, |a| a.origin_local);
-            for cell in &bp.cells {
-                let pos = part_offset + cell.local_pos;
-                shapes.push((
-                    avian3d::prelude::Position(pos),
-                    avian3d::prelude::Rotation::default(),
-                    avian3d::prelude::Collider::sphere(
-                        crate::cell::CELL_COLLISION_RADIUS,
-                    ),
-                ));
-            }
-        }
-        if !shapes.is_empty() {
-            commands.entity(root).insert((
-                avian3d::prelude::RigidBody::Kinematic,
-                avian3d::prelude::Collider::compound(shapes),
-            ));
-        }
-        // LimbAnimation on procedural-style limb body parts (kind =
-        // Limb). Mirrors the in-loop insertion in spawn_organism.
+    // Avian3d physics + LimbAnimation (same path as `spawn_organism`).
+    // Loaded organisms need this or they have no rigid bodies / joints
+    // and freeze at their saved pose; sliding organisms need the
+    // kinematic compound collider so other bodies can collide with them.
+    if movement_mode.is_sliding() {
+        insert_sliding_collider(commands, root, &body_parts_snapshot);
+        // LimbAnimation on Limb body parts; mirrors spawn_organism.
         for (idx, bp) in body_parts_snapshot.iter().enumerate() {
             if !bp.is_alive() { continue; }
             if !matches!(bp.kind, crate::cell::BodyPartKind::Limb) { continue; }
@@ -409,164 +581,7 @@ fn spawn_loaded_organism(
             commands.entity(bp_entities[idx]).insert(la);
         }
     } else {
-        // Limb-based: per-part Dynamic + joints + contact flags.
-        for (idx, bp) in body_parts_snapshot.iter().enumerate() {
-            if !bp.is_alive() { continue; }
-            // Single convex-hull collider per body part (see
-            // `limb_part_collider`) instead of a compound of one sphere
-            // per cell — far cheaper for Avian's narrow phase.
-            if let Some(collider) = limb_part_collider(&bp.cells) {
-                let ang_damping = if idx == 0 { BASE_ANGULAR_DAMPING } else { LIMB_ANGULAR_DAMPING };
-                // Friction for LIMB-PROPELLED crawling: the LIMB feet GRIP
-                // (high μ, Max combine) so a leg stroke pushes off the ground
-                // (the limbs do the propulsion — the guiderail), while the BASE
-                // belly is LOW-friction (Min combine) so the gripping-foot push
-                // slides the body forward instead of pinning it. The per-part
-                // floor (`enforce_limb_floor`) keeps every part at/above the
-                // surface so this stays non-penetrating and natural-looking.
-                let (fric_coeff, fric_rule) = if idx == 0 {
-                    (crate::simulation_settings::BASE_FRICTION_COEFFICIENT,
-                     avian3d::prelude::CoefficientCombine::Min)
-                } else {
-                    (crate::simulation_settings::LIMB_FRICTION_COEFFICIENT,
-                     avian3d::prelude::CoefficientCombine::Max)
-                };
-                commands.entity(bp_entities[idx]).insert((
-                    avian3d::prelude::RigidBody::Dynamic,
-                    collider.clone(),
-                    // Avian's auto-mass-compute pipeline silently fails
-                    // to populate `ComputedMass` / `ComputedAngularInertia`
-                    // for these compound colliders. Defaults of those
-                    // types store INVERSE values that init to zero
-                    // (representing infinite mass/inertia), so every
-                    // `Forces::apply_force` / `apply_torque` call
-                    // computes `acceleration = inverse_mass * force = 0`
-                    // and the body never moves. Explicitly deriving the
-                    // mass properties from the compound's shape ×
-                    // `BODY_PART_DENSITY` bypasses the broken auto-
-                    // compute path. Diagnosed May 2026 via the
-                    // constant-torque experiment in `avian_setup`.
-                    avian3d::prelude::MassPropertiesBundle::from_shape(&collider, BODY_PART_DENSITY),
-                    // Per-part friction (see `fric_coeff`/`fric_rule` above):
-                    // grippy feet (Max combine, μ→1.0) anchor the leg stroke;
-                    // slippery belly (Min combine, μ→0.05) slides instead of
-                    // pinning the body — together they propel an emergent crawl.
-                    avian3d::prelude::Friction::new(fric_coeff)
-                        .with_combine_rule(fric_rule),
-                    avian3d::prelude::CollisionEventsEnabled,
-                    crate::avian_setup::LimbContact::default(),
-                    // Base body gets heavy damping to absorb joint-
-                    // reaction torques; limbs get lighter damping so
-                    // the PD controller can produce dynamic swings.
-                    avian3d::prelude::AngularDamping(ang_damping),
-                    avian3d::prelude::LinearDamping(LIMB_LINEAR_DAMPING),
-                    // Avian's default sleep plugin freezes low-velocity
-                    // bodies, and the brain's `Forces::apply_torque`
-                    // writes don't wake them — every limb organism
-                    // settled, slept, and never moved again. Marker
-                    // keeps these bodies permanently integrated so the
-                    // PD controller's torques actually take effect.
-                    avian3d::prelude::SleepingDisabled,
-                    // Telemetry: the PD controller writes the last
-                    // commanded torque here every frame; the dataset
-                    // exporter reads it to log torque_norm per organism.
-                    crate::avian_setup::LastAppliedTorque::default(),
-                    // Filter out self-collision: a creature's own body parts
-                    // must not collide with each other. The joint chain holds
-                    // them together; self-contacts fight that (contact pushes
-                    // apart, joint pulls together) and the solver pumps that
-                    // conflict into explosive linear+angular velocity on the
-                    // light bodies. `SelfCollisionFilter` rejects same-organism
-                    // pairs; this marker activates the filter hook for them.
-                    avian3d::prelude::ActiveCollisionHooks::FILTER_PAIRS,
-                    // Velocity governor: pursuit locomotion is steady (~2.5 u/s)
-                    // and the gait is gentle, both well under these caps — so
-                    // the caps only clip the rare joint-instability spike,
-                    // bounding limb separation and preventing any fly-off,
-                    // without throttling normal motion.
-                    avian3d::prelude::MaxLinearSpeed(crate::simulation_settings::MAX_LIMB_LINEAR_SPEED),
-                    avian3d::prelude::MaxAngularSpeed(crate::simulation_settings::MAX_LIMB_ANGULAR_SPEED),
-                ));
-            }
-        }
-        // Spherical joints — one per appendage. The pivot is placed on
-        // the FACE between the parent cell adjacent to the attachment
-        // and the limb's first cell (see `limb_joint_anchors`), so the
-        // limb rotates like an anatomical shoulder joint rather than
-        // around its own centroid. Compliance is set to a tiny non-
-        // zero value (`LIMB_JOINT_COMPLIANCE`) — strictly-rigid joints
-        // (compliance = 0) are numerically fragile under the high PD
-        // torques the brain commands, and a microscopic give lets the
-        // solver converge cleanly.
-        for (idx, bp) in body_parts_snapshot.iter().enumerate() {
-            if !bp.is_alive() { continue; }
-            let Some(attach) = bp.attachment.as_ref() else { continue; };
-            // Defensive: a stale / out-of-range `parent_idx` (possible
-            // after sim-time predation soft-deletes + branch growth, or
-            // a hand-edited save) would otherwise panic on the indexing
-            // below. Skip the joint instead — the limb stays a free
-            // dynamic body rather than crashing the spawn.
-            let pidx = attach.parent_idx;
-            if pidx >= body_parts_snapshot.len() || !body_parts_snapshot[pidx].is_alive() {
-                warn!("limb joint skipped: parent_idx {pidx} out of range or consumed");
-                continue;
-            }
-            let parent_e = bp_entities[pidx];
-            let child_e  = bp_entities[idx];
-            let parent_origin = body_parts_snapshot[pidx].attachment.as_ref()
-                .map_or(Vec3::ZERO, |a| a.origin_local);
-            let (anchor1, anchor2, hinge_axis) =
-                limb_joint_anchors(parent_origin, &body_parts_snapshot[idx].cells, attach.origin_local);
-            commands.spawn((
-                // 1-DOF hinge: the limb swings in a single (vertical) plane and
-                // physically CANNOT orbit the body — the two non-hinge axes are
-                // held by a robust bilateral align constraint, unlike a ball
-                // joint's fragile, singular swing/twist limits that the limb
-                // kept spinning through. `align_compliance` leaves a small give
-                // so the limb can twist a little at the attachment (like a real
-                // shoulder/hip). Hinge axis ⟂ limb (vertical swing plane); see
-                // `limb_joint_anchors`.
-                avian3d::prelude::RevoluteJoint::new(parent_e, child_e)
-                    .with_local_anchor1(anchor1)
-                    .with_local_anchor2(anchor2)
-                    .with_hinge_axis(hinge_axis)
-                    .with_point_compliance(crate::avian_setup::LIMB_JOINT_COMPLIANCE)
-                    .with_align_compliance(crate::simulation_settings::LIMB_HINGE_ALIGN_COMPLIANCE)
-                    .with_angle_limits(
-                        -crate::simulation_settings::LIMB_SWING_LIMIT,
-                        crate::simulation_settings::LIMB_SWING_LIMIT,
-                    )
-                    // Built-in spring-damper angular motor (solved in-step,
-                    // 1-DOF on the hinge axis). The brain sets its
-                    // `target_position` each tick via `drive_limb_motors`;
-                    // this is what replaced the unstable external PD torque.
-                    .with_motor(
-                        avian3d::prelude::AngularMotor::new(
-                            avian3d::prelude::MotorModel::SpringDamper {
-                                frequency:     crate::simulation_settings::LIMB_MOTOR_FREQUENCY,
-                                damping_ratio: crate::simulation_settings::LIMB_MOTOR_DAMPING_RATIO,
-                            },
-                        )
-                        .with_max_torque(crate::simulation_settings::MAX_LIMB_TORQUE),
-                    ),
-                // Disable collision between this limb and its direct
-                // attachment parent: they overlap at the joint and would
-                // otherwise generate persistent contacts every substep —
-                // wasted narrow-phase work AND a solver fight (the joint
-                // pulls them together while the contact pushes them
-                // apart). Collision with NON-adjacent body parts of the
-                // same organism is unaffected, so intra-body interactions
-                // are preserved.
-                avian3d::prelude::JointCollisionDisabled,
-                // Link the joint back to its organism + limb so the motor
-                // driver can set this hinge's target angle each tick.
-                crate::avian_setup::LimbJointDrive {
-                    organism:    root,
-                    body_part:   idx,
-                    limb_entity: child_e,
-                },
-            ));
-        }
+        insert_limb_physics(commands, root, &bp_entities, &body_parts_snapshot, movement_mode.is_swimming());
     }
 
     root
@@ -574,10 +589,6 @@ fn spawn_loaded_organism(
 
 
 
-
-// Organism + markers + OrganismKind moved to `organism.rs`. They're
-// re-exported above via `pub use crate::organism::*;` so existing imports
-// continue to find them through `crate::colony::*`.
 
 // ── Spawning ─────────────────────────────────────────────────────────────────
 
@@ -589,9 +600,13 @@ fn spawn_colony(
     load_path:       Res<ColonyLoadPath>,
     smoothing:       Res<crate::simulation_settings::Smoothing>,
     map_size:        Res<MapSize>,
-    // NOTE: the launcher start-count / cap resources no longer drive
-    // the fresh cohort (it spawns fixed `.species` counts), but
-    // `--max-herbivores` still sizes the GPU brain pools in `main.rs`.
+    // Loaded .colony files carry a water level; apply it unless the user
+    // asked to keep launcher dimensions (--adjust-colony-dimensions).
+    mut water_level:        ResMut<crate::environment::WaterLevel>,
+    adjust_dimensions:      Res<crate::simulation_settings::AdjustColonyDimensions>,
+    // Launcher start-count / cap resources no longer drive the fresh
+    // cohort (fixed `.species` counts); `--max-herbivores` still sizes
+    // the GPU brain pools in `main.rs`.
     mut virtual_time:    ResMut<Time<Virtual>>,
     mut spawned:     Local<bool>,
 ) {
@@ -599,10 +614,8 @@ fn spawn_colony(
     *spawned = true;
 
     let materials = OrganismMaterials::new(&mut materials);
-    // Mirror the OrganismMaterials into a Resource so runtime spawners
-    // (`auto_spawn_heteros`) can reuse the same handles without
-    // rebuilding the StandardMaterials. Clone is cheap — each field is
-    // a Handle<StandardMaterial>.
+    // Mirror into a Resource so runtime spawners (`auto_spawn_heteros`)
+    // reuse the same handles. Clone is cheap (each field is a Handle).
     commands.insert_resource(OrganismMaterials {
         photo:      materials.photo.clone(),
         hetero:     materials.hetero.clone(),
@@ -610,24 +623,32 @@ fn spawn_colony(
     });
     let mut rng = rand::rng();
 
-    // If a colony save file was supplied on the command line, try to
-    // restore it. On any failure (missing file, malformed bytes, version
-    // mismatch) we log the reason and fall through to fresh generation
-    // so the run still produces something visible.
+    // If a save file was supplied, try to restore it; on any failure
+    // fall through to fresh generation so the run still produces output.
     if let Some(path) = &load_path.0 {
         match load_colony_from_file(path) {
-            Ok((notation, records)) => {
+            Ok((notation, loaded_water_level, records)) => {
                 let n = records.len();
-                for record in records {
+                // Apply the file's water level unless the user requested the
+                // launcher dimensions be kept (--adjust-colony-dimensions).
+                if !adjust_dimensions.0 {
+                    water_level.0 = loaded_water_level;
+                    info!("colony water level set to {} from save file", loaded_water_level);
+                }
+                for mut record in records {
+                    // Swimmers were authored/saved at terrain level (editor placement
+                    // bakes `terrain + 0.5`); re-seat them submerged relative to the
+                    // now-applied water level so they don't spawn above the surface.
+                    if record.organism.movement_mode.is_swimming() {
+                        let terrain = heightmap.height_at(record.pos.x, record.pos.z);
+                        record.pos.y = submerged_spawn_y(terrain, limb_floor_top(&heightmap), water_level.0);
+                    }
                     spawn_loaded_organism(record, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
                 }
-                // Resume the virtual clock at the saved point. Two
-                // `advance_by` calls: the first bumps `elapsed` to the
-                // target; the second (ZERO) resets THIS frame's `delta`
-                // back to 0, so no delta-integrating system (physics
-                // accumulator, movement) sees the jump as a single
-                // giant timestep. Bevy's normal per-frame update resumes
-                // from the new elapsed next frame.
+                // Resume the virtual clock at the saved point. First
+                // `advance_by` bumps `elapsed`; the second (ZERO) resets
+                // this frame's `delta` to 0 so no delta-integrating system
+                // sees the jump as one giant timestep.
                 let total = notation.total_secs();
                 if total > 0 {
                     virtual_time.advance_by(std::time::Duration::from_secs(total as u64));
@@ -643,31 +664,43 @@ fn spawn_colony(
         }
     }
 
-    // Fresh-start cohort: seed the world from authored `.species`
-    // files instead of procedurally-generated starter organisms. Each
-    // file is loaded once and spawned `count` times at random
-    // positions. Counts and paths are fixed (see the `SPAWN_*`
-    // constants); the launcher's start-count fields no longer drive
-    // the fresh cohort, though `--max-herbivores` still sizes the GPU
-    // brain pools in `main.rs`.
-    spawn_species_cohort(SPAWN_ALGAE_PATH,   SPAWN_ALGAE_COUNT,   &heightmap, &map_size, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
-    spawn_species_cohort(SPAWN_CRAWLER_PATH, SPAWN_CRAWLER_COUNT, &heightmap, &map_size, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
-    spawn_species_cohort(SPAWN_STRIDER_PATH, SPAWN_STRIDER_COUNT, &heightmap, &map_size, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
+    // Fresh-start cohort: seed from authored `.species` files at fixed
+    // counts (`SPAWN_*` constants).
+    spawn_species_cohort(SPAWN_ALGAE_PATH,   SPAWN_ALGAE_COUNT,   &heightmap, &map_size, water_level.0, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
+    spawn_species_cohort(SPAWN_SWIMMER_PATH, SPAWN_SWIMMER_COUNT, &heightmap, &map_size, water_level.0, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
+    spawn_species_cohort(SPAWN_STRIDER_PATH, SPAWN_STRIDER_COUNT, &heightmap, &map_size, water_level.0, smoothing.0, &mut commands, &mut meshes, &materials, &mut rng);
 }
 
 
-/// Build a STATIC appendage `BodyPart` from a full OCG (cells render at
-/// their authored positions; no per-frame rotation). Mirrors
-/// `colony_editor::placement::appendage_body_part`.
-fn appendage_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>) -> BodyPart {
-    let cells = ocg.iter().map(|(_, p, ct)| Cell::new(*p, *ct)).collect();
+/// Build an appendage `BodyPart` from a full OCG. `parent_idx` is the RUNTIME
+/// index of the part this one attaches to (0 = base; another appendage/limb
+/// index makes it a sub-part of that part).
+///
+/// REBASED to the first cell exactly like `limb_body_part_from_ocg`: the entity
+/// sits at the first-cell pivot and the cells are shifted relative to it, so
+/// the joint pivots at the CONTACT POINT and the body's centre of mass sits
+/// near its origin. Appendages used to keep `origin_local = ZERO` with cells at
+/// their authored positions (a holdover from when they were static decoration);
+/// once every part became a dynamic, spherical-jointed body, that pinned each
+/// appendage at the ROOT ORIGIN with its COM up to ~9 units away — a huge lever
+/// arm that turned fluid-drag/motor forces into violent spin (measured angular
+/// velocity ~9.6 rad/s, past the 8.0 clamp), whipping the parts around. That is
+/// the "freshly-spawned sub-limbed swimmer flung into the air" bug; rebasing
+/// (the limb treatment) collapses the lever to part-scale and fixes it. Mirrors
+/// `colony_editor::placement::appendage_body_part`. Rendering is unchanged (the
+/// mesh is built from the shifted OCG and the entity sits at the pivot).
+fn appendage_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize) -> BodyPart {
+    let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
+    let shifted: Vec<(usize, Vec3, CellType)> =
+        ocg.iter().map(|(i, p, ct)| (*i, *p - pivot, *ct)).collect();
+    let cells = shifted.iter().map(|(_, p, ct)| Cell::new(*p, *ct)).collect();
     BodyPart {
         kind:         BodyPartKind::Organ,
         local_offset: Vec3::ZERO,
         cells,
-        ocg,
+        ocg:          shifted,
         attachment:   Some(crate::body_part::Attachment {
-            parent_idx: 0, origin_local: Vec3::ZERO, rotation: Quat::IDENTITY,
+            parent_idx, origin_local: pivot, rotation: Quat::IDENTITY,
         }),
         consumed:   false,
         debug_blue: false,
@@ -675,11 +708,48 @@ fn appendage_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>) -> BodyPart {
     }
 }
 
-/// Build a LIMB `BodyPart` from a full OCG: cells are rebased so the
-/// first cell sits at the limb's local origin and the attachment pivot
-/// is that first cell, so the limb rotates around its base. Mirrors
-/// `colony_editor::placement::limb_body_part`.
-fn limb_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>) -> BodyPart {
+/// Build a limb `BodyPart` from a full OCG: cells rebased so the first
+/// cell sits at local origin and is the attachment pivot, so the limb
+/// rotates around its base. Mirrors `colony_editor::placement::limb_body_part`.
+/// One-shot (when `STANDING_TASK`): after the colony loads, despawn limb-based
+/// organisms beyond `STANDING_MAX_LIMB_ORGS` so the heavy multi-part Runners
+/// don't crater the frame rate. Runs once, the first frame limb organisms exist.
+pub fn cull_excess_limb_organisms_for_standing(
+    mut commands: Commands,
+    mut done:     Local<bool>,
+    q:            Query<(Entity, &Organism), With<OrganismRoot>>,
+) {
+    if *done { return; }
+    let limb: Vec<Entity> = q.iter()
+        .filter(|(_, o)| !o.movement_mode.is_sliding())
+        .map(|(e, _)| e)
+        .collect();
+    if limb.is_empty() { return; } // organisms not loaded/spawned yet
+    *done = true;
+    // Each limb organism is many dynamic bodies + joints (CPU physics), so the full
+    // loaded cohort craters the frame rate. A handful of independent PPO learners is
+    // plenty. Tighter cap for the heavy multi-part Runners under the standing task.
+    let keep = if crate::simulation_settings::STANDING_TASK {
+        crate::simulation_settings::STANDING_MAX_LIMB_ORGS
+    } else {
+        crate::simulation_settings::LOCOMOTION_MAX_LIMB_ORGS
+    };
+    let mut culled = 0;
+    for &e in limb.iter().skip(keep) {
+        commands.entity(e).despawn();
+        culled += 1;
+    }
+    info!("limb cull: kept {} limb organisms, despawned {} (FPS budget)",
+          keep.min(limb.len()), culled);
+}
+
+/// Build a limb `BodyPart` from a full OCG: cells rebased so the first cell
+/// sits at local origin and is the attachment pivot (the joint rotation
+/// point). `parent_idx` is the RUNTIME index of the part this limb attaches
+/// to — 0 = base, another limb's index makes this a SUB-LIMB jointed to that
+/// limb (NOT to the base; a sub-limb anchored to the base separates from its
+/// parent limb the moment the limb swings).
+fn limb_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize) -> BodyPart {
     let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
     let shifted: Vec<(usize, Vec3, CellType)> =
         ocg.iter().map(|(i, p, ct)| (*i, *p - pivot, *ct)).collect();
@@ -690,7 +760,7 @@ fn limb_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>) -> BodyPart {
         cells,
         ocg:          shifted,
         attachment:   Some(crate::body_part::Attachment {
-            parent_idx: 0, origin_local: pivot, rotation: Quat::IDENTITY,
+            parent_idx, origin_local: pivot, rotation: Quat::IDENTITY,
         }),
         consumed:   false,
         debug_blue: false,
@@ -698,26 +768,190 @@ fn limb_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>) -> BodyPart {
     }
 }
 
-/// Load a `.species` file and spawn `count` instances at random
-/// positions across the world. Used by `spawn_colony`'s fresh-start
-/// path. Body-part assembly (root + appendages, bilateral mirroring,
-/// limb-pivot rebasing) mirrors
-/// `colony_editor::placement::spawn_real_organism`, so a species spawns
-/// identically whether placed in the editor or seeded here. Each spawn
-/// gets an `ImportedSpeciesOrigin` (filename stem) so it founds its own
-/// lineage in the speciation registry. Errors (missing/bad file) are
-/// logged and the cohort is skipped.
+/// Load a `.species` file and spawn `count` instances at random positions.
+/// Body-part assembly mirrors `colony_editor::placement::spawn_real_organism`
+/// so a species spawns identically in editor or here. Each spawn gets an
+/// `ImportedSpeciesOrigin` (filename stem) so it founds its own lineage.
+/// Errors are logged and the cohort skipped.
 #[allow(clippy::too_many_arguments)]
+/// Top Y of the limb-physics floor collider — a single flat `Fixed` cuboid whose
+/// top face sits at the map-CENTRE terrain height (see `rapier_setup::spawn_terrain_floor`,
+/// which assumes a flat world). Swimmers must spawn ABOVE this, not just above the
+/// local heightmap height, or they spawn inside the cuboid and Rapier ejects them.
+pub fn limb_floor_top(heightmap: &HeightmapSampler) -> f32 {
+    use crate::world_geometry::HEIGHTMAP_CELL_SIZE;
+    let cx = heightmap.width as f32 * HEIGHTMAP_CELL_SIZE * 0.5;
+    let cz = heightmap.depth as f32 * HEIGHTMAP_CELL_SIZE * 0.5;
+    heightmap.height_at(cx, cz)
+}
+
+/// Spawn-time Y for a SWIMMING organism: submerged in the water column —
+/// `SWIM_SPAWN_CLEARANCE` below the surface and above the floor — so no body part
+/// breaches the water plane (which would fire the ceiling restoring force) NOR
+/// penetrates the floor cuboid (which would make Rapier eject the near-massless
+/// body upward). The floor reference is `max(local_terrain, floor_top)`: the actual
+/// physics floor is the flat cuboid at `floor_top`, but never go below the visible
+/// local terrain either. Centred in the column when deep enough; if the column is
+/// too shallow (water at/below the floor), falls back to just above the floor — the
+/// now-bounded confinement force settles it rather than launching it.
+pub fn submerged_spawn_y(local_terrain: f32, floor_top: f32, water_level: f32) -> f32 {
+    let floor = local_terrain.max(floor_top);
+    let min_y = floor + SWIM_SPAWN_CLEARANCE;
+    let max_y = water_level - SWIM_SPAWN_CLEARANCE;
+    if max_y > min_y { 0.5 * (min_y + max_y) } else { min_y }
+}
+
+/// SAFETY NET for every swimmer spawn path: re-seat a newly added SWIMMING
+/// organism whose root Y is outside the safe water column
+/// `[max(local_terrain, floor_top) + clearance, water − clearance]`.
+///
+/// The limb-physics floor is ONE FLAT cuboid whose top is the map-CENTRE
+/// terrain height (`rapier_setup::spawn_terrain_floor`) — on a non-flat map,
+/// any spawner using the walker convention (`local terrain + ~1`) places a
+/// swimmer INSIDE that cuboid wherever the local terrain is below the centre
+/// height, and Rapier's depenetration ejects the body violently upward (the
+/// "flung away on spawn" bug). The cohort / load / reproduction paths call
+/// `submerged_spawn_y` directly; this system catches the rest (editor/live
+/// placement, undo-restore, future spawners) — and runs in `PreUpdate`, so a
+/// frame-N spawn is re-seated BEFORE its first physics step in frame N+1's
+/// FixedUpdate (the parts' `GlobalTransform`s follow the root via the
+/// SyncBackend propagation, exactly like the initial spawn placement).
+pub fn reseat_new_swimmers(
+    heightmap: Option<Res<HeightmapSampler>>,
+    water:     Option<Res<crate::environment::WaterLevel>>,
+    mut roots: Query<(&Organism, &mut Transform), (Added<Organism>, With<OrganismRoot>)>,
+) {
+    let (Some(hm), Some(water)) = (heightmap, water) else { return };
+    let floor_top = limb_floor_top(&hm);
+    for (org, mut tf) in &mut roots {
+        if !org.movement_mode.is_swimming() { continue; }
+        let terrain = hm.height_at(tf.translation.x, tf.translation.z);
+        let min_y = terrain.max(floor_top) + SWIM_SPAWN_CLEARANCE;
+        let max_y = water.0 - SWIM_SPAWN_CLEARANCE;
+        let y = tf.translation.y;
+        // Inside the column (or exactly at the shallow-column fallback) → leave
+        // the spawner's placement alone.
+        let ok = if max_y > min_y {
+            (min_y..=max_y).contains(&y)
+        } else {
+            (y - min_y).abs() < 0.01
+        };
+        if !ok {
+            let safe = submerged_spawn_y(terrain, floor_top, water.0);
+            info!(
+                "re-seated swimmer spawn y {:.1} → {:.1} (floor_top {:.1}, terrain {:.1}, water {:.1})",
+                y, safe, floor_top, terrain, water.0
+            );
+            tf.translation.y = safe;
+        }
+    }
+}
+
+/// Spawn ONE organism from an already-loaded `.species` at a random in-bounds
+/// position. Owns the per-instance body-part assembly (the Bilateral right/left
+/// + NoSymmetry parent mapping), the water-based/swimming-submerged vs
+/// on-the-floor spawn height, and the Carnivore / `ImportedSpeciesOrigin` /
+/// brain tagging. Shared by the startup `spawn_species_cohort` and the runtime
+/// `auto_spawn_plankton`. Returns the spawned `OrganismRoot`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_species_instance(
+    species:     &crate::species_editor::save::LoadedSpecies,
+    name:        &str,
+    heightmap:   &HeightmapSampler,
+    map_size:    &MapSize,
+    water_level: f32,
+    smoothing:   bool,
+    commands:    &mut Commands,
+    meshes:      &mut ResMut<Assets<Mesh>>,
+    materials:   &OrganismMaterials,
+    rng:         &mut impl rand::Rng,
+) -> Option<Entity> {
+    if species.body_parts.is_empty() { return None; }
+    let kind = match species.metabolism {
+        crate::species_editor::session::Metabolism::Photoautotroph => OrganismKind::Photoautotroph,
+        crate::species_editor::session::Metabolism::Heterotroph    => OrganismKind::Heterotroph,
+    };
+    let is_carnivore = matches!(
+        species.classification,
+        crate::species_editor::session::Classification::Carnivore
+    );
+    let margin = crate::world_geometry::WORLD_SAFETY_MARGIN;
+
+    // Rebuilt per spawn (spawn_organism consumes it): root from part 0, later
+    // parts as appendages (Bilateral → mirrored pair). Each part's RUNTIME
+    // `parent_idx` is mapped from the species file's editor parent index,
+    // mirroring `placement::spawn_real_organism`: NoSymmetry is 1:1; Bilateral
+    // expands every appendage into a right+left pair tracked separately, so a
+    // SUB-LIMB's right half attaches to its parent limb's right half.
+    let mut body_parts = vec![root_body_part_from_ocg(&species.body_parts[0].ocg)];
+    let make = |o: Vec<(usize, Vec3, CellType)>, is_limb: bool, parent_idx: usize| -> BodyPart {
+        if is_limb { limb_body_part_from_ocg(o, parent_idx) } else { appendage_body_part_from_ocg(o, parent_idx) }
+    };
+    match species.symmetry {
+        Symmetry::Bilateral => {
+            let mut right_of: Vec<usize> = vec![0];
+            let mut left_of:  Vec<usize> = vec![0];
+            for lbp in &species.body_parts[1..] {
+                let p_right = right_of.get(lbp.parent).copied().unwrap_or(0);
+                let p_left  = left_of.get(lbp.parent).copied().unwrap_or(0);
+                let r_idx = body_parts.len();
+                body_parts.push(make(lbp.ocg.clone(), lbp.is_limb, p_right));
+                let l_idx = body_parts.len();
+                body_parts.push(make(crate::body_part::mirror_right_to_left(&lbp.ocg), lbp.is_limb, p_left));
+                right_of.push(r_idx);
+                left_of.push(l_idx);
+            }
+        }
+        Symmetry::NoSymmetry => {
+            for (i, lbp) in species.body_parts[1..].iter().enumerate() {
+                let parent = if lbp.parent <= i { lbp.parent } else { 0 };
+                body_parts.push(make(lbp.ocg.clone(), lbp.is_limb, parent));
+            }
+        }
+    }
+    let cell_count = body_parts.iter().map(|bp| bp.cells.len()).sum::<usize>() as f32;
+    let initial_energy = cell_count * crate::energy::MAX_ENERGY_PER_CELL * 0.5;
+
+    let x = rng.random_range(margin..(map_size.x - margin));
+    let z = rng.random_range(margin..(map_size.z - margin));
+    let terrain = heightmap.height_at(x, z);
+    // WATER-BASED organisms (swimmers + floating phototrophs like plankton)
+    // start submerged in the water column; everyone else on the floor.
+    let y = if species.movement.is_swimming() || !species.ground_based {
+        submerged_spawn_y(terrain, limb_floor_top(heightmap), water_level)
+    } else {
+        terrain + 1.0
+    };
+
+    let entity = spawn_organism(
+        Vec3::new(x, y, z), body_parts, kind, species.symmetry,
+        species.has_variable_form, species.is_sessile, species.intelligence,
+        smoothing, initial_energy, species.movement, species.ground_based,
+        commands, meshes, materials, rng,
+    );
+    if is_carnivore {
+        commands.entity(entity).try_insert(Carnivore);
+    }
+    commands.entity(entity).try_insert(
+        crate::lineages::species::ImportedSpeciesOrigin { name: name.to_string() },
+    );
+    if let Some(b) = &species.brain {
+        commands.entity(entity).try_insert(b.clone());
+    }
+    Some(entity)
+}
+
 fn spawn_species_cohort(
-    path:      &str,
-    count:     usize,
-    heightmap: &HeightmapSampler,
-    map_size:  &MapSize,
-    smoothing: bool,
-    commands:  &mut Commands,
-    meshes:    &mut ResMut<Assets<Mesh>>,
-    materials: &OrganismMaterials,
-    rng:       &mut impl rand::Rng,
+    path:        &str,
+    count:       usize,
+    heightmap:   &HeightmapSampler,
+    map_size:    &MapSize,
+    water_level: f32,
+    smoothing:   bool,
+    commands:    &mut Commands,
+    meshes:      &mut ResMut<Assets<Mesh>>,
+    materials:   &OrganismMaterials,
+    rng:         &mut impl rand::Rng,
 ) {
     let species = match crate::species_editor::save::load_species(std::path::Path::new(path)) {
         Ok(s)  => s,
@@ -729,74 +963,75 @@ fn spawn_species_cohort(
     }
     let name = std::path::Path::new(path).file_stem()
         .and_then(|s| s.to_str()).unwrap_or("species").to_string();
-    let kind = match species.metabolism {
-        crate::species_editor::session::Metabolism::Photoautotroph => OrganismKind::Photoautotroph,
-        crate::species_editor::session::Metabolism::Heterotroph    => OrganismKind::Heterotroph,
-    };
-    let is_carnivore = matches!(
-        species.classification,
-        crate::species_editor::session::Classification::Carnivore
-    );
-    let sliding = species.movement.is_sliding();
-    let margin  = crate::world_geometry::WORLD_SAFETY_MARGIN;
 
     for _ in 0..count {
-        // Body-part list rebuilt per spawn (spawn_organism consumes it):
-        // root from part 0; each later part is an appendage (bilateral
-        // → mirrored pair, NoSymmetry → single).
-        let mut body_parts = vec![root_body_part_from_ocg(&species.body_parts[0].ocg)];
-        for lbp in &species.body_parts[1..] {
-            let make = |o: Vec<(usize, Vec3, CellType)>| -> BodyPart {
-                if lbp.is_limb { limb_body_part_from_ocg(o) } else { appendage_body_part_from_ocg(o) }
-            };
-            match species.symmetry {
-                Symmetry::Bilateral => {
-                    body_parts.push(make(lbp.ocg.clone()));
-                    body_parts.push(make(crate::body_part::mirror_right_to_left(&lbp.ocg)));
-                }
-                Symmetry::NoSymmetry => body_parts.push(make(lbp.ocg.clone())),
-            }
-        }
-        let cell_count = body_parts.iter().map(|bp| bp.cells.len()).sum::<usize>() as f32;
-        let initial_energy = cell_count * crate::energy::MAX_ENERGY_PER_CELL * 0.5;
-
-        let x = rng.random_range(margin..(map_size.x - margin));
-        let z = rng.random_range(margin..(map_size.z - margin));
-        let y = heightmap.height_at(x, z) + 1.0;
-
-        let entity = spawn_organism(
-            Vec3::new(x, y, z),
-            body_parts,
-            kind,
-            species.symmetry,
-            species.has_variable_form,
-            species.is_sessile,
-            species.intelligence,
-            smoothing,
-            initial_energy,
-            sliding,
-            commands,
-            meshes,
-            materials,
-            rng,
+        spawn_species_instance(
+            &species, &name, heightmap, map_size, water_level, smoothing,
+            commands, meshes, materials, rng,
         );
-        if is_carnivore {
-            commands.entity(entity).try_insert(Carnivore);
-        }
-        commands.entity(entity).try_insert(
-            crate::lineages::species::ImportedSpeciesOrigin { name: name.clone() },
-        );
-        if let Some(b) = &species.brain {
-            commands.entity(entity).try_insert(b.clone());
-        }
     }
     info!("spawn_colony: spawned {count} × {name} from {path}");
 }
 
 
-/// Build the canonical root body part from a flat OCG. Cells mirror the OCG
-/// positions; the part is `regrowable` (mutation can extend it) and not in
-/// debug-blue mode.
+/// Maintain a minimum of `MIN_PLANKTON_COUNT` `ball_plankton`: whenever the
+/// live count drops below the floor, spawn the deficit from the species file.
+/// A reliable prey field (e.g. food for swimming heterotrophs).
+///
+/// Counts living organisms tagged `ImportedSpeciesOrigin { name: "ball_plankton" }`
+/// (the auto-spawned ones); reproduced descendants are unTagged and count as
+/// bonus prey. The species file is loaded once (cached in a `Local`). Throttled
+/// to ~1 Hz so the count-and-spawn isn't per-frame; always on (not gated by
+/// AI-training mode). The `MaxPhotoautotrophs` cap-cull
+/// (`apply_max_phototrophs_cull`) explicitly EXCLUDES the tagged `ball_plankton`
+/// floor from the random cull, so the cap and this floor no longer compete —
+/// that competition was the cause of constant plankton spawn/despawn/respawn
+/// churn (cull randomly kills a plankton → drops below floor → respawn → over
+/// cap → cull again). With a sane cap (≥ the floor) the total still trims to the
+/// cap by culling only non-floor phototrophs; if the cap is set below the floor
+/// the floor wins. Reproduced (untagged) plankton descendants remain cullable
+/// like any other phototroph.
+pub fn auto_spawn_plankton(
+    heightmap:  Option<Res<HeightmapSampler>>,
+    map_size:   Option<Res<MapSize>>,
+    water:      Option<Res<crate::environment::WaterLevel>>,
+    smoothing:  Option<Res<crate::simulation_settings::Smoothing>>,
+    org_mats:   Option<Res<OrganismMaterials>>,
+    existing:   Query<&crate::lineages::species::ImportedSpeciesOrigin, With<Photoautotroph>>,
+    mut species_cache: Local<Option<crate::species_editor::save::LoadedSpecies>>,
+    mut commands: Commands,
+    mut meshes:   ResMut<Assets<Mesh>>,
+) {
+    use crate::simulation_settings::{MIN_PLANKTON_COUNT, PLANKTON_SPECIES_PATH};
+    let (Some(heightmap), Some(map_size), Some(water), Some(smoothing), Some(org_mats)) =
+        (heightmap, map_size, water, smoothing, org_mats) else { return };
+
+    let current = existing.iter().filter(|o| o.name == "ball_plankton").count();
+    if current >= MIN_PLANKTON_COUNT { return; }
+
+    // Lazy-load + cache the species (one disk read for the run).
+    if species_cache.is_none() {
+        match crate::species_editor::save::load_species(std::path::Path::new(PLANKTON_SPECIES_PATH)) {
+            Ok(s)  => *species_cache = Some(s),
+            Err(e) => { error!("auto_spawn_plankton: failed to load {PLANKTON_SPECIES_PATH}: {e}"); return; }
+        }
+    }
+    let species = species_cache.as_ref().unwrap();
+
+    let mut rng = rand::rng();
+    let to_spawn = MIN_PLANKTON_COUNT - current;
+    for _ in 0..to_spawn {
+        spawn_species_instance(
+            species, "ball_plankton", &heightmap, &map_size, water.0, smoothing.0,
+            &mut commands, &mut meshes, &org_mats, &mut rng,
+        );
+    }
+    info!("auto_spawn_plankton: topped up plankton {current} → {MIN_PLANKTON_COUNT}");
+}
+
+
+/// Build the canonical root body part from a flat OCG; `regrowable` so
+/// mutation can extend it.
 pub fn root_body_part_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> BodyPart {
     let cells = ocg.iter()
         .map(|(_, pos, ct)| Cell::new(*pos, *ct))
@@ -814,12 +1049,10 @@ pub fn root_body_part_from_ocg(ocg: &[(usize, Vec3, CellType)]) -> BodyPart {
 }
 
 
-/// Set of shared StandardMaterial handles passed to `spawn_organism`. Sharing
-/// one handle per (kind × debug-flag) pair keeps GPU bind-group churn minimal.
-///
-/// Stored as a `Resource` so runtime spawners (`auto_spawn_heteros`,
-/// editor-mode placement) can reuse the same handles without rebuilding
-/// the `StandardMaterial`s. `spawn_colony` populates it on first run.
+/// Shared StandardMaterial handles for `spawn_organism`. Sharing one
+/// handle per (kind × debug-flag) pair keeps GPU bind-group churn minimal.
+/// Stored as a `Resource` so runtime spawners reuse the same handles;
+/// `spawn_colony` populates it on first run.
 #[derive(Resource)]
 pub struct OrganismMaterials {
     pub photo:       Handle<StandardMaterial>,
@@ -829,11 +1062,8 @@ pub struct OrganismMaterials {
 
 impl OrganismMaterials {
     pub fn new(materials: &mut Assets<StandardMaterial>) -> Self {
-        // The trophic material is now WHITE so the mesh's per-vertex
-        // colours (assigned per cell by `build_mesh_from_ocg`) come
-        // through unmultiplied — every cell shows its own colour
-        // regardless of the body part's overall trophic kind. The
-        // `photo` and `hetero` handles share one underlying material.
+        // White so per-vertex cell colours (from `build_mesh_from_ocg`)
+        // come through unmultiplied. `photo` and `hetero` share it.
         let body = materials.add(StandardMaterial {
             base_color: Color::WHITE,
             ..default()
@@ -841,11 +1071,8 @@ impl OrganismMaterials {
         Self {
             photo:      body.clone(),
             hetero:     body,
-            // `debug_blue` is kept as a full-part override for
-            // procedural reproduction appendages (which seed from a
-            // non-Placeholder cell and would otherwise look identical
-            // to the base body). Set on the BodyPart's `debug_blue`
-            // flag at creation time.
+            // Full-part override for procedural reproduction appendages,
+            // selected via the BodyPart's `debug_blue` flag.
             debug_blue: materials.add(StandardMaterial {
                 base_color: Color::srgb(0.2, 0.4, 0.95),
                 ..default()
@@ -853,29 +1080,23 @@ impl OrganismMaterials {
         }
     }
 
-    /// Pick the material handle for one body part, given the trophic kind of
-    /// its owning organism. Per-cell colouring lives on the mesh itself
-    /// (`Mesh::ATTRIBUTE_COLOR`), so this only needs to choose between the
-    /// shared white body material and the debug-blue full-part override.
+    /// Material handle for one body part. Per-cell colour lives on the mesh
+    /// (`Mesh::ATTRIBUTE_COLOR`), so this only chooses between the shared
+    /// white body material and the debug-blue full-part override.
     pub fn handle_for(&self, _kind: OrganismKind, bp: &BodyPart) -> Handle<StandardMaterial> {
         if bp.debug_blue {
             self.debug_blue.clone()
         } else {
-            // Same handle as `self.hetero`; `kind` is unused now that
-            // colour comes from per-vertex data.
             self.photo.clone()
         }
     }
 }
 
 
-/// Per-limb erratic-rotation parameters. Attached at spawn to every
-/// body-part entity whose `BodyPart::kind == BodyPartKind::Limb`. Each
-/// axis (X / Y / Z) oscillates independently with its own random
-/// frequency, phase and amplitude — incommensurate frequencies make the
-/// compound rotation read as chaotic rather than periodic. `mirror`
-/// inverts all three angles so the left half of a bilateral limb pair
-/// swings opposite to its right twin.
+/// Per-limb erratic-rotation parameters (sliding limbs only). Each axis
+/// oscillates independently; incommensurate frequencies read as chaotic
+/// rather than periodic. `mirror` inverts all three angles so a bilateral
+/// limb pair swings in opposition.
 #[derive(Component, Clone, Debug)]
 pub struct LimbAnimation {
     pub freqs:  [f32; 3],
@@ -884,10 +1105,8 @@ pub struct LimbAnimation {
     pub mirror: bool,
 }
 
-/// Apply the per-limb erratic rotation each frame. Runs in `Update`;
-/// `TransformSystems::Propagate` (PostUpdate) picks it up the same
-/// frame. Reads the default `Time` (virtual clock), so animation freezes
-/// in lock-step with the rest of the simulation when paused.
+/// Apply the per-limb erratic rotation each frame. Reads the virtual
+/// clock, so animation freezes in lock-step when the sim is paused.
 pub fn animate_limbs(
     time:  Res<Time>,
     mut q: Query<(&LimbAnimation, &mut Transform)>,
@@ -903,18 +1122,11 @@ pub fn animate_limbs(
 }
 
 
-/// Construct + register an organism from a list of body parts at world
-/// position `pos`. Each body part owns its own OCG; the mesh for each
-/// regrowable part is built by replaying the part's OCG through
-/// `build_mesh_from_ocg`. Used by both initial colony spawn and
-/// reproduction.
-///
-/// Hierarchy produced:
-///   OrganismRoot (transform = pos, has Organism + trophic marker)
-///   ├── body-part-0 child (Mesh3d, parent of any branches that attach to it)
-///   │   └── body-part-1 child (if attached to part 0; rotates around its
-///   │                          attachment.origin_local in part-0's frame)
-///   └── ...
+/// Construct + register an organism from a list of body parts at `pos`.
+/// Each body part owns its own OCG; regrowable-part meshes are built via
+/// `build_mesh_from_ocg`. Used by initial spawn and reproduction.
+/// Hierarchy: OrganismRoot (Organism + trophic marker) with one mesh
+/// child entity per body part (flat — see the parenting note below).
 pub fn spawn_organism(
     pos:                Vec3,
     mut body_parts:     Vec<BodyPart>,
@@ -925,39 +1137,38 @@ pub fn spawn_organism(
     intelligence_level: IntelligenceLevel,
     smoothing:          bool,
     initial_energy:     f32,
-    // Movement paradigm — see `Organism::sliding_movement`. Pass `true`
-    // for legacy / sliding organisms (current behaviour); `false` to
-    // spawn the organism into Avian's physics world for limb-based
-    // locomotion. Defaults to `true` at every current call site.
-    sliding_movement:   bool,
+    // Movement paradigm — see `Organism::movement_mode`. `is_sliding()` =
+    // kinematic root; otherwise limb-based (Avian dynamics).
+    movement_mode:      MovementMode,
+    // Ground- vs water-based — see `Organism::ground_based`. Only phototrophs
+    // may override the movement-mode default (floating algae); heterotrophs
+    // are coerced to `movement_mode.default_ground_based()` below.
+    ground_based:       bool,
     commands:           &mut Commands,
     meshes:             &mut ResMut<Assets<Mesh>>,
     materials:          &OrganismMaterials,
     rng:                &mut impl rand::Rng,
 ) -> Entity {
-    // Enforce the invariant: variable-form organisms are always sessile and
-    // always NoSymmetry. Caller bugs that violate this are silently fixed
-    // up here so downstream systems can trust the fields.
+    // Invariants: variable-form ⇒ NoSymmetry + sessile; sessile ⇒ sliding
+    // (sessile root is Kinematic; a Dynamic body would get pushed around).
     let symmetry  = if has_variable_form { Symmetry::NoSymmetry } else { symmetry };
     let is_sessile = is_sessile || has_variable_form;
-    // Sessile organisms MUST be on the sliding-movement path: their root
-    // is a `RigidBody::Kinematic` (immovable to physics; `apply_movement`
-    // skips it). Spawning a sessile organism into the limb-based Dynamic
-    // body path would let gravity, joint reactions, and collisions push
-    // it around — which presents to the player as a "sliding" sessile
-    // organism, the exact thing the sessile flag is supposed to prevent.
-    let sliding_movement = sliding_movement || is_sessile;
+    let movement_mode = if is_sessile { MovementMode::Sliding } else { movement_mode };
+    // Invariant: only PHOTOTROPHS may opt OUT of the movement-mode default
+    // (a floating, water-based alga is sessile/sliding yet not ground-based);
+    // heterotrophs always derive it (swimmers false, sliders/walkers true),
+    // and nobody can claim ground-based while on a fluid movement mode.
+    let ground_based = match kind {
+        OrganismKind::Photoautotroph => ground_based && movement_mode.default_ground_based(),
+        OrganismKind::Heterotroph    => movement_mode.default_ground_based(),
+    };
     if body_parts.is_empty() {
-        // Defensive — callers should always provide at least the root part.
-        // Returning a bogus entity would silently corrupt downstream queries.
         panic!("spawn_organism called with empty body_parts");
     }
 
-    // Bring per-cell physiology caches in sync with the assembled cell list
-    // before the Organism component is built. This populates each cell's
-    // `neighbour_count` and (for Photo cells) `PhotosyntheticCell::*`. The
-    // photosynthesis tick reads those caches per-frame; if we skipped this
-    // step every cell would produce zero energy.
+    // Sync per-cell physiology caches (neighbour_count, PhotosyntheticCell)
+    // before building the Organism; the photosynthesis tick reads them, so
+    // skipping this would make every cell produce zero energy.
     crate::physiology::recompute_body_parts(&mut body_parts);
 
     let angle     = rng.random::<f32>() * std::f32::consts::TAU;
@@ -967,12 +1178,8 @@ pub fn spawn_organism(
         OrganismKind::Heterotroph    => 15.0 + rng.random::<f32>() * 10.0,
     };
 
-    // Adult at spawn for any organism that won't grow during its own
-    // lifetime. Variable-form organisms grow via `continuous_growth`
-    // and only become adult once they reach `MAX_CELLS`; everything
-    // else is born "fully grown" (its body plan is whatever it was
-    // born with — reproduction grows the OFFSPRING by one cell, not
-    // the parent).
+    // Born adult unless variable-form (those grow via `continuous_growth`
+    // and become adult only at `MAX_CELLS`).
     let adult = !has_variable_form;
 
     let mut organism = Organism {
@@ -981,8 +1188,9 @@ pub fn spawn_organism(
         intelligence_level,
         is_sessile,
         has_variable_form,
-        sliding_movement,
-        limb_targets: [0.0; 8],
+        movement_mode,
+        ground_based,
+        limb_targets: [0.0; 10],
         adult,
         photo_cell_count:     0,
         non_photo_cell_count: 0,
@@ -1001,10 +1209,8 @@ pub fn spawn_organism(
         climb_energy_debt: 0.0,
         // Populated by recompute_cell_counts below.
         cached_bounding_radius: 0.0,
-        // Structural DNA slots — filled here so newly-reproduced /
-        // user-placed organisms enter the speciation system with a
-        // valid vector from frame 1. Brain-gene slots stay 0 until
-        // `sync_dna_from_brain_pool` runs.
+        // Structural DNA slots filled now (valid vector from frame 1);
+        // brain-gene slots stay 0 until `sync_dna_from_brain_pool` runs.
         dna: crate::lineages::dna::structural_dna(
             kind,
             symmetry,
@@ -1012,10 +1218,8 @@ pub fn spawn_organism(
             is_sessile,
             intelligence_level,
         ),
-        // Inherited from parent (when reproducing) in a separate
-        // post-spawn step by `reproduction.rs`; left `None` for
-        // initial-cohort spawns + editor placements so the
-        // classification tick assigns them.
+        // Set post-spawn by `reproduction.rs` when reproducing; `None`
+        // otherwise, so the classification tick assigns it.
         species_id: None,
     };
     organism.recompute_cell_counts();
@@ -1034,11 +1238,8 @@ pub fn spawn_organism(
         OrganismKind::Photoautotroph => { root_cmd.insert(Photoautotroph); }
         OrganismKind::Heterotroph    => { root_cmd.insert(Heterotroph); }
     }
-    // Wire intelligence-pool markers off the stored `intelligence_level`
-    // field. Level 0 → `BrainLevel0` keeps the entity out of the L1/L3
-    // assign queries. Levels 1 and 3 don't need a marker at spawn —
-    // their `assign_*` systems pick the entity up via the trophic
-    // marker (`Photoautotroph` / `Heterotroph`) and assign a slot.
+    // Level0 → `BrainLevel0` keeps the entity out of the L1-L3 assign
+    // queries; L1-L3 are picked up by their `assign_*` via trophic marker.
     match intelligence_level {
         IntelligenceLevel::Level0 => {
             root_cmd.insert(crate::intelligence_level_0::BrainLevel0);
@@ -1049,19 +1250,12 @@ pub fn spawn_organism(
     }
     let root = root_cmd.id();
 
-    // Spawn one mesh child per body part. Branches are parented to their
-    // attachment-target body part's entity so Bevy's transform propagation
-    // gives rotation-around-origin for free. We assume body parts are
-    // ordered such that any branch's parent_idx < its own index, which is
-    // the order callers naturally produce (parts cloned then appended).
+    // One mesh child entity per body part. Assumes any branch's parent_idx
+    // < its own index (the order callers naturally produce).
     let mut bp_entities: Vec<Entity> = Vec::with_capacity(body_parts.len());
     for (idx, bp) in body_parts.iter().enumerate() {
-        // Skip mesh creation for non-regrowable / empty parts (e.g. Krishi).
-        // Adult organisms get the smoothed mesh straight away (when
-        // `smoothing` is on); growing (variable-form) organisms get the
-        // faceted mesh that `continuous_growth` will replace once they
-        // reach MAX_CELLS. With `smoothing` off the faceted mesh is
-        // used unconditionally.
+        // Skip mesh for non-regrowable / empty parts. Adult + smoothing on
+        // → smoothed mesh, else faceted (continuous_growth re-smooths later).
         let mesh_handle = if bp.regrowable && !bp.ocg.is_empty() {
             let mesh = if adult && smoothing {
                 build_smoothed_mesh_from_ocg(&bp.ocg)
@@ -1073,8 +1267,7 @@ pub fn spawn_organism(
             None
         };
 
-        // Branch transform: translate by origin_local in parent's frame,
-        // apply attachment.rotation. Root: identity.
+        // Branch transform: origin_local + attachment.rotation; root identity.
         let transform = match &bp.attachment {
             Some(a) => Transform {
                 translation: a.origin_local,
@@ -1101,17 +1294,10 @@ pub fn spawn_organism(
         }
         let child = child_cmd.id();
 
-        // Limb animation: kind=Limb body parts get the `LimbAnimation`
-        // marker with randomized per-axis oscillator parameters. Mirror
-        // twins (entity origin on the −X side) get the inverted-sign
-        // animation so the pair swings opposite, like a real animal's
-        // limbs. The actual rotation update lives in `animate_limbs`.
-        //
-        // Limb-based organisms drive their joints via the physics
-        // engine (Phase 4 hooks brain PD targets into Avian), so the
-        // kinematic rotation marker is only inserted for sliding
-        // organisms — physics-driven limbs would fight the animation.
-        if sliding_movement
+        // Sliding-only: Limb parts get `LimbAnimation` (mirror twins on
+        // the −X side swing in opposition). Limb-based organisms drive
+        // joints via physics, which would fight this animation.
+        if movement_mode.is_sliding()
             && matches!(bp.kind, crate::cell::BodyPartKind::Limb) {
             use rand::RngExt;
             let mirror = bp.attachment.as_ref()
@@ -1138,215 +1324,25 @@ pub fn spawn_organism(
             commands.entity(child).insert(la);
         }
 
-        // Parent EVERY body-part entity directly under the OrganismRoot
-        // — branches included. Earlier this nested branches under their
-        // parent body-part entity for "rotation-around-pivot via
-        // transform propagation", but body-part transforms are identity
-        // in practice (Quat::IDENTITY rotation, Vec3::ZERO translation
-        // on the root part) so siblings-under-root gives the same
-        // world transform. The flat layout fixes a phantom-organism bug:
-        // when predation despawned body_parts[0]'s entity, Bevy's
-        // recursive try_despawn cascaded to every branch nested under
-        // it, even though `prey_dead == false` because other body
-        // parts were still alive in the Organism data — the root
-        // entity then survived with zero children and the data
-        // continued to claim alive body parts, becoming an invisible
-        // ghost that still photosynthesised and reproduced.
-        let _ = &bp.attachment; // attachment kept on the data side for
-                                // continuous_growth's branch geometry;
-                                // the entity hierarchy is flat.
+        // Flat layout: parent EVERY body-part entity directly under the
+        // root. Body-part transforms are identity in practice, so this
+        // matches nesting; it also avoids a phantom-organism bug where
+        // despawning body_parts[0] cascaded to nested branches (leaving a
+        // ghost root whose data still claimed alive parts).
+        let _ = &bp.attachment; // kept on the data side for continuous_growth
         commands.entity(root).add_child(child);
 
         bp_entities.push(child);
     }
 
-    // ── Avian3d physics components ─────────────────────────────────────
-    //
-    // Sliding organisms (current behaviour for everything):
-    //   * `RigidBody::Kinematic` on the OrganismRoot — its transform is
-    //     written by `apply_movement`; Avian's kinematic sync follows.
-    //   * One compound collider on the root built from every cell
-    //     across every body part, with cell positions offset by the
-    //     body part's attachment origin (so the collider matches the
-    //     world positions the rest of the codebase already uses).
-    //
-    // Limb-based organisms (none until Phase 5's species-editor toggle):
-    //   * Each body part entity gets `RigidBody::Dynamic` + its own
-    //     compound collider built from THAT part's cells.
-    //   * For each appendage (`attachment.is_some()`) we spawn a
-    //     `SphericalJoint` entity connecting the parent body-part
-    //     entity to the appendage entity, anchored at
-    //     `attachment.origin_local` on the parent and `Vec3::ZERO` on
-    //     the child (limb body parts are rebased so their local origin
-    //     sits at the first-cell pivot).
-    if sliding_movement {
-        let mut shapes: Vec<(avian3d::prelude::Position, avian3d::prelude::Rotation, avian3d::prelude::Collider)> = Vec::new();
-        for bp in &body_parts {
-            if !bp.is_alive() { continue; }
-            let part_offset = bp.attachment.as_ref()
-                .map_or(Vec3::ZERO, |a| a.origin_local);
-            for cell in &bp.cells {
-                let pos = part_offset + cell.local_pos;
-                shapes.push((
-                    avian3d::prelude::Position(pos),
-                    avian3d::prelude::Rotation::default(),
-                    avian3d::prelude::Collider::sphere(
-                        crate::cell::CELL_COLLISION_RADIUS,
-                    ),
-                ));
-            }
-        }
-        if !shapes.is_empty() {
-            commands.entity(root).insert((
-                avian3d::prelude::RigidBody::Kinematic,
-                avian3d::prelude::Collider::compound(shapes),
-            ));
-        }
+    // Avian3d physics. Sliding: Kinematic root (transform written by
+    // `apply_movement`) + one compound collider from all cells (offset by
+    // attachment origin to match world positions). Limb-based: per-part
+    // Dynamic body + collider, plus one hinge joint per appendage.
+    if movement_mode.is_sliding() {
+        insert_sliding_collider(commands, root, &body_parts);
     } else {
-        // Limb-based: per-part dynamic bodies.
-        for (idx, bp) in body_parts.iter().enumerate() {
-            if !bp.is_alive() { continue; }
-            // Single convex-hull collider per body part (see
-            // `limb_part_collider`) — matches the spawn_organism path.
-            if let Some(collider) = limb_part_collider(&bp.cells) {
-                let ang_damping = if idx == 0 { BASE_ANGULAR_DAMPING } else { LIMB_ANGULAR_DAMPING };
-                // Friction for LIMB-PROPELLED crawling: the LIMB feet GRIP
-                // (high μ, Max combine) so a leg stroke pushes off the ground
-                // (the limbs do the propulsion — the guiderail), while the BASE
-                // belly is LOW-friction (Min combine) so the gripping-foot push
-                // slides the body forward instead of pinning it. The per-part
-                // floor (`enforce_limb_floor`) keeps every part at/above the
-                // surface so this stays non-penetrating and natural-looking.
-                let (fric_coeff, fric_rule) = if idx == 0 {
-                    (crate::simulation_settings::BASE_FRICTION_COEFFICIENT,
-                     avian3d::prelude::CoefficientCombine::Min)
-                } else {
-                    (crate::simulation_settings::LIMB_FRICTION_COEFFICIENT,
-                     avian3d::prelude::CoefficientCombine::Max)
-                };
-                commands.entity(bp_entities[idx]).insert((
-                    avian3d::prelude::RigidBody::Dynamic,
-                    collider.clone(),
-                    // Density lowered from 1.0 so total organism mass
-                    // stays light enough that ground-contact friction
-                    // can be overcome by the brain's PD torques. See
-                    // `BODY_PART_DENSITY` for rationale.
-                    avian3d::prelude::MassPropertiesBundle::from_shape(&collider, BODY_PART_DENSITY),
-                    // Per-part friction (see `fric_coeff`/`fric_rule` above):
-                    // grippy feet (Max combine, μ→1.0) anchor the leg stroke;
-                    // slippery belly (Min combine, μ→0.05) slides instead of
-                    // pinning the body — together they propel an emergent crawl.
-                    avian3d::prelude::Friction::new(fric_coeff)
-                        .with_combine_rule(fric_rule),
-                    // Per-entity event toggle so Avian's narrow phase
-                    // emits `CollisionStart` / `CollisionEnd` messages
-                    // for this body part — consumed by
-                    // `update_limb_contacts` to populate `LimbContact`.
-                    avian3d::prelude::CollisionEventsEnabled,
-                    crate::avian_setup::LimbContact::default(),
-                    // Base body gets heavy damping to absorb joint-
-                    // reaction torques; limbs get lighter damping so
-                    // the PD controller can produce dynamic swings.
-                    avian3d::prelude::AngularDamping(ang_damping),
-                    avian3d::prelude::LinearDamping(LIMB_LINEAR_DAMPING),
-                    // Avian's default sleep plugin freezes low-velocity
-                    // bodies, and the brain's `Forces::apply_torque`
-                    // writes don't wake them — every limb organism
-                    // settled, slept, and never moved again. Marker
-                    // keeps these bodies permanently integrated so the
-                    // PD controller's torques actually take effect.
-                    avian3d::prelude::SleepingDisabled,
-                    // Telemetry: the PD controller writes the last
-                    // commanded torque here every frame; the dataset
-                    // exporter reads it to log torque_norm per organism.
-                    crate::avian_setup::LastAppliedTorque::default(),
-                    // Filter out self-collision: a creature's own body parts
-                    // must not collide with each other. The joint chain holds
-                    // them together; self-contacts fight that (contact pushes
-                    // apart, joint pulls together) and the solver pumps that
-                    // conflict into explosive linear+angular velocity on the
-                    // light bodies. `SelfCollisionFilter` rejects same-organism
-                    // pairs; this marker activates the filter hook for them.
-                    avian3d::prelude::ActiveCollisionHooks::FILTER_PAIRS,
-                    // Velocity governor: pursuit locomotion is steady (~2.5 u/s)
-                    // and the gait is gentle, both well under these caps — so
-                    // the caps only clip the rare joint-instability spike,
-                    // bounding limb separation and preventing any fly-off,
-                    // without throttling normal motion.
-                    avian3d::prelude::MaxLinearSpeed(crate::simulation_settings::MAX_LIMB_LINEAR_SPEED),
-                    avian3d::prelude::MaxAngularSpeed(crate::simulation_settings::MAX_LIMB_ANGULAR_SPEED),
-                ));
-            }
-        }
-        // Joints — one spherical joint per appendage. Skips the base
-        // body, which has no attachment. See `limb_joint_anchors` for
-        // pivot-placement details (joint sits on the cell-to-cell
-        // face) and `LIMB_JOINT_COMPLIANCE` for the small non-zero
-        // compliance that keeps the XPBD solver well-conditioned.
-        for (idx, bp) in body_parts.iter().enumerate() {
-            if !bp.is_alive() { continue; }
-            let Some(attach) = bp.attachment.as_ref() else { continue; };
-            // Defensive bounds/aliveness guard — see the parallel
-            // `spawn_organism` joint loop. A loaded colony that has been
-            // through sim time (predation, growth, reproduction) can
-            // carry a stale `parent_idx`; without this guard the index
-            // below panics, which is the load-time crash this fixes.
-            let pidx = attach.parent_idx;
-            if pidx >= body_parts.len() || !body_parts[pidx].is_alive() {
-                warn!("limb joint skipped on load: parent_idx {pidx} out of range or consumed");
-                continue;
-            }
-            let parent_e = bp_entities[pidx];
-            let child_e  = bp_entities[idx];
-            let parent_origin = body_parts[pidx].attachment.as_ref()
-                .map_or(Vec3::ZERO, |a| a.origin_local);
-            let (anchor1, anchor2, hinge_axis) =
-                limb_joint_anchors(parent_origin, &body_parts[idx].cells, attach.origin_local);
-            commands.spawn((
-                // 1-DOF hinge: the limb swings in a single (vertical) plane and
-                // physically CANNOT orbit the body — the two non-hinge axes are
-                // held by a robust bilateral align constraint, unlike a ball
-                // joint's fragile, singular swing/twist limits that the limb
-                // kept spinning through. `align_compliance` leaves a small give
-                // so the limb can twist a little at the attachment (like a real
-                // shoulder/hip). Hinge axis ⟂ limb (vertical swing plane); see
-                // `limb_joint_anchors`.
-                avian3d::prelude::RevoluteJoint::new(parent_e, child_e)
-                    .with_local_anchor1(anchor1)
-                    .with_local_anchor2(anchor2)
-                    .with_hinge_axis(hinge_axis)
-                    .with_point_compliance(crate::avian_setup::LIMB_JOINT_COMPLIANCE)
-                    .with_align_compliance(crate::simulation_settings::LIMB_HINGE_ALIGN_COMPLIANCE)
-                    .with_angle_limits(
-                        -crate::simulation_settings::LIMB_SWING_LIMIT,
-                        crate::simulation_settings::LIMB_SWING_LIMIT,
-                    )
-                    // Built-in spring-damper angular motor (solved in-step,
-                    // 1-DOF on the hinge axis). The brain sets its
-                    // `target_position` each tick via `drive_limb_motors`;
-                    // this is what replaced the unstable external PD torque.
-                    .with_motor(
-                        avian3d::prelude::AngularMotor::new(
-                            avian3d::prelude::MotorModel::SpringDamper {
-                                frequency:     crate::simulation_settings::LIMB_MOTOR_FREQUENCY,
-                                damping_ratio: crate::simulation_settings::LIMB_MOTOR_DAMPING_RATIO,
-                            },
-                        )
-                        .with_max_torque(crate::simulation_settings::MAX_LIMB_TORQUE),
-                    ),
-                // See spawn_organism: suppress the persistent self-contact
-                // between a limb and its joint-adjacent parent. Non-adjacent
-                // intra-body collisions are preserved.
-                avian3d::prelude::JointCollisionDisabled,
-                // Link the joint back to its organism + limb so the motor
-                // driver can set this hinge's target angle each tick.
-                crate::avian_setup::LimbJointDrive {
-                    organism:    root,
-                    body_part:   idx,
-                    limb_entity: child_e,
-                },
-            ));
-        }
+        insert_limb_physics(commands, root, &bp_entities, &body_parts, movement_mode.is_swimming());
     }
 
     root
@@ -1355,18 +1351,10 @@ pub fn spawn_organism(
 
 // ── Auto-spawn heterotrophs ─────────────────────────────────────────────────
 //
-// Tops the heterotroph population up to `MinHeteroCount` whenever a
-// heterotroph death event fires AND `AutoSpawnHeteros(true)`.
-//
-// Zero-overhead in the steady state: `RemovedComponents<Heterotroph>`
-// is empty between actual death events, so the early-return after the
-// flag check costs nothing. When the flag is off we drain the reader
-// once to avoid event backlog growth.
-//
-// Newly spawned organisms have no `BrainInheritance` component, so the
-// brain pool's slot-assign path samples fresh random hyperparameter
-// genes (see `intelligence_level_1_hetero::assign_brains_l1_hetero`)
-// rather than inheriting from any parent.
+// Tops heterotrophs up to `MinHeteroCount` on a death event when
+// `AutoSpawnHeteros(true)`. Zero-overhead in steady state (no removed
+// events); drain the reader when the flag is off to avoid backlog. New
+// organisms carry no `BrainInheritance`, so the pool samples fresh genes.
 pub fn auto_spawn_heteros(
     auto:           Res<crate::simulation_settings::AutoSpawnHeteros>,
     min_count:      Res<crate::simulation_settings::MinHeteroCount>,
@@ -1396,9 +1384,8 @@ pub fn auto_spawn_heteros(
 
     let mut rng = rand::rng();
     for _ in 0..to_spawn {
-        // Spawn strictly inside the WORLD_SAFETY_MARGIN inset so the
-        // organism is born inside the same XZ band that
-        // `apply_world_bounds` keeps it within at runtime.
+        // Inside the WORLD_SAFETY_MARGIN inset — the XZ band
+        // `apply_world_bounds` keeps organisms within at runtime.
         let x = rng.random_range(
             crate::world_geometry::WORLD_SAFETY_MARGIN
                 ..(map_size.x - crate::world_geometry::WORLD_SAFETY_MARGIN),
@@ -1433,7 +1420,8 @@ pub fn auto_spawn_heteros(
             intel,
             smoothing.0,
             max_e * 0.5,
-            true,  // sliding_movement — auto-spawned heteros use legacy sliding
+            MovementMode::Sliding,  // auto-spawned heteros use legacy sliding
+            true,                   // sliding ⇒ ground-based
             &mut commands,
             &mut meshes,
             &org_mats,
