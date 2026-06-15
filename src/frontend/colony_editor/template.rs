@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 
-use crate::cell::CellType;
+use crate::cell::{BodyPartKind, CellType};
 use crate::organism::{IntelligenceLevel, MovementMode, Symmetry};
 use crate::body_part::MIN_X_BILATERAL;
 
@@ -134,11 +134,13 @@ pub struct OrganismTemplate {
     /// full OCG (bilateral-expanded if applicable); `build_ocg` returns
     /// it verbatim.
     pub custom_ocg:    Option<Vec<(usize, Vec3, CellType)>>,
-    /// Appendage parts as `(OCG, is_limb, parent)`. OCG is the raw stored
-    /// shape (right-half for bilateral); `is_limb` rebases to a first-cell
-    /// pivot + tags `BodyPartKind::Limb`; `parent` is the EDITOR parent
-    /// index (0 = main body). Empty for single-part templates.
-    pub custom_appendages: Vec<(Vec<(usize, Vec3, CellType)>, bool, usize)>,
+    /// Appendage parts as `(OCG, kind, parent)`. OCG is the raw stored shape
+    /// (right-half for bilateral); `kind` is the `BodyPartKind` (Limb/Segment/
+    /// Static/Organ — all rebase to a first-cell pivot); `parent` is the EDITOR
+    /// parent index (0 = main body). A Bilateral `Limb`/`Organ` expands to a
+    /// mirrored pair; `Segment`/`Static` fuse to one midline part. Empty for
+    /// single-part templates.
+    pub custom_appendages: Vec<(Vec<(usize, Vec3, CellType)>, BodyPartKind, usize)>,
     /// Display name (species filename stem); `None` ⇒ "Hetero/Photo #N".
     pub species_name:  Option<String>,
     /// Carnivore flag. When `true`, spawn attaches a `Carnivore` marker

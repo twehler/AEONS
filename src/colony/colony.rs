@@ -217,9 +217,19 @@ fn insert_limb_physics(
         // drag footprint so the swimmer-only systems apply blade-element drag,
         // water-plane confinement, and neutral-buoyancy curriculum exclusion.
         if is_swimmer {
+            use bevy_rapier3d::prelude::{AdditionalMassProperties, MassProperties};
             commands.entity(bp_entities[idx]).insert((
                 crate::rapier_setup::SwimmerBody,
                 crate::rapier_setup::drag_shape_from_cells(&bp.cells),
+                // Isotropic inertia floor: conditions the Featherstone solve so a
+                // thin (e.g. 2-cell mirrored) link's tiny long-axis inertia can't
+                // make the 3-axis spherical multibody motor integrate to a NaN.
+                AdditionalMassProperties::MassProperties(MassProperties {
+                    local_center_of_mass: Vec3::ZERO,
+                    mass: 0.0,
+                    principal_inertia: Vec3::splat(crate::simulation_settings::SWIM_LINK_INERTIA_FLOOR),
+                    principal_inertia_local_frame: Quat::IDENTITY,
+                }),
             ));
         }
         // STANDING fall-reset: remember this part's pristine spawn-local pose (the
@@ -231,7 +241,8 @@ fn insert_limb_physics(
             None    => Transform::from_translation(Vec3::ZERO),
         };
         commands.entity(bp_entities[idx]).insert(crate::rapier_setup::LimbRestPose(rest));
-        if idx > 0 {
+        // Static parts are rigidly fixed (no motor, no brain twist couple).
+        if idx > 0 && !matches!(bp.kind, BodyPartKind::Static) {
             if let Some(parent_e) = bp.attachment.as_ref().map(|a| a.parent_idx)
                 .filter(|&p| p < bp_entities.len()).map(|p| bp_entities[p])
             {
@@ -262,6 +273,18 @@ fn insert_limb_physics(
         let parent_origin = parts[pidx].attachment.as_ref().map_or(Vec3::ZERO, |a| a.origin_local);
         let (anchor1, anchor2, hinge_axis) =
             limb_joint_anchors(parent_origin, &parts[idx].cells, attach.origin_local);
+        // STATIC: a rigid fixed joint — no motor, no `LimbJointDrive`, so neither
+        // `drive_limb_motors`/`drive_swim_motors` nor the brain can move it. It
+        // rides the body as one rigid unit. Deferred-attached for the same reason
+        // as limb joints (both bodies must be Rapier-registered first).
+        if matches!(bp.kind, BodyPartKind::Static) {
+            commands.entity(child_e).insert(crate::rapier_setup::PendingFixedJoint {
+                parent: parent_e,
+                anchor1,
+                anchor2,
+            });
+            continue;
+        }
         let drive = crate::rapier_setup::LimbJointDrive {
             organism:    root,
             body_part:   idx,
@@ -374,6 +397,7 @@ impl Plugin for ColonyPlugin {
         app.init_resource::<crate::simulation_settings::MinHeteroCount>();
         app.init_resource::<crate::simulation_settings::MinHeteroCountEditState>();
         app.init_resource::<AutosaveTimer>();
+        app.init_resource::<crate::simulation_settings::RunElapsed>();
         app.init_resource::<crate::dataset_export::ExportDatasetRequested>();
         app.init_resource::<crate::dataset_export::AutoExportSchedule>();
         // Rotate prior-run dataset artefacts once at process start,
@@ -393,6 +417,7 @@ impl Plugin for ColonyPlugin {
         // gravity-falls sliding prey in Update; clamping after pins them to terrain).
         app.add_systems(PostUpdate, maintain_prey_near_herbivores);
         app.add_systems(Update, animate_limbs);
+        app.add_systems(Update, tick_run_elapsed);
         app.add_systems(Update, save_colony_system);
         app.add_systems(Update, autosave_system);
         app.add_systems(Update, auto_spawn_heteros);
@@ -409,6 +434,23 @@ impl Plugin for ColonyPlugin {
         // Reproduction offspring already carry one (with `parent_id`), so
         // the `Without<LineageRecord>` filter skips them.
         app.add_systems(Update, assign_lineage_records);
+    }
+}
+
+
+/// Accumulate WALL-clock seconds into `RunElapsed` from the uncapped real-time
+/// clock while the sim is running. This is the elapsed-time source for exports
+/// + save headers: unlike `Time<Virtual>` (whose `max_delta` cap makes it
+/// under-count wall time across slow frames), it counts a multi-second freeze
+/// in full, and unlike a raw `Time<Real>` read it pauses with the sim and is
+/// seeded on load so a resumed colony continues its age.
+fn tick_run_elapsed(
+    real_time:   Res<Time<bevy::time::Real>>,
+    running:     Res<crate::simulation_settings::SimulationRunning>,
+    mut elapsed: ResMut<crate::simulation_settings::RunElapsed>,
+) {
+    if running.0 {
+        elapsed.0 += real_time.delta().as_secs_f64();
     }
 }
 
@@ -449,7 +491,7 @@ fn spawn_loaded_organism(
     materials: &OrganismMaterials,
     rng:       &mut impl rand::Rng,
 ) -> Entity {
-    let LoadedRecord { pos, rotation, kind, organism, brain, brain_limb } = record;
+    let LoadedRecord { pos, rotation, kind, organism, brain, brain_limb, species_name } = record;
     if organism.body_parts.is_empty() {
         // Defensive — should never happen on a valid save.
         return commands.spawn_empty().id();
@@ -494,6 +536,32 @@ fn spawn_loaded_organism(
         root_cmd.insert(b);
     }
     let root = root_cmd.id();
+
+    // v011: pin species identity at spawn from the saved name. Resolve (or
+    // create) the named species in the registry and set `species_id` NOW, so the
+    // per-species brain restore in the pools' assign step lands in the right
+    // shared net instead of the transient UNCLASSIFIED one (which the ~1 Hz
+    // speciation reclassification would otherwise strand). Same-name organisms
+    // collapse to one id, so a reloaded colony keeps its species and the trained
+    // shared policy. Older saves carry no name → classified fresh, as before.
+    if let Some(name) = species_name {
+        commands.queue(move |world: &mut World| {
+            let id = {
+                let Some(mut registry) =
+                    world.get_resource_mut::<crate::lineages::species::SpeciesRegistry>()
+                else { return };
+                let existing = registry.find_alive_by_name(&name).map(|s| s.id);
+                existing.unwrap_or_else(|| registry.create_with_name(name.clone(), Vec::new(), None))
+            };
+            if let Ok(mut e) = world.get_entity_mut(root) {
+                if let Some(mut org) = e.get_mut::<Organism>() {
+                    if org.species_id.is_none() {
+                        org.species_id = Some(id);
+                    }
+                }
+            }
+        });
+    }
 
     let mut bp_entities: Vec<Entity> = Vec::with_capacity(body_parts_snapshot.len());
     for (idx, bp) in body_parts_snapshot.iter().enumerate() {
@@ -608,6 +676,7 @@ fn spawn_colony(
     // cohort (fixed `.species` counts); `--max-herbivores` still sizes
     // the GPU brain pools in `main.rs`.
     mut virtual_time:    ResMut<Time<Virtual>>,
+    mut run_elapsed:     ResMut<crate::simulation_settings::RunElapsed>,
     mut spawned:     Local<bool>,
 ) {
     if *spawned { return; }
@@ -654,6 +723,9 @@ fn spawn_colony(
                     virtual_time.advance_by(std::time::Duration::from_secs(total as u64));
                     virtual_time.advance_by(std::time::Duration::ZERO);
                 }
+                // Seed the wall-clock run age so exports/saves continue from the
+                // saved elapsed time (the header is written from `RunElapsed`).
+                run_elapsed.0 = total as f64;
                 info!("loaded colony from {} — {} organisms restored, virtual time resumed at {}h{}m{}s",
                       path, n, notation.hours, notation.minutes, notation.seconds);
                 return;
@@ -672,30 +744,28 @@ fn spawn_colony(
 }
 
 
-/// Build an appendage `BodyPart` from a full OCG. `parent_idx` is the RUNTIME
-/// index of the part this one attaches to (0 = base; another appendage/limb
-/// index makes it a sub-part of that part).
+/// Build an appendage `BodyPart` of the given `kind` from a full OCG.
+/// `parent_idx` is the RUNTIME index of the part this one attaches to (0 = base;
+/// another appendage index makes it a sub-part of that part).
 ///
-/// REBASED to the first cell exactly like `limb_body_part_from_ocg`: the entity
-/// sits at the first-cell pivot and the cells are shifted relative to it, so
-/// the joint pivots at the CONTACT POINT and the body's centre of mass sits
-/// near its origin. Appendages used to keep `origin_local = ZERO` with cells at
-/// their authored positions (a holdover from when they were static decoration);
-/// once every part became a dynamic, spherical-jointed body, that pinned each
-/// appendage at the ROOT ORIGIN with its COM up to ~9 units away — a huge lever
-/// arm that turned fluid-drag/motor forces into violent spin (measured angular
-/// velocity ~9.6 rad/s, past the 8.0 clamp), whipping the parts around. That is
-/// the "freshly-spawned sub-limbed swimmer flung into the air" bug; rebasing
-/// (the limb treatment) collapses the lever to part-scale and fixes it. Mirrors
-/// `colony_editor::placement::appendage_body_part`. Rendering is unchanged (the
-/// mesh is built from the shifted OCG and the entity sits at the pivot).
-fn appendage_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize) -> BodyPart {
+/// REBASED to the first cell: the entity sits at the first-cell pivot and the
+/// cells are shifted relative to it, so the joint pivots at the CONTACT POINT
+/// and the body's centre of mass sits near its origin. (Appendages used to keep
+/// `origin_local = ZERO` with cells at their authored positions, pinning each at
+/// the ROOT ORIGIN with its COM up to ~9 units away — a huge lever arm that
+/// turned fluid-drag/motor forces into violent spin, the "freshly-spawned
+/// sub-limbed swimmer flung into the air" bug; rebasing collapses the lever to
+/// part-scale.) `kind` decides the runtime wiring in `insert_limb_physics`:
+/// `Limb`/`Organ`/`Segment` get a motorized joint driven by the brain; `Static`
+/// gets a rigid fixed joint with no brain connection. Mirrors
+/// `colony_editor::placement::{limb,appendage}_body_part`.
+pub fn kinded_appendage_from_ocg(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize, kind: BodyPartKind) -> BodyPart {
     let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
     let shifted: Vec<(usize, Vec3, CellType)> =
         ocg.iter().map(|(i, p, ct)| (*i, *p - pivot, *ct)).collect();
     let cells = shifted.iter().map(|(_, p, ct)| Cell::new(*p, *ct)).collect();
     BodyPart {
-        kind:         BodyPartKind::Organ,
+        kind,
         local_offset: Vec3::ZERO,
         cells,
         ocg:          shifted,
@@ -706,6 +776,18 @@ fn appendage_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: u
         debug_blue: false,
         regrowable: true,
     }
+}
+
+/// Combine a Bilateral right-half OCG with its mirror into ONE midline part's
+/// OCG (right cells, then their mirror, renumbered). Used for `Segment`/`Static`
+/// appendages so they DON'T split into a pair. The right half's first cell stays
+/// at index 0, so `kinded_appendage_from_ocg` still pivots about it. Midline
+/// cells (`x ≈ 0`) are their own mirror and are not duplicated
+/// (`mirror_right_to_left` skips them), matching the base-body fuse.
+pub fn fuse_bilateral_ocg(right_ocg: &[(usize, Vec3, CellType)]) -> Vec<(usize, Vec3, CellType)> {
+    let left = crate::body_part::mirror_right_to_left(right_ocg);
+    right_ocg.iter().chain(left.iter()).enumerate()
+        .map(|(i, (_, p, ct))| (i, *p, *ct)).collect()
 }
 
 /// Build a limb `BodyPart` from a full OCG: cells rebased so the first
@@ -741,31 +823,6 @@ pub fn cull_excess_limb_organisms_for_standing(
     }
     info!("limb cull: kept {} limb organisms, despawned {} (FPS budget)",
           keep.min(limb.len()), culled);
-}
-
-/// Build a limb `BodyPart` from a full OCG: cells rebased so the first cell
-/// sits at local origin and is the attachment pivot (the joint rotation
-/// point). `parent_idx` is the RUNTIME index of the part this limb attaches
-/// to — 0 = base, another limb's index makes this a SUB-LIMB jointed to that
-/// limb (NOT to the base; a sub-limb anchored to the base separates from its
-/// parent limb the moment the limb swings).
-fn limb_body_part_from_ocg(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize) -> BodyPart {
-    let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
-    let shifted: Vec<(usize, Vec3, CellType)> =
-        ocg.iter().map(|(i, p, ct)| (*i, *p - pivot, *ct)).collect();
-    let cells = shifted.iter().map(|(_, p, ct)| Cell::new(*p, *ct)).collect();
-    BodyPart {
-        kind:         BodyPartKind::Limb,
-        local_offset: Vec3::ZERO,
-        cells,
-        ocg:          shifted,
-        attachment:   Some(crate::body_part::Attachment {
-            parent_idx, origin_local: pivot, rotation: Quat::IDENTITY,
-        }),
-        consumed:   false,
-        debug_blue: false,
-        regrowable: true,
-    }
 }
 
 /// Load a `.species` file and spawn `count` instances at random positions.
@@ -878,15 +935,21 @@ fn spawn_species_instance(
     let margin = crate::world_geometry::WORLD_SAFETY_MARGIN;
 
     // Rebuilt per spawn (spawn_organism consumes it): root from part 0, later
-    // parts as appendages (Bilateral → mirrored pair). Each part's RUNTIME
-    // `parent_idx` is mapped from the species file's editor parent index,
-    // mirroring `placement::spawn_real_organism`: NoSymmetry is 1:1; Bilateral
-    // expands every appendage into a right+left pair tracked separately, so a
-    // SUB-LIMB's right half attaches to its parent limb's right half.
-    let mut body_parts = vec![root_body_part_from_ocg(&species.body_parts[0].ocg)];
-    let make = |o: Vec<(usize, Vec3, CellType)>, is_limb: bool, parent_idx: usize| -> BodyPart {
-        if is_limb { limb_body_part_from_ocg(o, parent_idx) } else { appendage_body_part_from_ocg(o, parent_idx) }
+    // parts as appendages. Each part's RUNTIME `parent_idx` is mapped from the
+    // species file's editor parent index, mirroring `placement::spawn_real_organism`.
+    // NoSymmetry is 1:1. Bilateral: a `Limb` expands into a right+left PAIR tracked
+    // separately (a sub-limb's right half attaches to its parent's right half);
+    // `Segment`/`Static` FUSE their two halves into ONE midline part (no split),
+    // with both `right_of`/`left_of` pointing at that single part so a child of a
+    // segment attaches correctly regardless of which half it was authored on.
+    // Base body: NoSymmetry uses the OCG verbatim; Bilateral FUSES the stored
+    // right half with its mirror into one symmetric part (the `.species` stores
+    // only the right half), matching the colony-editor's `expand()`.
+    let base_part = match species.symmetry {
+        Symmetry::Bilateral  => crate::body_part::bilateral_body_part_from_right_ocg(&species.body_parts[0].ocg),
+        Symmetry::NoSymmetry => root_body_part_from_ocg(&species.body_parts[0].ocg),
     };
+    let mut body_parts = vec![base_part];
     match species.symmetry {
         Symmetry::Bilateral => {
             let mut right_of: Vec<usize> = vec![0];
@@ -894,18 +957,32 @@ fn spawn_species_instance(
             for lbp in &species.body_parts[1..] {
                 let p_right = right_of.get(lbp.parent).copied().unwrap_or(0);
                 let p_left  = left_of.get(lbp.parent).copied().unwrap_or(0);
-                let r_idx = body_parts.len();
-                body_parts.push(make(lbp.ocg.clone(), lbp.is_limb, p_right));
-                let l_idx = body_parts.len();
-                body_parts.push(make(crate::body_part::mirror_right_to_left(&lbp.ocg), lbp.is_limb, p_left));
-                right_of.push(r_idx);
-                left_of.push(l_idx);
+                match lbp.kind {
+                    BodyPartKind::Segment | BodyPartKind::Static => {
+                        // Single fused midline part — never split.
+                        let idx = body_parts.len();
+                        body_parts.push(kinded_appendage_from_ocg(
+                            fuse_bilateral_ocg(&lbp.ocg), p_right, lbp.kind));
+                        right_of.push(idx);
+                        left_of.push(idx);
+                    }
+                    kind => {
+                        // Limb / Organ → mirrored right+left pair.
+                        let r_idx = body_parts.len();
+                        body_parts.push(kinded_appendage_from_ocg(lbp.ocg.clone(), p_right, kind));
+                        let l_idx = body_parts.len();
+                        body_parts.push(kinded_appendage_from_ocg(
+                            crate::body_part::mirror_right_to_left(&lbp.ocg), p_left, kind));
+                        right_of.push(r_idx);
+                        left_of.push(l_idx);
+                    }
+                }
             }
         }
         Symmetry::NoSymmetry => {
             for (i, lbp) in species.body_parts[1..].iter().enumerate() {
                 let parent = if lbp.parent <= i { lbp.parent } else { 0 };
-                body_parts.push(make(lbp.ocg.clone(), lbp.is_limb, parent));
+                body_parts.push(kinded_appendage_from_ocg(lbp.ocg.clone(), parent, lbp.kind));
             }
         }
     }
@@ -935,8 +1012,59 @@ fn spawn_species_instance(
     commands.entity(entity).try_insert(
         crate::lineages::species::ImportedSpeciesOrigin { name: name.to_string() },
     );
-    if let Some(b) = &species.brain {
-        commands.entity(entity).try_insert(b.clone());
+    // PERSISTENT floor identity for the prey field. `ImportedSpeciesOrigin` is
+    // stripped by speciation (~1 Hz) on first classification, so it cannot be
+    // used to recognise the auto-spawned plankton floor past the first second —
+    // doing so made `auto_spawn_plankton` (count) and `apply_max_phototrophs_cull`
+    // (exclusion) both go blind, driving perpetual spawn/despawn/respawn churn.
+    // This marker survives classification. Reproduced descendants don't spawn
+    // through here, so they stay unmarked → cullable, as intended.
+    if name == "ball_plankton" {
+        commands.entity(entity).try_insert(BallPlankton);
+    }
+    if let Some(brain) = &species.brain {
+        // Attach the matching restore COMPONENT. The PPO payload (`BrainRestoreLimb`)
+        // serves both walkers and swimmers; the organism's movement mode routes it
+        // to the limb or swim pool's assign step.
+        match brain {
+            crate::species_editor::save::LoadedBrain::Sliding(b) => {
+                commands.entity(entity).try_insert(b.clone());
+            }
+            crate::species_editor::save::LoadedBrain::Ppo(b) => {
+                commands.entity(entity).try_insert(b.clone());
+            }
+        }
+        // This import carries a TRAINED brain. Pin its species identity NOW
+        // (at spawn) instead of waiting for the ~1 Hz speciation tick: the
+        // per-species brain pools restore saved weights keyed by `species_id`
+        // in their assign step, so a still-`None` species_id would restore the
+        // trained weights into the transient UNCLASSIFIED net — and they'd be
+        // dropped when the clone is later reclassified into its real (fresh)
+        // net. Resolving the named species here gives every same-name clone one
+        // shared id, so the restore lands in the right shared net and all clones
+        // boot from — and keep sharing — the trained policy. (Mirrors the
+        // name-routing in `speciation::classify_organisms`; only brain-carrying
+        // imports take this path, so plankton and brainless imports are
+        // unaffected and still classify lazily.)
+        let species_name = name.to_string();
+        commands.queue(move |world: &mut World| {
+            let id = {
+                let Some(mut registry) =
+                    world.get_resource_mut::<crate::lineages::species::SpeciesRegistry>()
+                else { return };
+                let existing = registry.find_alive_by_name(&species_name).map(|s| s.id);
+                existing.unwrap_or_else(|| {
+                    registry.create_with_name(species_name.clone(), Vec::new(), None)
+                })
+            };
+            if let Ok(mut e) = world.get_entity_mut(entity) {
+                if let Some(mut org) = e.get_mut::<Organism>() {
+                    if org.species_id.is_none() {
+                        org.species_id = Some(id);
+                    }
+                }
+            }
+        });
     }
     Some(entity)
 }
@@ -974,30 +1102,41 @@ fn spawn_species_cohort(
 }
 
 
+/// Persistent marker for an auto-spawned `ball_plankton` floor organism. Set at
+/// spawn (`spawn_species_instance`) and NEVER removed, unlike the transient
+/// `ImportedSpeciesOrigin` tag that speciation strips on first classification.
+/// Both the floor top-up (`auto_spawn_plankton`) and the cap-cull exclusion
+/// (`apply_max_phototrophs_cull`) key off this so the prey field is recognised
+/// for the whole run. Reproduced descendants don't carry it (different spawn
+/// path) → they count as bonus prey and stay cullable.
+#[derive(Component)]
+pub struct BallPlankton;
+
+
 /// Maintain a minimum of `MIN_PLANKTON_COUNT` `ball_plankton`: whenever the
 /// live count drops below the floor, spawn the deficit from the species file.
 /// A reliable prey field (e.g. food for swimming heterotrophs).
 ///
-/// Counts living organisms tagged `ImportedSpeciesOrigin { name: "ball_plankton" }`
-/// (the auto-spawned ones); reproduced descendants are unTagged and count as
-/// bonus prey. The species file is loaded once (cached in a `Local`). Throttled
-/// to ~1 Hz so the count-and-spawn isn't per-frame; always on (not gated by
+/// Counts living organisms carrying the persistent `BallPlankton` marker (the
+/// auto-spawned ones); reproduced descendants are unmarked and count as bonus
+/// prey. The species file is loaded once (cached in a `Local`). Throttled to
+/// ~1 Hz so the count-and-spawn isn't per-frame; always on (not gated by
 /// AI-training mode). The `MaxPhotoautotrophs` cap-cull
-/// (`apply_max_phototrophs_cull`) explicitly EXCLUDES the tagged `ball_plankton`
-/// floor from the random cull, so the cap and this floor no longer compete —
-/// that competition was the cause of constant plankton spawn/despawn/respawn
-/// churn (cull randomly kills a plankton → drops below floor → respawn → over
-/// cap → cull again). With a sane cap (≥ the floor) the total still trims to the
-/// cap by culling only non-floor phototrophs; if the cap is set below the floor
-/// the floor wins. Reproduced (untagged) plankton descendants remain cullable
-/// like any other phototroph.
+/// (`apply_max_phototrophs_cull`) explicitly EXCLUDES `BallPlankton` from the
+/// random cull, so the cap and this floor no longer compete — that competition
+/// was the cause of constant plankton spawn/despawn/respawn churn (cull randomly
+/// kills a plankton → drops below floor → respawn → over cap → cull again). With
+/// a sane cap (≥ the floor) the total still trims to the cap by culling only
+/// non-floor phototrophs; if the cap is set below the floor the floor wins.
+/// Reproduced (unmarked) plankton descendants remain cullable like any other
+/// phototroph.
 pub fn auto_spawn_plankton(
     heightmap:  Option<Res<HeightmapSampler>>,
     map_size:   Option<Res<MapSize>>,
     water:      Option<Res<crate::environment::WaterLevel>>,
     smoothing:  Option<Res<crate::simulation_settings::Smoothing>>,
     org_mats:   Option<Res<OrganismMaterials>>,
-    existing:   Query<&crate::lineages::species::ImportedSpeciesOrigin, With<Photoautotroph>>,
+    existing:   Query<(), (With<BallPlankton>, With<Photoautotroph>)>,
     mut species_cache: Local<Option<crate::species_editor::save::LoadedSpecies>>,
     mut commands: Commands,
     mut meshes:   ResMut<Assets<Mesh>>,
@@ -1006,7 +1145,7 @@ pub fn auto_spawn_plankton(
     let (Some(heightmap), Some(map_size), Some(water), Some(smoothing), Some(org_mats)) =
         (heightmap, map_size, water, smoothing, org_mats) else { return };
 
-    let current = existing.iter().filter(|o| o.name == "ball_plankton").count();
+    let current = existing.iter().count();
     if current >= MIN_PLANKTON_COUNT { return; }
 
     // Lazy-load + cache the species (one disk read for the run).

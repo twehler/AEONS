@@ -383,13 +383,18 @@ fn run_simulation(
 
     let world_path_input = Path::new(&map_path);
 
-    // `Time<Virtual>` defaults `max_delta` to 250 ms (Bevy's anti-spiral-of-
-    // death cap), silently discarding the excess from virtual time. AEONS
-    // uses the sim clock observationally and routinely produces >250 ms
-    // frames (training step, CubeCL compile, dense predation), which would
-    // accumulate large under-counts over a long run. Bump the cap to 60 s.
-    let mut virtual_time = Time::<Virtual>::default();
-    virtual_time.set_max_delta(std::time::Duration::from_secs(60));
+    // `Time<Virtual>` keeps Bevy's default 250 ms `max_delta` — the anti-
+    // spiral-of-death cap. The fixed-update accumulator grows by the (capped)
+    // virtual delta each frame and FixedUpdate drains it at 64 Hz, so an
+    // UNCAPPED delta lets a single slow frame (CUDA kernel compile, heavy
+    // multibody spawn) inject many seconds of catch-up → hundreds–thousands of
+    // physics+brain steps in one frame → a self-sustaining freeze at ~0 FPS
+    // with the machine mostly idle (latency/single-thread-bound). The cap
+    // bounds catch-up to ≤16 steps/frame; under genuine slowness the sim now
+    // degrades gracefully (virtual time falls behind wall time) instead of
+    // dying. WALL-clock elapsed for exports/saves comes from `RunElapsed`
+    // (accumulated from `Time<Real>`, uncapped), NOT this capped clock.
+    let virtual_time = Time::<Virtual>::default();
     app.insert_resource(virtual_time);
 
     // Inject the optional colony-load path so ColonyPlugin's spawn system

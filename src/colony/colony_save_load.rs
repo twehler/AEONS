@@ -69,12 +69,17 @@ use crate::environment::{WaterLevel, DEFAULT_WATER_LEVEL};
 // Cached `PhotosyntheticCell` data is NOT serialised — fully derivable
 // from `cell_type` + `neighbour_count` on load.
 
-/// Current save format magic (v010). The loader accepts v001-v010;
+/// Current save format magic (v011). The loader accepts v001-v011;
 /// missing fields are synthesised from deterministic spawn-time rules,
 /// and brain blocks for an obsolete architecture are parsed-and-dropped
 /// (those organisms come up with fresh-init weights, but their structure
 /// — positions, body parts, energy — is restored correctly).
-const SAVE_MAGIC:             &[u8;8] = b"AEONS010";
+/// v011 adds a per-organism SPECIES NAME string (after the intelligence byte)
+/// so species identity — and thus the per-species shared brain — survives a
+/// reload: on load the named species is resolved/created in the registry and
+/// `species_id` is pinned at spawn (older saves carry no name → classified fresh).
+const SAVE_MAGIC:             &[u8;8] = b"AEONS011";
+const SAVE_MAGIC_LEGACY_V010: &[u8;8] = b"AEONS010";
 const SAVE_MAGIC_LEGACY_V009: &[u8;8] = b"AEONS009";
 const SAVE_MAGIC_LEGACY_V008: &[u8;8] = b"AEONS008";
 const SAVE_MAGIC_LEGACY_V007: &[u8;8] = b"AEONS007";
@@ -118,8 +123,9 @@ pub struct SaveRequested(pub Option<std::path::PathBuf>);
 
 pub(crate) fn save_colony_system(
     mut save_requested: ResMut<SaveRequested>,
-    // Source of the v008 time-notation (current virtual elapsed time).
-    virtual_time: Res<Time<Virtual>>,
+    // Source of the v008 time-notation: WALL-clock run age (uncapped real
+    // time accumulated while running), not the capped virtual clock.
+    run_elapsed: Res<crate::simulation_settings::RunElapsed>,
     // v009 global water level, written into the header after the time block.
     water:        Res<WaterLevel>,
     organisms: Query<
@@ -136,6 +142,13 @@ pub(crate) fn save_colony_system(
     pool_limb_h:  NonSend<crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
     pool_limb_l2: NonSend<crate::intelligence_level_2_limb::BrainPoolL2Limb>,
     pool_limb_l3: NonSend<crate::intelligence_level_3_limb::BrainPoolL3Limb>,
+    // Swim pool — persisted in the limb-brain block as kind 4 (shares the
+    // `BrainRestoreLimb` payload struct; routed back to the swim pool on load
+    // by the organism's movement mode).
+    pool_swim:    NonSend<crate::intelligence_level_1_swimming::BrainPoolSwim1>,
+    // v011 species identity: maps each organism's `species_id` to its display
+    // name so the name (not the volatile id) is what gets persisted.
+    registry: Res<crate::lineages::species::SpeciesRegistry>,
 ) {
     let Some(target_path) = save_requested.0.take() else { return };
 
@@ -143,7 +156,7 @@ pub(crate) fn save_colony_system(
     buf.extend_from_slice(SAVE_MAGIC);
 
     // v008 time notation, immediately after the magic.
-    let notation = TimeNotation::from_secs(virtual_time.elapsed_secs() as u32);
+    let notation = TimeNotation::from_secs(run_elapsed.0 as u32);
     put_u32(&mut buf, notation.hours);
     put_u32(&mut buf, notation.minutes);
     put_u32(&mut buf, notation.seconds);
@@ -159,6 +172,7 @@ pub(crate) fn save_colony_system(
     let snap_h  = pool_limb_h.0.snapshot();
     let snap_l2 = pool_limb_l2.0.snapshot();
     let snap_l3 = pool_limb_l3.0.snapshot();
+    let snap_swim = pool_swim.0.snapshot();
 
     // Two-pass to write the count up front.
     let count = organisms.iter()
@@ -208,13 +222,23 @@ pub(crate) fn save_colony_system(
             IntelligenceLevel::Level2 => 2,
             IntelligenceLevel::Level3 => 3,
         });
+        // v011 species name (u32 len + UTF-8). Empty when the organism is
+        // unclassified or its species is gone — load treats empty as "no name"
+        // and classifies it fresh.
+        let species_name = org.species_id
+            .and_then(|id| registry.get(id).map(|s| s.name.clone()))
+            .unwrap_or_default();
+        put_u32(&mut buf, species_name.len() as u32);
+        buf.extend_from_slice(species_name.as_bytes());
 
         put_u32(&mut buf, org.body_parts.len() as u32);
         for bp in &org.body_parts {
             put_u8(&mut buf, match bp.kind {
-                BodyPartKind::Body  => 0,
-                BodyPartKind::Limb  => 1,
-                BodyPartKind::Organ => 2,
+                BodyPartKind::Body    => 0,
+                BodyPartKind::Limb    => 1,
+                BodyPartKind::Organ   => 2,
+                BodyPartKind::Segment => 3,
+                BodyPartKind::Static  => 4,
             });
             put_vec3(&mut buf, bp.local_offset);
             put_u8(&mut buf, bp.consumed   as u8);
@@ -272,17 +296,22 @@ pub(crate) fn save_colony_system(
         }
 
         // v007 limb-brain block: kind tag + payload. Kind tags 0=none,
-        // 1=herbivore_1_limb, 2=l2_limb, 3=l3_limb (routed by
-        // intelligence_level + carnivore marker). Non-limb organisms write 0.
+        // 1=herbivore_1_limb, 2=l2_limb, 3=l3_limb (routed by intelligence_level
+        // + carnivore marker), 4=swim (v011 — same `BrainRestoreLimb` payload,
+        // swim dims). Non-PPO organisms write 0.
         let limb_brain = if !org.movement_mode.is_sliding() && is_hetero {
-            match org.intelligence_level {
-                IntelligenceLevel::Level1 if !is_carn =>
-                    snap_h.extract(entity).map(|b| (1u8, b)),
-                IntelligenceLevel::Level2 =>
-                    snap_l2.extract(entity).map(|b| (2u8, b)),
-                IntelligenceLevel::Level3 =>
-                    snap_l3.extract(entity).map(|b| (3u8, b)),
-                _ => None,
+            if org.movement_mode.is_swimming() {
+                snap_swim.extract(entity).map(|b| (4u8, b))
+            } else {
+                match org.intelligence_level {
+                    IntelligenceLevel::Level1 if !is_carn =>
+                        snap_h.extract(entity).map(|b| (1u8, b)),
+                    IntelligenceLevel::Level2 =>
+                        snap_l2.extract(entity).map(|b| (2u8, b)),
+                    IntelligenceLevel::Level3 =>
+                        snap_l3.extract(entity).map(|b| (3u8, b)),
+                    _ => None,
+                }
             }
         } else {
             None
@@ -376,6 +405,10 @@ pub(crate) struct LoadedRecord {
     /// organisms / older formats. Attached as a `BrainRestoreLimb`
     /// for the matching limb pool to consume next PreUpdate.
     pub(crate) brain_limb: Option<crate::limb_ppo::BrainRestoreLimb>,
+    /// Saved species name (v011+). `None` for unclassified organisms / older
+    /// formats. `spawn_loaded_organism` resolves it to a registry species and
+    /// pins `species_id` at spawn so the per-species brain restore lands right.
+    pub(crate) species_name: Option<String>,
 }
 
 
@@ -391,7 +424,8 @@ pub(crate) fn load_colony_from_file(
         return Err(std::io::Error::other("file too short — missing magic"));
     }
     let magic = &bytes[..SAVE_MAGIC.len()];
-    let format_v010 = magic == SAVE_MAGIC;
+    let format_v011 = magic == SAVE_MAGIC;
+    let format_v010 = magic == SAVE_MAGIC_LEGACY_V010;
     let format_v009 = magic == SAVE_MAGIC_LEGACY_V009;
     let format_v008 = magic == SAVE_MAGIC_LEGACY_V008;
     let format_v007 = magic == SAVE_MAGIC_LEGACY_V007;
@@ -401,15 +435,15 @@ pub(crate) fn load_colony_from_file(
     let format_v003 = magic == SAVE_MAGIC_LEGACY_V003;
     let format_v002 = magic == SAVE_MAGIC_LEGACY_V002;
     let format_v001 = magic == SAVE_MAGIC_LEGACY_V001;
-    if !format_v010 && !format_v009 && !format_v008 && !format_v007 && !format_v006 && !format_v005 && !format_v004 && !format_v003 && !format_v002 && !format_v001 {
+    if !format_v011 && !format_v010 && !format_v009 && !format_v008 && !format_v007 && !format_v006 && !format_v005 && !format_v004 && !format_v003 && !format_v002 && !format_v001 {
         return Err(std::io::Error::other(
             "magic mismatch — not an AEONS colony save (or unsupported version)",
         ));
     }
-    // v008/v009/v010 share the v007 per-organism record layout (apart from
-    // the movement byte's meaning + the v010 ground_based byte, handled
-    // below), so every v007 feature flag also holds for them.
-    let format_v007_layout = format_v010 || format_v009 || format_v008 || format_v007;
+    // v008..v011 share the v007 per-organism record layout (apart from the
+    // movement byte's meaning, the v010 ground_based byte, and the v011 species
+    // name — all handled below), so every v007 feature flag also holds for them.
+    let format_v007_layout = format_v011 || format_v010 || format_v009 || format_v008 || format_v007;
     // v002+ have the intelligence_level byte after has_variable_form.
     let has_intelligence_byte = format_v007_layout || format_v006 || format_v005 || format_v004 || format_v003 || format_v002;
     // v006+ have the movement byte (before intelligence_level). In v006..v008
@@ -417,13 +451,15 @@ pub(crate) fn load_colony_from_file(
     // tag. Older saves default to Sliding.
     let has_movement_byte = format_v007_layout || format_v006;
     // v009+: the movement byte is the new 4-way tag (else the old bool).
-    let movement_byte_is_tag = format_v010 || format_v009;
-    // v010: ground_based byte right after the movement byte.
-    let has_ground_byte = format_v010;
+    let movement_byte_is_tag = format_v011 || format_v010 || format_v009;
+    // v010+: ground_based byte right after the movement byte.
+    let has_ground_byte = format_v011 || format_v010;
     // v008+ carry the elapsed-time block right after the magic.
-    let has_time_block = format_v010 || format_v009 || format_v008;
+    let has_time_block = format_v011 || format_v010 || format_v009 || format_v008;
     // v007+ append a limb-brain block after the sliding-brain block.
     let has_limb_brain_section = format_v007_layout;
+    // v011: a per-organism species-name string right after the intelligence byte.
+    let has_species_name = format_v011;
     c += SAVE_MAGIC.len();
 
     // v008+ time notation right after the magic; older formats → t=0.
@@ -535,6 +571,20 @@ pub(crate) fn load_colony_from_file(
             }
         };
 
+        // v011 species name (u32 len + UTF-8). Empty / absent ⇒ `None` (the
+        // organism is classified fresh on the first speciation tick, as before).
+        let species_name: Option<String> = if has_species_name {
+            let len = read_u32(&bytes, &mut c)? as usize;
+            if c + len > bytes.len() {
+                return Err(std::io::Error::other("EOF reading species name"));
+            }
+            let s = String::from_utf8_lossy(&bytes[c..c + len]).into_owned();
+            c += len;
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        };
+
         let bp_count = read_u32(&bytes, &mut c)?;
         let mut body_parts: Vec<BodyPart> = Vec::with_capacity(bp_count as usize);
         for _ in 0..bp_count {
@@ -542,6 +592,8 @@ pub(crate) fn load_colony_from_file(
                 0 => BodyPartKind::Body,
                 1 => BodyPartKind::Limb,
                 2 => BodyPartKind::Organ,
+                3 => BodyPartKind::Segment,
+                4 => BodyPartKind::Static,
                 other => return Err(std::io::Error::other(
                     format!("unknown body-part kind tag: {other}"),
                 )),
@@ -649,14 +701,15 @@ pub(crate) fn load_colony_from_file(
                 None
             };
 
-        // v007 limb-brain block: kind tag 0..3 (0=none, 1/2/3 = the limb
-        // pools). Non-zero → decode `BrainRestoreLimb`; `spawn_loaded_organism`
-        // attaches it for the matching limb pool to consume.
+        // v007 limb-brain block: kind tag 0..4 (0=none, 1/2/3 = the limb pools,
+        // 4 = swim (v011)). All non-zero kinds carry a `BrainRestoreLimb` payload
+        // (swim reuses the struct, swim dims); `spawn_loaded_organism` attaches
+        // it and the organism's movement mode routes it to the limb or swim pool.
         let brain_limb: Option<crate::limb_ppo::BrainRestoreLimb> = if has_limb_brain_section {
             let kind = read_u8(&bytes, &mut c)?;
             if kind == 0 {
                 None
-            } else if kind > 3 {
+            } else if kind > 4 {
                 return Err(std::io::Error::other(
                     format!("unknown limb-brain kind tag: {kind}"),
                 ));
@@ -717,7 +770,7 @@ pub(crate) fn load_colony_from_file(
         };
         organism.recompute_bounding_radius();
 
-        out.push(LoadedRecord { pos, rotation, kind, organism, brain, brain_limb });
+        out.push(LoadedRecord { pos, rotation, kind, organism, brain, brain_limb, species_name });
     }
 
     Ok((notation, water_level, out))

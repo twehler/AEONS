@@ -1356,7 +1356,7 @@ pub fn update_max_phototrophs_text(
 pub fn apply_max_phototrophs_cull(
     mut commands:   Commands,
     max_photo:      Res<MaxPhotoautotrophs>,
-    photos:         Query<(Entity, Option<&crate::lineages::species::ImportedSpeciesOrigin>),
+    photos:         Query<(Entity, Has<crate::colony::BallPlankton>),
                           (With<OrganismRoot>, With<Photoautotroph>)>,
     mut message:    ResMut<CullMessage>,
 ) {
@@ -1368,17 +1368,19 @@ pub fn apply_max_phototrophs_cull(
     let total = photos.iter().count();
     if total <= cap { return; }
 
-    // NEVER cull the auto-spawned `ball_plankton` FLOOR. `auto_spawn_plankton`
-    // keeps a minimum of these as the prey field; if the random cull despawned
-    // them, the count would drop below the floor, the floor would respawn the
-    // deficit, that would push back over the cap, and the cull would fire
-    // again — the perpetual plankton spawn/despawn/respawn churn. Only the
-    // non-floor phototrophs (other species + untagged reproduced plankton
-    // descendants) are cullable. With a sane cap (≥ the floor) the total still
-    // trims exactly to the cap; if the cap is set BELOW the floor the floor
-    // wins (and the loop still terminates — nothing respawns over the cap).
+    // NEVER cull the auto-spawned `ball_plankton` FLOOR (the persistent
+    // `BallPlankton` marker — NOT `ImportedSpeciesOrigin`, which speciation
+    // strips after ~1 s, blinding this exclusion). `auto_spawn_plankton` keeps a
+    // minimum of these as the prey field; if the random cull despawned them, the
+    // count would drop below the floor, the floor would respawn the deficit, that
+    // would push back over the cap, and the cull would fire again — the perpetual
+    // plankton spawn/despawn/respawn churn. Only the non-floor phototrophs (other
+    // species + unmarked reproduced plankton descendants) are cullable. With a
+    // sane cap (≥ the floor) the total still trims exactly to the cap; if the cap
+    // is set BELOW the floor the floor wins (and the loop still terminates —
+    // nothing respawns over the cap).
     let mut cullable: Vec<Entity> = photos.iter()
-        .filter(|(_, origin)| !origin.is_some_and(|o| o.name == "ball_plankton"))
+        .filter(|(_, is_floor)| !is_floor)
         .map(|(e, _)| e)
         .collect();
 

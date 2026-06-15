@@ -8,6 +8,7 @@
 // predation gradient (many-part prey can be nibbled over encounters).
 
 use bevy::prelude::*;
+use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 
 use crate::cell::*;
@@ -23,7 +24,24 @@ pub struct PredationPlugin;
 impl Plugin for PredationPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<OrganismContactEvent>();
-        app.add_systems(Update, emit_proximity_predation.before(predation_system));
+        // `emit_proximity_predation` scans the `WorldModelGrid`, which is only
+        // rebuilt at the brain-tick cadence (`rebuild_world_model_grid`, gated
+        // by the same `on_timer` in FixedUpdate). Running it every render frame
+        // re-scanned an unchanged grid ~9× more often than it could produce new
+        // information. Gate it to that exact cadence and order it AFTER the grid
+        // rebuild so it reads a fresh grid. FixedUpdate runs before Update in a
+        // frame, so proximity events are still drained the same frame by
+        // `predation_system` — no added eat latency beyond one brain tick.
+        app.add_systems(
+            FixedUpdate,
+            emit_proximity_predation
+                .after(crate::world_model::rebuild_world_model_grid)
+                .run_if(on_timer(crate::simulation_settings::HETERO_BRAIN_TICK_INTERVAL)),
+        );
+        // `predation_system` stays per-frame: it is the sole reader of
+        // `OrganismContactEvent`, whose OTHER producer (`organism_collision`,
+        // sliding↔sliding) emits in `Last` every frame. Throttling the reader
+        // would strand those collision events.
         app.add_systems(Update, predation_system);
     }
 }

@@ -183,6 +183,19 @@ impl Default for TimeSpeed {
 }
 
 
+/// Wall-clock seconds the simulation has been ACTIVELY running, accumulated
+/// from `Time<Real>` (uncapped, so a multi-second freeze is counted in full —
+/// unlike `Time<Virtual>`, whose `max_delta` cap makes it under-count wall time
+/// during slow frames). Advances only while `SimulationRunning` is true (so
+/// pauses / editor modes don't inflate it), and is seeded from a loaded save's
+/// elapsed-time header so a resumed colony continues its age. This is the
+/// elapsed-time source for dataset exports + save headers; the virtual clock
+/// still drives brain cadence / gait phase. `f64` to keep sub-second resolution
+/// over multi-hour runs.
+#[derive(Resource, Default)]
+pub struct RunElapsed(pub f64);
+
+
 /// When `true`, adult organisms get their meshes smoothed (Jacobi smoother in
 /// `volumetric_growth::smooth_vertices`), at most once per organism (at spawn for
 /// non-variable-form; on the growth tick crossing `MAX_CELLS` for variable-form).
@@ -885,18 +898,25 @@ pub const SWIM_BODY_DENSITY: f32 = 1.0;
 /// on a light body — belt-and-suspenders with `SWIM_BODY_DENSITY`.
 pub const SWIM_DRAG_MAX_FORCE:  f32 = 25.0;
 pub const SWIM_DRAG_MAX_TORQUE: f32 = 10.0;
-/// Swimmer-specific HINGE MOTOR gains. Making swimmer bodies ~neutral-buoyancy
-/// (SWIM_BODY_DENSITY) raised their mass ~83× over the near-massless terrestrial
-/// `BODY_PART_DENSITY`, so the terrestrial motor (stiffness 6 / damping 1.2 /
-/// max-torque 10) can no longer budge the limbs. Scaling all three gains by the
-/// same mass ratio reproduces the (working) terrestrial per-limb angular dynamics
-/// — same accelerations, same damping ratio (stable) — so the limbs actually
-/// stroke. Tune from here: raise the ratio multiplier for livelier strokes, lower
-/// it if they thrash. (`ForceBased` motor → these are real torques that propel.)
+/// Swimmer motor force cap. The spherical multibody motor is now
+/// `AccelerationBased` (mass-invariant), so it uses the BASE `LIMB_MOTOR_STIFFNESS`
+/// / `LIMB_MOTOR_DAMPING` gains directly — no mass-ratio gain scaling (that was a
+/// `ForceBased` workaround that overflowed thin links to NaN). Only the force CAP
+/// stays mass-ratio-scaled: a neutral-buoyancy body (~83× the terrestrial mass)
+/// needs force ∝ mass to reach a target accel, so the cap must be high enough; a
+/// small-inertia link only ever draws a small impulse, so a high cap is harmless.
+/// See `rapier_setup::spherical_data`.
 pub const SWIM_MASS_RATIO:      f32 = SWIM_BODY_DENSITY / BODY_PART_DENSITY;
 pub const SWIM_MAX_LIMB_TORQUE: f32 = MAX_LIMB_TORQUE     * SWIM_MASS_RATIO;
-pub const SWIM_MOTOR_STIFFNESS: f32 = LIMB_MOTOR_STIFFNESS * SWIM_MASS_RATIO;
-pub const SWIM_MOTOR_DAMPING:   f32 = LIMB_MOTOR_DAMPING   * SWIM_MASS_RATIO;
+/// Isotropic angular-inertia floor (added per swimmer body part via
+/// `AdditionalMassProperties`). Reduced-coordinate (`MultibodyJoint`) chains with
+/// THIN links — e.g. a 2-cell mirrored limb whose inertia about its long axis is
+/// ~0.18 — make the Featherstone articulated-inertia solve ill-conditioned, so the
+/// 3-axis spherical motor occasionally integrates to a NaN joint coordinate (solver
+/// panic). Adding this isotropic inertia lifts the thin axis to a well-conditioned
+/// value, stabilising the solve. Tune: lower if limbs feel sluggish, raise if a NaN
+/// still slips through (the non-finite safety net is the hard backstop either way).
+pub const SWIM_LINK_INERTIA_FLOOR: f32 = 1.0;
 /// Vertical clearance used when placing a swimmer in the water column at spawn:
 /// kept this far below the surface and above the terrain floor so no body part
 /// breaches the water plane on the first frame (which would trigger the ceiling

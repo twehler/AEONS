@@ -16,10 +16,10 @@ use crate::colony_editor::template::{Metabolism, OrganismTemplate};
 use crate::energy::MAX_ENERGY_PER_CELL;
 
 
-const SAVE_MAGIC: &[u8; 8] = b"AEONS010";
+const SAVE_MAGIC: &[u8; 8] = b"AEONS011";
 
 
-/// Write every organism in `templates` to `path` in the v010 .colony
+/// Write every organism in `templates` to `path` in the v011 .colony
 /// format. The file is overwritten on each call. Must stay byte-identical
 /// to `colony_save_load::save_colony_system`'s header + per-organism layout.
 /// `water_level` is the global water surface Y stored in the v009+ header.
@@ -71,26 +71,30 @@ fn root_part(ocg: &[(usize, Vec3, CellType)]) -> WireBodyPart {
     }
 }
 
-fn appendage_part(ocg: &[(usize, Vec3, CellType)], is_limb: bool, parent_idx: u32) -> WireBodyPart {
-    if is_limb {
-        // Rebase to first-cell pivot — mirrors `placement::limb_body_part`
-        // so saves round-trip pixel-for-pixel.
-        let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
-        let shifted: Vec<(usize, Vec3, CellType)> = ocg.iter()
-            .map(|(i, p, ct)| (*i, *p - pivot, *ct))
-            .collect();
-        WireBodyPart {
-            kind:       BodyPartKind::Limb,
-            attachment: Some((parent_idx, pivot)),
-            cells:      shifted.iter().map(|(_, p, ct)| (*p, *ct)).collect(),
-            ocg:        shifted,
-        }
-    } else {
-        WireBodyPart {
-            kind:       BodyPartKind::Organ,
+/// Build one appendage `WireBodyPart` from its FINAL OCG (caller has already
+/// mirrored/fused for symmetry). `Limb`/`Segment`/`Static` rebase to the
+/// first-cell pivot (the joint point), matching `colony::kinded_appendage_from_ocg`
+/// so editor-save and live-spawn round-trip identically; legacy `Organ` keeps the
+/// old origin-ZERO, un-rebased layout for `.colony` byte-compat.
+fn appendage_part(ocg: &[(usize, Vec3, CellType)], kind: BodyPartKind, parent_idx: u32) -> WireBodyPart {
+    match kind {
+        BodyPartKind::Organ | BodyPartKind::Body => WireBodyPart {
+            kind,
             attachment: Some((parent_idx, Vec3::ZERO)),
             cells:      ocg.iter().map(|(_, p, ct)| (*p, *ct)).collect(),
             ocg:        ocg.to_vec(),
+        },
+        _ => {
+            let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
+            let shifted: Vec<(usize, Vec3, CellType)> = ocg.iter()
+                .map(|(i, p, ct)| (*i, *p - pivot, *ct))
+                .collect();
+            WireBodyPart {
+                kind,
+                attachment: Some((parent_idx, pivot)),
+                cells:      shifted.iter().map(|(_, p, ct)| (*p, *ct)).collect(),
+                ocg:        shifted,
+            }
         }
     }
 }
@@ -113,23 +117,37 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
     let mut parts: Vec<WireBodyPart> = vec![root_part(&root_ocg)];
     match tpl.symmetry {
         Symmetry::NoSymmetry => {
-            for (app_raw, is_limb, parent) in &tpl.custom_appendages {
-                parts.push(appendage_part(app_raw, *is_limb, *parent as u32));
+            for (app_raw, kind, parent) in &tpl.custom_appendages {
+                parts.push(appendage_part(app_raw, *kind, *parent as u32));
             }
         }
         Symmetry::Bilateral => {
+            // Limb/Organ expand to a mirrored pair; Segment/Static fuse to ONE
+            // midline part. Mirrors `placement::spawn_real_organism` so the saved
+            // `.colony` matches the live preview.
             let mut right_of: Vec<u32> = vec![0];
             let mut left_of:  Vec<u32> = vec![0];
-            for (app_raw, is_limb, parent) in &tpl.custom_appendages {
+            for (app_raw, kind, parent) in &tpl.custom_appendages {
                 let p_right = right_of[*parent];
                 let p_left  = left_of[*parent];
-                let r_idx = parts.len() as u32;
-                parts.push(appendage_part(app_raw, *is_limb, p_right));
-                let l_idx = parts.len() as u32;
-                let mirrored = crate::body_part::mirror_right_to_left(app_raw);
-                parts.push(appendage_part(&mirrored, *is_limb, p_left));
-                right_of.push(r_idx);
-                left_of.push(l_idx);
+                match kind {
+                    BodyPartKind::Segment | BodyPartKind::Static => {
+                        let idx = parts.len() as u32;
+                        parts.push(appendage_part(
+                            &crate::colony::fuse_bilateral_ocg(app_raw), *kind, p_right));
+                        right_of.push(idx);
+                        left_of.push(idx);
+                    }
+                    _ => {
+                        let r_idx = parts.len() as u32;
+                        parts.push(appendage_part(app_raw, *kind, p_right));
+                        let l_idx = parts.len() as u32;
+                        let mirrored = crate::body_part::mirror_right_to_left(app_raw);
+                        parts.push(appendage_part(&mirrored, *kind, p_left));
+                        right_of.push(r_idx);
+                        left_of.push(l_idx);
+                    }
+                }
             }
         }
     }
@@ -184,14 +202,19 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
         IntelligenceLevel::Level2 => 2,
         IntelligenceLevel::Level3 => 3,
     });
+    // v011 species name — editor-authored colonies carry no runtime species, so
+    // write an empty name (len 0). Loaders classify these fresh, as before.
+    put_u32(buf, 0);
 
     // ── body parts ──────────────────────────────────────────────────
     put_u32(buf, parts.len() as u32);
     for part in &parts {
         put_u8 (buf, match part.kind {
-            BodyPartKind::Body  => 0,
-            BodyPartKind::Limb  => 1,
-            BodyPartKind::Organ => 2,
+            BodyPartKind::Body    => 0,
+            BodyPartKind::Limb    => 1,
+            BodyPartKind::Organ   => 2,
+            BodyPartKind::Segment => 3,
+            BodyPartKind::Static  => 4,
         });
         put_vec3(buf, Vec3::ZERO);   // local_offset
         put_u8 (buf, 0);             // consumed

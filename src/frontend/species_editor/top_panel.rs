@@ -423,7 +423,14 @@ fn apply_loaded_species(session: &mut SpeciesSession, loaded: LoadedSpecies) {
         ground_based:   loaded.ground_based,
     };
     session.body_parts = loaded.body_parts.into_iter()
-        .map(|p| EditorBodyPart { name: p.name, ocg: p.ocg, is_limb: p.is_limb, parent: p.parent })
+        .enumerate()
+        .map(|(i, p)| EditorBodyPart {
+            name: p.name,
+            ocg: p.ocg,
+            // Base body (index 0) is always Body; appendages keep their kind.
+            kind: if i == 0 { crate::cell::BodyPartKind::Body } else { p.kind },
+            parent: p.parent,
+        })
         .collect();
     session.active_body_part = 0;
     // A loaded body has appended cells → Metabolism + Symmetry lock.

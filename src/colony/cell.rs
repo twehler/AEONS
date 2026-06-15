@@ -167,12 +167,28 @@ impl Cell {
 
 // ── Body part ────────────────────────────────────────────────────────────────
 
-/// Anatomical role of a body part. Currently a hint only.
+/// Anatomical role of a body part — and, for appendages, how it behaves at
+/// spawn (mirroring) and runtime (joint + brain wiring):
+///   * `Body`    — the root part (index 0); never an appendage.
+///   * `Limb`    — paired moving appendage: in a Bilateral organism it expands
+///                 into a right+left PAIR of separately-jointed parts; motorized
+///                 joint driven by the brain.
+///   * `Organ`   — legacy non-limb appendage (colony-editor / pre-v11 `.species`):
+///                 behaves like `Limb` at runtime (mirrors + motorized) but tagged
+///                 distinctly (cosmetic sliding-animation gate).
+///   * `Segment` — midline MOVING structure: a Bilateral organism fuses its two
+///                 halves into ONE part (like the base body) instead of splitting;
+///                 motorized joint driven by the brain. For a segmented spine.
+///   * `Static`  — midline FIXED structure: fuses to one part like `Segment`, but
+///                 attaches with a rigid fixed joint — no articulation, and the
+///                 brain has no movement connection to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyPartKind {
     Body,
     Limb,
     Organ,
+    Segment,
+    Static,
 }
 
 #[derive(Clone, Debug)]

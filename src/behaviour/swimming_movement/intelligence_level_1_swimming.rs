@@ -69,8 +69,16 @@ pub fn assign_brains_swim_1(
         if !matches!(organism.intelligence_level, IntelligenceLevel::Level1) { continue; }
         if !organism.movement_mode.is_swimming() { continue; }
         let Some(s) = pool.0.enrol(e) else { continue };
-        // Limb-architecture payloads don't fit this pool — drop them (see above).
-        if restore.is_some() {
+        // A `BrainRestoreLimb` payload on a SWIMMER is a saved/exported SWIM net
+        // (limb & swim PPO brains share the payload struct; movement mode routes
+        // it here). Restore it into this organism's species net. Shape-guarded:
+        // a genuine terrestrial-limb payload would fail the swim-dim check and
+        // degrade to a fresh warm-start. Keyed by the organism's species_id,
+        // which `.species` imports pin eagerly at spawn so the restore lands in
+        // the right shared net.
+        if let Some(r) = restore {
+            let key = organism.species_id.unwrap_or(crate::swim_ppo::UNCLASSIFIED);
+            pool.0.restore_species(key, r);
             commands.entity(e).try_remove::<crate::limb_ppo::BrainRestoreLimb>();
         }
         // SHARED policy → no per-slot weight inheritance; the slot is pure

@@ -264,68 +264,6 @@ pub(super) fn respawn_template(
     )).id()
 }
 
-/// Build an appendage `BodyPart` from a full OCG (already mirrored if needed).
-/// REBASED to the first cell exactly like `limb_body_part` (entity at the
-/// first-cell pivot, cells shifted relative to it): once every part became a
-/// dynamic spherical-jointed body, an appendage left at `origin_local = ZERO`
-/// with authored-position cells was pinned at the ROOT ORIGIN with its COM far
-/// away — a large lever arm that spun it violently (the sub-limbed-swimmer
-/// "flung into the air" bug). Rebasing pivots the joint at the contact point
-/// and keeps the COM near the origin. Rendering is unchanged (mesh from the
-/// shifted OCG, entity at the pivot). `kind = Organ` (vs `limb_body_part`'s
-/// `Limb`) is the only remaining difference.
-fn appendage_body_part(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize) -> crate::cell::BodyPart {
-    let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
-    let shifted_ocg: Vec<(usize, Vec3, CellType)> = ocg.iter()
-        .map(|(i, p, ct)| (*i, *p - pivot, *ct))
-        .collect();
-    let cells = shifted_ocg.iter()
-        .map(|(_, p, ct)| crate::cell::Cell::new(*p, *ct))
-        .collect();
-    crate::cell::BodyPart {
-        kind:         crate::cell::BodyPartKind::Organ,
-        local_offset: Vec3::ZERO,
-        cells,
-        ocg:          shifted_ocg,
-        attachment:   Some(crate::body_part::Attachment {
-            parent_idx,
-            origin_local: pivot,
-            rotation:     Quat::IDENTITY,
-        }),
-        consumed:     false,
-        debug_blue:   false,
-        regrowable:   true,
-    }
-}
-
-/// Build a LIMB `BodyPart` from a full OCG: entity positioned at the
-/// first cell, cells rebased relative to it, so rotating the entity
-/// rotates the limb about that pivot. Tagged `BodyPartKind::Limb` so
-/// `spawn_organism` attaches the `LimbAnimation` marker.
-fn limb_body_part(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: usize) -> crate::cell::BodyPart {
-    let pivot = ocg.first().map(|(_, p, _)| *p).unwrap_or(Vec3::ZERO);
-    let shifted_ocg: Vec<(usize, Vec3, CellType)> = ocg.iter()
-        .map(|(i, p, ct)| (*i, *p - pivot, *ct))
-        .collect();
-    let cells = shifted_ocg.iter()
-        .map(|(_, p, ct)| crate::cell::Cell::new(*p, *ct))
-        .collect();
-    crate::cell::BodyPart {
-        kind:         crate::cell::BodyPartKind::Limb,
-        local_offset: Vec3::ZERO,
-        cells,
-        ocg:          shifted_ocg,
-        attachment:   Some(crate::body_part::Attachment {
-            parent_idx,
-            origin_local: pivot,
-            rotation:     Quat::IDENTITY,
-        }),
-        consumed:     false,
-        debug_blue:   false,
-        regrowable:   true,
-    }
-}
-
 /// Merged-mode helper: translate `OrganismTemplate` into the args
 /// `colony::spawn_organism` expects, yielding an `OrganismRoot`
 /// indistinguishable from a reproduced/loaded organism. Initial energy
@@ -345,28 +283,41 @@ fn spawn_real_organism(
     // right+left pair, tracked separately so a sub-limb's right half
     // attaches to its parent's right (left to left). Sub-limbs are always
     // authored after their parent, so parent indices exist by then.
-    let make = |o: Vec<(usize, Vec3, CellType)>, is_limb: bool, parent_idx: usize| -> crate::cell::BodyPart {
-        if is_limb { limb_body_part(o, parent_idx) } else { appendage_body_part(o, parent_idx) }
-    };
+    use crate::cell::BodyPartKind;
+    use crate::colony::{fuse_bilateral_ocg, kinded_appendage_from_ocg};
     match template.symmetry {
         Symmetry::NoSymmetry => {
-            for (app_raw, is_limb, parent) in &template.custom_appendages {
-                body_parts.push(make(app_raw.clone(), *is_limb, *parent));
+            for (app_raw, kind, parent) in &template.custom_appendages {
+                body_parts.push(kinded_appendage_from_ocg(app_raw.clone(), *parent, *kind));
             }
         }
         Symmetry::Bilateral => {
-            // Per-editor-index right/left runtime indices.
+            // Per-editor-index right/left runtime indices. Limb/Organ expand to a
+            // mirrored pair; Segment/Static fuse to ONE midline part (both
+            // right_of/left_of point at it). Mirrors `colony::spawn_species_instance`.
             let mut right_of: Vec<usize> = vec![0]; // editor 0 (base) → runtime 0
             let mut left_of:  Vec<usize> = vec![0];
-            for (app_raw, is_limb, parent) in &template.custom_appendages {
+            for (app_raw, kind, parent) in &template.custom_appendages {
                 let p_right = right_of[*parent];
                 let p_left  = left_of[*parent];
-                let r_idx = body_parts.len();
-                body_parts.push(make(app_raw.clone(), *is_limb, p_right));
-                let l_idx = body_parts.len();
-                body_parts.push(make(crate::body_part::mirror_right_to_left(app_raw), *is_limb, p_left));
-                right_of.push(r_idx);
-                left_of.push(l_idx);
+                match kind {
+                    BodyPartKind::Segment | BodyPartKind::Static => {
+                        let idx = body_parts.len();
+                        body_parts.push(kinded_appendage_from_ocg(
+                            fuse_bilateral_ocg(app_raw), p_right, *kind));
+                        right_of.push(idx);
+                        left_of.push(idx);
+                    }
+                    _ => {
+                        let r_idx = body_parts.len();
+                        body_parts.push(kinded_appendage_from_ocg(app_raw.clone(), p_right, *kind));
+                        let l_idx = body_parts.len();
+                        body_parts.push(kinded_appendage_from_ocg(
+                            crate::body_part::mirror_right_to_left(app_raw), p_left, *kind));
+                        right_of.push(r_idx);
+                        left_of.push(l_idx);
+                    }
+                }
             }
         }
     }
@@ -467,12 +418,18 @@ pub(super) fn spawn_species_template_at(
     };
     let entity = respawn_template(&template, commands, meshes, materials, org_materials, smoothing);
 
-    // If the species carried a trained brain, attach a copy of the
-    // restore payload; `assign_brains_herbivore_1` consumes it next
-    // PreUpdate. All bulk instances share the payload and diverge
-    // through training, as designed.
+    // If the species carried a trained brain, attach a copy of the matching
+    // restore component; the relevant pool's `assign_brains_*` consumes it next
+    // PreUpdate (movement mode routes the PPO payload to the limb or swim pool).
     if let Some(brain) = &species.brain {
-        commands.entity(entity).try_insert(brain.clone());
+        match brain {
+            crate::species_editor::save::LoadedBrain::Sliding(b) => {
+                commands.entity(entity).try_insert(b.clone());
+            }
+            crate::species_editor::save::LoadedBrain::Ppo(b) => {
+                commands.entity(entity).try_insert(b.clone());
+            }
+        }
     }
 
     session.templates.push(OrganismTemplate { entity, ..template });

@@ -6,7 +6,7 @@ use bevy::prelude::*;
 
 use crate::organism::{IntelligenceLevel, MovementMode, Symmetry};
 use crate::colony_editor::template::{Form, Metabolism, OrganismTemplate};
-use crate::cell::CellType;
+use crate::cell::{BodyPartKind, CellType};
 
 
 // ── Loaded species ──────────────────────────────────────────────────────────
@@ -37,14 +37,15 @@ pub struct LoadedSpecies {
     /// Base-body OCG (pre-expanded to right + mirrored-left for bilateral,
     /// so downstream placement/save need not special-case it).
     pub ocg:               Vec<(usize, Vec3, CellType)>,
-    /// Appendage parts as `(OCG, is_limb, parent)` — raw stored OCG,
-    /// limb flag, and EDITOR parent index. Expanded to runtime parts at
-    /// spawn (bilateral → mirrored pair). Empty for single-part species.
-    pub appendages:        Vec<(Vec<(usize, Vec3, CellType)>, bool, usize)>,
-    /// `Some` when the `.species` file carried trained brain weights;
-    /// each spawn gets a copy as a `BrainRestoreHerbivore1` consumed by
-    /// `assign_brains_herbivore_1`. `None` for fresh/legacy files.
-    pub brain: Option<crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1>,
+    /// Appendage parts as `(OCG, kind, parent)` — raw stored OCG, `BodyPartKind`
+    /// (Limb / Segment / Static / Organ), and EDITOR parent index. Expanded to
+    /// runtime parts at spawn: a Bilateral `Limb`/`Organ` → mirrored pair;
+    /// `Segment`/`Static` → one fused midline part. Empty for single-part species.
+    pub appendages:        Vec<(Vec<(usize, Vec3, CellType)>, BodyPartKind, usize)>,
+    /// `Some` when the `.species` file carried trained brain weights; each spawn
+    /// gets a copy of the matching restore component, consumed by the relevant
+    /// pool's `assign_brains_*`. `None` for fresh/legacy files.
+    pub brain: Option<crate::species_editor::save::LoadedBrain>,
 }
 
 

@@ -166,6 +166,30 @@ const MIN_HETERO_BUFFER_MAX_LEN: usize = 6;
 const MIN_HETERO_BG_IDLE:    Color = Color::srgb(0.18, 0.18, 0.18);
 const MIN_HETERO_BG_FOCUSED: Color = Color::srgb(0.10, 0.30, 0.10);
 
+/// The "Species:" rename row (hidden until an organism with a species is
+/// selected). Toggled by `update_species_rename_row_visibility`.
+#[derive(Component)]
+struct SpeciesRenameRow;
+
+/// Click-target for the species-name rename text field.
+#[derive(Component)]
+struct SpeciesRenameInput;
+
+/// Marker on the Text child inside the rename input box.
+#[derive(Component)]
+struct SpeciesRenameText;
+
+/// Max chars in the species-name buffer.
+const SPECIES_RENAME_BUFFER_MAX_LEN: usize = 32;
+
+/// Focus + edit buffer for the species-rename field (mirrors
+/// `MinHeteroCountEditState`).
+#[derive(Resource, Default)]
+struct SpeciesRenameEditState {
+    focused: bool,
+    buffer:  String,
+}
+
 /// One per labelled organism (`target` = OrganismRoot). Spawned as a child of
 /// `ViewportImage` so `Val::Px` positions are viewport-local pixels — the exact
 /// space `Camera::world_to_viewport` returns.
@@ -193,6 +217,7 @@ impl Plugin for IndividuumNavigatorPlugin {
             .init_resource::<ShowIndividualIdentifiers>()
             .init_resource::<VerticalDividerDragState>()
             .init_resource::<ExportSpeciesRequested>()
+            .init_resource::<SpeciesRenameEditState>()
             .add_message::<ViewportPick>()
             .add_systems(Update, (
                 assign_individual_identifiers,
@@ -214,6 +239,11 @@ impl Plugin for IndividuumNavigatorPlugin {
                 update_min_hetero_text,
                 handle_export_buttons,
                 dispatch_export_species_requests,
+                (
+                    update_species_rename_row_visibility,
+                    handle_species_rename_input,
+                    update_species_rename_text,
+                ),
             ));
     }
 }
@@ -307,6 +337,48 @@ pub fn spawn_navigator_panel(parent: &mut ChildSpawnerCommands) {
             },
             Pickable::IGNORE,
         ));
+
+        // ── Selected-species rename field (hidden until an organism with a
+        //    classified species is selected; click to edit, Enter to commit). ─
+        panel.spawn((
+            SpeciesRenameRow,
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items:    AlignItems::Center,
+                margin:         UiRect::bottom(Val::Px(6.0)),
+                display:        Display::None,
+                ..default()
+            },
+        ))
+        .with_children(|row| {
+            row.spawn((
+                Text::new("Species:"),
+                TextFont { font_size: 12.0, ..default() },
+                TextColor(Color::srgb(0.75, 0.75, 0.75)),
+                Node { margin: UiRect::right(Val::Px(6.0)), flex_shrink: 0.0, ..default() },
+                Pickable::IGNORE,
+            ));
+            row.spawn((
+                SpeciesRenameInput,
+                Button,
+                Node {
+                    flex_grow: 1.0,
+                    min_width: Val::Px(0.0),
+                    padding:   UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
+                    ..default()
+                },
+                BackgroundColor(MIN_HETERO_BG_IDLE),
+            ))
+            .with_children(|btn| {
+                btn.spawn((
+                    SpeciesRenameText,
+                    Text::new(""),
+                    TextFont { font_size: 12.0, ..default() },
+                    TextColor(Color::WHITE),
+                    Pickable::IGNORE,
+                ));
+            });
+        });
 
         // ── Scrollable list of per-organism buttons ────────────────────
         // `Overflow::scroll_y()` enables clipping; mouse-wheel handling
@@ -671,7 +743,15 @@ fn update_label_positions(
     // parts move, so the label tracks the trunk part (`BodyPartIndex(0)`),
     // the true location. For sliding organisms the trunk's GlobalTransform
     // equals the root's — correct on both paths.
-    base_part_q: Query<(&ChildOf, &crate::cell::BodyPartIndex, &GlobalTransform)>,
+    //
+    // We read the part's pose from the AUTHORITATIVE Rapier body (when present),
+    // not its `GlobalTransform`: for swimmer multibody links bevy_rapier writes a
+    // garbage Transform during writeback that is only corrected in `PostUpdate`
+    // (`sync_multibody_link_transforms`), so the `Update`-time `GlobalTransform`
+    // read here is wrong (was the cause of ghost labels at random locations).
+    base_part_q: Query<(&ChildOf, &crate::cell::BodyPartIndex, &GlobalTransform,
+                        Option<&bevy_rapier3d::prelude::RapierRigidBodyHandle>)>,
+    rb_set_q:    Query<&bevy_rapier3d::prelude::RapierRigidBodySet>,
     mut labels:  Query<(&IndividualLabel, &ComputedNode, &mut Node, &mut Visibility)>,
 ) {
     // Hide all labels outside Simulation mode. The labels are UI nodes under
@@ -700,11 +780,21 @@ fn update_label_positions(
 
     // Map each OrganismRoot to its trunk part's (`BodyPartIndex(0)`) world
     // position — the moving anchor for limb organisms.
+    let rb_set = rb_set_q.single().ok();
     let mut base_pos: HashMap<Entity, Vec3> = HashMap::new();
-    for (parent, idx, gx) in &base_part_q {
-        if idx.0 == 0 {
-            base_pos.insert(parent.parent(), gx.translation());
-        }
+    for (parent, idx, gx, handle) in &base_part_q {
+        if idx.0 != 0 { continue; }
+        // Authoritative Rapier pose if the part is a registered body; else the
+        // propagated GlobalTransform (correct for non-physics / sliding paths).
+        let pos = handle
+            .zip(rb_set)
+            .and_then(|(h, set)| set.bodies.get(h.0))
+            .map(|rb| {
+                let t = rb.position().translation;
+                Vec3::new(t.x, t.y, t.z)
+            })
+            .unwrap_or_else(|| gx.translation());
+        base_pos.insert(parent.parent(), pos);
     }
 
     for (label, label_node, mut node, mut vis) in &mut labels {
@@ -1034,6 +1124,131 @@ fn update_min_hetero_text(
 }
 
 
+/// Show the "Species:" rename row only while an organism WITH a classified
+/// species is selected; hide + unfocus otherwise.
+fn update_species_rename_row_visibility(
+    selected:  Res<SelectedOrganism>,
+    organisms: Query<&crate::organism::Organism>,
+    mut row_q: Query<&mut Node, With<SpeciesRenameRow>>,
+    mut state: ResMut<SpeciesRenameEditState>,
+) {
+    let has_species = selected.0
+        .and_then(|e| organisms.get(e).ok())
+        .and_then(|o| o.species_id)
+        .is_some();
+    for mut node in &mut row_q {
+        let want = if has_species { Display::Flex } else { Display::None };
+        if node.display != want { node.display = want; }
+    }
+    if !has_species && state.focused {
+        state.focused = false;
+        state.buffer.clear();
+    }
+}
+
+/// Click + keyboard router for the species-rename field. Click focuses (seeds
+/// the buffer with the current name), Enter / click-outside commits the rename
+/// into `SpeciesRegistry` (renaming the selected organism's whole species —
+/// every member shares the name, and the per-species brain, keyed by id, is
+/// untouched), Escape cancels. Accepts any printable character.
+fn handle_species_rename_input(
+    mouse:         Res<ButtonInput<MouseButton>>,
+    mut keyboard:  MessageReader<KeyboardInput>,
+    selected:      Res<SelectedOrganism>,
+    organisms:     Query<&crate::organism::Organism>,
+    mut registry:  ResMut<crate::lineages::species::SpeciesRegistry>,
+    interaction_q: Query<&Interaction, With<SpeciesRenameInput>>,
+    mut state:     ResMut<SpeciesRenameEditState>,
+) {
+    let species_id = selected.0
+        .and_then(|e| organisms.get(e).ok())
+        .and_then(|o| o.species_id);
+    let Some(species_id) = species_id else {
+        for _ in keyboard.read() {}
+        if state.focused { state.focused = false; state.buffer.clear(); }
+        return;
+    };
+
+    let click_on_input = mouse.just_pressed(MouseButton::Left)
+        && interaction_q.iter().any(|i| matches!(i, Interaction::Pressed));
+    let click_outside  = mouse.just_pressed(MouseButton::Left) && !click_on_input;
+
+    if click_on_input && !state.focused {
+        state.focused = true;
+        state.buffer.clear();
+        if let Some(s) = registry.get(species_id) {
+            state.buffer.push_str(&s.name);
+        }
+    }
+    if click_outside && state.focused {
+        commit_species_rename(&mut state, &mut registry, species_id);
+    }
+    if !state.focused {
+        for _ in keyboard.read() {}
+        return;
+    }
+
+    for ev in keyboard.read() {
+        if !ev.state.is_pressed() { continue; }
+        match ev.key_code {
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                commit_species_rename(&mut state, &mut registry, species_id);
+            }
+            KeyCode::Escape => { state.focused = false; state.buffer.clear(); }
+            KeyCode::Backspace => { state.buffer.pop(); }
+            _ => {
+                if let Some(text) = ev.text.as_ref() {
+                    for c in text.chars() {
+                        if state.buffer.len() >= SPECIES_RENAME_BUFFER_MAX_LEN { break; }
+                        if !c.is_control() { state.buffer.push(c); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn commit_species_rename(
+    state:      &mut SpeciesRenameEditState,
+    registry:   &mut crate::lineages::species::SpeciesRegistry,
+    species_id: u32,
+) {
+    let name = state.buffer.trim().to_string();
+    if !name.is_empty() {
+        if let Some(s) = registry.get_mut(species_id) {
+            if s.name != name { s.name = name; }
+        }
+    }
+    state.focused = false;
+    state.buffer.clear();
+}
+
+/// Refresh the rename field's text: the live species name when idle, the edit
+/// buffer (with a cursor) while focused; background reflects focus.
+fn update_species_rename_text(
+    selected:   Res<SelectedOrganism>,
+    organisms:  Query<&crate::organism::Organism>,
+    registry:   Res<crate::lineages::species::SpeciesRegistry>,
+    state:      Res<SpeciesRenameEditState>,
+    mut text_q: Query<&mut Text, With<SpeciesRenameText>>,
+    mut bg_q:   Query<&mut BackgroundColor, With<SpeciesRenameInput>>,
+) {
+    let current = selected.0
+        .and_then(|e| organisms.get(e).ok())
+        .and_then(|o| o.species_id)
+        .and_then(|id| registry.get(id).map(|s| s.name.clone()))
+        .unwrap_or_default();
+    let display = if state.focused { format!("{}_", state.buffer) } else { current };
+    for mut text in &mut text_q {
+        if text.0 != display { text.0 = display.clone(); }
+    }
+    let bg = if state.focused { MIN_HETERO_BG_FOCUSED } else { MIN_HETERO_BG_IDLE };
+    for mut b in &mut bg_q {
+        if b.0 != bg { *b = BackgroundColor(bg); }
+    }
+}
+
+
 /// Refresh each label's species sub-text from `Organism::species_id` via
 /// `SpeciesRegistry`. Writes only on change (avoids `Changed<Text>` churn).
 fn update_label_species_text(
@@ -1103,34 +1318,46 @@ fn handle_export_buttons(
     }
 }
 
-/// Worker — consumes one pending export request, snapshots the brain from the
-/// herbivore pool, encodes the .species v3 payload, writes to disk.
+/// Worker — consumes one pending export request, snapshots the organism's brain
+/// from whichever pool it belongs to (sliding herbivore_1, a limb walker pool,
+/// or the swim pool), encodes a v10 `.species` payload, writes to disk.
+///
+/// Sliding herbivores keep the legacy single bilateral right-half "Base Body"
+/// export. Walkers and swimmers are exported as their LITERAL multi-part body
+/// plan with `symmetry = NoSymmetry` (each runtime part verbatim) so respawn
+/// rebuilds the exact structure the PPO policy was trained on.
 fn dispatch_export_species_requests(
     mut request: ResMut<ExportSpeciesRequested>,
-    pool:        NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
+    pool_sl:     NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
+    pool_lh:     NonSend<crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
+    pool_l2:     NonSend<crate::intelligence_level_2_limb::BrainPoolL2Limb>,
+    pool_l3:     NonSend<crate::intelligence_level_3_limb::BrainPoolL3Limb>,
+    pool_sw:     NonSend<crate::intelligence_level_1_swimming::BrainPoolSwim1>,
     query:       Query<
         (
             &Organism,
-            &crate::intelligence_level_herbivore_1_sliding::BrainSlotHerbivore1,
             Has<crate::colony::Photoautotroph>,
             Has<Heterotroph>,
             Has<crate::colony::Carnivore>,
+            Option<&crate::intelligence_level_herbivore_1_sliding::BrainSlotHerbivore1>,
+            Option<&crate::intelligence_level_herbivore_1_limb::BrainSlotHerbivore1Limb>,
+            Option<&crate::intelligence_level_2_limb::BrainSlotL2Limb>,
+            Option<&crate::intelligence_level_3_limb::BrainSlotL3Limb>,
+            Option<&crate::intelligence_level_1_swimming::BrainSlotSwim1>,
         ),
         With<OrganismRoot>,
     >,
 ) {
+    use crate::species_editor::session::{Classification, Metabolism};
+    use crate::species_editor::save::LoadedBrain;
+    use crate::organism::{Symmetry, MovementMode};
+
     let Some((entity, path)) = request.0.take() else { return };
 
-    let Ok((org, slot, is_photo, is_hetero, is_carn)) = query.get(entity) else {
-        warn!(
-            "export species: entity {:?} not found / has no herbivore_1 brain slot \
-             (only Level1 + Heterotroph + !Carnivore organisms can be exported)",
-            entity,
-        );
+    let Ok((org, is_photo, is_hetero, is_carn, sl, lh, l2, l3, sw)) = query.get(entity) else {
+        warn!("export species: entity {:?} not found", entity);
         return;
     };
-
-    use crate::species_editor::session::{Classification, Metabolism};
     let metabolism = if is_photo {
         Metabolism::Photoautotroph
     } else if is_hetero {
@@ -1140,38 +1367,58 @@ fn dispatch_export_species_requests(
         return;
     };
     let classification = if is_carn { Classification::Carnivore } else { Classification::Herbivore };
-
-    // .species stores the RIGHT half only: filter bilateral body-part-0 to
-    // `p.x > 0`; NoSymmetry saves the full OCG.
-    let ocg_full = if org.body_parts.is_empty() {
+    if org.body_parts.is_empty() {
         warn!("export species: entity {:?} has no body parts", entity);
-        return;
-    } else {
-        &org.body_parts[0].ocg
-    };
-    let ocg: Vec<_> = match org.symmetry {
-        crate::organism::Symmetry::NoSymmetry => ocg_full.clone(),
-        crate::organism::Symmetry::Bilateral  => ocg_full.iter()
-            .filter(|(_, p, _)| p.x > 0.0)
-            .copied()
-            .collect(),
-    };
-    if ocg.is_empty() {
-        warn!("export species: entity {:?} produced empty OCG after symmetry filter", entity);
         return;
     }
 
-    let brain = pool.extract_slot(slot.0);
+    // Per pool: build the body-plan `parts`, symmetry, movement, ground, and the
+    // brain payload. `None` ⇒ this organism has no exportable trained brain yet.
+    type Parts = Vec<(String, crate::cell::BodyPartKind, usize, Vec<(usize, bevy::math::Vec3, crate::cell::CellType)>)>;
+    let export: Option<(Parts, Symmetry, MovementMode, bool, LoadedBrain)> = if let Some(slot) = sl {
+        // SLIDING herbivore_1 — single bilateral right-half "Base Body" (legacy).
+        let ocg_full = &org.body_parts[0].ocg;
+        let ocg: Vec<_> = match org.symmetry {
+            Symmetry::NoSymmetry => ocg_full.clone(),
+            Symmetry::Bilateral  => ocg_full.iter().filter(|(_, p, _)| p.x > 0.0).copied().collect(),
+        };
+        if ocg.is_empty() { None } else {
+            Some((vec![("Base Body".to_string(), crate::cell::BodyPartKind::Body, 0, ocg)],
+                  org.symmetry, MovementMode::Sliding, true,
+                  LoadedBrain::Sliding(pool_sl.extract_slot(slot.0))))
+        }
+    } else {
+        // PPO walker / swimmer — literal multi-part body plan, NoSymmetry.
+        let restore = if lh.is_some() { pool_lh.0.snapshot().extract(entity) }
+            else if l2.is_some()      { pool_l2.0.snapshot().extract(entity) }
+            else if l3.is_some()      { pool_l3.0.snapshot().extract(entity) }
+            else if sw.is_some()      { pool_sw.0.extract_species_for(entity) }
+            else { None };
+        restore.map(|r| {
+            let parts: Parts = org.body_parts.iter().enumerate().map(|(i, bp)| {
+                let name = if i == 0 { "Base Body".to_string() } else { format!("Part {i}") };
+                // Literal runtime kind: a trained NoSymmetry export rebuilds the
+                // exact structure (no re-mirroring), so the kind round-trips as-is.
+                let parent  = bp.attachment.as_ref().map(|a| a.parent_idx).unwrap_or(0);
+                (name, bp.kind, parent, bp.ocg.clone())
+            }).collect();
+            (parts, Symmetry::NoSymmetry, org.movement_mode, org.ground_based, LoadedBrain::Ppo(r))
+        })
+    };
+
+    let Some((parts, symmetry, movement, ground_based, brain)) = export else {
+        warn!(
+            "export species: entity {:?} has no exportable trained brain — needs a \
+             live brain slot in the sliding-L1-herbivore, a walker (limb), or the \
+             swimmer pool (Level0 / sessile / not-yet-enrolled organisms can't be exported)",
+            entity,
+        );
+        return;
+    };
 
     let bytes = crate::species_editor::save::encode_species_with_brain(
-        metabolism,
-        org.symmetry,
-        org.intelligence_level,
-        org.has_variable_form,
-        org.is_sessile,
-        classification,
-        &ocg,
-        &brain,
+        metabolism, symmetry, org.intelligence_level, org.has_variable_form, org.is_sessile,
+        classification, movement, ground_based, &parts, &brain,
     );
 
     // Ensure target directory exists (user may have picked outside ./species/).
@@ -1184,10 +1431,11 @@ fn dispatch_export_species_requests(
         }
     }
 
+    let cells: usize = parts.iter().map(|p| p.3.len()).sum();
     match std::fs::write(&path, &bytes) {
         Ok(()) => info!(
-            "trained species exported to {} — {} cells, {} bytes",
-            path.display(), ocg.len(), bytes.len(),
+            "trained species exported to {} — {} parts, {} cells, {} bytes",
+            path.display(), parts.len(), cells, bytes.len(),
         ),
         Err(e) => error!("export species: write to {} failed: {}", path.display(), e),
     }

@@ -529,6 +529,43 @@ pub fn new_species_brain(device: &CudaDevice) -> SpeciesBrain {
     SpeciesBrain { actor, critic, opt_actor, opt_critic, training_step: 0 }
 }
 
+/// Full read-only snapshot of the swim pool, fanned into per-SLOT flat buffers
+/// (mirrors `LimbPoolSnapshot`): one GPU→CPU pull per live species, then
+/// per-organism `extract` is pure CPU slicing. Reuses the `BrainRestoreLimb`
+/// payload struct (swim dims). Produced by `BrainPoolSwim::snapshot` for the
+/// `.colony` save.
+pub struct SwimPoolSnapshot {
+    actor_w1:      Vec<f32>,
+    actor_b1:      Vec<f32>,
+    actor_w2:      Vec<f32>,
+    actor_b2:      Vec<f32>,
+    actor_log_std: Vec<f32>,
+    critic_w1:     Vec<f32>,
+    critic_b1:     Vec<f32>,
+    critic_w2:     Vec<f32>,
+    critic_b2:     Vec<f32>,
+    map:           HashMap<Entity, u32>,
+}
+
+impl SwimPoolSnapshot {
+    /// Slice one slot's swim net into a `BrainRestoreLimb`; `None` if the entity
+    /// has no slot.
+    pub fn extract(&self, e: Entity) -> Option<crate::limb_ppo::BrainRestoreLimb> {
+        let s = *self.map.get(&e)? as usize;
+        Some(crate::limb_ppo::BrainRestoreLimb {
+            actor_w1:      self.actor_w1[s * IN * HIDDEN .. (s + 1) * IN * HIDDEN].to_vec(),
+            actor_b1:      self.actor_b1[s * HIDDEN      .. (s + 1) * HIDDEN]      .to_vec(),
+            actor_w2:      self.actor_w2[s * HIDDEN * OUT .. (s + 1) * HIDDEN * OUT].to_vec(),
+            actor_b2:      self.actor_b2[s * OUT         .. (s + 1) * OUT]         .to_vec(),
+            actor_log_std: self.actor_log_std[s * OUT    .. (s + 1) * OUT]         .to_vec(),
+            critic_w1:     self.critic_w1[s * IN * HIDDEN .. (s + 1) * IN * HIDDEN].to_vec(),
+            critic_b1:     self.critic_b1[s * HIDDEN     .. (s + 1) * HIDDEN]      .to_vec(),
+            critic_w2:     self.critic_w2[s * HIDDEN     .. (s + 1) * HIDDEN]      .to_vec(),
+            critic_b2:     self.critic_b2[s ..= s].to_vec(),
+        })
+    }
+}
+
 impl BrainPoolSwim {
     /// Allocate the pool. `n` sizes the per-slot bookkeeping arrays (max
     /// concurrent swimmers). Per-species nets are NOT built here — they're
@@ -585,6 +622,129 @@ impl BrainPoolSwim {
             self.map.values().map(|&s| self.slot_species[s as usize]).collect();
         live.insert(UNCLASSIFIED);
         self.species.retain(|k, _| live.contains(k));
+    }
+
+    /// Extract one organism's CURRENT species net as a `BrainRestoreLimb`-shaped
+    /// payload. Swim nets share the same 2-D actor+critic field layout as limb
+    /// nets (only the dims differ), and the on-disk serializer is length-prefixed,
+    /// so the same payload type carries either — distinguished at load by the
+    /// organism's movement mode, not by a separate struct. Returns `None` if the
+    /// organism has no slot or its species has no net yet. Used by the
+    /// Individuum-Navigator "export trained organism" path for swimmers.
+    pub fn extract_species_for(&self, e: Entity) -> Option<crate::limb_ppo::BrainRestoreLimb> {
+        let s = *self.map.get(&e)? as usize;
+        self.extract_species_net(self.slot_species[s])
+    }
+
+    /// Pull a species' shared swim net off the GPU into a `BrainRestoreLimb`-shaped
+    /// payload (one sync per tensor). `None` if the species has no net yet.
+    pub fn extract_species_net(&self, key: u32) -> Option<crate::limb_ppo::BrainRestoreLimb> {
+        let b = self.species.get(&key)?;
+        Some(crate::limb_ppo::BrainRestoreLimb {
+            actor_w1:      b.actor.w1.val().clone().into_data().into_vec::<f32>().ok()?,
+            actor_b1:      b.actor.b1.val().clone().into_data().into_vec::<f32>().ok()?,
+            actor_w2:      b.actor.w2.val().clone().into_data().into_vec::<f32>().ok()?,
+            actor_b2:      b.actor.b2.val().clone().into_data().into_vec::<f32>().ok()?,
+            actor_log_std: b.actor.log_std.val().clone().into_data().into_vec::<f32>().ok()?,
+            critic_w1:     b.critic.w1.val().clone().into_data().into_vec::<f32>().ok()?,
+            critic_b1:     b.critic.b1.val().clone().into_data().into_vec::<f32>().ok()?,
+            critic_w2:     b.critic.w2.val().clone().into_data().into_vec::<f32>().ok()?,
+            critic_b2:     b.critic.b2.val().clone().into_data().into_vec::<f32>().ok()?,
+        })
+    }
+
+    /// Overwrite a SPECIES' shared swim net from a saved `BrainRestoreLimb`-shaped
+    /// payload (swim dims). Shape-validated against swim `IN`/`HIDDEN`/`OUT`; on a
+    /// mismatch (e.g. a payload that's actually a terrestrial-limb brain, or a
+    /// pre-resize save) it's rejected and the species lazily warm-starts a fresh
+    /// net — degrade, don't panic. Called by `assign_brains_swim_1` when a loaded
+    /// / imported swimmer of species `key` carries the payload.
+    pub fn restore_species(&mut self, key: u32, r: &crate::limb_ppo::BrainRestoreLimb) {
+        let shapes_ok = r.actor_w1.len()      == IN * HIDDEN
+            && r.actor_b1.len()      == HIDDEN
+            && r.actor_w2.len()      == HIDDEN * OUT
+            && r.actor_b2.len()      == OUT
+            && r.actor_log_std.len() == OUT
+            && r.critic_w1.len()     == IN * HIDDEN
+            && r.critic_b1.len()     == HIDDEN
+            && r.critic_w2.len()     == HIDDEN
+            && r.critic_b2.len()     == 1;
+        if !shapes_ok {
+            warn!(
+                "swim brain restore skipped: payload shapes don't match swim \
+                 architecture (IN={IN}, HIDDEN={HIDDEN}, OUT={OUT}); species {key} \
+                 keeps / lazily warm-starts fresh weights"
+            );
+            self.ensure_species(key);
+            return;
+        }
+        let device = self.device.clone();
+        let actor = SwimActor::<MyBackend> {
+            w1:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_w1.clone(),      [IN, HIDDEN]), &device)),
+            b1:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_b1.clone(),      [1, HIDDEN]),  &device)),
+            w2:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_w2.clone(),      [HIDDEN, OUT]), &device)),
+            b2:      Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_b2.clone(),      [1, OUT]),     &device)),
+            log_std: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.actor_log_std.clone(), [1, OUT]),     &device)),
+        };
+        let critic = SwimCritic::<MyBackend> {
+            w1: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.critic_w1.clone(), [IN, HIDDEN]), &device)),
+            b1: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.critic_b1.clone(), [1, HIDDEN]),  &device)),
+            w2: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.critic_w2.clone(), [HIDDEN, 1]),  &device)),
+            b2: Param::from_tensor(Tensor::<MyBackend, 2>::from_data(TensorData::new(r.critic_b2.clone(), [1, 1]),       &device)),
+        };
+        let opt_actor:  Box<dyn SwimOptActor>  = Box::new(AdamConfig::new().init());
+        let opt_critic: Box<dyn SwimOptCritic> = Box::new(AdamConfig::new().init());
+        self.species.insert(key, SpeciesBrain {
+            actor, critic, opt_actor, opt_critic, training_step: 0,
+        });
+    }
+
+    /// Per-SLOT snapshot (mirrors `BrainPoolLimb::snapshot`): pull each live
+    /// species' net to CPU once, fan it into every occupied slot's row, so
+    /// `SwimPoolSnapshot::extract(entity)` is pure CPU slicing. Unoccupied slots
+    /// stay zero (never read). Used by the `.colony` save.
+    pub fn snapshot(&self) -> SwimPoolSnapshot {
+        let n = self.n;
+        let mut snap = SwimPoolSnapshot {
+            actor_w1:      vec![0.0; n * IN * HIDDEN],
+            actor_b1:      vec![0.0; n * HIDDEN],
+            actor_w2:      vec![0.0; n * HIDDEN * OUT],
+            actor_b2:      vec![0.0; n * OUT],
+            actor_log_std: vec![0.0; n * OUT],
+            critic_w1:     vec![0.0; n * IN * HIDDEN],
+            critic_b1:     vec![0.0; n * HIDDEN],
+            critic_w2:     vec![0.0; n * HIDDEN],
+            critic_b2:     vec![0.0; n],
+            map:           self.map.clone(),
+        };
+        let zeros = || crate::limb_ppo::BrainRestoreLimb {
+            actor_w1:      vec![0.0; IN * HIDDEN],
+            actor_b1:      vec![0.0; HIDDEN],
+            actor_w2:      vec![0.0; HIDDEN * OUT],
+            actor_b2:      vec![0.0; OUT],
+            actor_log_std: vec![0.0; OUT],
+            critic_w1:     vec![0.0; IN * HIDDEN],
+            critic_b1:     vec![0.0; HIDDEN],
+            critic_w2:     vec![0.0; HIDDEN],
+            critic_b2:     vec![0.0; 1],
+        };
+        let mut cache: HashMap<u32, crate::limb_ppo::BrainRestoreLimb> = HashMap::new();
+        for (_e, &slot) in self.map.iter() {
+            let s = slot as usize;
+            if s >= n { continue; }
+            let key = self.slot_species[s];
+            let flat = cache.entry(key).or_insert_with(|| self.extract_species_net(key).unwrap_or_else(zeros));
+            snap.actor_w1     [s * IN * HIDDEN .. (s + 1) * IN * HIDDEN].copy_from_slice(&flat.actor_w1);
+            snap.actor_b1     [s * HIDDEN      .. (s + 1) * HIDDEN]     .copy_from_slice(&flat.actor_b1);
+            snap.actor_w2     [s * HIDDEN * OUT .. (s + 1) * HIDDEN * OUT].copy_from_slice(&flat.actor_w2);
+            snap.actor_b2     [s * OUT         .. (s + 1) * OUT]        .copy_from_slice(&flat.actor_b2);
+            snap.actor_log_std[s * OUT         .. (s + 1) * OUT]        .copy_from_slice(&flat.actor_log_std);
+            snap.critic_w1    [s * IN * HIDDEN .. (s + 1) * IN * HIDDEN].copy_from_slice(&flat.critic_w1);
+            snap.critic_b1    [s * HIDDEN      .. (s + 1) * HIDDEN]     .copy_from_slice(&flat.critic_b1);
+            snap.critic_w2    [s * HIDDEN      .. (s + 1) * HIDDEN]     .copy_from_slice(&flat.critic_w2);
+            snap.critic_b2    [s ..= s]                                 .copy_from_slice(&flat.critic_b2);
+        }
+        snap
     }
 
     /// Pop a fresh slot for an organism. `None` once the pool is full. No
@@ -683,11 +843,15 @@ impl BrainPoolSwim {
             self.ensure_species(*key);
             let brain = self.species.get(key).expect("species ensured above");
             let cnt = slots.len();
-            let mut rows = vec![0.0_f32; cnt * IN];
+            // Pad the batch row count to a power of two so the GPU sees a
+            // bounded set of shapes; padded rows are zero and ignored by the
+            // readback loop below (it indexes only i < cnt).
+            let pad = crate::limb_ppo::pad_batch(cnt);
+            let mut rows = vec![0.0_f32; pad * IN];
             for (i, &s) in slots.iter().enumerate() {
                 rows[i * IN..i * IN + IN].copy_from_slice(&input_buf[s * IN..s * IN + IN]);
             }
-            let obs_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(rows, [cnt, IN]), &device);
+            let obs_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(rows, [pad, IN]), &device);
             let mu = brain.actor.forward(obs_t.clone()).into_data().into_vec::<f32>().expect("swim actor forward");
             let v  = brain.critic.forward(obs_t).into_data().into_vec::<f32>().expect("swim critic forward");
             for (i, &s) in slots.iter().enumerate() {
@@ -841,7 +1005,9 @@ impl BrainPoolSwim {
             let cnt = slots.len();
 
             // ── 0. V(s_T) bootstrap per slot (batched critic forward). ──
-            let mut last_obs_buf: Vec<f32> = vec![0.0; cnt * IN];
+            // Pad to pow2; padded rows are zero and read back only for i < cnt.
+            let pad_c = crate::limb_ppo::pad_batch(cnt);
+            let mut last_obs_buf: Vec<f32> = vec![0.0; pad_c * IN];
             for (i, &s) in slots.iter().enumerate() {
                 if let Some(last) = self.rollouts[s].back() {
                     last_obs_buf[i * IN..i * IN + IN].copy_from_slice(&last.obs);
@@ -850,7 +1016,7 @@ impl BrainPoolSwim {
             let bootstrap_vec = {
                 let brain = self.species.get(&key).expect("species ensured above");
                 let last_obs_t = Tensor::<MyBackend, 2>::from_data(
-                    TensorData::new(last_obs_buf, [cnt, IN]), &device);
+                    TensorData::new(last_obs_buf, [pad_c, IN]), &device);
                 brain.critic.forward(last_obs_t)
                     .into_data().into_vec::<f32>().expect("swim bootstrap critic forward")
             };
@@ -887,12 +1053,31 @@ impl BrainPoolSwim {
             let mean_return = ret_mean as f32;
             let return_var  = ret_var as f32;
 
-            // ── 2. GPU tensors ([M, ·]). ──
-            let states_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(states,  [m, IN]),  &device);
-            let actions_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(actions, [m, OUT]), &device);
-            let old_lp_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(old_lp,  [m, 1]),   &device);
-            let adv_t     = Tensor::<MyBackend, 2>::from_data(TensorData::new(adv,     [m, 1]),   &device);
-            let returns_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(returns, [m, 1]),   &device);
+            // ── 2. GPU tensors, batch padded to pow2 ([Mpad, ·]). ──
+            // Pad the pooled buffers with zero rows up to the next power of two
+            // so the backend sees a BOUNDED set of training shapes (one autotune
+            // each, not one per transition count). Padded rows are masked OUT of
+            // the loss (`mask_t`), so they add zero gradient and the loss
+            // normalisation matches the unpadded mean over the `m` real rows.
+            let m_pad = crate::limb_ppo::pad_batch(m);
+            states.resize(m_pad * IN, 0.0);
+            actions.resize(m_pad * OUT, 0.0);
+            old_lp.resize(m_pad, 0.0);
+            adv.resize(m_pad, 0.0);
+            returns.resize(m_pad, 0.0);
+            // Scaled mask: real rows carry `m_pad / m` so that `.mean()` over the
+            // padded batch equals the original mean over the `m` real rows;
+            // padded rows carry 0.0 (so even a non-finite padded term → 0).
+            let mut mask_v = vec![0.0_f32; m_pad];
+            let row_scale = m_pad as f32 / m as f32;
+            for v in mask_v.iter_mut().take(m) { *v = row_scale; }
+            let mask_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(mask_v, [m_pad, 1]), &device);
+
+            let states_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(states,  [m_pad, IN]),  &device);
+            let actions_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(actions, [m_pad, OUT]), &device);
+            let old_lp_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(old_lp,  [m_pad, 1]),   &device);
+            let adv_t     = Tensor::<MyBackend, 2>::from_data(TensorData::new(adv,     [m_pad, 1]),   &device);
+            let returns_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(returns, [m_pad, 1]),   &device);
 
             // ── 3. PPO_EPOCHS updates over THIS species' net. ──
             let mut last_actor_loss:  f32 = 0.0;
@@ -926,11 +1111,14 @@ impl BrainPoolSwim {
 
                     let entropy = log_std_b.add_scalar(entropy_const).sum_dim(1).mean();
 
-                    let loss = (policy_loss.clone() + value_loss.clone().mul_scalar(VALUE_LOSS_COEF)).mean()
+                    // Mask out padded rows (× mask_t); the scaled mask makes the
+                    // padded-batch mean equal the original mean over `m` rows.
+                    let loss = ((policy_loss.clone() + value_loss.clone().mul_scalar(VALUE_LOSS_COEF))
+                            * mask_t.clone()).mean()
                         - entropy.clone().mul_scalar(ENTROPY_COEF);
 
                     if epoch == PPO_EPOCHS - 1 {
-                        last_actor_loss = crate::limb_ppo::scalar_of(policy_loss.mean());
+                        last_actor_loss = crate::limb_ppo::scalar_of((policy_loss * mask_t.clone()).mean());
                         last_total_loss = crate::limb_ppo::scalar_of(loss.clone());
                         last_entropy    = crate::limb_ppo::scalar_of(entropy);
                     }
@@ -942,7 +1130,7 @@ impl BrainPoolSwim {
                     // Critic: fresh graph (the one above was consumed by backward).
                     let v2 = brain.critic.forward(states_t.clone());
                     let v2_diff = v2 - returns_t.clone();
-                    let critic_loss = (v2_diff.clone() * v2_diff).mul_scalar(0.5).mean();
+                    let critic_loss = ((v2_diff.clone() * v2_diff).mul_scalar(0.5) * mask_t.clone()).mean();
                     if epoch == PPO_EPOCHS - 1 {
                         last_critic_loss = crate::limb_ppo::scalar_of(critic_loss.clone());
                     }

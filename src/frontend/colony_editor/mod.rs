@@ -159,9 +159,10 @@ fn load_species_into_session(
     };
     let base_raw = loaded.body_parts.first().map(|p| p.ocg.clone()).unwrap_or_default();
     let ocg = expand(&base_raw);
-    let appendages: Vec<(Vec<(usize, bevy::math::Vec3, crate::cell::CellType)>, bool, usize)> =
+    let appendages: Vec<(Vec<(usize, bevy::math::Vec3, crate::cell::CellType)>, crate::cell::BodyPartKind, usize)> =
         loaded.body_parts.iter().skip(1)
-            .map(|p| (p.ocg.clone(), p.is_limb, p.parent))
+            // Preserve the full kind so Segment/Static fuse (not split) at spawn/save.
+            .map(|p| (p.ocg.clone(), p.kind, p.parent))
             .collect();
 
     let display_name = path.file_stem()
@@ -200,6 +201,12 @@ fn load_species_into_session(
 /// Consumes `EditorSession::load_species_path`, loads + appends, and
 /// auto-selects the new species.
 fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
+    // Read-only check FIRST (immutable deref): `.take()` mutably derefs `session`
+    // and would mark `EditorSession` CHANGED every frame even when there's nothing
+    // to load — which makes every `session.is_changed()`-gated rebuild (the species
+    // palette, etc.) despawn+respawn its rows each frame → massive UI flicker. Only
+    // touch it mutably when a load is actually pending.
+    if session.load_species_path.is_none() { return; }
     let Some(path) = session.load_species_path.take() else { return };
     if let Some(id) = load_species_into_session(&mut session, &path) {
         session.selected_species_id = Some(id);

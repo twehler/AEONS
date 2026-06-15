@@ -299,6 +299,20 @@ pub fn scalar_of<const D: usize>(t: Tensor<MyBackend, D>) -> f32 {
     data.into_vec::<f32>().expect("scalar_of: f32 dtype").first().copied().unwrap_or(0.0)
 }
 
+/// Round a batch row count up to the next power of two so the GPU backend sees
+/// a BOUNDED set of tensor shapes (≤ log2(N)+1 buckets) instead of one new
+/// shape per live organism / transition count. CubeCL JIT-compiles AND
+/// autotunes per problem shape, so an unbounded batch dimension (= live count)
+/// made every spawn that nudged the count to a never-seen value pay a fresh
+/// compile + autotune stall. With pow2 bucketing each shape is hit — and
+/// warmed — once, early, then reused. Padded rows are zero-filled and either
+/// sliced off the forward readback or masked out of the train loss, so policy
+/// outputs and gradients are unchanged. `0 → 1` (never build a 0-row tensor).
+#[inline]
+pub fn pad_batch(n: usize) -> usize {
+    if n <= 1 { 1 } else { n.next_power_of_two() }
+}
+
 
 pub fn build_observation(
     organism:     &Organism,
@@ -1133,11 +1147,15 @@ impl BrainPoolLimb {
             self.ensure_species(*key);
             let brain = self.species.get(key).expect("species ensured above");
             let cnt = slots.len();
-            let mut rows = vec![0.0_f32; cnt * IN];
+            // Pad the batch row count to a power of two so the GPU sees a
+            // bounded set of shapes; padded rows are zero and ignored by the
+            // readback loop below (it indexes only i < cnt).
+            let pad = pad_batch(cnt);
+            let mut rows = vec![0.0_f32; pad * IN];
             for (i, &s) in slots.iter().enumerate() {
                 rows[i * IN..i * IN + IN].copy_from_slice(&input_buf[s * IN..s * IN + IN]);
             }
-            let obs_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(rows, [cnt, IN]), &device);
+            let obs_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(rows, [pad, IN]), &device);
             let mu = brain.actor.forward(obs_t.clone()).into_data().into_vec::<f32>().expect("limb actor forward");
             let v  = brain.critic.forward(obs_t).into_data().into_vec::<f32>().expect("limb critic forward");
             for (i, &s) in slots.iter().enumerate() {
@@ -1413,7 +1431,9 @@ impl BrainPoolLimb {
             let cnt = slots.len();
 
             // ── 0. V(s_T) bootstrap per slot (batched critic forward). ──
-            let mut last_obs_buf: Vec<f32> = vec![0.0; cnt * IN];
+            // Pad to pow2; padded rows are zero and read back only for i < cnt.
+            let pad_c = pad_batch(cnt);
+            let mut last_obs_buf: Vec<f32> = vec![0.0; pad_c * IN];
             for (i, &s) in slots.iter().enumerate() {
                 if let Some(last) = self.rollouts[s].back() {
                     last_obs_buf[i * IN..i * IN + IN].copy_from_slice(&last.obs);
@@ -1422,7 +1442,7 @@ impl BrainPoolLimb {
             let bootstrap_vec = {
                 let brain = self.species.get(&key).expect("species ensured above");
                 let last_obs_t = Tensor::<MyBackend, 2>::from_data(
-                    TensorData::new(last_obs_buf, [cnt, IN]), &device);
+                    TensorData::new(last_obs_buf, [pad_c, IN]), &device);
                 brain.critic.forward(last_obs_t)
                     .into_data().into_vec::<f32>().expect("limb bootstrap critic forward")
             };
@@ -1462,12 +1482,31 @@ impl BrainPoolLimb {
             let mean_return = ret_mean as f32;
             let return_var  = ret_var as f32;
 
-            // ── 2. GPU tensors ([M, ·]). ──
-            let states_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(states,  [m, IN]),  &device);
-            let actions_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(actions, [m, OUT]), &device);
-            let old_lp_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(old_lp,  [m, 1]),   &device);
-            let adv_t     = Tensor::<MyBackend, 2>::from_data(TensorData::new(adv,     [m, 1]),   &device);
-            let returns_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(returns, [m, 1]),   &device);
+            // ── 2. GPU tensors, batch padded to pow2 ([Mpad, ·]). ──
+            // Pad the pooled buffers with zero rows up to the next power of two
+            // so the backend sees a BOUNDED set of training shapes (one autotune
+            // each, not one per transition count). Padded rows are masked OUT of
+            // the loss (`mask_t`), so they add zero gradient and the loss
+            // normalisation matches the unpadded mean over the `m` real rows.
+            let m_pad = pad_batch(m);
+            states.resize(m_pad * IN, 0.0);
+            actions.resize(m_pad * OUT, 0.0);
+            old_lp.resize(m_pad, 0.0);
+            adv.resize(m_pad, 0.0);
+            returns.resize(m_pad, 0.0);
+            // Scaled mask: real rows carry `m_pad / m` so that `.mean()` over the
+            // padded batch equals the original mean over the `m` real rows;
+            // padded rows carry 0.0 (so even a non-finite padded term → 0).
+            let mut mask_v = vec![0.0_f32; m_pad];
+            let row_scale = m_pad as f32 / m as f32;
+            for v in mask_v.iter_mut().take(m) { *v = row_scale; }
+            let mask_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(mask_v, [m_pad, 1]), &device);
+
+            let states_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(states,  [m_pad, IN]),  &device);
+            let actions_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(actions, [m_pad, OUT]), &device);
+            let old_lp_t  = Tensor::<MyBackend, 2>::from_data(TensorData::new(old_lp,  [m_pad, 1]),   &device);
+            let adv_t     = Tensor::<MyBackend, 2>::from_data(TensorData::new(adv,     [m_pad, 1]),   &device);
+            let returns_t = Tensor::<MyBackend, 2>::from_data(TensorData::new(returns, [m_pad, 1]),   &device);
 
             // ── 3. PPO_EPOCHS updates over THIS species' net. ──
             let mut last_actor_loss:  f32 = 0.0;
@@ -1501,11 +1540,14 @@ impl BrainPoolLimb {
 
                     let entropy = log_std_b.add_scalar(entropy_const).sum_dim(1).mean();
 
-                    let loss = (policy_loss.clone() + value_loss.clone().mul_scalar(VALUE_LOSS_COEF)).mean()
+                    // Mask out padded rows (× mask_t); the scaled mask makes the
+                    // padded-batch mean equal the original mean over `m` rows.
+                    let loss = ((policy_loss.clone() + value_loss.clone().mul_scalar(VALUE_LOSS_COEF))
+                            * mask_t.clone()).mean()
                         - entropy.clone().mul_scalar(ENTROPY_COEF);
 
                     if epoch == PPO_EPOCHS - 1 {
-                        last_actor_loss = scalar_of(policy_loss.mean());
+                        last_actor_loss = scalar_of((policy_loss * mask_t.clone()).mean());
                         last_total_loss = scalar_of(loss.clone());
                         last_entropy    = scalar_of(entropy);
                     }
@@ -1517,7 +1559,7 @@ impl BrainPoolLimb {
                     // Critic: fresh graph (the one above was consumed by backward).
                     let v2 = brain.critic.forward(states_t.clone());
                     let v2_diff = v2 - returns_t.clone();
-                    let critic_loss = (v2_diff.clone() * v2_diff).mul_scalar(0.5).mean();
+                    let critic_loss = ((v2_diff.clone() * v2_diff).mul_scalar(0.5) * mask_t.clone()).mean();
                     if epoch == PPO_EPOCHS - 1 {
                         last_critic_loss = scalar_of(critic_loss.clone());
                     }

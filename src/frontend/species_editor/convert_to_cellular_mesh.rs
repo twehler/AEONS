@@ -32,7 +32,7 @@ use bevy::math::Mat3;
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 
-use crate::cell::CellType;
+use crate::cell::{BodyPartKind, CellType};
 use crate::colony::Symmetry;
 use crate::frontend::PANEL_BG_COLOR;
 use crate::simulation_settings::WindowMode;
@@ -294,16 +294,16 @@ fn convert(
 /// each parent precedes its children (the spawn path requires `parent <= index`
 /// for NoSymmetry). Every appendage's OCG is reordered so the cell nearest its
 /// parent's centroid is index 0 — that first cell is the runtime attachment
-/// pivot / rotation point. Appendages default to `is_limb = false` (organs);
-/// the user toggles limbs in the Body-part panel.
+/// pivot / rotation point. Appendages default to `Static` (inert structural
+/// parts); the user re-assigns kind (Limb / Segment / Static) in the Body-part panel.
 fn build_body_parts(parts_ocg: Vec<Vec<(usize, Vec3, CellType)>>) -> Vec<EditorBodyPart> {
     let n = parts_ocg.len();
     if n == 1 {
         return vec![EditorBodyPart {
-            name:    "Base Body".to_string(),
-            ocg:     renumber(parts_ocg.into_iter().next().unwrap()),
-            is_limb: false,
-            parent:  0,
+            name:   "Base Body".to_string(),
+            ocg:    renumber(parts_ocg.into_iter().next().unwrap()),
+            kind:   BodyPartKind::Body,
+            parent: 0,
         }];
     }
 
@@ -375,7 +375,7 @@ fn build_body_parts(parts_ocg: Vec<Vec<(usize, Vec3, CellType)>>) -> Vec<EditorB
             EditorBodyPart {
                 name: if is_base { "Base Body".to_string() } else { format!("Body Part {new}") },
                 ocg: renumber(ocg),
-                is_limb: false,
+                kind: if is_base { BodyPartKind::Body } else { BodyPartKind::Static },
                 parent,
             }
         })

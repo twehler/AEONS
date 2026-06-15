@@ -86,6 +86,20 @@ fn random_2d_direction(
     let dt = time.delta();
 
     for (mut organism, mut timer) in &mut query {
+        // Active wander is only for organisms that actually translate under it:
+        // GROUND-BASED, non-sessile photoautotrophs. Sessile ones are skipped by
+        // `apply_movement` (they never move), and water-based floaters drift via
+        // buoyancy rather than propelling. Assigning EITHER a wander speed is a
+        // phantom — it never moves them, but `energy.rs` still charges its
+        // movement cost. For a SUBMERGED floater (e.g. sessile water-based
+        // `ball_plankton`) that's the speed³ fluid-drag term, which dwarfs
+        // photosynthesis and starves it to 0 → despawn (then the plankton floor
+        // respawns it → perpetual sporadic despawn/respawn). Keep their speed 0.
+        if organism.is_sessile || !organism.ground_based {
+            if organism.movement_speed != 0.0 { organism.movement_speed = 0.0; }
+            continue;
+        }
+
         timer.timer.tick(dt);
         if !timer.timer.just_finished() { continue; }
 
@@ -251,6 +265,12 @@ fn apply_floor_collision(
 ) {
     let half = RD_HALF_SIZE;
     for (mut transform, mut organism) in &mut query {
+        // Kinematic-sliding only (mirrors `apply_gravity`): limb/swimmer floor
+        // handling lives in `rapier_setup::enforce_limb_floor_and_contacts`.
+        // This system runs `.after(TransformSystems::Propagate)` — i.e. after
+        // `sync_multibody_link_transforms` — so without this guard it would
+        // clobber Rapier's authoritative pose for any penetrating dynamic body.
+        if !organism.movement_mode.is_sliding() { continue; }
         let mut max_pen = 0.0_f32;
 
         for body_part in &organism.body_parts {

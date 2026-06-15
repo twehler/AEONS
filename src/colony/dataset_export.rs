@@ -173,7 +173,10 @@ pub fn export_dataset_system(
         &bevy_rapier3d::prelude::Velocity,
         &crate::rapier_setup::LastAppliedTorque,
     )>,
-    virtual_time: Res<Time<Virtual>>,
+    // WALL-clock run age (uncapped real time), not the capped virtual clock —
+    // so a freeze doesn't misreport the elapsed-time stamp. The auto-export
+    // SCHEDULE (`tick_auto_export_schedule`) still fires on virtual milestones.
+    run_elapsed:  Res<crate::simulation_settings::RunElapsed>,
     pool:         NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
     pool_limb_h:  NonSend<crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
     pool_limb_l2: NonSend<crate::intelligence_level_2_limb::BrainPoolL2Limb>,
@@ -193,7 +196,7 @@ pub fn export_dataset_system(
     // Single GPU forward pass; per-organism lookups are then pure CPU.
     let telemetry = pool.snapshot_telemetry();
 
-    if let Err(e) = write_csv(&mut out, &query, virtual_time.elapsed_secs(), &pool, &telemetry) {
+    if let Err(e) = write_csv(&mut out, &query, run_elapsed.0 as f32, &pool, &telemetry) {
         error!("export-dataset: write failure on {}: {}", path.display(), e);
         return;
     }
@@ -267,15 +270,15 @@ pub fn export_dataset_system(
 
     write_limb_pool_csv(
         &path, "limb_herbivore_1", &snap_h, &query, &limb_telemetry,
-        virtual_time.elapsed_secs(),
+        run_elapsed.0 as f32,
     );
     write_limb_pool_csv(
         &path, "limb_l2", &snap_l2, &query, &limb_telemetry,
-        virtual_time.elapsed_secs(),
+        run_elapsed.0 as f32,
     );
     write_limb_pool_csv(
         &path, "limb_l3", &snap_l3, &query, &limb_telemetry,
-        virtual_time.elapsed_secs(),
+        run_elapsed.0 as f32,
     );
 
     // ── Side-car: limb-pool training-stats CSVs (one per pool with

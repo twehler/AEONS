@@ -5,7 +5,7 @@
 use bevy::prelude::*;
 use std::path::PathBuf;
 
-use crate::cell::CellType;
+use crate::cell::{BodyPartKind, CellType};
 use crate::colony::{IntelligenceLevel, Symmetry};
 use crate::organism::MovementMode;
 
@@ -213,9 +213,12 @@ pub struct EditorBodyPart {
     /// Right-half (Bilateral) or full (NoSymmetry) OCG, editor-local
     /// coords, sequential indices 0..N.
     pub ocg: Vec<(usize, Vec3, CellType)>,
-    /// Limb flag. Limbs spawn with `BodyPartKind::Limb` and rotate around their
-    /// FIRST cell (the attachment seed). The base body (index 0) is never a limb.
-    pub is_limb: bool,
+    /// Part kind, set via the Body-part panel's "Kind" dropdown. Appendages are
+    /// `Limb` (paired, splits in Bilateral), `Segment` (midline moving, fuses in
+    /// Bilateral) or `Static` (midline, rigid fixed joint, no brain movement).
+    /// All rotate/attach around their FIRST cell (the attachment seed). The base
+    /// body (index 0) is always `Body` and ignores this field.
+    pub kind: BodyPartKind,
     /// Index (into `body_parts`) of the part this one attaches to. `0` = main
     /// body. Pointing at another LIMB makes this a sub-limb. Base body has
     /// `parent = 0` (self / ignored).
@@ -280,6 +283,10 @@ pub struct SpeciesSession {
     /// In-progress rename text. Committed to the part's `name` on Enter,
     /// discarded on Escape.
     pub rename_buffer: String,
+
+    /// Body-part row whose "Kind" dropdown is currently open, if any. The
+    /// dropdown overlay lifecycle (`body_part_panel`) keys off this.
+    pub kind_dropdown_open: Option<usize>,
 }
 
 impl Default for SpeciesSession {
@@ -297,6 +304,7 @@ impl Default for SpeciesSession {
             deletion_mode:      false,
             renaming_body_part: None,
             rename_buffer:      String::new(),
+            kind_dropdown_open: None,
         };
         s.seed_base();
         s
@@ -320,10 +328,10 @@ impl SpeciesSession {
             Symmetry::Bilateral  => Vec3::new(crate::body_part::MIN_X_BILATERAL, 0.0, 0.0),
         };
         self.body_parts = vec![EditorBodyPart {
-            name:    "Base Body".to_string(),
-            ocg:     vec![(0usize, pos, starter)],
-            is_limb: false,
-            parent:  0,
+            name:   "Base Body".to_string(),
+            ocg:    vec![(0usize, pos, starter)],
+            kind:   BodyPartKind::Body,
+            parent: 0,
         }];
         self.active_body_part   = 0;
         self.first_cell_spawned = true;

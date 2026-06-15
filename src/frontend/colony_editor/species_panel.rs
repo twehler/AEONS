@@ -280,18 +280,28 @@ fn handle_load_species_button(
     }
 }
 
-/// Rebuild the list rows on `session.is_changed()` (avoids per-frame rebuild).
+/// Rebuild the list rows when the loaded-species set actually changes. Gated on
+/// `session.is_changed()` AND a content diff: comparing the existing rows' ids to
+/// `loaded_species` means a spurious session change-mark (any unrelated field
+/// touch) can NEVER despawn+respawn the rows → no flicker, regardless of upstream.
 fn rebuild_species_list(
     session:       Res<EditorSession>,
     mut commands:  Commands,
     container_q:   Query<Entity, With<SpeciesListContainer>>,
-    existing_rows: Query<Entity, With<SpeciesListRow>>,
+    existing_rows: Query<(Entity, &SpeciesListRow)>,
 ) {
     if !session.is_changed() { return; }
     let Ok(container) = container_q.single() else { return };
 
+    // Only rebuild if the species-id set differs from what's already shown.
+    let mut current: Vec<u32> = existing_rows.iter().map(|(_, r)| r.0).collect();
+    let mut wanted:  Vec<u32> = session.loaded_species.iter().map(|s| s.id).collect();
+    current.sort_unstable();
+    wanted.sort_unstable();
+    if current == wanted { return; }
+
     // Despawn-and-rebuild — cheap given few rows and rare rebuilds.
-    for e in &existing_rows { commands.entity(e).despawn(); }
+    for (e, _) in &existing_rows { commands.entity(e).despawn(); }
     if session.loaded_species.is_empty() { return; }
 
     for species in &session.loaded_species {

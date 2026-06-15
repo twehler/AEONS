@@ -33,7 +33,8 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use bevy::prelude::*;
-use bevy_rapier3d::prelude::{ExternalForce, GravityScale, Velocity};
+use bevy_rapier3d::prelude::{ExternalForce, GravityScale, Velocity, RapierRigidBodyHandle, RapierRigidBodySet};
+use bevy_rapier3d::utils::iso_to_transform;
 
 use crate::colony::{Organism, OrganismRoot};
 use crate::cell::BodyPartIndex;
@@ -94,18 +95,40 @@ pub fn tick_limb_force_probe(
     )>,
     joint_q:      Query<&LimbJointDrive>,
     gt_q:         Query<&GlobalTransform>,
+    // PHYSICS-TRUTH separation: read each body's actual Rapier isometry, immune
+    // to any Bevy GlobalTransform writeback lag (the Transform-diff `max_anchor_sep`
+    // can read high for multibody links even when the joint is rigidly coupled).
+    rb_set_q:     Query<&RapierRigidBodySet>,
+    handle_q:     Query<&RapierRigidBodyHandle>,
 ) {
     if !sim_running.0 { return; }
     let now = virtual_time.elapsed_secs();
+    let rb_set = rb_set_q.single().ok();
 
     // ── Joint anchor separation per organism (constraint-violation signal). ──
+    // Two measures: `anchor_sep` from Bevy GlobalTransforms (legacy, writeback-lag
+    // prone) and `rapier_sep` from the live Rapier body isometries (the truth).
     let mut anchor_sep: std::collections::HashMap<Entity, f32> = std::collections::HashMap::new();
+    let mut rapier_sep: std::collections::HashMap<Entity, f32> = std::collections::HashMap::new();
     for drive in &joint_q {
         if let (Ok(limb_gt), Ok(par_gt)) = (gt_q.get(drive.limb_entity), gt_q.get(drive.parent)) {
             let sep = (limb_gt.transform_point(drive.anchor2)
                      - par_gt.transform_point(drive.anchor1)).length();
             let m = anchor_sep.entry(drive.organism).or_insert(0.0);
             if sep > *m { *m = sep; }
+        }
+        // Rapier-truth: world anchor points from the actual body poses.
+        if let Some(set) = rb_set {
+            if let (Ok(lh), Ok(ph)) = (handle_q.get(drive.limb_entity), handle_q.get(drive.parent)) {
+                if let (Some(lb), Some(pb)) = (set.bodies.get(lh.0), set.bodies.get(ph.0)) {
+                    let lt = iso_to_transform(lb.position());
+                    let pt = iso_to_transform(pb.position());
+                    let sep = (lt.transform_point(drive.anchor2)
+                             - pt.transform_point(drive.anchor1)).length();
+                    let m = rapier_sep.entry(drive.organism).or_insert(0.0);
+                    if sep > *m { *m = sep; }
+                }
+            }
         }
     }
 
@@ -139,9 +162,11 @@ pub fn tick_limb_force_probe(
             e.worst_part_idx = idx.0 as i32;
             e.worst_part_kind = org.body_parts.get(idx.0)
                 .map(|bp| match bp.kind {
-                    crate::cell::BodyPartKind::Body  => 0u8,
-                    crate::cell::BodyPartKind::Limb  => 1,
-                    crate::cell::BodyPartKind::Organ => 2,
+                    crate::cell::BodyPartKind::Body    => 0u8,
+                    crate::cell::BodyPartKind::Limb    => 1,
+                    crate::cell::BodyPartKind::Organ   => 2,
+                    crate::cell::BodyPartKind::Segment => 3,
+                    crate::cell::BodyPartKind::Static  => 4,
                 }).unwrap_or(255);
         }
         if vel.linear.y.abs() > e.max_linvel_y.abs() { e.max_linvel_y = vel.linear.y; }
@@ -181,7 +206,7 @@ pub fn tick_limb_force_probe(
                       base_y;min_part_y;max_part_y;base_grav_scale;\
                       max_force_mag;max_force_y;max_torque_mag;\
                       max_linvel;max_linvel_y;max_angvel;\
-                      worst_part_idx;worst_part_kind;max_lever;max_anchor_sep\n",
+                      worst_part_idx;worst_part_kind;max_lever;max_anchor_sep;max_rapier_sep\n",
                 ).is_ok() {
                     info!("limb force probe logging to {}", path.display());
                     probe.writer = Some(w);
@@ -217,13 +242,14 @@ pub fn tick_limb_force_probe(
              {:.3};{:.3};{:.3};{:.1};\
              {:.4};{:.4};{:.4};\
              {:.4};{:.4};{:.4};\
-             {};{};{:.4};{:.4}\n",
+             {};{};{:.4};{:.4};{:.4}\n",
             now, entity.index(), age, bool01(org.movement_mode.is_swimming()),
             a.base_y, a.min_part_y, a.max_part_y, a.base_grav,
             a.max_force_mag, a.max_force_y, a.max_torque_mag,
             a.max_linvel, a.max_linvel_y, a.max_angvel,
             a.worst_part_idx, a.worst_part_kind, a.max_lever,
             anchor_sep.get(&entity).copied().unwrap_or(0.0),
+            rapier_sep.get(&entity).copied().unwrap_or(0.0),
         );
         rows.push(row);
     }

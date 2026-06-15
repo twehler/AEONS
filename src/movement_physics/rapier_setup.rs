@@ -7,16 +7,23 @@
 //     on the root + compound collider over all cells. `apply_movement` writes
 //     the root transform; Rapier's kinematic sync follows it.
 //   * Limb organisms (`!movement_mode.is_sliding()`): `RigidBody::Dynamic` PER
-//     body part, connected to their attachment parent by a REDUCED-COORDINATE
-//     `MultibodyJoint` (revolute, 1-DOF hinge + in-solver position motor). The
-//     multibody (generalized-coordinate) formulation means a hinge has exactly
-//     one rotational DOF and the bodies are mathematically incapable of
-//     separating — the whole reason for migrating off Avian's XPBD soft joints.
-//     The brain drives each hinge's target angle (`drive_limb_motors`).
+//     body part, connected to their attachment parent by a joint chosen by
+//     movement mode + part kind:
+//       - WALKERS/standers: a maximal-coordinate `ImpulseJoint` (revolute hinge
+//         + in-solver position motor), driven by `drive_limb_motors`. (Walkers
+//         stay on impulse joints: the reduced-coordinate path amplified a
+//         low-gravity standing warm-start fling — see the architecture doc.)
+//       - SWIMMERS: a REDUCED-COORDINATE `MultibodyJoint` (spherical, 3-DOF ball
+//         + per-axis position motors), driven by `drive_swim_motors`. In a
+//         Featherstone articulation the child's pose is a function of (parent
+//         pose, joint angle) with NO translational DOF in the state vector, so
+//         the joint anchors are mathematically INCAPABLE of separating under any
+//         force — the definitive fix for chained segments drifting apart.
+//       - STATIC parts: a rigid `FixedJoint` (no motor, no brain link).
+//     `LimbJointDrive` is inserted alongside every joint (motors + telemetry).
 //
 // The joint is a COMPONENT on the CHILD limb entity (referencing the parent
-// body entity), unlike Avian's standalone joint entities. `LimbJointDrive` is
-// inserted alongside it on the same child entity.
+// body entity), unlike Avian's standalone joint entities.
 //
 // Gravity is the Rapier default (-9.81 Y), matching the +Y-up world.
 
@@ -38,7 +45,7 @@ use crate::simulation_settings::{
     WATER_DENSITY, SWIM_DRAG_CD, SWIM_ANGULAR_DRAG_COEF,
     SWIM_BORDER_STIFFNESS, SWIM_CONFINE_MAX_FORCE,
     SWIM_DRAG_MAX_FORCE, SWIM_DRAG_MAX_TORQUE,
-    SWIM_MAX_LIMB_TORQUE, SWIM_MOTOR_STIFFNESS, SWIM_MOTOR_DAMPING,
+    SWIM_MAX_LIMB_TORQUE,
 };
 use crate::cell::{Cell, CELL_COLLISION_RADIUS};
 use crate::environment::WaterLevel;
@@ -104,12 +111,47 @@ impl Plugin for RapierSetupPlugin {
             RapierPhysicsPlugin::<SelfCollisionFilter>::default()
                 .in_fixed_schedule(),
         );
-        // Attach deferred multibody joints once both bodies are registered.
-        // NOTE: the orphan-joint cleanup is deliberately NOT scheduled — removing
-        // a multibody joint individually can double-free the articulation
-        // (bevy_rapier panic). Limb organisms are guarded against despawn instead,
-        // so a joint's parent never disappears under it.
-        app.add_systems(PreUpdate, attach_pending_limb_joints);
+        // Attach deferred joints once bodies are registered: walkers/standers get
+        // an `ImpulseJoint` per part; swimmers get a single atomic reduced-coordinate
+        // `MultibodyJoint` articulation (separation impossible by construction);
+        // statics get a rigid `FixedJoint`.
+        app.add_systems(PreUpdate, (
+            attach_pending_limb_joints,
+            attach_pending_swimmer_multibody,
+            attach_pending_fixed_joints,
+        ));
+        // BULLETPROOF multibody despawn teardown — tears out a whole articulation
+        // in one idempotent call before bevy_rapier's per-body removal hits
+        // rapier3d 0.32's buggy per-joint `remove` (issue #382, the
+        // `multibody_joint_set.rs:223` `.unwrap()` panic). `sync_removals` runs in
+        // TWO places when physics is `.in_fixed_schedule()`: in `PhysicsSet::SyncBackend`
+        // (FixedUpdate) AND, because removal-detection must not miss events, in
+        // PostUpdate (bevy_rapier plugin.rs:292-297). A despawn in `Update` (e.g. the
+        // colony editor's CLEAR, predation, the limb cull) is processed by the
+        // PostUpdate copy that SAME frame — before any FixedUpdate runs — so the net
+        // MUST precede BOTH copies. (An earlier FixedUpdate-only net "passed" the cull
+        // only by luck: the cull fires ~1 frame post-spawn, often before the atomic
+        // multibody attach, so the culled bodies had no articulation yet.)
+        app.add_systems(FixedUpdate, teardown_multibody_on_removal.before(PhysicsSet::SyncBackend));
+        // Non-finite safety net — remove any organism whose body went NaN/inf
+        // BEFORE the solver can touch it (it would otherwise panic). Runs before
+        // the physics step.
+        app.add_systems(FixedUpdate, cull_nonfinite_bodies.before(PhysicsSet::SyncBackend));
+        app.add_systems(
+            PostUpdate,
+            teardown_multibody_on_removal.before(bevy_rapier3d::plugin::systems::sync_removals),
+        );
+        // EXPLICIT multibody-link transform sync: overwrite swimmer parts' Bevy
+        // transforms from the authoritative Rapier pose AFTER bevy_rapier's
+        // (unreliable, for nested multibody children) writeback and BEFORE Bevy
+        // propagates GlobalTransform — so the rendered/colliding pose matches the
+        // articulation and the parts visibly stay pinned to their joints.
+        app.add_systems(
+            PostUpdate,
+            sync_multibody_link_transforms
+                .after(PhysicsSet::Writeback)
+                .before(bevy::transform::TransformSystems::Propagate),
+        );
         // Zero the persistent ExternalForce at the TOP of the step so the twist
         // couple + swimmer drag + confinement ACCUMULATE onto a clean slate.
         // Safety net first: scrub any non-finite swimmer velocity before anything
@@ -341,6 +383,18 @@ pub struct LimbTwistDrive {
 #[derive(Component, Clone, Copy)]
 pub struct PendingLimbJoint(pub LimbJointDrive);
 
+/// Marker for a STATIC body part's deferred RIGID joint. Carries just the parent
+/// body + the two anchor points (same scheme as the limb joints: `anchor2` is the
+/// part's first cell, `anchor1` the same point in the parent's frame). Converted
+/// to a real `FixedJoint` by `attach_pending_fixed_joints` once both bodies are
+/// Rapier-registered. No motor and no `LimbJointDrive`, so the brain never moves it.
+#[derive(Component, Clone, Copy)]
+pub struct PendingFixedJoint {
+    pub parent:  Entity,
+    pub anchor1: Vec3,
+    pub anchor2: Vec3,
+}
+
 /// Convert `PendingLimbJoint`s into real `ImpulseJoint`s once both the child
 /// and its parent are registered Rapier bodies (`RapierRigidBodyHandle` present).
 /// If the parent never becomes a body (e.g. a body-less part), the pending joint
@@ -354,16 +408,192 @@ pub fn attach_pending_limb_joints(
     for (e, pj) in &pending {
         let parent = pj.0.parent;
         // Self-loop guard: a part must never joint to itself (a malformed root
-        // attachment). (Also avoided a degenerate articulation back when multibody
-        // joints were briefly trialled here.)
+        // attachment).
         if parent == e { commands.entity(e).try_remove::<PendingLimbJoint>(); continue; }
+        // SWIMMERS are handled by `attach_pending_swimmer_multibody` (atomic,
+        // reduced-coordinate). Only WALKERS/standers get an `ImpulseJoint` here.
+        let is_swimmer = organisms.get(pj.0.organism)
+            .map(|o| o.movement_mode.is_swimming()).unwrap_or(false);
+        if is_swimmer { continue; }
         if registered.get(e).is_ok() && registered.get(parent).is_ok() {
-            // Swimmers use scaled motor gains (heavier neutral-buoyancy mass).
-            let is_swimmer = organisms.get(pj.0.organism)
-                .map(|o| o.movement_mode.is_swimming()).unwrap_or(false);
             commands.entity(e)
-                .try_insert(build_limb_joint(&pj.0, is_swimmer))
+                .try_insert(build_limb_joint(&pj.0, false))
                 .try_remove::<PendingLimbJoint>();
+        }
+    }
+}
+
+/// Attach a SWIMMER organism's chain as a single REDUCED-COORDINATE articulation:
+/// each part's joint becomes a `MultibodyJoint` (spherical, 3-DOF ball). In a
+/// Featherstone articulation the child's pose is a function of (parent pose, joint
+/// angle) — the translational DOFs do not exist in the state vector, so the joint
+/// anchors are **mathematically incapable of separating**, regardless of motor
+/// torque, spin, mass ratio or contact. This is the definitive fix for chained
+/// segments drifting apart.
+///
+/// ATOMIC + ordered: a partial / out-of-order multibody insert forms a degenerate
+/// articulation, so we wait until EVERY one of the organism's pending joints has
+/// both bodies Rapier-registered, then insert them **parent-before-child** (sorted
+/// by body-part index — body_parts is BFS-ordered, so parent index < child index)
+/// in one frame. `LimbJointDrive` is kept (motors + separation telemetry).
+pub fn attach_pending_swimmer_multibody(
+    mut commands: Commands,
+    pending:      Query<(Entity, &PendingLimbJoint)>,
+    registered:   Query<(), With<RapierRigidBodyHandle>>,
+    organisms:    Query<&crate::colony::Organism>,
+) {
+    use std::collections::HashMap;
+    // Group this organism's pending swimmer joints together.
+    let mut by_org: HashMap<Entity, Vec<(Entity, LimbJointDrive)>> = HashMap::new();
+    for (e, pj) in &pending {
+        if pj.0.parent == e { commands.entity(e).try_remove::<PendingLimbJoint>(); continue; }
+        let swims = organisms.get(pj.0.organism)
+            .map(|o| o.movement_mode.is_swimming()).unwrap_or(false);
+        if !swims { continue; }
+        by_org.entry(pj.0.organism).or_default().push((e, pj.0));
+    }
+
+    for (_org, mut joints) in by_org {
+        // Gate: hold until the whole tree is registered (every child AND every
+        // parent — the parent set includes the base body, which has no pending
+        // joint of its own). One missing handle ⇒ defer the entire organism.
+        let all_ready = joints.iter().all(|(child, d)|
+            registered.get(*child).is_ok() && registered.get(d.parent).is_ok());
+        if !all_ready { continue; }
+
+        // Insert root-to-leaf so each child's parent is already a multibody link.
+        joints.sort_by_key(|(_, d)| d.body_part);
+        for (child, d) in joints {
+            commands.entity(child)
+                .try_insert(MultibodyJoint::new(d.parent, spherical_data(&d, [0.0; 3])))
+                .try_remove::<PendingLimbJoint>();
+        }
+    }
+}
+
+/// BULLETPROOF multibody teardown for despawns. `rapier3d` 0.32's per-joint
+/// `MultibodyJointSet::remove` has a root-link bug (issue #382, fixed in 0.33):
+/// when a whole organism despawns atomically, bevy_rapier's `sync_removals`
+/// removes each body in turn and the second link hits a stale arena entry →
+/// panic. We pre-empt it: BEFORE `PhysicsSet::SyncBackend`, for every entity that
+/// just lost its `RapierRigidBodyHandle` (i.e. is despawning), tear out its whole
+/// articulation in ONE call (`remove_multibody_articulations`, which clears all
+/// `rb2mb` mappings without the buggy sub-tree rebuild). It is idempotent (guarded
+/// by `rb2mb.get`), so calling it for several links of the same organism is safe,
+/// and it makes BOTH of bevy_rapier's later removal paths (`bodies.remove` and the
+/// multibody-joint-handle removal) find nothing live → no-op. This catches EVERY
+/// despawn path (predation, out-of-bounds, startup cull, future) because it hooks
+/// the component removal itself, not individual call sites. Non-multibody bodies
+/// (walkers, sliders) are no-ops here.
+pub fn teardown_multibody_on_removal(
+    mut removed: RemovedComponents<RapierRigidBodyHandle>,
+    mut ctx:     Query<(&mut RapierContextJoints, &RapierRigidBodySet)>,
+) {
+    let Ok((mut joints, rb_set)) = ctx.single_mut() else { return };
+    for entity in removed.read() {
+        if let Some(&handle) = rb_set.entity2body().get(&entity) {
+            joints.multibody_joints.remove_multibody_articulations(handle, true);
+        }
+    }
+}
+
+/// HARD SAFETY NET: a body whose Rapier state has gone non-finite (NaN/inf) will
+/// panic the solver next step (`f32::clamp` on a NaN joint coordinate inside the
+/// multibody motor constraint). Before each physics step we scan all body parts;
+/// any organism with a non-finite body has its multibody articulation removed
+/// IMMEDIATELY (so this step can't touch it) and the whole organism is despawned.
+/// Self-contained (doesn't depend on the deferred despawn/teardown timing) → it
+/// GUARANTEES no NaN ever reaches `step_simulation`, regardless of the underlying
+/// numerical instability. Losing the odd unstable organism is acceptable; a crash
+/// is not.
+pub fn cull_nonfinite_bodies(
+    mut commands:  Commands,
+    mut joints_q:  Query<&mut RapierContextJoints>,
+    rb_set_q:      Query<&RapierRigidBodySet>,
+    parts:         Query<(&bevy::prelude::ChildOf, &RapierRigidBodyHandle)>,
+    roots:         Query<(), With<crate::colony::OrganismRoot>>,
+) {
+    let (Ok(mut joints), Ok(rb_set)) = (joints_q.single_mut(), rb_set_q.single()) else { return };
+    use std::collections::HashMap;
+    let mut kill: HashMap<bevy::prelude::Entity, bevy_rapier3d::rapier::dynamics::RigidBodyHandle> = HashMap::new();
+    for (child_of, handle) in &parts {
+        if let Some(b) = rb_set.bodies.get(handle.0) {
+            let p = b.position().translation;
+            if !p.is_finite() || !b.linvel().is_finite() || !b.angvel().is_finite() {
+                kill.entry(child_of.parent()).or_insert(handle.0);
+            }
+        }
+    }
+    for (root, handle) in kill {
+        // Remove the whole articulation NOW so this step never solves a NaN motor.
+        joints.multibody_joints.remove_multibody_articulations(handle, true);
+        if roots.get(root).is_ok() {
+            commands.entity(root).despawn();
+            warn!("culled organism {:?}: non-finite physics state (multibody instability)", root);
+        }
+    }
+}
+
+/// EXPLICIT multibody-link transform sync (the render/gameplay fix).
+///
+/// bevy_rapier 0.34's `writeback_rigid_bodies` does not reliably write a
+/// REDUCED-COORDINATE multibody link's pose onto its Bevy `Transform` when the
+/// link is a nested child entity: the physics (the Rapier body isometry == the
+/// articulation's `local_to_world`) is perfectly coupled, but the Bevy
+/// `GlobalTransform` desyncs by a large per-organism offset. Everything that
+/// reads `GlobalTransform` — the rendered mesh, predation `EAT_RADIUS`, the world
+/// model, navigators — then sees the parts floating away from their joints even
+/// though the joint physically holds. (Diagnosed from data: `|GT − rb|` up to
+/// hundreds of units while `rb == mblink` and inter-part spacing stays the snake's
+/// true shape.)
+///
+/// Fix: for every swimmer body part, overwrite its local `Transform` from the
+/// AUTHORITATIVE Rapier body world pose each frame, AFTER bevy_rapier's writeback
+/// and BEFORE Bevy's transform propagation, so the propagated `GlobalTransform`
+/// equals the true articulated pose. Walkers/sliders are untouched (their
+/// writeback is correct).
+pub fn sync_multibody_link_transforms(
+    rb_set_q:   Query<&RapierRigidBodySet>,
+    globals:    Query<&GlobalTransform>,
+    // `With<SwimmerBody>`: only swimmer organisms use reduced-coordinate
+    // multibody links, and the marker is on every swimmer body part (incl.
+    // the base). Filtering at the query level skips the per-frame
+    // `organisms.get(root) → continue` over every walker/slider part.
+    mut parts:  Query<(&bevy::prelude::ChildOf, &RapierRigidBodyHandle, &mut Transform),
+                      (With<crate::cell::BodyPartIndex>, With<SwimmerBody>)>,
+) {
+    let Ok(rb_set) = rb_set_q.single() else { return };
+    for (child_of, handle, mut transform) in &mut parts {
+        let root = child_of.parent();
+        let Some(rb) = rb_set.bodies.get(handle.0) else { continue };
+        let Ok(parent_gt) = globals.get(root) else { continue };
+        // World pose from the physics body → local transform under the (static)
+        // root, so propagation yields GlobalTransform == the true articulated pose.
+        let world = GlobalTransform::from(bevy_rapier3d::utils::iso_to_transform(rb.position()));
+        let new_local = world.reparented_to(parent_gt);
+        if *transform != new_local { *transform = new_local; }
+    }
+}
+
+/// Convert `PendingFixedJoint`s (STATIC parts) into real `ImpulseJoint`s with a
+/// `FixedJoint` once both bodies are Rapier-registered — rigidly welding the part
+/// to its parent (no articulation, no motor). Mirrors the deferral in
+/// `attach_pending_limb_joints` (same unknown-handle panic otherwise).
+pub fn attach_pending_fixed_joints(
+    mut commands: Commands,
+    pending:      Query<(Entity, &PendingFixedJoint)>,
+    registered:   Query<(), With<RapierRigidBodyHandle>>,
+) {
+    for (e, pj) in &pending {
+        if pj.parent == e { commands.entity(e).try_remove::<PendingFixedJoint>(); continue; }
+        if registered.get(e).is_ok() && registered.get(pj.parent).is_ok() {
+            let data = FixedJointBuilder::new()
+                .local_anchor1(pj.anchor1)
+                .local_anchor2(pj.anchor2)
+                .build();
+            commands.entity(e)
+                .try_insert(ImpulseJoint::new(pj.parent, data))
+                .try_remove::<PendingFixedJoint>();
         }
     }
 }
@@ -424,14 +654,22 @@ fn spherical_data(drive: &LimbJointDrive, target: [f32; 3]) -> TypedJoint {
     ] {
         b = b
             .limits(axis, [-LIMB_SWING_LIMIT, LIMB_SWING_LIMIT])
-            // Swimmer motor gains: bodies carry ~83× the terrestrial mass
-            // (neutral buoyancy), so the gains are mass-ratio-scaled to keep
-            // the per-limb dynamics matched to the working terrestrial case.
-            .motor_position(axis, t, SWIM_MOTOR_STIFFNESS, SWIM_MOTOR_DAMPING)
+            // ACCELERATION-based (mass-invariant): the motor commands a target
+            // angular ACCELERATION, so the solved impulse scales with each link's
+            // ACTUAL articulated inertia. This is essential for reduced-coordinate
+            // multibody chains with thin/small links (e.g. a 2-cell mirrored limb,
+            // tiny inertia about its long axis): a ForceBased motor applied a
+            // fixed ×83 mass-ratio-scaled torque through that tiny inertia →
+            // runaway angular acceleration → NaN joint coordinate → solver panic
+            // (`unit_joint_motor_constraint` clamp on a NaN `curr_pos`). Because
+            // the gains are now mass-invariant, the ×SWIM_MASS_RATIO scaling is
+            // DROPPED — base gains apply uniformly regardless of body mass.
+            .motor_position(axis, t, LIMB_MOTOR_STIFFNESS, LIMB_MOTOR_DAMPING)
+            // Cap kept high (heavy neutral-buoyancy bodies need force ∝ mass to
+            // hit a target accel); with accel-based motors a small-inertia link
+            // only ever draws a small impulse, so the cap never drives overflow.
             .motor_max_force(axis, SWIM_MAX_LIMB_TORQUE)
-            // FORCE-based for the same reason as the hinge: real torque that
-            // pushes water (via the blade-element drag) and propels the body.
-            .motor_model(axis, MotorModel::ForceBased);
+            .motor_model(axis, MotorModel::AccelerationBased);
     }
     b.into()
 }
@@ -629,7 +867,12 @@ impl Default for SwimJointTargets {
 pub fn drive_swim_motors(
     sim_running: Res<crate::simulation_settings::SimulationRunning>,
     organisms:   Query<(&crate::colony::Organism, &SwimJointTargets)>,
-    mut joints:  Query<(&LimbJointDrive, &mut ImpulseJoint)>,
+    // Swimmer ball joints are REDUCED-COORDINATE `MultibodyJoint`s (separation
+    // impossible by construction); walkers keep `ImpulseJoint` (driven by
+    // `drive_limb_motors`). Rebuilding `joint.data` retargets the 3 per-axis
+    // position motors; the spherical DOF count is constant (3), so the
+    // multibody user-change path stays well-defined.
+    mut joints:  Query<(&LimbJointDrive, &mut MultibodyJoint)>,
     mut torque_log: Query<&mut LastAppliedTorque>,
 ) {
     if !sim_running.0 { return; }

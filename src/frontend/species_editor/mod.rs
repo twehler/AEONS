@@ -81,7 +81,9 @@ impl Plugin for SpeciesEditorPlugin {
                 body_part_panel::handle_begin_new_body_part,
                 body_part_panel::manage_body_part_list,
                 body_part_panel::handle_body_part_row_clicks,
-                body_part_panel::handle_limb_toggle,
+                body_part_panel::handle_kind_button_clicks,
+                body_part_panel::manage_kind_dropdown,
+                body_part_panel::handle_kind_option_clicks,
                 body_part_panel::handle_rename_input,
                 body_part_panel::sync_body_part_rows,
             ))
