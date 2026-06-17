@@ -202,9 +202,19 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
         IntelligenceLevel::Level2 => 2,
         IntelligenceLevel::Level3 => 3,
     });
-    // v011 species name — editor-authored colonies carry no runtime species, so
-    // write an empty name (len 0). Loaders classify these fresh, as before.
-    put_u32(buf, 0);
+    // v011 species name. When a template carries a trained brain, persist its
+    // source species name: `spawn_loaded_organism` pins `species_id` from it at
+    // spawn, which is what makes the per-species brain restore (below) land in
+    // the right shared net. Brain-less / unnamed templates write an empty name
+    // (len 0) and are classified fresh, as before.
+    match (&tpl.species_name, &tpl.brain) {
+        (Some(name), Some(_)) if !name.is_empty() => {
+            let nb = name.as_bytes();
+            put_u32(buf, nb.len() as u32);
+            buf.extend_from_slice(nb);
+        }
+        _ => put_u32(buf, 0),
+    }
 
     // ── body parts ──────────────────────────────────────────────────
     put_u32(buf, parts.len() as u32);
@@ -267,11 +277,45 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
         }
     }
 
-    // sliding-brain section: 0 = no payload (loader installs fresh weights).
-    put_u8(buf, 0);
-
-    // limb-brain section: kind tag 0 = none (loader installs fresh weights).
-    put_u8(buf, 0);
+    // ── Brain blocks ─────────────────────────────────────────────────
+    // Mirror `colony_save_load::save_colony_system` so an editor-imported
+    // trained species PERSISTS its weights and restores the SAME way as a
+    // sim-saved organism. A template is either sliding (sliding block) or
+    // limb/swim (limb block) — never both; the unused block is written absent.
+    // `None` brain ⇒ both absent (loader installs fresh weights, as before).
+    match &tpl.brain {
+        Some(crate::species_editor::save::LoadedBrain::Sliding(b)) => {
+            put_u8(buf, 1); // sliding-brain present
+            crate::intelligence_level_herbivore_1_sliding::encode_brain_restore(buf, b);
+            put_u8(buf, 0); // limb-brain: none
+        }
+        Some(crate::species_editor::save::LoadedBrain::Ppo(b)) => {
+            put_u8(buf, 0); // sliding-brain: none
+            // Limb-brain kind tag (same routing as the runtime save): 4=swim,
+            // else by intelligence (1=herbivore_1, 2=L2, 3=L3). A combo with no
+            // routable pool writes 0 (drop) — exactly what the runtime would do.
+            let kind: u8 = if tpl.movement_mode.is_swimming() {
+                4
+            } else {
+                match tpl.intelligence {
+                    IntelligenceLevel::Level1 if !tpl.is_carnivore => 1,
+                    IntelligenceLevel::Level2 => 2,
+                    IntelligenceLevel::Level3 => 3,
+                    _ => 0,
+                }
+            };
+            if kind == 0 {
+                put_u8(buf, 0); // unroutable → limb-brain none
+            } else {
+                put_u8(buf, kind);
+                crate::limb_ppo::encode_brain_restore_limb(buf, b);
+            }
+        }
+        None => {
+            put_u8(buf, 0); // sliding-brain: none
+            put_u8(buf, 0); // limb-brain: none
+        }
+    }
 }
 
 

@@ -412,6 +412,31 @@ pub(crate) struct LoadedRecord {
 }
 
 
+/// Validate an untrusted element count read from the file BEFORE allocating.
+/// A corrupt or version-incompatible file can decode a garbage length whose
+/// `Vec::with_capacity` would attempt a multi-GB allocation and ABORT the whole
+/// process (an alloc failure can't be caught like a normal error). A file
+/// claiming `count` elements that each occupy at least `min_elem_bytes` is
+/// impossible if that exceeds the bytes actually remaining — reject it as a
+/// clean `Err` the caller can surface instead.
+fn checked_count(
+    count:          u32,
+    min_elem_bytes: usize,
+    cursor:         usize,
+    total:          usize,
+    what:           &str,
+) -> std::io::Result<usize> {
+    let remaining    = total.saturating_sub(cursor);
+    let max_possible = remaining / min_elem_bytes.max(1);
+    if count as usize > max_possible {
+        return Err(std::io::Error::other(format!(
+            "{what}: implausible count {count} ({remaining} byte(s) left, \u{2264} {max_possible} possible) \
+             \u{2014} file is corrupt or from an unsupported version"
+        )));
+    }
+    Ok(count as usize)
+}
+
 pub(crate) fn load_colony_from_file(
     path: &str,
 ) -> std::io::Result<(TimeNotation, f32, Vec<LoadedRecord>)> {
@@ -456,6 +481,10 @@ pub(crate) fn load_colony_from_file(
     let has_ground_byte = format_v011 || format_v010;
     // v008+ carry the elapsed-time block right after the magic.
     let has_time_block = format_v011 || format_v010 || format_v009 || format_v008;
+    // v009+ carry the global water level after the time block. (v011 was added
+    // to this set late — omitting it here mis-read the water f32 AS the organism
+    // count, yielding a ~1.1-billion-element allocation that aborted the process.)
+    let has_water_level = format_v011 || format_v010 || format_v009;
     // v007+ append a limb-brain block after the sliding-brain block.
     let has_limb_brain_section = format_v007_layout;
     // v011: a per-organism species-name string right after the intelligence byte.
@@ -473,14 +502,15 @@ pub(crate) fn load_colony_from_file(
     };
 
     // v009+ global water level, after the time block; older formats default.
-    let water_level = if format_v010 || format_v009 {
+    let water_level = if has_water_level {
         read_f32(&bytes, &mut c)?
     } else {
         DEFAULT_WATER_LEVEL
     };
 
     let count = read_u32(&bytes, &mut c)?;
-    let mut out: Vec<LoadedRecord> = Vec::with_capacity(count as usize);
+    let count = checked_count(count, 32, c, bytes.len(), "organism count")?;
+    let mut out: Vec<LoadedRecord> = Vec::with_capacity(count);
 
     for _ in 0..count {
         let kind_byte = read_u8(&bytes, &mut c)?;
@@ -586,7 +616,8 @@ pub(crate) fn load_colony_from_file(
         };
 
         let bp_count = read_u32(&bytes, &mut c)?;
-        let mut body_parts: Vec<BodyPart> = Vec::with_capacity(bp_count as usize);
+        let bp_count = checked_count(bp_count, 16, c, bytes.len(), "body-part count")?;
+        let mut body_parts: Vec<BodyPart> = Vec::with_capacity(bp_count);
         for _ in 0..bp_count {
             let bp_kind = match read_u8(&bytes, &mut c)? {
                 0 => BodyPartKind::Body,
@@ -614,7 +645,8 @@ pub(crate) fn load_colony_from_file(
             };
 
             let cell_count = read_u32(&bytes, &mut c)?;
-            let mut cells: Vec<Cell> = Vec::with_capacity(cell_count as usize);
+            let cell_count = checked_count(cell_count, 18, c, bytes.len(), "cell count")?;
+            let mut cells: Vec<Cell> = Vec::with_capacity(cell_count);
             for _ in 0..cell_count {
                 let local_pos       = read_vec3(&bytes, &mut c)?;
                 let cell_type       = read_cell_type(&bytes, &mut c)?;
@@ -633,7 +665,8 @@ pub(crate) fn load_colony_from_file(
             }
 
             let ocg_count = read_u32(&bytes, &mut c)?;
-            let mut ocg: Vec<(usize, Vec3, CellType)> = Vec::with_capacity(ocg_count as usize);
+            let ocg_count = checked_count(ocg_count, 17, c, bytes.len(), "OCG count")?;
+            let mut ocg: Vec<(usize, Vec3, CellType)> = Vec::with_capacity(ocg_count);
             for _ in 0..ocg_count {
                 let idx = read_u32(&bytes, &mut c)? as usize;
                 let p   = read_vec3(&bytes, &mut c)?;

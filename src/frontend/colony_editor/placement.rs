@@ -415,6 +415,8 @@ pub(super) fn spawn_species_template_at(
         movement_mode: species.movement_mode,
         is_sessile:   species.is_sessile,
         ground_based: species.ground_based,
+        // Carry the species' trained brain so an editor colony save persists it.
+        brain:        species.brain.clone(),
     };
     let entity = respawn_template(&template, commands, meshes, materials, org_materials, smoothing);
 

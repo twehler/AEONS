@@ -157,6 +157,11 @@ pub struct OrganismTemplate {
     /// (floating, water-based algae); `spawn_organism` coerces heterotrophs
     /// to the movement-mode default.
     pub ground_based: bool,
+    /// Trained brain carried from a `.species` import (or a loaded `.colony`),
+    /// so an editor-saved colony PERSISTS the weights instead of fresh-init.
+    /// `Some` ⇒ `save::write_organism` encodes the matching `.colony` brain
+    /// block (sliding or limb/swim); `None` ⇒ both blocks written absent.
+    pub brain: Option<crate::species_editor::save::LoadedBrain>,
 }
 
 impl OrganismTemplate {

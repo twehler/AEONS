@@ -11,7 +11,6 @@
 use bevy::prelude::*;
 use bevy::input::keyboard::KeyboardInput;
 use rand::prelude::*;
-use std::path::PathBuf;
 
 use crate::world_geometry::{HeightmapSampler, MapSize};
 use crate::colony_editor::session::EditorSession;
@@ -33,9 +32,6 @@ const TITLE_FONT_PX:      f32 = 16.0;
 const SECTION_HEADING_PX: f32 = 13.0;
 const LABEL_FONT_PX:      f32 = 11.0;
 
-const LOAD_BTN_HEIGHT:    f32 = 36.0;
-const LOAD_BTN_COLOR:     Color = Color::srgb(0.20, 0.45, 0.70);
-const LOAD_BTN_HOVER:     Color = Color::srgb(0.30, 0.55, 0.80);
 
 const SPECIES_ROW_HEIGHT: f32 = 30.0;
 const SPECIES_ROW_GAP:    f32 = 3.0;
@@ -62,9 +58,6 @@ const BULK_BTN_DISABLED:  Color = Color::srgb(0.18, 0.18, 0.18);
 
 #[derive(Component)]
 pub struct SpeciesPanel;
-
-#[derive(Component)]
-struct LoadSpeciesButton;
 
 #[derive(Component)]
 struct SpeciesListContainer;
@@ -104,7 +97,6 @@ impl Plugin for SpeciesPanelPlugin {
         app
             .init_resource::<SpeciesPanelState>()
             .add_systems(Update, (
-                handle_load_species_button,
                 rebuild_species_list,
                 handle_species_row_clicks,
                 sync_species_row_visuals,
@@ -149,28 +141,8 @@ pub fn spawn_with_offset(parent: &mut ChildSpawnerCommands, top_offset_px: f32) 
                 Pickable::IGNORE,
             ));
 
-            // Load Species button.
-            panel.spawn((
-                LoadSpeciesButton,
-                Button,
-                Node {
-                    width:           Val::Percent(100.0),
-                    height:          Val::Px(LOAD_BTN_HEIGHT),
-                    align_items:     AlignItems::Center,
-                    justify_content: JustifyContent::Center,
-                    margin:          UiRect::bottom(Val::Px(10.0)),
-                    ..default()
-                },
-                BackgroundColor(LOAD_BTN_COLOR),
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("Load Species"),
-                    TextFont { font_size: 14.0, ..default() },
-                    TextColor(Color::WHITE),
-                    Pickable::IGNORE,
-                ));
-            });
+            // Species are auto-loaded from `species/` on every editor entry
+            // (`reload_species_*` in mod.rs) — no manual Load button.
 
             // Scrollable species list (`Overflow::scroll_y()`). No
             // explicit wheel handling — the list is bounded at ~tens of
@@ -253,32 +225,6 @@ pub fn spawn_with_offset(parent: &mut ChildSpawnerCommands, top_offset_px: f32) 
 
 
 // ── Systems ──────────────────────────────────────────────────────────────────
-
-/// Load Species button → open rfd dialog → stash chosen path on the
-/// session. The dispatcher in `mod.rs` consumes the path next tick.
-fn handle_load_species_button(
-    mut interactions: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<LoadSpeciesButton>)>,
-    mut session:      ResMut<EditorSession>,
-) {
-    for (interaction, mut bg) in &mut interactions {
-        match *interaction {
-            Interaction::Pressed => {
-                *bg = BackgroundColor(LOAD_BTN_HOVER);
-                let initial_dir = std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."));
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("AEONS species (.species)", &["species"])
-                    .set_directory(initial_dir)
-                    .pick_file()
-                {
-                    session.load_species_path = Some(path);
-                }
-            }
-            Interaction::Hovered => *bg = BackgroundColor(LOAD_BTN_HOVER),
-            Interaction::None    => *bg = BackgroundColor(LOAD_BTN_COLOR),
-        }
-    }
-}
 
 /// Rebuild the list rows when the loaded-species set actually changes. Gated on
 /// `session.is_changed()` AND a content diff: comparing the existing rows' ids to

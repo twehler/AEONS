@@ -100,6 +100,22 @@ pub struct EditorSession {
     /// every template AND despawns every live `OrganismRoot`.
     pub show_clear_modal: bool,
 
+    /// One-shot "Load Colony" flag; set by the inventory-panel button.
+    /// `dispatch_load_request` consumes it: warns (if dirty) or confirms.
+    pub load_requested: bool,
+
+    /// Whether the unsaved-work confirmation modal for Load Colony is visible.
+    pub show_load_modal: bool,
+
+    /// Set when the user confirms loading (Yes, or clean state). Consumed by
+    /// `perform_colony_load`, which opens the rfd picker and replaces the colony.
+    pub load_confirmed: bool,
+
+    /// Error message from the last failed colony load (bad/corrupt/unsupported
+    /// file). `Some` drives an error modal; the OK button clears it. The current
+    /// colony is left untouched when a load fails.
+    pub load_error: Option<String>,
+
     // ── Species navigator state ───────────────────────────────────
     /// All `.species` files loaded this session.
     pub loaded_species:        Vec<LoadedSpecies>,
@@ -107,6 +123,4 @@ pub struct EditorSession {
     pub next_species_id:       u32,
     /// Selected species; drives single-click placement and bulk-spawn.
     pub selected_species_id:   Option<u32>,
-    /// One-shot rfd-chosen path; consumed by `dispatch_load_species_requests`.
-    pub load_species_path:     Option<std::path::PathBuf>,
 }

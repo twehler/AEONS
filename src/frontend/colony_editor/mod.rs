@@ -8,6 +8,7 @@ pub mod creation_panel;
 pub mod exit_modal;
 pub mod inventory_panel;
 pub mod layout;
+pub mod load_modal;
 pub mod placement;
 pub mod save;
 pub mod session;
@@ -39,9 +40,12 @@ impl Plugin for ColonyEditorPlugin {
             .add_plugins(placement::PlacementPlugin)
             .add_plugins(exit_modal::ExitModalPlugin)
             .add_plugins(clear_modal::ClearModalPlugin)
+            .add_plugins(load_modal::LoadModalPlugin)
             .add_plugins(undo::UndoPlugin)
-            .add_systems(Startup, spawn_editor_lighting)
-            .add_systems(Update, (dispatch_save_requests, dispatch_load_species_requests));
+            // Standalone editor: load the species folder once at boot (its
+            // only "access"); the manual Load button is gone.
+            .add_systems(Startup, (spawn_editor_lighting, reload_species_at_startup))
+            .add_systems(Update, dispatch_save_requests);
     }
 }
 
@@ -198,32 +202,26 @@ fn load_species_into_session(
     Some(id)
 }
 
-/// Consumes `EditorSession::load_species_path`, loads + appends, and
-/// auto-selects the new species.
-fn dispatch_load_species_requests(mut session: ResMut<EditorSession>) {
-    // Read-only check FIRST (immutable deref): `.take()` mutably derefs `session`
-    // and would mark `EditorSession` CHANGED every frame even when there's nothing
-    // to load — which makes every `session.is_changed()`-gated rebuild (the species
-    // palette, etc.) despawn+respawn its rows each frame → massive UI flicker. Only
-    // touch it mutably when a load is actually pending.
-    if session.load_species_path.is_none() { return; }
-    let Some(path) = session.load_species_path.take() else { return };
-    if let Some(id) = load_species_into_session(&mut session, &path) {
-        session.selected_species_id = Some(id);
-    }
+/// Clear the navigator and re-scan `species/` from disk. Drives the automatic
+/// reload so newly added / sim-exported `.species` files appear without a
+/// restart (and the manual Load button is unnecessary). `selected_species_id`
+/// is reset because the ids it referenced are re-issued by the rescan.
+fn reload_species_folder(session: &mut EditorSession) {
+    session.loaded_species.clear();
+    session.selected_species_id = None;
+    scan_species_folder(session);
 }
 
-/// Startup scan of `species/` next to the executable: loads every
-/// `*.species` in filename-sorted order (deterministic). No auto-select.
-/// Missing/unreadable dir is ignored.
-fn autoload_species_folder(mut session: ResMut<EditorSession>) {
+/// Scan `species/` next to the executable and append every `*.species` in
+/// filename-sorted order (deterministic). Missing/unreadable dir is ignored.
+fn scan_species_folder(session: &mut EditorSession) {
     let dir = std::path::Path::new("species");
     if !dir.is_dir() {
-        debug!("no species/ directory next to the binary — nothing to autoload");
+        debug!("no species/ directory next to the binary — nothing to load");
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        warn!("species/ directory exists but couldn't be read — skipping autoload");
+        warn!("species/ directory exists but couldn't be read — skipping load");
         return;
     };
     let mut paths: Vec<std::path::PathBuf> = entries
@@ -232,7 +230,28 @@ fn autoload_species_folder(mut session: ResMut<EditorSession>) {
         .collect();
     paths.sort();
     for path in paths {
-        let _ = load_species_into_session(&mut session, &path);
+        let _ = load_species_into_session(session, &path);
+    }
+}
+
+/// Standalone editor: populate the navigator once at boot (its single "access").
+fn reload_species_at_startup(mut session: ResMut<EditorSession>) {
+    reload_species_folder(&mut session);
+}
+
+/// Merged editor: re-scan the species folder every time the user ENTERS the
+/// Colony Editor (`WindowMode` transitions into `EditColony`). The `Local`
+/// tracks the previous mode so it fires once per entry — not every frame — and
+/// `session` is only mutated on an actual entry (no per-frame CHANGED flicker).
+fn reload_species_on_enter_edit(
+    mode:        Res<WindowMode>,
+    mut prev:    Local<Option<WindowMode>>,
+    mut session: ResMut<EditorSession>,
+) {
+    let entered = *mode == WindowMode::EditColony && *prev != Some(WindowMode::EditColony);
+    *prev = Some(*mode);
+    if entered {
+        reload_species_folder(&mut session);
     }
 }
 
@@ -315,15 +334,15 @@ impl Plugin for EditorOverlayPlugin {
             .add_plugins(species_panel::SpeciesPanelPlugin)
             .add_plugins(exit_modal::ExitModalPlugin)
             .add_plugins(clear_modal::ClearModalPlugin)
+            .add_plugins(load_modal::LoadModalPlugin)
             .add_plugins(undo::UndoPlugin)
             .add_plugins(placement::PlacementPlugin)
             .add_systems(Update, dispatch_save_requests.run_if(in_edit_colony_mode))
-            // Consumes the Load Species path stash; without it the
-            // species never reaches the navigator list in merged mode.
-            .add_systems(Update, dispatch_load_species_requests.run_if(in_edit_colony_mode))
+            // Auto-reload the Species Navigator from `species/` every time the
+            // user enters the Colony Editor (replaces the manual Load button).
+            // Self-gates on the EditColony transition, so it runs ungated.
+            .add_systems(Update, reload_species_on_enter_edit)
             // After Startup: tag panels, then hide them (boot in Simulation).
-            .add_systems(PostStartup, (tag_editor_overlay_panels, initial_hide_editor_panels).chain())
-            // Populate the navigator list from `species/` at startup.
-            .add_systems(Startup, autoload_species_folder);
+            .add_systems(PostStartup, (tag_editor_overlay_panels, initial_hide_editor_panels).chain());
     }
 }

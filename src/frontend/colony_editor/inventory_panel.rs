@@ -30,6 +30,11 @@ const BACK_BTN_HEIGHT:  f32 = 30.0;
 const BACK_BTN_COLOR:   Color = Color::srgb(0.30, 0.30, 0.32);
 const BACK_BTN_HOVER:   Color = Color::srgb(0.40, 0.40, 0.42);
 
+// Load Colony — same blue family as Save, slightly darker to distinguish.
+const LOAD_BTN_HEIGHT:  f32 = 36.0;
+const LOAD_BTN_COLOR:   Color = Color::srgb(0.18, 0.34, 0.52);
+const LOAD_BTN_HOVER:   Color = Color::srgb(0.24, 0.44, 0.66);
+
 // Clear All — destructive action, dim red.
 const CLEAR_BTN_HEIGHT: f32   = 32.0;
 const CLEAR_BTN_COLOR:  Color = Color::srgb(0.55, 0.20, 0.20);
@@ -51,6 +56,9 @@ struct InventoryRow { id: u32 }
 struct SaveButton;
 
 #[derive(Component)]
+struct LoadButton;
+
+#[derive(Component)]
 struct ReturnButton;
 
 #[derive(Component)]
@@ -67,6 +75,7 @@ impl Plugin for InventoryPanelPlugin {
             sync_rows,
             handle_row_clicks,
             handle_save_button,
+            handle_load_button,
             handle_return_button,
             handle_clear_all_button,
         ));
@@ -126,6 +135,32 @@ pub fn spawn_with_offset(parent: &mut ChildSpawnerCommands, top_offset_px: f32) 
                 .with_children(|b| {
                     b.spawn((
                         Text::new("Save Colony…"),
+                        TextFont { font_size: 14.0, ..default() },
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
+                });
+
+            // Load Colony button — replaces the current colony with one
+            // loaded from a `.colony` file (warns first if there are
+            // unsaved changes).
+            panel
+                .spawn((
+                    LoadButton,
+                    Button,
+                    Node {
+                        width:  Val::Percent(100.0),
+                        height: Val::Px(LOAD_BTN_HEIGHT),
+                        margin: UiRect::bottom(Val::Px(6.0)),
+                        align_items:     AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    },
+                    BackgroundColor(LOAD_BTN_COLOR),
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        Text::new("Load Colony…"),
                         TextFont { font_size: 14.0, ..default() },
                         TextColor(Color::WHITE),
                         Pickable::IGNORE,
@@ -321,6 +356,23 @@ fn handle_save_button(
             }
             Interaction::Hovered => *bg = BackgroundColor(SAVE_BTN_HOVER),
             Interaction::None    => *bg = BackgroundColor(SAVE_BTN_COLOR),
+        }
+    }
+}
+
+fn handle_load_button(
+    mut interactions: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<LoadButton>)>,
+    mut session:      ResMut<EditorSession>,
+) {
+    for (interaction, mut bg) in &mut interactions {
+        match *interaction {
+            Interaction::Pressed => {
+                // Load-modal dispatcher decides warn-vs-load on `dirty`.
+                session.load_requested = true;
+                *bg = BackgroundColor(LOAD_BTN_HOVER);
+            }
+            Interaction::Hovered => *bg = BackgroundColor(LOAD_BTN_HOVER),
+            Interaction::None    => *bg = BackgroundColor(LOAD_BTN_COLOR),
         }
     }
 }
