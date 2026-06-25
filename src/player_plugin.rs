@@ -102,7 +102,20 @@ impl Default for SpeciesEditorFlycam {
 }
 
 
-fn setup_player(mut commands: Commands) {
+fn setup_player(
+    mut commands: Commands,
+    water:        Res<crate::environment::WaterLevel>,
+) {
+    use std::f32::consts::{PI, FRAC_PI_4};
+    // Spawn 50 units above the water surface, yawed 180° about Y and pitched
+    // 45° downward. Built in the same (yaw·Y) * (pitch·X) convention
+    // `player_look` reconstructs from, so the first mouse-look won't snap.
+    // (`WaterLevel` is inserted at app-build time, so it's present here at
+    // Startup; a `.colony` that overrides the level applies that override later,
+    // during its async load, so this uses the launcher/arg/default level.)
+    let cam_y = water.0 + 50.0;
+    let rotation =
+        Quat::from_axis_angle(Vec3::Y, PI) * Quat::from_axis_angle(Vec3::X, -FRAC_PI_4);
     commands.spawn((
         Camera3d::default(),
         // Tight far plane bounds both the visible mesh set and the cascade-
@@ -114,8 +127,7 @@ fn setup_player(mut commands: Commands) {
             ..default()
         }),
         FlyCam,
-        // Spawn at altitude 100 looking down-away from the origin.
-        Transform::from_xyz(20.0, 100.0, 20.0).looking_at(Vec3::new(40.0, 0.0, 40.0), Vec3::Y),
+        Transform::from_xyz(20.0, cam_y, 20.0).with_rotation(rotation),
         AmbientLight {
             color: Color::srgb(0.8, 0.8, 1.0),
             brightness: 500.0,

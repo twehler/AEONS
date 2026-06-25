@@ -11,9 +11,9 @@ use std::time::Duration;
 /// Default seeded into `MaxPhotoautotrophs` when nothing else (launcher / CLI)
 /// sets it: the running-population cap on photoautotrophs only (heterotrophs use
 /// the independent `MaxHerbivores`; the GPU brain pool sizes off that instead).
-/// 150 keeps prey plentiful for herbivores while holding ~60 FPS — higher counts
-/// bloat meshes + colliders + photosynthesis until frame rate collapses.
-pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 150;
+/// Higher counts bloat meshes + colliders + photosynthesis and cost frame rate;
+/// 5000 trades FPS for a very dense prey/algae field (the user-chosen running cap).
+pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 5000;
 
 /// Launcher-side default for the herbivore reproduction cap; reproduction stops
 /// scheduling herbivore births once reached. Each limb herbivore is many dynamic
@@ -273,7 +273,12 @@ pub struct MinHeteroCountEditState {
 pub struct OrganismPoolSize(pub usize);
 
 impl Default for OrganismPoolSize {
-    fn default() -> Self { Self(DEFAULT_MAX_PHOTOAUTOTROPHS) }
+    // Decoupled from `DEFAULT_MAX_PHOTOAUTOTROPHS` (photos have no brain slots):
+    // `main.rs` sizes the real pool off `MaxHerbivores` (×4), and this fallback
+    // only applies on the no-`--max-herbivores` direct-binary path. Pinned at 150
+    // so raising the photoautotroph cap can never inflate the GPU brain-pool
+    // allocation (a 1500-slot pool would be a large alloc + long CubeCL compile).
+    fn default() -> Self { Self(150) }
 }
 
 

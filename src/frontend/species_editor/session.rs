@@ -200,6 +200,74 @@ pub fn symmetry_label(sym: Symmetry) -> &'static str {
 
 // ── Draft species (cycler values) ───────────────────────────────────────────
 
+/// Phototroph grounding mode — the three authorable states of the top-panel
+/// Grounding cycler. Editable for PHOTOTROPHS (all three states) and for
+/// ground-moving HETEROTROPHS (terrestrial ↔ ocean-floor — a benthic slider);
+/// locked to water-based for swimmers. `OceanFloor` is benthic: it is
+/// ground-anchored exactly like `GroundBased` (gravity holds it down, identical
+/// runtime behaviour — it slides on / sinks to the terrain) but SPAWNS on
+/// submerged terrain — the seafloor — instead
+/// of dry land (see `colony::spawn_species_instance`). The runtime `Organism`
+/// stores only the `ground_based` bool, so `OceanFloor` differs solely in spawn
+/// PLACEMENT; its seafloor-ness is then captured by the spawned position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grounding {
+    GroundBased,
+    WaterBased,
+    OceanFloor,
+}
+
+impl Grounding {
+    /// Cycle order for the editor button: Ground → Water → Ocean-Floor → …
+    pub fn cycle(self) -> Self {
+        match self {
+            Grounding::GroundBased => Grounding::WaterBased,
+            Grounding::WaterBased  => Grounding::OceanFloor,
+            Grounding::OceanFloor  => Grounding::GroundBased,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Grounding::GroundBased => "Ground-Based",
+            Grounding::WaterBased  => "Water-Based",
+            Grounding::OceanFloor  => "Ocean-Floor",
+        }
+    }
+    /// Ground-anchored? Both terrestrial and benthic (ocean-floor) are; only
+    /// floating water-based is not. This is the runtime `Organism::ground_based`.
+    pub fn is_ground_based(self) -> bool {
+        matches!(self, Grounding::GroundBased | Grounding::OceanFloor)
+    }
+    /// Wants seafloor (submerged-terrain) spawn placement?
+    pub fn is_ocean_floor(self) -> bool {
+        matches!(self, Grounding::OceanFloor)
+    }
+    /// `.species` grounding byte. 0/1 PRESERVE the pre-v13 BOOL meaning
+    /// (0 = water, 1 = ground) so older files load unchanged; 2 = ocean-floor (v13+).
+    pub fn to_species_tag(self) -> u8 {
+        match self {
+            Grounding::WaterBased  => 0,
+            Grounding::GroundBased => 1,
+            Grounding::OceanFloor  => 2,
+        }
+    }
+    /// Inverse of `to_species_tag` (the caller applies the movement-mode clamp).
+    pub fn from_species_tag(b: u8) -> Self {
+        match b {
+            2 => Grounding::OceanFloor,
+            1 => Grounding::GroundBased,
+            _ => Grounding::WaterBased,
+        }
+    }
+    /// Rebuild from runtime/template flags (no `OceanFloor` is recoverable from a
+    /// live organism — it carries only the `ground_based` bool).
+    pub fn from_flags(ground_based: bool, ocean_floor: bool) -> Self {
+        if ocean_floor { Grounding::OceanFloor }
+        else if ground_based { Grounding::GroundBased }
+        else { Grounding::WaterBased }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct DraftSpecies {
     pub metabolism:     Metabolism,
@@ -209,23 +277,47 @@ pub struct DraftSpecies {
     pub mobility:       Mobility,
     pub classification: Classification,
     pub movement:       MovementMode,
-    /// Ground- vs water-based (the top-panel Grounding cycler). Only
-    /// editable for PHOTOTROPHS (a floating, water-based alga); heterotrophs
-    /// always derive it from `movement` — see `effective_ground_based`.
-    pub ground_based:   bool,
+    /// Phototroph grounding (the top-panel Grounding cycler): ground / water /
+    /// ocean-floor. Only editable for PHOTOTROPHS; heterotrophs always derive it
+    /// from `movement` — see `effective_grounding` / `effective_ground_based`.
+    pub grounding:      Grounding,
 }
 
 impl DraftSpecies {
-    /// The `Organism::ground_based` value this draft actually produces:
-    /// phototrophs honour the Grounding cycler (clamped by the movement
-    /// mode — a fluid mode can never be ground-based); heterotrophs always
-    /// derive it from the movement mode. Mirrors `spawn_organism`'s coercion
-    /// so the saved `.species` byte equals the spawned organism's field.
-    pub fn effective_ground_based(&self) -> bool {
+    /// The tri-state grounding this draft actually produces: phototrophs honour
+    /// the Grounding cycler (clamped by the movement mode — a fluid mode can
+    /// never be ground-anchored); heterotrophs derive ground-vs-water from the
+    /// movement mode but may still choose ocean-floor (benthic) placement while
+    /// ground-moving. Mirrors `spawn_organism`'s coercion so the saved
+    /// `.species` byte equals the spawned organism's placement + behaviour.
+    pub fn effective_grounding(&self) -> Grounding {
         match self.metabolism {
-            Metabolism::Photoautotroph => self.ground_based && self.movement.default_ground_based(),
-            Metabolism::Heterotroph    => self.movement.default_ground_based(),
+            Metabolism::Photoautotroph => {
+                // A fluid movement mode forces water-based regardless of cycler.
+                if self.grounding.is_ground_based() && !self.movement.default_ground_based() {
+                    Grounding::WaterBased
+                } else {
+                    self.grounding
+                }
+            }
+            Metabolism::Heterotroph => {
+                // Ground-vs-water is movement-derived (a swimmer floats), but a
+                // ground-moving heterotroph may still be a BENTHIC slider that
+                // spawns on the ocean floor — honour that choice.
+                if !self.movement.default_ground_based() {
+                    Grounding::WaterBased
+                } else if self.grounding.is_ocean_floor() {
+                    Grounding::OceanFloor
+                } else {
+                    Grounding::GroundBased
+                }
+            }
         }
+    }
+
+    /// The `Organism::ground_based` bool this draft produces (ground-anchored?).
+    pub fn effective_ground_based(&self) -> bool {
+        self.effective_grounding().is_ground_based()
     }
 }
 
@@ -242,8 +334,8 @@ impl Default for DraftSpecies {
             // deliberate opt-in to physics + PPO locomotion.
             movement:       MovementMode::Sliding,
             // Ground-based is the default; phototroph drafts may opt into
-            // water-based (floating algae) via the Grounding cycler.
-            ground_based:   true,
+            // water-based (floating algae) or ocean-floor (benthic) grounding.
+            grounding:      Grounding::GroundBased,
         }
     }
 }

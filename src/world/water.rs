@@ -84,6 +84,15 @@ fn apply_buoyancy(
     let dt = time.delta_secs();
 
     for (transform, mut organism) in &mut query {
+        // GROUND-ANCHORED organisms (land AND ocean-floor sliders + phototrophs)
+        // never float: gravity sinks them and the heightmap floor-clamp holds
+        // them on the terrain — exactly like a land slider. Buoyancy is for
+        // WATER-BASED bodies (floating algae / swimmers) only; applying it to a
+        // submerged benthic organism is what made ocean-floor life rise to the
+        // surface instead of staying on the seafloor.
+        if organism.ground_based {
+            continue;
+        }
         if transform.translation.y >= water.0 {
             continue;
         }

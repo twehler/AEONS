@@ -916,6 +916,10 @@ pub fn reseat_new_swimmers(
 /// brain tagging. Shared by the startup `spawn_species_cohort` and the runtime
 /// `auto_spawn_plankton`. Returns the spawned `OrganismRoot`.
 #[allow(clippy::too_many_arguments)]
+/// Max random XZ samples when seeking submerged terrain for an OCEAN-FLOOR
+/// (benthic) phototroph before giving up and using the last sample.
+const SEAFLOOR_SPAWN_TRIES: usize = 32;
+
 fn spawn_species_instance(
     species:     &crate::species_editor::save::LoadedSpecies,
     name:        &str,
@@ -994,11 +998,22 @@ fn spawn_species_instance(
     let cell_count = body_parts.iter().map(|bp| bp.cells.len()).sum::<usize>() as f32;
     let initial_energy = cell_count * crate::energy::MAX_ENERGY_PER_CELL * 0.5;
 
-    let x = rng.random_range(margin..(map_size.x - margin));
-    let z = rng.random_range(margin..(map_size.z - margin));
+    let mut x = rng.random_range(margin..(map_size.x - margin));
+    let mut z = rng.random_range(margin..(map_size.z - margin));
+    // OCEAN-FLOOR (benthic) phototrophs must sit on SUBMERGED terrain, so
+    // rejection-sample an XZ whose terrain is below the water surface (keeping
+    // the last sample if the map has no submerged terrain at all).
+    if species.ocean_floor {
+        for _ in 0..SEAFLOOR_SPAWN_TRIES {
+            if heightmap.height_at(x, z) < water_level { break; }
+            x = rng.random_range(margin..(map_size.x - margin));
+            z = rng.random_range(margin..(map_size.z - margin));
+        }
+    }
     let terrain = heightmap.height_at(x, z);
     // WATER-BASED organisms (swimmers + floating phototrophs like plankton)
-    // start submerged in the water column; everyone else on the floor.
+    // start submerged in the water column; ground-based AND ocean-floor
+    // organisms sit on the terrain floor (the seafloor, where it is underwater).
     let y = if species.movement.is_swimming() || !species.ground_based {
         submerged_spawn_y(terrain, limb_floor_top(heightmap), water_level)
     } else {

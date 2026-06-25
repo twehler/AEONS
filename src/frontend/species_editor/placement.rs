@@ -29,8 +29,17 @@ const SNAP_RADIUS_PX: f32 = 60.0;
 
 const PREVIEW_BLUE:        Color = Color::srgba(0.20, 0.45, 0.95, 0.55);
 const BILATERAL_AXIS_HEIGHT: f32 = 12.0;
-const BILATERAL_AXIS_RADIUS: f32 = 0.06;
+// Thin reference bars — ¼ the old 0.06 radius (the front arrow below is the
+// bold heading indicator).
+const BILATERAL_AXIS_RADIUS: f32 = 0.015;
 const BILATERAL_AXIS_COLOR:  Color = Color::srgba(0.95, 0.92, 0.20, 0.90);
+// FRONT (heading) arrow along +Z — the organism's forward axis (the limb/swim
+// brains treat body +Z as "forward"). A distinct cyan so the body's front reads
+// at a glance against the yellow mirror axes.
+const FRONT_ARROW_COLOR:       Color = Color::srgba(0.15, 0.85, 0.95, 0.95);
+const FRONT_ARROW_LEN:         f32 = 6.0;
+const FRONT_ARROW_HEAD_RADIUS: f32 = 0.30;
+const FRONT_ARROW_HEAD_HEIGHT: f32 = 1.00;
 
 
 // ── Markers ──────────────────────────────────────────────────────────────────
@@ -156,6 +165,38 @@ pub fn refresh_bilateral_axis(
         MeshMaterial3d(mat),
         Transform::from_translation(SPECIES_EDITOR_ORIGIN)
             .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+        RenderLayers::layer(SPECIES_EDITOR_LAYER),
+        bevy::light::NotShadowCaster,
+    ));
+
+    // FRONT (heading) arrow along +Z: a thin shaft + cone in a distinct cyan, so
+    // the body's "front" is unambiguous (+Z is the canonical forward axis).
+    let front_mat = materials.add(StandardMaterial {
+        base_color: FRONT_ARROW_COLOR,
+        alpha_mode: AlphaMode::Blend,
+        unlit:      true,
+        ..default()
+    });
+    // Shaft: cylinder (long axis +Y) rotated +90° about X so it lies along +Z,
+    // centred at z = LEN/2 → spans the origin out to +Z·LEN.
+    commands.spawn((
+        SpeciesBilateralAxis,
+        Mesh3d(meshes.add(Cylinder::new(BILATERAL_AXIS_RADIUS * 2.0, FRONT_ARROW_LEN).mesh())),
+        MeshMaterial3d(front_mat.clone()),
+        Transform::from_translation(SPECIES_EDITOR_ORIGIN + Vec3::new(0.0, 0.0, FRONT_ARROW_LEN * 0.5))
+            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+        RenderLayers::layer(SPECIES_EDITOR_LAYER),
+        bevy::light::NotShadowCaster,
+    ));
+    // Arrowhead: cone (apex +Y) rotated +90° about X so its apex points +Z, set
+    // just past the shaft tip.
+    commands.spawn((
+        SpeciesBilateralAxis,
+        Mesh3d(meshes.add(Cone { radius: FRONT_ARROW_HEAD_RADIUS, height: FRONT_ARROW_HEAD_HEIGHT }.mesh())),
+        MeshMaterial3d(front_mat),
+        Transform::from_translation(
+            SPECIES_EDITOR_ORIGIN + Vec3::new(0.0, 0.0, FRONT_ARROW_LEN + FRONT_ARROW_HEAD_HEIGHT * 0.5))
+            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
         RenderLayers::layer(SPECIES_EDITOR_LAYER),
         bevy::light::NotShadowCaster,
     ));

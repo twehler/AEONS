@@ -597,8 +597,31 @@ pub fn cull_nonfinite_bodies(
             // inside `step_simulation` (the rare ~hours-in crash). Culling here on a
             // non-finite orientation removes the body before that step runs.
             let pose = bevy_rapier3d::utils::iso_to_transform(b.position());
+            // Read the AUTHORITATIVE Rapier velocity (a reduced-coordinate
+            // multibody link's velocity is recomputed from the articulation's
+            // generalized coordinates each step, so the Bevy `Velocity` component
+            // — and hence `clamp_limb_velocity`'s write to it — is IGNORED for
+            // swimmers; only this Rapier-side figure is real).
+            let lv = b.linvel();
+            let av = b.angvel();
+            let linvel = Vec3::new(lv.x, lv.y, lv.z);
+            let angvel = Vec3::new(av.x, av.y, av.z);
+            // Cull on non-finite OR runaway-but-still-FINITE magnitude. The
+            // velocity governor cannot bind a multibody swimmer link (see above),
+            // so over a long run its speed diverges unchecked (observed: base
+            // speed → ~1e14, still finite → it sails past a NaN-only check). The
+            // NEXT step squares that velocity in the solver, overflows finite →
+            // inf → NaN, and panics in `f32::clamp(min=NaN,max=NaN)` inside
+            // `step_simulation`. The bound below is ~2500× the
+            // `MAX_LIMB_LINEAR_SPEED`/`MAX_LIMB_ANGULAR_SPEED` caps — utterly
+            // unreachable by a healthy organism (walkers are hard-clamped to those
+            // caps; a sane swimmer never approaches it), so this only ever removes
+            // an already-unrecoverable body: the SAME outcome as the existing NaN
+            // cull, just one step earlier — before the runaway can crash the solver.
+            const RUNAWAY_SPEED: f32 = 1.0e4;
             if !pose.translation.is_finite() || !pose.rotation.is_finite()
-                || !b.linvel().is_finite() || !b.angvel().is_finite() {
+                || !linvel.is_finite() || !angvel.is_finite()
+                || linvel.length() > RUNAWAY_SPEED || angvel.length() > RUNAWAY_SPEED {
                 kill.entry(child_of.parent()).or_insert(handle.0);
             }
         }
@@ -608,7 +631,7 @@ pub fn cull_nonfinite_bodies(
         joints.multibody_joints.remove_multibody_articulations(handle, true);
         if roots.get(root).is_ok() {
             commands.entity(root).despawn();
-            warn!("culled organism {:?}: non-finite physics state (multibody instability)", root);
+            warn!("culled organism {:?}: non-finite or runaway physics state (multibody instability)", root);
         }
     }
 }
@@ -973,6 +996,21 @@ fn spawn_terrain_floor(
 
 // ── Limb hinge-motor target driver (EMERGENT, brain-driven) ──────────────────
 
+/// Sanitise a brain-produced motor command before it reaches a Rapier joint.
+///
+/// `f32::clamp` only panics on NaN *bounds*; a NaN *value* passes straight
+/// through (`NaN.clamp(-1.0, 1.0) == NaN`). So a diverged PPO net writing NaN
+/// into `limb_targets` / `SwimJointTargets` would seed a NaN motor target, and
+/// the next `step_simulation` solves a NaN motor → the
+/// `f32::clamp(min=NaN, max=NaN)` panic inside the solver. `cull_nonfinite_bodies`
+/// cannot catch this: the body's translation/rotation/velocity are all still
+/// finite — only the commanded setpoint is NaN. Map any non-finite command to a
+/// neutral 0.0 here, the last line of defence before Rapier.
+#[inline]
+fn sane_motor_cmd(x: f32) -> f32 {
+    if x.is_finite() { x.clamp(-1.0, 1.0) } else { 0.0 }
+}
+
 /// Refresh each limb `MultibodyJoint`'s revolute position-motor target from the
 /// brain's per-joint output each physics step. Rebuilds the joint data so the
 /// in-solver position motor (stiffness/damping PD) tracks the new setpoint.
@@ -998,7 +1036,7 @@ pub fn drive_limb_motors(
         if i == 0 || i >= organism.body_parts.len() { continue; }
 
         let out_idx = (i - 1) % MAX_LIMB_JOINTS;
-        let cmd = organism.limb_targets[out_idx].clamp(-1.0, 1.0);
+        let cmd = sane_motor_cmd(organism.limb_targets[out_idx]);
         let target = cmd * LIMB_SWING_LIMIT;
 
         joint.data = revolute_data(drive, target);
@@ -1049,9 +1087,9 @@ pub fn drive_swim_motors(
 
         let base = ((i - 1) % MAX_LIMB_JOINTS) * 3;
         let target = [
-            targets.0[base    ].clamp(-1.0, 1.0) * LIMB_SWING_LIMIT,
-            targets.0[base + 1].clamp(-1.0, 1.0) * LIMB_SWING_LIMIT,
-            targets.0[base + 2].clamp(-1.0, 1.0) * LIMB_SWING_LIMIT,
+            sane_motor_cmd(targets.0[base    ]) * LIMB_SWING_LIMIT,
+            sane_motor_cmd(targets.0[base + 1]) * LIMB_SWING_LIMIT,
+            sane_motor_cmd(targets.0[base + 2]) * LIMB_SWING_LIMIT,
         ];
         joint.data = spherical_data(drive, target);
 
@@ -1083,7 +1121,7 @@ pub fn drive_limb_twist(
         let i = drive.body_part;
         if i == 0 || i >= organism.body_parts.len() { continue; }
         let out_idx = MAX_LIMB_JOINTS + (i - 1) % N_LIMB_TWIST_GROUPS;
-        let cmd = organism.limb_targets[out_idx].clamp(-1.0, 1.0);
+        let cmd = sane_motor_cmd(organism.limb_targets[out_idx]);
         let axis_world = (gt.rotation() * drive.axis_local).normalize_or_zero();
         let t = axis_world * (cmd * crate::simulation_settings::MAX_LIMB_TWIST_TORQUE);
         *acc.entry(limb_e).or_default() += t;

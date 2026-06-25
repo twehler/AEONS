@@ -35,8 +35,9 @@ pub const SPECIES_EDITOR_ORIGIN: Vec3 = Vec3::new(100_000.0, 1_000.0, 100_000.0)
 /// cells too.
 pub const SPECIES_EDITOR_LAYER: usize = 1;
 
-/// Pixel heights of the two panels.
-pub const TOP_PANEL_HEIGHT_PX:    f32 = 52.0;
+/// Pixel heights of the two panels. The top panel is tall enough for the
+/// grouped, captioned attribute cards (section label + caption + value).
+pub const TOP_PANEL_HEIGHT_PX:    f32 = 66.0;
 /// Tall enough for a colour swatch plus a two-line label beneath it.
 pub const BOTTOM_PANEL_HEIGHT_PX: f32 = 112.0;
 

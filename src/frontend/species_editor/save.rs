@@ -27,7 +27,7 @@ use crate::cell::{BodyPartKind, CellType};
 use crate::colony::{IntelligenceLevel, Symmetry};
 use crate::organism::MovementMode;
 
-use super::session::{Classification, Metabolism, SpeciesSession};
+use super::session::{Classification, Grounding, Metabolism, SpeciesSession};
 
 /// Version deltas (loader accepts v1–v8; older versions default the
 /// missing fields as noted):
@@ -65,6 +65,12 @@ use super::session::{Classification, Metabolism, SpeciesSession};
 ///        link). Pre-v11 `is_limb`: true→Limb, false→Organ (both moved+mirrored,
 ///        so this preserves runtime behaviour). Editor saves AND trained exports
 ///        both write v11; the brain block keeps the v10 KIND-tag scheme.
+///   v12: OCG positions stored at the new 0.5 geometry scale (no load-time
+///        rescale); layout otherwise identical to v11.
+///   v13: the v9 grounding byte widens from a BOOL to a tri-state tag
+///        {0 = water, 1 = ground, 2 = ocean-floor (benthic, seafloor-spawned)}.
+///        The 0/1 values are unchanged, so v9–v12 files load identically.
+const MAGIC_V13:    &[u8; 8] = b"AEONSS13";
 const MAGIC_V12:    &[u8; 8] = b"AEONSS12";
 const MAGIC_V11:    &[u8; 8] = b"AEONSS11";
 const MAGIC_V10:    &[u8; 8] = b"AEONSS10";
@@ -77,7 +83,7 @@ const MAGIC_V4:     &[u8; 8] = b"AEONSS04";
 const MAGIC_V3:     &[u8; 8] = b"AEONSS03";
 const MAGIC_V2:     &[u8; 8] = b"AEONSS02";
 const MAGIC_V1:     &[u8; 8] = b"AEONSS01";
-const MAGIC: &[u8; 8] = MAGIC_V12;
+const MAGIC: &[u8; 8] = MAGIC_V13;
 
 
 pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
@@ -149,10 +155,11 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     // (Sliding=0, LimbBasedWalking=1 — see colony_save_load.rs), forced by
     // .species v6/v7 back-compat. Do NOT "align" the two — it breaks round-trips.
     buf.push(movement_byte(session.draft.movement));
-    // v9: ground- vs water-based. The EFFECTIVE value (phototroph cycler
-    // choice, heterotroph movement-derived) so the byte equals the spawned
-    // organism's `Organism::ground_based`.
-    buf.push(session.draft.effective_ground_based() as u8);
+    // v9/v13: grounding byte. The EFFECTIVE tri-state tag (phototroph cycler
+    // choice, heterotroph movement-derived, movement-clamped) so the byte
+    // equals the spawned organism's placement + behaviour. 0/1 match the
+    // pre-v13 bool (water/ground); 2 = ocean-floor (benthic).
+    buf.push(session.draft.effective_grounding().to_species_tag());
 
     // Skip empty parts (appendage begun but never given a cell). Filtering
     // shifts indices, so each part's `parent` (index into the FULL list) must
@@ -245,7 +252,7 @@ pub fn encode_species_with_brain(
 ) -> Vec<u8> {
     let total_cells: usize = parts.iter().map(|p| p.3.len()).sum();
     let mut buf: Vec<u8> = Vec::with_capacity(64 + total_cells * 17 + 64 * 1024);
-    buf.extend_from_slice(MAGIC_V12);
+    buf.extend_from_slice(MAGIC_V13);
 
     let kind_byte: u8 = match metabolism {
         Metabolism::Photoautotroph => 0,
@@ -277,7 +284,9 @@ pub fn encode_species_with_brain(
         MovementMode::Swimming         => 2,
         MovementMode::Flying           => 3,
     });
-    // v9: ground- vs water-based byte.
+    // v9/v13: grounding byte (tri-state tag — 0 water, 1 ground, 2 ocean-floor).
+    // A live organism carries only the `ground_based` bool, so an export can only
+    // ever be water (0) or ground (1) — never ocean-floor (re-mark it in the editor).
     buf.push(if ground_based { 1 } else { 0 });
 
     buf.extend_from_slice(&(parts.len() as u32).to_le_bytes());
@@ -354,6 +363,11 @@ pub struct LoadedSpecies {
     /// `false` for floating phototrophs and all fluid movement modes. Mapped
     /// directly into `Organism::ground_based` at spawn.
     pub ground_based:      bool,
+    /// Benthic (ocean-floor) phototroph (v13+): a ground-based alga that SPAWNS
+    /// on submerged terrain. Only consulted by `spawn_species_instance` for
+    /// placement — the runtime organism is plain ground-based. `false` for all
+    /// older files and every non-ocean-floor species.
+    pub ocean_floor:       bool,
     /// All body parts (index 0 = base body). v1–v3 files yield a single
     /// "Base Body" part.
     pub body_parts:        Vec<LoadedBodyPart>,
@@ -371,10 +385,15 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     fn err(msg: &str) -> Error { Error::new(ErrorKind::InvalidData, msg.to_string()) }
 
     if bytes.len() < 8 + 5 + 4 { return Err(err("species file too short for header")); }
-    let is_v12 = &bytes[..8] == MAGIC_V12;
+    let is_v13 = &bytes[..8] == MAGIC_V13;
+    // v13 only widens the grounding byte to a tri-state (adds ocean-floor); its
+    // layout + geometry scale are identical to v12. Folding it into `is_v12`
+    // makes every v12/v11 gate (scaled OCG, kind tag, parent, brain block) cover
+    // v13 too — only the grounding read interprets the tag (always tag-decoded).
+    let is_v12 = is_v13 || &bytes[..8] == MAGIC_V12;
     // v12 == v11 LAYOUT + a geometry-rescale marker (OCG stored at the new 0.5
     // scale). Treating `is_v11` as "v11 layout" makes every v11 gate (kind tag,
-    // parent, brain block) also cover v12; `is_v12` alone marks scaled files.
+    // parent, brain block) also cover v12/v13; `is_v12` marks scaled files.
     let is_v11 = is_v12 || &bytes[..8] == MAGIC_V11;
     let is_v10 = &bytes[..8] == MAGIC_V10;
     let is_v9 = &bytes[..8] == MAGIC_V9;
@@ -387,7 +406,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
     let is_v2 = &bytes[..8] == MAGIC_V2;
     let is_v1 = &bytes[..8] == MAGIC_V1;
     if !is_v11 && !is_v10 && !is_v9 && !is_v8 && !is_v7 && !is_v6 && !is_v5 && !is_v4 && !is_v3 && !is_v2 && !is_v1 {
-        return Err(err("species magic mismatch (expected AEONSS01..AEONSS12)"));
+        return Err(err("species magic mismatch (expected AEONSS01..AEONSS13)"));
     }
 
     let mut c = 8usize;
@@ -429,15 +448,28 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
         MovementMode::Sliding
     };
 
-    // v9: ground- vs water-based byte after movement; older files derive it
-    // from the movement mode. Clamped so a fluid movement mode can never
-    // claim ground-based (same invariant as `spawn_organism`).
-    let ground_based = if is_v9 || is_v10 || is_v11 {
+    // v9: grounding byte after movement; older files derive it from the
+    // movement mode. v9–v12 stored a BOOL (0 = water, 1 = ground); v13 widened
+    // it to a tri-state tag (0 = water, 1 = ground, 2 = ocean-floor benthic) —
+    // the 0/1 values are unchanged, so old files decode identically via the same
+    // tag map. Clamped so a fluid movement mode can never be ground-anchored
+    // (the `spawn_organism` invariant); an ocean-floor tag on a fluid mode
+    // degrades to water-based. (`is_v11` already covers v12/v13.)
+    let grounding = if is_v9 || is_v10 || is_v11 {
         let b = bytes[c]; c += 1;
-        (b != 0) && movement.default_ground_based()
+        let raw = Grounding::from_species_tag(b);
+        if raw.is_ground_based() && !movement.default_ground_based() {
+            Grounding::WaterBased
+        } else {
+            raw
+        }
+    } else if movement.default_ground_based() {
+        Grounding::GroundBased
     } else {
-        movement.default_ground_based()
+        Grounding::WaterBased
     };
+    let ground_based = grounding.is_ground_based();
+    let ocean_floor  = grounding.is_ocean_floor();
 
     let metabolism = match kind_byte {
         0 => Metabolism::Photoautotroph,
@@ -524,7 +556,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
 
     Ok(LoadedSpecies {
         metabolism, symmetry, intelligence, has_variable_form, is_sessile,
-        classification, movement, ground_based, body_parts, brain,
+        classification, movement, ground_based, ocean_floor, body_parts, brain,
     })
 }
 
