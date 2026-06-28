@@ -29,6 +29,27 @@ pub enum Symmetry {
     Bilateral,
 }
 
+impl Symmetry {
+    /// Stable `.colony`/`.species` serialisation tag (NoSymmetry=0, Bilateral=1).
+    #[inline]
+    pub fn to_tag(self) -> u8 {
+        match self {
+            Symmetry::NoSymmetry => 0,
+            Symmetry::Bilateral  => 1,
+        }
+    }
+    /// Inverse of [`Symmetry::to_tag`]; `None` on an unknown byte (corrupt or
+    /// newer-format file). Mirrors the original reader, which errored on unknown.
+    #[inline]
+    pub fn from_tag(tag: u8) -> Option<Symmetry> {
+        match tag {
+            0 => Some(Symmetry::NoSymmetry),
+            1 => Some(Symmetry::Bilateral),
+            _ => None,
+        }
+    }
+}
+
 
 /// Locomotion paradigm. Selects the physics representation, brain pool, and
 /// movement-driving system. Inherited verbatim; defaults to `Sliding`.
@@ -70,6 +91,30 @@ impl MovementMode {
             MovementMode::LimbBasedWalking  => "Limb-Movement",
             MovementMode::Swimming          => "Swimming",
             MovementMode::Flying            => "Flying",
+        }
+    }
+    /// Stable `.colony`/`.species` serialisation tag (v009+ 4-way movement_mode:
+    /// Sliding=0, LimbBasedWalking=1, Swimming=2, Flying=3). NOT the pre-v009
+    /// sliding/limb bool — that legacy decode stays inline in the loader.
+    #[inline]
+    pub fn to_tag(self) -> u8 {
+        match self {
+            MovementMode::Sliding          => 0,
+            MovementMode::LimbBasedWalking => 1,
+            MovementMode::Swimming         => 2,
+            MovementMode::Flying           => 3,
+        }
+    }
+    /// Inverse of [`MovementMode::to_tag`]; `None` on an unknown byte (corrupt
+    /// or newer-format file). Mirrors the original reader, which errored on unknown.
+    #[inline]
+    pub fn from_tag(tag: u8) -> Option<MovementMode> {
+        match tag {
+            0 => Some(MovementMode::Sliding),
+            1 => Some(MovementMode::LimbBasedWalking),
+            2 => Some(MovementMode::Swimming),
+            3 => Some(MovementMode::Flying),
+            _ => None,
         }
     }
 }
@@ -114,6 +159,29 @@ impl IntelligenceLevel {
                 let _ = rng.random::<f32>();
                 IntelligenceLevel::Level1
             }
+        }
+    }
+
+    /// Stable `.colony`/`.species` serialisation tag (Level0=0 … Level3=3).
+    #[inline]
+    pub fn to_tag(self) -> u8 {
+        match self {
+            IntelligenceLevel::Level0 => 0,
+            IntelligenceLevel::Level1 => 1,
+            IntelligenceLevel::Level2 => 2,
+            IntelligenceLevel::Level3 => 3,
+        }
+    }
+    /// Inverse of [`IntelligenceLevel::to_tag`]; `None` on an unknown byte
+    /// (corrupt or newer-format file). Mirrors the original reader's error-on-unknown.
+    #[inline]
+    pub fn from_tag(tag: u8) -> Option<IntelligenceLevel> {
+        match tag {
+            0 => Some(IntelligenceLevel::Level0),
+            1 => Some(IntelligenceLevel::Level1),
+            2 => Some(IntelligenceLevel::Level2),
+            3 => Some(IntelligenceLevel::Level3),
+            _ => None,
         }
     }
 }
@@ -178,6 +246,11 @@ pub struct Organism {
     pub photo_cell_count: i32,
     /// Cached `CellType::AbsorptionCell` count; same lifecycle as `photo_cell_count`.
     pub non_photo_cell_count: i32,
+    /// Cached Σ `CellType::upkeep_mult` over alive cells — the per-cell energy
+    /// upkeep weight. Same lifecycle as the cell counts (maintained at every
+    /// composition change: spawn/load recompute, growth +=, predation -=); read
+    /// by `energy::manage_energy` to avoid an O(cells) walk per energy tick.
+    pub upkeep_weight: f32,
     pub energy: f32,
     /// True when the organism has an unobstructed line to the sun. Maintained
     /// by `photosynthesis.rs`.
@@ -231,12 +304,12 @@ pub struct Organism {
 
 impl Organism {
     /// Total grown cells across alive body parts (consumed parts skipped).
+    /// O(1): every alive cell is classified into exactly one of the two cached
+    /// counts and (for alive parts) `cells.len() == ocg.len()`, so their sum IS
+    /// the grown cell count — no per-cell walk needed.
     #[inline]
     pub fn grown_cell_count(&self) -> usize {
-        self.body_parts.iter()
-            .filter(|bp| bp.is_alive())
-            .map(|bp| bp.ocg.len())
-            .sum()
+        (self.photo_cell_count.max(0) + self.non_photo_cell_count.max(0)) as usize
     }
 
     /// (photo_count, non_photo_count) from the cached fields. Maintainers of
@@ -258,12 +331,21 @@ impl Organism {
     /// the energy cost. Photo cells contribute 0; standard tissue 1.0; jelly and
     /// inert material less — so a creature of only standard cells gives exactly
     /// its non-photo cell count (unchanged from the old flat-count upkeep).
+    /// O(1): returns the cached `upkeep_weight` (see the field doc for the
+    /// maintenance contract). `recompute_upkeep_weight` re-derives it from cells.
+    #[inline]
     pub fn upkeep_cell_weight(&self) -> f32 {
-        self.body_parts.iter()
+        self.upkeep_weight
+    }
+
+    /// Re-derive `upkeep_weight` from the current alive cells. Used by the load
+    /// path (which sets the cell counts from file, not via `recompute_cell_counts`).
+    pub fn recompute_upkeep_weight(&mut self) {
+        self.upkeep_weight = self.body_parts.iter()
             .filter(|bp| bp.is_alive())
             .flat_map(|bp| bp.cells.iter())
             .map(|cell| cell.cell_type.upkeep_mult())
-            .sum()
+            .sum();
     }
 
     /// Cached max distance from the root any grown cell can reach. A
@@ -302,13 +384,16 @@ impl Organism {
     pub fn recompute_cell_counts(&mut self) {
         let mut p = 0i32;
         let mut np = 0i32;
+        let mut upkeep = 0.0f32;
         for bp in self.body_parts.iter().filter(|bp| bp.is_alive()) {
             for cell in &bp.cells {
                 if cell.cell_type.is_photo() { p += 1; } else { np += 1; }
+                upkeep += cell.cell_type.upkeep_mult();
             }
         }
         self.photo_cell_count     = p;
         self.non_photo_cell_count = np;
+        self.upkeep_weight        = upkeep;
         self.cached_bounding_radius = self.compute_bounding_radius();
     }
 

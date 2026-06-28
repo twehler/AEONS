@@ -10,6 +10,7 @@
 
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
 
 use crate::cell::*;
 use crate::colony::*;
@@ -87,7 +88,8 @@ struct BodyPartSnapshot {
 struct OrganismSnapshot {
     entity:         Entity,
     root_world_pos: Vec3,
-    /// Type flags (currently unused by the event-only path; retained).
+    /// `is_photo` prunes plant↔plant pairs (never predatory); `is_carnivore`
+    /// is retained for the event-only path.
     is_photo:       bool,
     is_carnivore:   bool,
     /// `false` for limb organisms. This system computes cell positions as
@@ -160,10 +162,18 @@ pub fn apply_organism_collision(
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
-    // ── 1. Snapshot every organism (immutable read of (Organism, Transform))
-    let snapshots: Vec<OrganismSnapshot> = params.p0().iter()
-        .map(|(o, t, e, is_photo, is_carn)| snapshot(e, o, t, is_photo, is_carn))
-        .collect();
+    // ── 1. Snapshot every organism (PARALLEL). `snapshot` transforms every cell
+    //    to world space (O(cells)) independently per organism. The query rows are
+    //    materialised into a Vec of references first — `&Organism`/`&Transform`
+    //    are Send+Sync (no interior mutability) — then mapped over rayon. The block
+    //    scope keeps the borrowing query alive only for the snapshot build.
+    let snapshots: Vec<OrganismSnapshot> = {
+        let q = params.p0();
+        let rows: Vec<(&Organism, &Transform, Entity, bool, bool)> = q.iter().collect();
+        rows.par_iter()
+            .map(|&(o, t, e, is_photo, is_carn)| snapshot(e, o, t, is_photo, is_carn))
+            .collect()
+    };
 
     if snapshots.is_empty() { return; }
 
@@ -176,78 +186,90 @@ pub fn apply_organism_collision(
             .push(i);
     }
 
-    // Dedup set for emitted events (no positional separation — see narrow phase).
-    let mut emitted: HashSet<(Entity, Entity, usize, usize)> = HashSet::new();
-
     let cell_contact_d  = CELL_COLLISION_RADIUS * 2.0;
     let cell_contact_d2 = cell_contact_d * cell_contact_d;
+    let broad_r2        = ORGANISM_BROAD_RADIUS * ORGANISM_BROAD_RADIUS;
 
-    // ── 3. Pair loop — broad → mid → narrow ──────────────────────────────────
-    for (idx_a, snap_a) in snapshots.iter().enumerate() {
-        let key   = grid_key(snap_a.root_world_pos, ORGANISM_BROAD_RADIUS);
-        let nkeys = neighbour_keys(key);
+    // ── 3. Pair loop — broad → mid → narrow, PARALLEL over the outer index. ──
+    // Each unordered pair (idx_a, idx_b<idx_a excluded) is processed under exactly
+    // ONE idx_a (the smaller), so the dedup HashSet — needed because the inner
+    // cell loops can re-emit the same body-part-pair key — is per-task and needs no
+    // cross-thread coordination. rayon preserves sequential order in `collect`, so
+    // the emitted-event order (and thus predation's first-claim-wins behaviour) is
+    // identical to the serial version. `snapshots`/`organism_grid` are read-only here.
+    let events: Vec<OrganismContactEvent> = (0..snapshots.len()).into_par_iter()
+        .flat_map_iter(|idx_a| {
+            let snap_a = &snapshots[idx_a];
+            let mut local: Vec<OrganismContactEvent> = Vec::new();
+            let mut emitted: HashSet<(Entity, Entity, usize, usize)> = HashSet::new();
+            let nkeys = neighbour_keys(grid_key(snap_a.root_world_pos, ORGANISM_BROAD_RADIUS));
 
-        for nkey in nkeys {
-            let Some(bucket) = organism_grid.get(&nkey) else { continue };
+            for nkey in nkeys {
+                let Some(bucket) = organism_grid.get(&nkey) else { continue };
 
-            for &idx_b in bucket {
-                if idx_b <= idx_a { continue; }
-                let snap_b = &snapshots[idx_b];
+                for &idx_b in bucket {
+                    if idx_b <= idx_a { continue; }
+                    let snap_b = &snapshots[idx_b];
 
-                // Skip pairs involving a limb organism (their true positions
-                // live in Avian, not `root × local`); `emit_limb_contact_events`
-                // handles those. Sliding↔sliding pairs stay here.
-                if !snap_a.sliding || !snap_b.sliding {
-                    continue;
-                }
+                    // Skip pairs involving a limb organism (their true positions
+                    // live in Avian, not `root × local`); `handle_limb_collisions`
+                    // handles those. Sliding↔sliding pairs stay here.
+                    if !snap_a.sliding || !snap_b.sliding { continue; }
 
-                // Broad phase: skip pairs whose roots are far apart.
-                let dx = snap_a.root_world_pos - snap_b.root_world_pos;
-                if dx.length_squared() >= ORGANISM_BROAD_RADIUS * ORGANISM_BROAD_RADIUS {
-                    continue;
-                }
+                    // Two photoautotrophs can never predate each other, so the only
+                    // outcome of testing a plant↔plant pair is an event `predation.rs`
+                    // immediately discards. Skip them — this drops the bulk of the
+                    // cell-vs-cell work in a dense seated plant field.
+                    if snap_a.is_photo && snap_b.is_photo { continue; }
 
-                // Mid phase: per-body-part bounding-sphere overlap.
-                for bp_a in &snap_a.body_parts {
-                    for bp_b in &snap_b.body_parts {
-                        let bp_d  = bp_a.world_centroid - bp_b.world_centroid;
-                        let r_sum = bp_a.bound_radius + bp_b.bound_radius;
-                        if bp_d.length_squared() >= r_sum * r_sum { continue; }
+                    // Broad phase: skip pairs whose roots are far apart.
+                    let dx = snap_a.root_world_pos - snap_b.root_world_pos;
+                    if dx.length_squared() >= broad_r2 { continue; }
 
-                        // Narrow phase: cell-pair sphere intersection.
-                        // Quadratic but cheap (<50 cells/part, broad/mid prune).
-                        for &ca in &bp_a.cells_world {
-                            for &cb in &bp_b.cells_world {
-                                let d2 = (cb - ca).length_squared();
-                                if d2 >= cell_contact_d2 || d2 < 1e-6 { continue; }
+                    // Mid phase: per-body-part bounding-sphere overlap.
+                    for bp_a in &snap_a.body_parts {
+                        for bp_b in &snap_b.body_parts {
+                            let bp_d  = bp_a.world_centroid - bp_b.world_centroid;
+                            let r_sum = bp_a.bound_radius + bp_b.bound_radius;
+                            if bp_d.length_squared() >= r_sum * r_sum { continue; }
 
-                                // Canonical key (sort by entity) so the pair
-                                // collapses to one event regardless of order.
-                                let key = if snap_a.entity < snap_b.entity {
-                                    (snap_a.entity, snap_b.entity, bp_a.index, bp_b.index)
-                                } else {
-                                    (snap_b.entity, snap_a.entity, bp_b.index, bp_a.index)
-                                };
+                            // Narrow phase: cell-pair sphere intersection.
+                            // Quadratic but cheap (<50 cells/part, broad/mid prune).
+                            for &ca in &bp_a.cells_world {
+                                for &cb in &bp_b.cells_world {
+                                    let d2 = (cb - ca).length_squared();
+                                    if d2 >= cell_contact_d2 || d2 < 1e-6 { continue; }
 
-                                if emitted.insert(key) {
-                                    contact_events.write(OrganismContactEvent {
-                                        a: snap_a.entity,
-                                        b: snap_b.entity,
-                                        body_part_a: bp_a.index,
-                                        body_part_b: bp_b.index,
-                                    });
+                                    // Canonical key (sort by entity) so the pair
+                                    // collapses to one event regardless of order.
+                                    let key = if snap_a.entity < snap_b.entity {
+                                        (snap_a.entity, snap_b.entity, bp_a.index, bp_b.index)
+                                    } else {
+                                        (snap_b.entity, snap_a.entity, bp_b.index, bp_a.index)
+                                    };
+
+                                    if emitted.insert(key) {
+                                        local.push(OrganismContactEvent {
+                                            a: snap_a.entity,
+                                            b: snap_b.entity,
+                                            body_part_a: bp_a.index,
+                                            body_part_b: bp_b.index,
+                                        });
+                                    }
+                                    // Events only — no positional push (every push
+                                    // variant introduced a worse failure mode).
                                 }
-
-                                // Events only — no positional push (every push
-                                // variant introduced a worse failure mode).
-                                // Geometric overlap is tolerated; organisms
-                                // separate naturally as they re-target.
                             }
                         }
                     }
                 }
             }
-        }
+            local
+        })
+        .collect();
+
+    for ev in events {
+        contact_events.write(ev);
     }
 
     // No push step (events only). `params.p1()` (`&mut Transform`) is unused

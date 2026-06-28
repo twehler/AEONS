@@ -41,6 +41,10 @@ pub struct GridEntry {
     pub velocity: Vec3,
     pub ty:       OrganismType,
     pub entity:   Entity,
+    /// Whether this organism lives on the terrain (ground/ocean-floor) rather
+    /// than in the water volume (swimming / floating). Lets a benthic hunter
+    /// tell which prey share its domain (and are thus actually reachable).
+    pub ground_based: bool,
 }
 
 
@@ -67,6 +71,7 @@ pub fn rebuild_world_model_grid(
         let key = ((p.x / bucket).floor() as i32, (p.z / bucket).floor() as i32);
         grid.grid.entry(key).or_default().push(GridEntry {
             pos: p, velocity: org.velocity, ty: OrganismType::Photo, entity: e,
+            ground_based: org.ground_based,
         });
     }
     for (e, tf, org) in heteros.iter() {
@@ -74,7 +79,36 @@ pub fn rebuild_world_model_grid(
         let key = ((p.x / bucket).floor() as i32, (p.z / bucket).floor() as i32);
         grid.grid.entry(key).or_default().push(GridEntry {
             pos: p, velocity: org.velocity, ty: OrganismType::Hetero, entity: e,
+            ground_based: org.ground_based,
         });
+    }
+}
+
+
+/// Visit every grid entry in the bucket ring around `self_pos`, invoking
+/// `f(&entry)` once per entry. `span` is the bucket-ring half-width: the
+/// scan covers buckets `[kx-span, kx+span] × [kz-span, kz+span]` (so
+/// `span = 1` is the 3×3 ring every short-range probe uses, and a larger
+/// `span` — derived from a wider scan radius — covers more rings).
+///
+/// This is the shared spatial-hash traversal underlying all the
+/// neighbour/prey probes; each caller supplies its own distance metric,
+/// type filter, self-exclusion rule, and inclusion bound in `f`, so the
+/// SET OF ENTRIES VISITED here is byte-identical to the hand-inlined
+/// loops it replaces.
+#[inline]
+pub(crate) fn for_each_in_ring(grid: &WorldModelGrid, self_pos: Vec3, span: i32, mut f: impl FnMut(&GridEntry)) {
+    let bucket = WORLD_MODEL_RADIUS;
+    let kx = (self_pos.x / bucket).floor() as i32;
+    let kz = (self_pos.z / bucket).floor() as i32;
+    for dx in -span..=span {
+        for dz in -span..=span {
+            if let Some(entries) = grid.grid.get(&(kx + dx, kz + dz)) {
+                for entry in entries {
+                    f(entry);
+                }
+            }
+        }
     }
 }
 
@@ -88,6 +122,9 @@ pub struct Neighbour {
     pub rel:      Vec3,
     pub velocity: Vec3,
     pub ty:       OrganismType,
+    /// Mirrors `GridEntry::ground_based` — whether this neighbour lives on the
+    /// terrain (so a benthic hunter can reach it) or in the water volume.
+    pub ground_based: bool,
 }
 
 
@@ -95,36 +132,46 @@ pub struct Neighbour {
 /// sorted by ascending distance. Returns an array of length
 /// `WORLD_MODEL_K`; trailing slots are `None` when fewer than K
 /// neighbours are in range.
+///
+/// `scratch` is a caller-owned candidate buffer reused across calls — it
+/// is cleared on entry, so a single `Vec` threaded through a per-organism
+/// loop avoids a fresh allocation per organism per brain tick. Only the
+/// top-`WORLD_MODEL_K` candidates are sorted (partial selection), not the
+/// whole in-range list.
 pub fn collect_neighbours(
     grid:     &WorldModelGrid,
     self_pos: Vec3,
+    scratch:  &mut Vec<(f32, Neighbour)>,
 ) -> [Option<Neighbour>; WORLD_MODEL_K] {
-    let bucket    = WORLD_MODEL_RADIUS;
     let radius_sq = WORLD_MODEL_RADIUS * WORLD_MODEL_RADIUS;
-    let kx = (self_pos.x / bucket).floor() as i32;
-    let kz = (self_pos.z / bucket).floor() as i32;
 
-    let mut candidates: Vec<(f32, Neighbour)> = Vec::new();
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            if let Some(entries) = grid.grid.get(&(kx + dx, kz + dz)) {
-                for &e in entries {
-                    let rel = e.pos - self_pos;
-                    let d2  = rel.length_squared();
-                    if d2 < 1e-6 { continue; }      // self-exclusion
-                    if d2 > radius_sq { continue; }
-                    candidates.push((d2, Neighbour {
-                        entity: e.entity, rel, velocity: e.velocity, ty: e.ty,
-                    }));
-                }
-            }
-        }
+    scratch.clear();
+    for_each_in_ring(grid, self_pos, 1, |e| {
+        let rel = e.pos - self_pos;
+        let d2  = rel.length_squared();
+        if d2 < 1e-6 { return; }      // self-exclusion
+        if d2 > radius_sq { return; }
+        scratch.push((d2, Neighbour {
+            entity: e.entity, rel, velocity: e.velocity, ty: e.ty,
+            ground_based: e.ground_based,
+        }));
+    });
+
+    // Partial top-K: partition so the K nearest land in `scratch[..K]`,
+    // then sort only that prefix by ascending distance — O(n) selection
+    // instead of an O(n log n) full sort of every in-range candidate.
+    let k = WORLD_MODEL_K.min(scratch.len());
+    if scratch.len() > k {
+        scratch.select_nth_unstable_by(k - 1, |a, b| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
-    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let prefix = &mut scratch[..k];
+    prefix.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut out: [Option<Neighbour>; WORLD_MODEL_K] = [None; WORLD_MODEL_K];
-    for (i, (_, n)) in candidates.into_iter().take(WORLD_MODEL_K).enumerate() {
-        out[i] = Some(n);
+    for (i, (_, n)) in prefix.iter().enumerate() {
+        out[i] = Some(*n);
     }
     out
 }
@@ -139,24 +186,15 @@ pub fn count_local_prey(
     self_pos: Vec3,
     radius:   f32,
 ) -> u32 {
-    let bucket    = WORLD_MODEL_RADIUS;
     let radius_sq = radius * radius;
-    let kx = (self_pos.x / bucket).floor() as i32;
-    let kz = (self_pos.z / bucket).floor() as i32;
     let mut n: u32 = 0;
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            if let Some(entries) = grid.grid.get(&(kx + dx, kz + dz)) {
-                for &e in entries {
-                    if !matches!(e.ty, OrganismType::Photo) { continue; }
-                    let rel = e.pos - self_pos;
-                    let d2  = rel.x * rel.x + rel.z * rel.z;
-                    if d2 < 1e-6 { continue; }
-                    if d2 <= radius_sq { n += 1; }
-                }
-            }
-        }
-    }
+    for_each_in_ring(grid, self_pos, 1, |e| {
+        if !matches!(e.ty, OrganismType::Photo) { return; }
+        let rel = e.pos - self_pos;
+        let d2  = rel.x * rel.x + rel.z * rel.z;
+        if d2 < 1e-6 { return; }
+        if d2 <= radius_sq { n += 1; }
+    });
     n
 }
 
@@ -237,8 +275,9 @@ pub fn fill_world_model(
     grid:       &WorldModelGrid,
     self_pos:   Vec3,
     out:        &mut [f32],
+    scratch:    &mut Vec<(f32, Neighbour)>,
 ) {
-    let neighbours = collect_neighbours(grid, self_pos);
+    let neighbours = collect_neighbours(grid, self_pos, scratch);
     encode_neighbours(&neighbours, out);
 }
 
@@ -265,54 +304,40 @@ pub fn nearest_prey_within(grid: &WorldModelGrid, self_pos: Vec3, radius: f32) -
     let bucket    = WORLD_MODEL_RADIUS;
     let radius_sq = radius * radius;
     let span      = (radius / bucket).ceil() as i32;
-    let kx = (self_pos.x / bucket).floor() as i32;
-    let kz = (self_pos.z / bucket).floor() as i32;
 
     let mut best: Option<(f32, Vec3, Entity)> = None;
-    for dx in -span..=span {
-        for dz in -span..=span {
-            if let Some(entries) = grid.grid.get(&(kx + dx, kz + dz)) {
-                for &e in entries {
-                    if !matches!(e.ty, OrganismType::Photo) { continue; }
-                    let rel = e.pos - self_pos;
-                    let d2  = rel.length_squared();
-                    // No self-exclusion: the Photo filter + Heterotroph
-                    // caller make it unnecessary, and a `d2 < 1e-6` skip
-                    // would drop a photo a herbivore is parked exactly on.
-                    if d2 > radius_sq { continue; }
-                    if best.map_or(true, |(b, _, _)| d2 < b) {
-                        best = Some((d2, rel, e.entity));
-                    }
-                }
-            }
+    for_each_in_ring(grid, self_pos, span, |e| {
+        if !matches!(e.ty, OrganismType::Photo) { return; }
+        let rel = e.pos - self_pos;
+        let d2  = rel.length_squared();
+        // No self-exclusion: the Photo filter + Heterotroph
+        // caller make it unnecessary, and a `d2 < 1e-6` skip
+        // would drop a photo a herbivore is parked exactly on.
+        if d2 > radius_sq { return; }
+        if best.map_or(true, |(b, _, _)| d2 < b) {
+            best = Some((d2, rel, e.entity));
         }
-    }
+    });
     best.map(|(d2, rel, ent)| (rel, d2.sqrt(), ent))
 }
 
 
 /// Every photoautotroph within `WORLD_MODEL_RADIUS` of `self_pos`, as
 /// `(rel_xz, distance)`. Self-excluded via exact-position match.
-pub fn prey_in_radius(grid: &WorldModelGrid, self_pos: Vec3) -> Vec<(Vec2, f32)> {
-    let bucket    = WORLD_MODEL_RADIUS;
+///
+/// Writes into the caller-owned `out` buffer (cleared on entry) so a
+/// single `Vec` reused across a per-organism loop avoids a fresh
+/// allocation per call.
+pub fn prey_in_radius(grid: &WorldModelGrid, self_pos: Vec3, out: &mut Vec<(Vec2, f32)>) {
     let radius_sq = WORLD_MODEL_RADIUS * WORLD_MODEL_RADIUS;
-    let kx = (self_pos.x / bucket).floor() as i32;
-    let kz = (self_pos.z / bucket).floor() as i32;
 
-    let mut out: Vec<(Vec2, f32)> = Vec::new();
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            if let Some(entries) = grid.grid.get(&(kx + dx, kz + dz)) {
-                for &e in entries {
-                    if !matches!(e.ty, OrganismType::Photo) { continue; }
-                    let rel = e.pos - self_pos;
-                    let d2  = rel.length_squared();
-                    if d2 < 1e-6 { continue; }
-                    if d2 > radius_sq { continue; }
-                    out.push((Vec2::new(rel.x, rel.z), d2.sqrt()));
-                }
-            }
-        }
-    }
-    out
+    out.clear();
+    for_each_in_ring(grid, self_pos, 1, |e| {
+        if !matches!(e.ty, OrganismType::Photo) { return; }
+        let rel = e.pos - self_pos;
+        let d2  = rel.length_squared();
+        if d2 < 1e-6 { return; }
+        if d2 > radius_sq { return; }
+        out.push((Vec2::new(rel.x, rel.z), d2.sqrt()));
+    });
 }

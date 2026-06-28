@@ -125,6 +125,13 @@ fn grow_variable_form_organisms(
             );
         }
 
+        // The body just changed shape (its lowest cell may have moved), so re-seat
+        // it on the floor: drop the one-shot placement marker and
+        // `place_sessile_organisms` re-runs once next frame. Variable-form ⇒
+        // sessile, so every grown organism is a seated plant. Cost is bounded to
+        // the few organisms that grew this tick — not per frame.
+        commands.entity(root_entity).remove::<crate::movement::SurfacePlaced>();
+
         // Adult transition: fires once, on the tick that crosses `MAX_CELLS`
         // (the guard above then excludes the organism forever). Smoothing is
         // gated on `Smoothing`; when off, `adult` still flips (so a later
@@ -200,13 +207,14 @@ fn grow_new_branch(
     new_part.ocg = grown_ocg;
     physiology::recompute_body_part(&mut new_part);
 
-    // Update cached cell counts — predation/energy/physiology read the cache.
+    // Update cached cell counts + upkeep weight — energy/physiology read the cache.
     for cell in &new_part.cells {
         if cell.cell_type.is_photo() {
             organism.photo_cell_count += 1;
         } else {
             organism.non_photo_cell_count += 1;
         }
+        organism.upkeep_weight += cell.cell_type.upkeep_mult();
     }
 
     let new_idx = organism.body_parts.len();
@@ -269,6 +277,7 @@ fn extend_root_part(
     } else {
         organism.non_photo_cell_count += 1;
     }
+    organism.upkeep_weight += new_cell_type.upkeep_mult();
     // Refresh cached bounding radius — the new cell may extend the envelope.
     organism.recompute_bounding_radius();
 

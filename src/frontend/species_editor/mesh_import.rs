@@ -29,6 +29,9 @@ use crate::simulation_settings::WindowMode;
 use super::session::SpeciesSession;
 use super::SPECIES_EDITOR_ORIGIN;
 use super::SPECIES_EDITOR_LAYER;
+use crate::ui_modal::{
+    self, ConfirmModalSpec, NoButtonStyle, YES_BTN_COLOR, YES_BTN_HOVER,
+};
 
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -192,109 +195,32 @@ pub const IMPORT_BG_HOVER: Color = Color::srgb(0.24, 0.60, 0.66);
 
 // ── Warning modal (unsaved changes) ───────────────────────────────────────────
 
-const MODAL_BACKDROP:    Color = Color::srgba(0.0, 0.0, 0.0, 0.55);
-const MODAL_CARD:        Color = Color::srgb(0.15, 0.15, 0.18);
-const MODAL_CARD_BORDER: Color = Color::srgb(0.40, 0.40, 0.45);
-const MODAL_YES:         Color = Color::srgb(0.55, 0.18, 0.18); // red — discards cells
-const MODAL_YES_HOVER:   Color = Color::srgb(0.68, 0.22, 0.22);
-const MODAL_NO:          Color = Color::srgb(0.24, 0.56, 0.36); // green — safe default
-const MODAL_NO_HOVER:    Color = Color::srgb(0.32, 0.66, 0.42);
-const MODAL_NO_BORDER:   Color = Color::srgb(0.95, 0.95, 0.95);
-
 pub fn manage_warning_modal_visibility(
     mut commands: Commands,
     mesh:         Res<MeshImport>,
     existing:     Query<Entity, With<ImportWarnModalRoot>>,
 ) {
-    let want = mesh.show_warning_modal;
-    let is   = !existing.is_empty();
-    if want && !is {
-        spawn_warning_modal(&mut commands);
-    } else if !want && is {
-        for e in &existing { commands.entity(e).despawn(); }
-    }
+    ui_modal::sync_modal_visibility(
+        &mut commands, mesh.show_warning_modal, &existing, spawn_warning_modal);
 }
 
 fn spawn_warning_modal(commands: &mut Commands) {
-    commands
-        .spawn((
-            ImportWarnModalRoot,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(0.0), left: Val::Px(0.0),
-                width: Val::Percent(100.0), height: Val::Percent(100.0),
-                justify_content: JustifyContent::Center,
-                align_items:     AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(MODAL_BACKDROP),
-            GlobalZIndex(120),
-        ))
-        .with_children(|root| {
-            root.spawn((
-                Node {
-                    width: Val::Px(580.0),
-                    flex_direction: FlexDirection::Column,
-                    align_items: AlignItems::Center,
-                    padding: UiRect::all(Val::Px(22.0)),
-                    border:  UiRect::all(Val::Px(1.0)),
-                    ..default()
-                },
-                BackgroundColor(MODAL_CARD),
-                BorderColor::all(MODAL_CARD_BORDER),
-            ))
-            .with_children(|card| {
-                card.spawn((
-                    Text::new("Importing a mesh will delete the current cells, and there \
-                               are unsaved changes. Are you sure?"),
-                    TextFont { font_size: 15.0, ..default() },
-                    TextColor(Color::srgb(0.9, 0.9, 0.9)),
-                    Node { margin: UiRect::bottom(Val::Px(20.0)), ..default() },
-                    Pickable::IGNORE,
-                ));
-                card.spawn(Node {
-                    flex_direction:  FlexDirection::Row,
-                    justify_content: JustifyContent::Center,
-                    align_items:     AlignItems::Center,
-                    ..default()
-                })
-                .with_children(|row| {
-                    row.spawn((
-                        ImportWarnNoButton, Button,
-                        Node {
-                            width: Val::Px(110.0), height: Val::Px(36.0),
-                            margin: UiRect::right(Val::Px(16.0)),
-                            border: UiRect::all(Val::Px(2.0)),
-                            align_items: AlignItems::Center,
-                            justify_content: JustifyContent::Center,
-                            ..default()
-                        },
-                        BackgroundColor(MODAL_NO),
-                        BorderColor::all(MODAL_NO_BORDER),
-                    ))
-                    .with_children(|b| { b.spawn((
-                        Text::new("No"),
-                        TextFont { font_size: 16.0, ..default() },
-                        TextColor(Color::WHITE), Pickable::IGNORE,
-                    )); });
-                    row.spawn((
-                        ImportWarnYesButton, Button,
-                        Node {
-                            width: Val::Px(110.0), height: Val::Px(36.0),
-                            align_items: AlignItems::Center,
-                            justify_content: JustifyContent::Center,
-                            ..default()
-                        },
-                        BackgroundColor(MODAL_YES),
-                    ))
-                    .with_children(|b| { b.spawn((
-                        Text::new("Yes"),
-                        TextFont { font_size: 16.0, ..default() },
-                        TextColor(Color::WHITE), Pickable::IGNORE,
-                    )); });
-                });
-            });
-        });
+    ui_modal::spawn_confirm_modal(
+        commands,
+        &ConfirmModalSpec {
+            title:      None,
+            body:       "Importing a mesh will delete the current cells, and there \
+                         are unsaved changes. Are you sure?".to_string(),
+            body_font_size: ui_modal::BODY_FONT_SIZE_LG,
+            body_color:     ui_modal::BODY_COLOR_LG,
+            card_width: 580.0,
+            z_index:    120,
+            no_style:   NoButtonStyle::Safe,
+        },
+        ImportWarnModalRoot,
+        ImportWarnNoButton,
+        ImportWarnYesButton,
+    );
 }
 
 pub fn handle_warning_modal_buttons(
@@ -308,24 +234,15 @@ pub fn handle_warning_modal_buttons(
     mut mesh:     ResMut<MeshImport>,
 ) {
     for (interaction, mut bg) in &mut yes_q {
-        match *interaction {
-            Interaction::Pressed => {
-                mesh.show_warning_modal = false;
-                begin_import(&asset_server, &mut commands, &mut session, &mut mesh);
-                *bg = BackgroundColor(MODAL_YES_HOVER);
-            }
-            Interaction::Hovered => *bg = BackgroundColor(MODAL_YES_HOVER),
-            Interaction::None    => *bg = BackgroundColor(MODAL_YES),
+        if ui_modal::modal_button_pressed(interaction, &mut bg, YES_BTN_COLOR, YES_BTN_HOVER) {
+            mesh.show_warning_modal = false;
+            begin_import(&asset_server, &mut commands, &mut session, &mut mesh);
         }
     }
+    let no_style = NoButtonStyle::Safe;
     for (interaction, mut bg) in &mut no_q {
-        match *interaction {
-            Interaction::Pressed => {
-                mesh.show_warning_modal = false;
-                *bg = BackgroundColor(MODAL_NO_HOVER);
-            }
-            Interaction::Hovered => *bg = BackgroundColor(MODAL_NO_HOVER),
-            Interaction::None    => *bg = BackgroundColor(MODAL_NO),
+        if ui_modal::modal_button_pressed(interaction, &mut bg, no_style.base(), no_style.hover()) {
+            mesh.show_warning_modal = false;
         }
     }
 }

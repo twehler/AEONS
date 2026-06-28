@@ -57,13 +57,21 @@ fn update_sunlight(
         }
     }
 
-    for (entity, mut organism, transform) in query.iter_mut() {
+    // Entity-disjoint per-organism writes; reads `&heightmap` (POD, Sync) and
+    // `&base_pos` (HashMap read, Sync). `base_pos` is built serially above (borrows
+    // only `base_part_q`, which doesn't overlap `query`), so by here that borrow has
+    // ended. No Commands / MessageWriter / NonSend / shared scratch → fans out over
+    // ComputeTaskPool. (Deliberately no `.to_bits()` guard — none existed; the bool
+    // is written every 10 Hz tick as before.)
+    let heightmap = &*heightmap;
+    let base_pos  = &base_pos;
+    query.par_iter_mut().for_each(|(entity, mut organism, transform)| {
         // Prefer the trunk part's world position; fall back to the root
         // transform if (briefly) no trunk part is registered.
         let origin = base_pos.get(&entity).copied()
             .unwrap_or(transform.translation);
-        organism.in_sunlight = is_lit(origin, &heightmap, sun, escape_y);
-    }
+        organism.in_sunlight = is_lit(origin, heightmap, sun, escape_y);
+    });
 }
 
 /// Marches a ray from `origin` toward the sun. Returns `true` once the ray

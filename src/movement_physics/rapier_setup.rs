@@ -582,10 +582,12 @@ pub fn cull_nonfinite_bodies(
     rb_set_q:      Query<&RapierRigidBodySet>,
     parts:         Query<(&bevy::prelude::ChildOf, &RapierRigidBodyHandle)>,
     roots:         Query<(), With<crate::colony::OrganismRoot>>,
+    // Reused per-root kill set (root entity → one of its body handles). Cleared
+    // each run instead of reallocated; usually empty (no body went non-finite).
+    mut kill: Local<std::collections::HashMap<bevy::prelude::Entity, bevy_rapier3d::rapier::dynamics::RigidBodyHandle>>,
 ) {
     let (Ok(mut joints), Ok(rb_set)) = (joints_q.single_mut(), rb_set_q.single()) else { return };
-    use std::collections::HashMap;
-    let mut kill: HashMap<bevy::prelude::Entity, bevy_rapier3d::rapier::dynamics::RigidBodyHandle> = HashMap::new();
+    kill.clear();
     for (child_of, handle) in &parts {
         if let Some(b) = rb_set.bodies.get(handle.0) {
             // Check translation, ORIENTATION, and both velocities. Orientation is
@@ -626,7 +628,7 @@ pub fn cull_nonfinite_bodies(
             }
         }
     }
-    for (root, handle) in kill {
+    for (&root, &handle) in kill.iter() {
         // Remove the whole articulation NOW so this step never solves a NaN motor.
         joints.multibody_joints.remove_multibody_articulations(handle, true);
         if roots.get(root).is_ok() {
@@ -952,12 +954,13 @@ pub fn handle_limb_collisions(
 pub fn clamp_limb_velocity(
     mut q: Query<&mut Velocity, With<LastAppliedTorque>>,
 ) {
-    for mut v in &mut q {
+    // Entity-disjoint: each closure clamps only its own `Velocity`.
+    q.par_iter_mut().for_each(|mut v| {
         let ls = v.linear.length();
         if ls > MAX_LIMB_LINEAR_SPEED { v.linear *= MAX_LIMB_LINEAR_SPEED / ls; }
         let as_ = v.angular.length();
         if as_ > MAX_LIMB_ANGULAR_SPEED { v.angular *= MAX_LIMB_ANGULAR_SPEED / as_; }
-    }
+    });
 }
 
 
@@ -1011,6 +1014,11 @@ fn sane_motor_cmd(x: f32) -> f32 {
     if x.is_finite() { x.clamp(-1.0, 1.0) } else { 0.0 }
 }
 
+/// Below this absolute change (radians) in a commanded motor target the joint
+/// data is NOT rebuilt: a position motor holds its last setpoint, so a sub-epsilon
+/// retarget is a solver no-op. Tiny so any real command change still goes through.
+const MOTOR_TARGET_EPS: f32 = 1.0e-4;
+
 /// Refresh each limb `MultibodyJoint`'s revolute position-motor target from the
 /// brain's per-joint output each physics step. Rebuilds the joint data so the
 /// in-solver position motor (stiffness/damping PD) tracks the new setpoint.
@@ -1021,12 +1029,17 @@ fn sane_motor_cmd(x: f32) -> f32 {
 pub fn drive_limb_motors(
     sim_running: Res<crate::simulation_settings::SimulationRunning>,
     organisms:   Query<&crate::colony::Organism>,
-    mut joints:  Query<(&LimbJointDrive, &mut ImpulseJoint)>,
+    mut joints:  Query<(Entity, &LimbJointDrive, &mut ImpulseJoint)>,
     mut torque_log: Query<&mut LastAppliedTorque>,
+    // Per-joint cache of the last commanded hinge target (radians), keyed by the
+    // joint entity. A position motor HOLDS its last target, so rebuilding the
+    // joint data with an unchanged target is a no-op for the solver — skipping
+    // it is behaviourally identical and avoids the per-step struct rebuild.
+    mut last_target: Local<std::collections::HashMap<Entity, f32>>,
 ) {
     if !sim_running.0 { return; }
 
-    for (drive, mut joint) in &mut joints {
+    for (joint_e, drive, mut joint) in &mut joints {
         let Ok(organism) = organisms.get(drive.organism) else { continue };
         if organism.movement_mode.is_sliding() { continue; }
         // Swimmers carry BALL joints driven by `drive_swim_motors` from the
@@ -1039,7 +1052,15 @@ pub fn drive_limb_motors(
         let cmd = sane_motor_cmd(organism.limb_targets[out_idx]);
         let target = cmd * LIMB_SWING_LIMIT;
 
-        joint.data = revolute_data(drive, target);
+        // Skip the motor rebuild when the new target matches the last commanded
+        // one (within epsilon): the in-solver position motor already holds it.
+        match last_target.get(&joint_e) {
+            Some(&prev) if (prev - target).abs() <= MOTOR_TARGET_EPS => {}
+            _ => {
+                joint.data = revolute_data(drive, target);
+                last_target.insert(joint_e, target);
+            }
+        }
 
         if let Ok(mut last) = torque_log.get_mut(drive.limb_entity) {
             last.0 = Vec3::new(target, 0.0, 0.0);
@@ -1074,12 +1095,17 @@ pub fn drive_swim_motors(
     // `drive_limb_motors`). Rebuilding `joint.data` retargets the 3 per-axis
     // position motors; the spherical DOF count is constant (3), so the
     // multibody user-change path stays well-defined.
-    mut joints:  Query<(&LimbJointDrive, &mut MultibodyJoint)>,
+    mut joints:  Query<(Entity, &LimbJointDrive, &mut MultibodyJoint)>,
     mut torque_log: Query<&mut LastAppliedTorque>,
+    // Per-joint cache of the last commanded 3-axis target (radians), keyed by the
+    // joint entity. The spherical position motors hold their last targets, so
+    // rebuilding `joint.data` (which also re-reads `swim_tuning()` and reformats
+    // every axis) with an unchanged target is a no-op — skipping it is identical.
+    mut last_target: Local<std::collections::HashMap<Entity, [f32; 3]>>,
 ) {
     if !sim_running.0 { return; }
 
-    for (drive, mut joint) in &mut joints {
+    for (joint_e, drive, mut joint) in &mut joints {
         let Ok((organism, targets)) = organisms.get(drive.organism) else { continue };
         if !organism.movement_mode.is_swimming() { continue; }
         let i = drive.body_part;
@@ -1091,7 +1117,17 @@ pub fn drive_swim_motors(
             sane_motor_cmd(targets.0[base + 1]) * LIMB_SWING_LIMIT,
             sane_motor_cmd(targets.0[base + 2]) * LIMB_SWING_LIMIT,
         ];
-        joint.data = spherical_data(drive, target);
+
+        // Skip the motor rebuild (and its `swim_tuning()` read + per-axis
+        // reformat) when all three axis targets match the last commanded ones.
+        let unchanged = matches!(last_target.get(&joint_e), Some(prev)
+            if (prev[0] - target[0]).abs() <= MOTOR_TARGET_EPS
+            && (prev[1] - target[1]).abs() <= MOTOR_TARGET_EPS
+            && (prev[2] - target[2]).abs() <= MOTOR_TARGET_EPS);
+        if !unchanged {
+            joint.data = spherical_data(drive, target);
+            last_target.insert(joint_e, target);
+        }
 
         if let Ok(mut last) = torque_log.get_mut(drive.limb_entity) {
             last.0 = Vec3::new(target[0], target[1], target[2]);
@@ -1108,9 +1144,12 @@ pub fn drive_limb_twist(
     organisms:   Query<&crate::colony::Organism>,
     limbs:       Query<(Entity, &LimbTwistDrive, &GlobalTransform)>,
     mut forces:  Query<(Entity, &mut ExternalForce)>,
+    // Reused per-entity torque accumulator (limb +T / parent −T couple). Cleared
+    // each run instead of reallocated, so a steady-state population pays no churn.
+    mut acc: Local<std::collections::HashMap<Entity, Vec3>>,
 ) {
     if !sim_running.0 { return; }
-    let mut acc: std::collections::HashMap<Entity, Vec3> = std::collections::HashMap::new();
+    acc.clear();
     for (limb_e, drive, gt) in &limbs {
         let Ok(organism) = organisms.get(drive.organism) else { continue };
         if organism.movement_mode.is_sliding() { continue; }
@@ -1171,20 +1210,22 @@ pub fn apply_fluid_drag(
 ) {
     if !sim_running.0 { return; }
     let water_y = water.0;
-    for (gt, vel, mut ext, drag) in &mut q {
+    // Per-part drag is entity-disjoint (each closure writes only its own
+    // `ExternalForce`), so it fans out over ComputeTaskPool. The "water resistance"
+    // tuning is loop-invariant — read it ONCE out of the closure (it also scales
+    // blade-element thrust, so cd/ang_coef cover both resistance and propulsion).
+    let cd       = SWIM_DRAG_CD * swim_tuning().drag_mult;
+    let ang_coef = SWIM_ANGULAR_DRAG_COEF * swim_tuning().drag_mult;
+    q.par_iter_mut().for_each(|(gt, vel, mut ext, drag)| {
         // Above the surface → no water to push against; fall with dry-land
         // physics. (Same threshold as `apply_water_gravity`'s gravity toggle.)
-        if gt.translation().y > water_y { continue; }
+        if gt.translation().y > water_y { return; }
         // Never compute drag from a non-finite velocity (would propagate NaN
         // straight into the solver and panic the physics step).
-        if !vel.linear.is_finite() { continue; }
+        if !vel.linear.is_finite() { return; }
         let rot = gt.rotation();
         let v_local = rot.inverse() * vel.linear;
         let a = drag.area_local;
-        // "Water resistance" env knob (×SWIM_DRAG_CD / angular coef). NOTE this
-        // drag is ALSO the blade-element propulsion source, so it scales thrust
-        // and resistance together.
-        let cd = SWIM_DRAG_CD * swim_tuning().drag_mult;
         // Per-axis quadratic drag, CLAMPED: the v² term is explosive on a light
         // body if velocity spikes, so cap each axis force. (With SWIM_BODY_DENSITY
         // the body is heavy enough that this cap is rarely hit, but it guarantees
@@ -1198,12 +1239,12 @@ pub fn apply_fluid_drag(
         if fw.is_finite() { ext.force += fw; }
         let w = vel.angular;
         if w.is_finite() {
-            let mut t = -SWIM_ANGULAR_DRAG_COEF * swim_tuning().drag_mult * w.length() * w;
+            let mut t = -ang_coef * w.length() * w;
             let tl = t.length();
             if tl > SWIM_DRAG_MAX_TORQUE { t *= SWIM_DRAG_MAX_TORQUE / tl; }
             ext.torque += t;
         }
-    }
+    });
 }
 
 /// Keep swimmers inside the map's XZ bounds with SOFT restoring forces (no
@@ -1218,22 +1259,24 @@ pub fn confine_swimmers(
 ) {
     if !sim_running.0 { return; }
     let r = CELL_COLLISION_RADIUS;
-    for (gt, mut ext) in &mut q {
+    let (map_x, map_z) = (map.x, map.z);
+    // Entity-disjoint: each closure writes only its own `ExternalForce`.
+    q.par_iter_mut().for_each(|(gt, mut ext)| {
         let pos = gt.translation();
         // XZ soft borders: clamped springs (`stiffness × overshoot`, capped at
         // SWIM_CONFINE_MAX_FORCE so a far-out body can't get an explosive
         // impulse — it is pushed back firmly but finitely).
         if pos.x < r {
             ext.force.x += (SWIM_BORDER_STIFFNESS * (r - pos.x)).min(SWIM_CONFINE_MAX_FORCE);
-        } else if pos.x > map.x - r {
-            ext.force.x -= (SWIM_BORDER_STIFFNESS * (pos.x - (map.x - r))).min(SWIM_CONFINE_MAX_FORCE);
+        } else if pos.x > map_x - r {
+            ext.force.x -= (SWIM_BORDER_STIFFNESS * (pos.x - (map_x - r))).min(SWIM_CONFINE_MAX_FORCE);
         }
         if pos.z < r {
             ext.force.z += (SWIM_BORDER_STIFFNESS * (r - pos.z)).min(SWIM_CONFINE_MAX_FORCE);
-        } else if pos.z > map.z - r {
-            ext.force.z -= (SWIM_BORDER_STIFFNESS * (pos.z - (map.z - r))).min(SWIM_CONFINE_MAX_FORCE);
+        } else if pos.z > map_z - r {
+            ext.force.z -= (SWIM_BORDER_STIFFNESS * (pos.z - (map_z - r))).min(SWIM_CONFINE_MAX_FORCE);
         }
-    }
+    });
 }
 
 
@@ -1256,10 +1299,12 @@ pub fn apply_water_gravity(
 ) {
     if !sim_running.0 { return; }
     let water_y = water.0;
-    for (gt, mut gs) in &mut q {
+    // Entity-disjoint: each closure writes only its own `GravityScale`. The
+    // write-guard (only on a surface crossing) keeps Rapier's sync idle in steady state.
+    q.par_iter_mut().for_each(|(gt, mut gs)| {
         let target = if gt.translation().y > water_y { 1.0 } else { 0.0 };
         if gs.0 != target { gs.0 = target; }
-    }
+    });
 }
 
 
@@ -1270,10 +1315,11 @@ pub fn apply_water_gravity(
 pub fn sanitize_swimmer_velocity(
     mut q: Query<&mut Velocity, With<SwimmerBody>>,
 ) {
-    for mut v in &mut q {
+    // Entity-disjoint: each closure touches only its own `Velocity`.
+    q.par_iter_mut().for_each(|mut v| {
         if !v.linear.is_finite()  { v.linear  = Vec3::ZERO; }
         if !v.angular.is_finite() { v.angular = Vec3::ZERO; }
-    }
+    });
 }
 
 // ── Heading-steering ASSIST toward prey (locomotion task) ────────────────────

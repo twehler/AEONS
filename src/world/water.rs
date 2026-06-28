@@ -82,8 +82,11 @@ fn apply_buoyancy(
     mut query: Query<(&Transform, &mut Organism), With<OrganismRoot>>,
 ) {
     let dt = time.delta_secs();
+    let water_y = water.0;
 
-    for (transform, mut organism) in &mut query {
+    // Per-organism buoyancy/drag is entity-disjoint (own velocity + speed, no
+    // Commands), so it fans out over `ComputeTaskPool`.
+    query.par_iter_mut().for_each(|(transform, mut organism)| {
         // GROUND-ANCHORED organisms (land AND ocean-floor sliders + phototrophs)
         // never float: gravity sinks them and the heightmap floor-clamp holds
         // them on the terrain — exactly like a land slider. Buoyancy is for
@@ -91,14 +94,14 @@ fn apply_buoyancy(
         // submerged benthic organism is what made ocean-floor life rise to the
         // surface instead of staying on the seafloor.
         if organism.ground_based {
-            continue;
+            return;
         }
-        if transform.translation.y >= water.0 {
-            continue;
+        if transform.translation.y >= water_y {
+            return;
         }
 
         let bounding = organism.bounding_radius().max(1.0);
-        let depth      = water.0 - transform.translation.y;
+        let depth      = water_y - transform.translation.y;
         let submersion = (depth / bounding).clamp(0.0, 1.0);
 
         // Buoyancy: upward force proportional to submersion.
@@ -126,5 +129,5 @@ fn apply_buoyancy(
         }
 
         // No FinCell type exists, so no per-cell thrust bonus applies here.
-    }
+    });
 }

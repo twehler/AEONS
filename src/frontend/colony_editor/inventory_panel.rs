@@ -243,8 +243,10 @@ fn sync_rows(
 ) {
     let Ok(list) = list_q.single() else { return };
 
-    let known_ids:    Vec<u32> = rows_q.iter().map(|(_, row, _)| row.id).collect();
-    let template_ids: Vec<u32> = session.templates.iter().map(|t| t.id).collect();
+    // O(1) membership tests instead of per-row/per-template Vec scans.
+    use std::collections::HashSet;
+    let known_ids:    HashSet<u32> = rows_q.iter().map(|(_, row, _)| row.id).collect();
+    let template_ids: HashSet<u32> = session.templates.iter().map(|t| t.id).collect();
 
     // Despawn rows whose template is gone.
     for (entity, row, _) in rows_q.iter() {

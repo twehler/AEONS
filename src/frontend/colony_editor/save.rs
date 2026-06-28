@@ -11,7 +11,7 @@ use std::io::Write;
 use bevy::prelude::*;
 
 use crate::cell::{BodyPartKind, CellType};
-use crate::organism::{IntelligenceLevel, MovementMode, Symmetry};
+use crate::organism::{IntelligenceLevel, Symmetry};
 use crate::colony_editor::template::{Metabolism, OrganismTemplate};
 use crate::energy::MAX_ENERGY_PER_CELL;
 
@@ -179,29 +179,16 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
     put_f32(buf, 0.0);                // climb_energy_debt
     put_i32(buf, photo_cells);
     put_i32(buf, non_photo_cells);
-    put_u8 (buf, match tpl.symmetry {
-        Symmetry::NoSymmetry => 0,
-        Symmetry::Bilateral  => 1,
-    });
+    put_u8 (buf, tpl.symmetry.to_tag());
     put_u8 (buf, tpl.is_sessile() as u8);
     put_u8 (buf, tpl.has_variable_form() as u8);
     // movement paradigm: v009 4-way tag (0=Sliding, 1=LimbBasedWalking,
     // 2=Swimming, 3=Flying) — written directly from the template's MovementMode.
-    put_u8 (buf, match tpl.movement_mode {
-        MovementMode::Sliding          => 0,
-        MovementMode::LimbBasedWalking => 1,
-        MovementMode::Swimming         => 2,
-        MovementMode::Flying           => 3,
-    });
+    put_u8 (buf, tpl.movement_mode.to_tag());
     // v010: ground- vs water-based (floating phototrophs).
     put_u8 (buf, tpl.ground_based as u8);
     // intelligence level — saved so loaders don't re-roll it.
-    put_u8 (buf, match tpl.intelligence {
-        IntelligenceLevel::Level0 => 0,
-        IntelligenceLevel::Level1 => 1,
-        IntelligenceLevel::Level2 => 2,
-        IntelligenceLevel::Level3 => 3,
-    });
+    put_u8 (buf, tpl.intelligence.to_tag());
     // v011 species name. When a template carries a trained brain, persist its
     // source species name: `spawn_loaded_organism` pins `species_id` from it at
     // spawn, which is what makes the per-species brain restore (below) land in
@@ -219,13 +206,7 @@ fn write_organism(buf: &mut Vec<u8>, tpl: &OrganismTemplate) {
     // ── body parts ──────────────────────────────────────────────────
     put_u32(buf, parts.len() as u32);
     for part in &parts {
-        put_u8 (buf, match part.kind {
-            BodyPartKind::Body    => 0,
-            BodyPartKind::Limb    => 1,
-            BodyPartKind::Organ   => 2,
-            BodyPartKind::Segment => 3,
-            BodyPartKind::Static  => 4,
-        });
+        put_u8 (buf, part.kind.to_tag());
         put_vec3(buf, Vec3::ZERO);   // local_offset
         put_u8 (buf, 0);             // consumed
         put_u8 (buf, 0);             // debug_blue

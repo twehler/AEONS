@@ -32,8 +32,10 @@ impl Plugin for LineagesPlugin {
             .add_systems(Update, (
                 // Ordering is load-bearing: sync writes DNA → averages
                 // consume updated DNA → classify consumes fresh centroids.
-                // `chain()` ties them to one 1 Hz cadence (timer owned by
-                // `update_species_averages`, queried by `classify_organisms`).
+                // `chain()` ties them to one 1 Hz cadence: `sync_dna_from_phenotype`
+                // (first) OWNS the `SpeciationTimer` tick; the other two read
+                // `just_finished()`. All three early-return on off-tick frames, so
+                // the per-organism DNA walk no longer runs every frame.
                 sync_dna_from_phenotype,
                 update_species_averages,
                 classify_organisms,

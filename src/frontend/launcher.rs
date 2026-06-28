@@ -230,7 +230,7 @@ impl LauncherApp {
     fn launch_simulation(&mut self, ctx: &egui::Context) {
         let map = self.map_path.trim();
         if map.is_empty() {
-            self.status = "Please enter a path to a .glb world file.".into();
+            self.status = "Please enter a path to a .glb or .world world file.".into();
             return;
         }
         let colony = self.colony_path.trim();
@@ -255,7 +255,7 @@ impl LauncherApp {
     fn launch_editor(&mut self, ctx: &egui::Context) {
         let map = self.map_path.trim();
         if map.is_empty() {
-            self.status = "Please enter a path to a .glb world file.".into();
+            self.status = "Please enter a path to a .glb or .world world file.".into();
             return;
         }
         // Colony field is silently ignored in editor mode (simulation-only).
@@ -314,7 +314,7 @@ impl eframe::App for LauncherApp {
                 ui.put(
                     textfield_rect,
                     egui::TextEdit::singleline(&mut self.map_path)
-                        .hint_text("Path to .glb world file")
+                        .hint_text("Path to .glb or .world world file")
                         .font(egui::FontId::proportional(TEXTFIELD_FONT_SIZE)),
                 );
                 let open_map_rect = egui::Rect::from_min_size(OPEN_MAP_BTN_POS, OPEN_BTN_SIZE);
@@ -323,7 +323,7 @@ impl eframe::App for LauncherApp {
                     // `set_parent(frame)` ties the dialog to the window so the
                     // portal stacks it in front (Wayland places it behind otherwise).
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("glTF binary (.glb)", &["glb"])
+                        .add_filter("AEONS world / glTF", &["world", "glb"])
                         .add_filter("All files", &["*"])
                         .set_directory(&start)
                         .set_parent(frame)

@@ -9,6 +9,7 @@
 
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
+use rayon::prelude::*;
 use std::collections::HashSet;
 
 use crate::cell::*;
@@ -64,18 +65,39 @@ pub fn emit_proximity_predation(
     if !sim_running.0 { return; }
     let Some(grid) = grid else { return };
     let eat = crate::simulation_settings::EAT_RADIUS;
+
+    // PASS 1 (serial): apply the limb-hetero gates — these use the `orgs`/`heteros`
+    // Query lookups, which aren't Send across rayon — and snapshot the qualifying
+    // (root, base-part world pos) into an owned Send Vec, in `bases` iteration order.
+    let mut candidates: Vec<(Entity, Vec3)> = Vec::new();
     for (co, idx, gt) in &bases {
         if idx.0 != 0 { continue; } // base body part
         let root = co.parent();
         if !heteros.contains(root) { continue; }
         if orgs.get(root).map(|o| o.movement_mode.is_sliding()).unwrap_or(true) { continue; } // limb only
-        let pos = gt.translation();
-        if let Some((_, dist, prey)) = crate::world_model::nearest_prey(&grid, pos) {
-            if dist < eat {
+        candidates.push((root, gt.translation()));
+    }
+
+    // PASS 2 (parallel): the per-candidate work is the `nearest_prey` grid scan,
+    // which reads only the Sync grid. rayon `collect` PRESERVES the sequential order
+    // of `candidates`, so the downstream first-claim dedup in `predation_system` sees
+    // the identical event order as the serial version.
+    let grid_ref = &*grid;
+    let events: Vec<OrganismContactEvent> = candidates
+        .par_iter()
+        .filter_map(|&(root, pos)| {
+            crate::world_model::nearest_prey(grid_ref, pos).and_then(|(_, dist, prey)| {
                 // Eat the prey's trunk (part 0) → consumes the whole phototroph.
-                out.write(OrganismContactEvent { a: root, b: prey, body_part_a: 0, body_part_b: 0 });
-            }
-        }
+                (dist < eat).then_some(OrganismContactEvent {
+                    a: root, b: prey, body_part_a: 0, body_part_b: 0,
+                })
+            })
+        })
+        .collect();
+
+    // PASS 3 (serial): MessageWriter is exclusive — replay the collected events.
+    for ev in events {
+        out.write(ev);
     }
 }
 
@@ -152,6 +174,10 @@ fn predation_system(
             let bp_counts = prey_org.body_parts[prey_bp_idx].cell_counts();
             prey_org.photo_cell_count     -= bp_counts.0 as i32;
             prey_org.non_photo_cell_count -= bp_counts.1 as i32;
+            // Keep the cached upkeep weight in sync: drop the eaten part's cells.
+            let bp_upkeep: f32 = prey_org.body_parts[prey_bp_idx].cells.iter()
+                .map(|c| c.cell_type.upkeep_mult()).sum();
+            prey_org.upkeep_weight = (prey_org.upkeep_weight - bp_upkeep).max(0.0);
 
             let bp = &mut prey_org.body_parts[prey_bp_idx];
             bp.consumed = true;

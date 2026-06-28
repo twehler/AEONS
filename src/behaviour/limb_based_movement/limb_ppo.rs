@@ -209,6 +209,143 @@ pub trait LimbSlot {
     fn slot(&self) -> u32;
 }
 
+
+// ── Per-level wrapper boilerplate (macros) ────────────────────────────────────
+//
+// The three limb-level dispatch files (`intelligence_level_{herbivore_1,2,3}_limb.rs`)
+// are byte-identical except for the level literal and the slot/pool type + system
+// fn names. These macros generate the SHARED scaffolding so each level file is one
+// (or two) macro invocations. They expand to exactly the code those files used to
+// contain by hand — same public symbol names + signatures, same behaviour. The
+// per-level files still own anything genuinely level-specific (e.g. the
+// herbivore_1 carnivore filter + STANDING_TASK restore branch, and the
+// `share_limb_policies_herbivore_1` no-op), which is written out there directly.
+//
+// All paths are fully-qualified (`$crate::limb_ppo::…`, `bevy::…`) so the macros
+// expand correctly regardless of which module invokes them.
+
+/// Generate the parts of a limb-pool wrapper that NEVER differ between levels:
+/// the `BrainSlot*Limb` marker component (+ its `LimbSlot` impl), the
+/// `BrainPool*Limb` `NonSend` resource newtype (+ its `FromWorld`), the
+/// `free_brains_*_limb` lifecycle system, and the `apply_intelligence_level_*_limb`
+/// per-tick step system. The differing tokens are passed in.
+///
+/// Parameters:
+///   * `$pool`   — pool resource type name (e.g. `BrainPoolHerbivore1Limb`)
+///   * `$slot`   — slot marker component type name (e.g. `BrainSlotHerbivore1Limb`)
+///   * `$free`   — `free_brains_*_limb` system fn name
+///   * `$apply`  — `apply_intelligence_level_*_limb` system fn name
+#[macro_export]
+macro_rules! define_limb_pool_common {
+    ($pool:ident, $slot:ident, $free:ident, $apply:ident $(,)?) => {
+        /// Slot index into the pool. One per limb-based heterotroph in this
+        /// level's enrolment filter; freed when the organism despawns.
+        #[derive(bevy::prelude::Component, Clone, Copy)]
+        pub struct $slot(pub u32);
+
+        impl $crate::limb_ppo::LimbSlot for $slot {
+            fn slot(&self) -> u32 { self.0 }
+        }
+
+        /// Per-organism PPO pool for this level. `NonSend` (burn-cuda tensors
+        /// aren't `Send`). Wraps the shared `limb_ppo` engine.
+        pub struct $pool(pub $crate::limb_ppo::BrainPoolLimb);
+
+        impl bevy::prelude::FromWorld for $pool {
+            fn from_world(world: &mut bevy::prelude::World) -> Self {
+                let n = world.resource::<$crate::simulation_settings::OrganismPoolSize>().0;
+                let device = burn_cuda::CudaDevice::default();
+                Self($crate::limb_ppo::BrainPoolLimb::new(n, device))
+            }
+        }
+
+        /// Release pool slots for organisms that lost their slot component.
+        /// Uses the pool's entity-keyed map to find the row after the component
+        /// is gone.
+        pub fn $free(
+            mut pool:    bevy::prelude::NonSendMut<$pool>,
+            mut removed: bevy::prelude::RemovedComponents<$slot>,
+        ) {
+            let slots: Vec<(bevy::prelude::Entity, u32)> = removed.read()
+                .filter_map(|e| pool.0.map.get(&e).map(|&s| (e, s)))
+                .collect();
+            for (e, s) in slots {
+                pool.0.release(e, s);
+            }
+        }
+
+        /// Per-tick brain step. Delegates to the shared `apply_step` engine:
+        /// build observations, batched actor forward, sample actions, write to
+        /// `Organism::limb_targets`, record rollout entries for the PPO update.
+        pub fn $apply(
+            mut pool: bevy::prelude::NonSendMut<$pool>,
+            organisms: bevy::prelude::Query<(bevy::prelude::Entity, &mut $crate::colony::Organism, &$slot)>,
+            body_parts: bevy::prelude::Query<(
+                &bevy::prelude::ChildOf,
+                &$crate::cell::BodyPartIndex,
+                &bevy::prelude::GlobalTransform,
+                &bevy_rapier3d::prelude::Velocity,
+                Option<&$crate::rapier_setup::LimbContact>,
+            )>,
+            world_grid: bevy::prelude::Res<$crate::world_model::WorldModelGrid>,
+            heightmap: Option<bevy::prelude::Res<$crate::world_geometry::HeightmapSampler>>,
+            virtual_time: bevy::prelude::Res<bevy::prelude::Time<bevy::prelude::Virtual>>,
+        ) {
+            let obs_inputs = $crate::limb_ppo::gather_limb_obs_inputs(&body_parts, &world_grid, heightmap.as_deref());
+            pool.0.apply_step(organisms, &obs_inputs, virtual_time.elapsed_secs());
+        }
+    };
+}
+
+/// Generate the SIMPLE `assign_brains_*_limb` enrolment system used by the L2 and
+/// L3 limb pools (no carnivore filter, no STANDING_TASK restore branch — those are
+/// herbivore_1-only, so herbivore_1 writes its own `assign` by hand). Mirrors the
+/// hand-written body exactly: enrol on the matching `IntelligenceLevel`, skip
+/// sliders + swimmers, restore saved species weights, clear inheritance markers.
+///
+/// Parameters:
+///   * `$assign` — `assign_brains_*_limb` system fn name
+///   * `$pool`   — pool resource type name
+///   * `$slot`   — slot marker component type name
+///   * `$level`  — `IntelligenceLevel` variant to enrol (e.g. `Level2`)
+#[macro_export]
+macro_rules! define_limb_pool_assign {
+    ($assign:ident, $pool:ident, $slot:ident, $level:ident $(,)?) => {
+        pub fn $assign(
+            mut pool:     bevy::prelude::NonSendMut<$pool>,
+            new:          bevy::prelude::Query<(
+                bevy::prelude::Entity,
+                &$crate::colony::Organism,
+                Option<&$crate::limb_ppo::BrainRestoreLimb>,
+                Option<&$crate::rl_helpers::BrainInheritance>,
+            ), (
+                bevy::prelude::With<$crate::colony::Heterotroph>,
+                bevy::prelude::Without<$slot>,
+            )>,
+            mut commands: bevy::prelude::Commands,
+        ) {
+            for (e, organism, restore, inheritance) in new.iter() {
+                if !matches!(organism.intelligence_level, $crate::colony::IntelligenceLevel::$level) { continue; }
+                if organism.movement_mode.is_sliding() { continue; }
+                // Swimmers train in their own pool (intelligence_level_1_swimming).
+                if organism.movement_mode.is_swimming() { continue; }
+                let Some(s) = pool.0.enrol(e) else { continue };
+                // Saved weights (loaded `.colony`) → overwrite this organism's SPECIES
+                // net (keyed by species_id, UNCLASSIFIED until first classified).
+                if let Some(r) = restore {
+                    pool.0.restore_species(organism.species_id.unwrap_or(0), r);
+                    commands.entity(e).try_remove::<$crate::limb_ppo::BrainRestoreLimb>();
+                }
+                // SHARED policy → no per-slot weight inheritance; a newborn of an
+                // existing species already shares that species' trained net. Just clear
+                // any inheritance marker so it isn't reprocessed.
+                if inheritance.is_some() { commands.entity(e).try_remove::<$crate::rl_helpers::BrainInheritance>(); }
+                commands.entity(e).try_insert($slot(s));
+            }
+        }
+    };
+}
+
 /// Bundle of physics-derived observation inputs gathered per organism
 /// by `apply_step`'s pre-pass. Fields default to zero so partial
 /// gathers (e.g. an organism missing a second limb) leave their slots
@@ -467,13 +604,15 @@ pub fn gather_limb_obs_inputs(
     // "in front of me / to my left" instead of "world-X / world-Z".
     // The nearest photoautotroph distance is also captured here for
     // the reward shaper (progress toward food).
+    // Reused candidate buffer for `collect_neighbours` (cleared per call).
+    let mut nb_scratch: Vec<(f32, crate::world_model::Neighbour)> = Vec::new();
     for (root, entry) in out.iter_mut() {
         if let Some(pos) = base_pos.get(root) {
             // Base clearance above terrain → the STANDING height-target signal.
             if let Some(hm) = heightmap {
                 entry.base_clearance = pos.y - hm.height_at(pos.x, pos.z);
             }
-            let neighbours = crate::world_model::collect_neighbours(world_grid, *pos);
+            let neighbours = crate::world_model::collect_neighbours(world_grid, *pos, &mut nb_scratch);
             crate::world_model::encode_neighbours_body_local(
                 &neighbours, entry.base_rot, &mut entry.world_model,
             );

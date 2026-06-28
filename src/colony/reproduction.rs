@@ -83,12 +83,17 @@ fn reproduction_system(
     // brain slot until one frees.
     let photo_cap  = max_photoautotrophs.0;
     let herb_cap   = max_herbivores.0;
-    let live_photos = query.iter()
-        .filter(|(_, _, _, is_photo, _, _)| *is_photo)
-        .count();
-    let live_herbivores = query.iter()
-        .filter(|(_, _, _, _, is_hetero, is_carn)| *is_hetero && !*is_carn)
-        .count();
+    // Single pre-pass over the population (was two separate `iter().count()`
+    // passes). The caps must be evaluated against the PRE-mutation snapshot,
+    // so these are computed before the mutating loop rather than folded into
+    // it — folding would expose a partial count to each cap check and change
+    // which organisms pass. One pre-pass + one mutation loop = 2 walks (was 3).
+    let mut live_photos: usize = 0;
+    let mut live_herbivores: usize = 0;
+    for (_, _, _, is_photo, is_hetero, is_carn) in &query {
+        if is_photo { live_photos += 1; }
+        if is_hetero && !is_carn { live_herbivores += 1; }
+    }
     let mut pending_photo_births:     usize = 0;
     let mut pending_herbivore_births: usize = 0;
 
@@ -331,6 +336,10 @@ fn reproduction_system(
                     water,
                 )
             }
+            // SLIDERS (incl. sessile plants) sit ON the terrain — the unscaled
+            // `+ 1.0` lift left sessile offspring hovering at the 0.1 scale.
+            Some(hm) if organism.movement_mode.is_sliding() => hm.height_at(spawn_x, spawn_z),
+            // LIMB walkers keep the clearance above the Rapier floor cuboid.
             Some(hm) => hm.height_at(spawn_x, spawn_z) + 1.0,
             None     => transform.translation.y,
         };

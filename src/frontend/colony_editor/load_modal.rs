@@ -22,25 +22,18 @@ use crate::colony_editor::template::{Form, Metabolism, OrganismTemplate};
 use crate::environment::WaterLevel;
 use crate::organism::{OrganismRoot, Symmetry};
 use crate::simulation_settings::Smoothing;
+use crate::ui_modal::{
+    self, ConfirmModalSpec, NoButtonStyle,
+    MODAL_BACKDROP_COLOR, MODAL_CARD_COLOR, MODAL_CARD_BORDER,
+    MODAL_BTN_WIDTH, MODAL_BTN_HEIGHT,
+    YES_BTN_COLOR, YES_BTN_HOVER, NO_BTN_HOVER_PLAIN, NO_BTN_COLOR_PLAIN,
+};
 
 
-// ── Tunables (mirror exit_modal.rs) ─────────────────────────────────────────
+// ── Tunables (the error modal reuses the shared palette) ─────────────────────
 
-const MODAL_BACKDROP_COLOR: Color = Color::srgba(0.0, 0.0, 0.0, 0.55);
-const MODAL_CARD_COLOR:     Color = Color::srgb(0.15, 0.15, 0.18);
-const MODAL_CARD_BORDER:    Color = Color::srgb(0.40, 0.40, 0.45);
-
-const MODAL_CARD_WIDTH:     f32   = 480.0;
-const MODAL_CARD_PADDING:   f32   = 22.0;
-
-const MODAL_BTN_WIDTH:      f32   = 110.0;
-const MODAL_BTN_HEIGHT:     f32   = 36.0;
-const MODAL_BTN_GAP:        f32   = 16.0;
-
-const YES_BTN_COLOR:        Color = Color::srgb(0.55, 0.18, 0.18);
-const YES_BTN_HOVER:        Color = Color::srgb(0.68, 0.22, 0.22);
-const NO_BTN_COLOR:         Color = Color::srgb(0.20, 0.45, 0.30);
-const NO_BTN_HOVER:         Color = Color::srgb(0.26, 0.55, 0.36);
+const MODAL_CARD_WIDTH:   f32 = 480.0;
+const MODAL_CARD_PADDING: f32 = 22.0;
 
 
 // ── Marker components ───────────────────────────────────────────────────────
@@ -101,117 +94,26 @@ fn manage_modal_visibility(
     session:      Res<EditorSession>,
     existing:     Query<Entity, With<LoadModalRoot>>,
 ) {
-    let want_visible = session.show_load_modal;
-    let is_visible   = !existing.is_empty();
-
-    if want_visible && !is_visible {
-        spawn_modal(&mut commands);
-    } else if !want_visible && is_visible {
-        for e in &existing { commands.entity(e).despawn(); }
-    }
+    ui_modal::sync_modal_visibility(
+        &mut commands, session.show_load_modal, &existing, spawn_modal);
 }
 
 fn spawn_modal(commands: &mut Commands) {
-    commands
-        .spawn((
-            LoadModalRoot,
-            // Full-screen backdrop blocks clicks falling through to the editor.
-            Node {
-                position_type: PositionType::Absolute,
-                top:    Val::Px(0.0),
-                left:   Val::Px(0.0),
-                width:  Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                justify_content: JustifyContent::Center,
-                align_items:     AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(MODAL_BACKDROP_COLOR),
-            GlobalZIndex(100),
-        ))
-        .with_children(|root| {
-            root
-                .spawn((
-                    Node {
-                        width:  Val::Px(MODAL_CARD_WIDTH),
-                        flex_direction: FlexDirection::Column,
-                        align_items:    AlignItems::Center,
-                        padding: UiRect::all(Val::Px(MODAL_CARD_PADDING)),
-                        border:  UiRect::all(Val::Px(1.0)),
-                        ..default()
-                    },
-                    BackgroundColor(MODAL_CARD_COLOR),
-                    BorderColor::all(MODAL_CARD_BORDER),
-                ))
-                .with_children(|card| {
-                    card.spawn((
-                        Text::new("Your work is not saved."),
-                        TextFont { font_size: 18.0, ..default() },
-                        TextColor(Color::WHITE),
-                        Node { margin: UiRect::bottom(Val::Px(6.0)), ..default() },
-                        Pickable::IGNORE,
-                    ));
-                    card.spawn((
-                        Text::new("Loading a colony will discard the current one. Continue?"),
-                        TextFont { font_size: 14.0, ..default() },
-                        TextColor(Color::srgb(0.85, 0.85, 0.85)),
-                        Node { margin: UiRect::bottom(Val::Px(20.0)), ..default() },
-                        Pickable::IGNORE,
-                    ));
-
-                    card.spawn(Node {
-                        flex_direction:  FlexDirection::Row,
-                        justify_content: JustifyContent::Center,
-                        ..default()
-                    })
-                    .with_children(|row| {
-                        // No (cancel) on the left.
-                        row.spawn((
-                            LoadModalNoButton,
-                            Button,
-                            Node {
-                                width:  Val::Px(MODAL_BTN_WIDTH),
-                                height: Val::Px(MODAL_BTN_HEIGHT),
-                                margin: UiRect::right(Val::Px(MODAL_BTN_GAP)),
-                                align_items:     AlignItems::Center,
-                                justify_content: JustifyContent::Center,
-                                ..default()
-                            },
-                            BackgroundColor(NO_BTN_COLOR),
-                        ))
-                        .with_children(|btn| {
-                            btn.spawn((
-                                Text::new("No"),
-                                TextFont { font_size: 16.0, ..default() },
-                                TextColor(Color::WHITE),
-                                Pickable::IGNORE,
-                            ));
-                        });
-
-                        // Yes (confirm load) on the right.
-                        row.spawn((
-                            LoadModalYesButton,
-                            Button,
-                            Node {
-                                width:  Val::Px(MODAL_BTN_WIDTH),
-                                height: Val::Px(MODAL_BTN_HEIGHT),
-                                align_items:     AlignItems::Center,
-                                justify_content: JustifyContent::Center,
-                                ..default()
-                            },
-                            BackgroundColor(YES_BTN_COLOR),
-                        ))
-                        .with_children(|btn| {
-                            btn.spawn((
-                                Text::new("Yes"),
-                                TextFont { font_size: 16.0, ..default() },
-                                TextColor(Color::WHITE),
-                                Pickable::IGNORE,
-                            ));
-                        });
-                    });
-                });
-        });
+    ui_modal::spawn_confirm_modal(
+        commands,
+        &ConfirmModalSpec {
+            title:      Some("Your work is not saved.".to_string()),
+            body:       "Loading a colony will discard the current one. Continue?".to_string(),
+            body_font_size: ui_modal::BODY_FONT_SIZE,
+            body_color:     ui_modal::BODY_COLOR,
+            card_width: MODAL_CARD_WIDTH,
+            z_index:    100,
+            no_style:   NoButtonStyle::Plain,
+        },
+        LoadModalRoot,
+        LoadModalNoButton,
+        LoadModalYesButton,
+    );
 }
 
 
@@ -225,24 +127,15 @@ fn handle_modal_buttons(
     mut session: ResMut<EditorSession>,
 ) {
     for (interaction, mut bg) in &mut yes_q {
-        match *interaction {
-            Interaction::Pressed => {
-                session.show_load_modal = false;
-                session.load_confirmed  = true;
-                *bg = BackgroundColor(YES_BTN_HOVER);
-            }
-            Interaction::Hovered => *bg = BackgroundColor(YES_BTN_HOVER),
-            Interaction::None    => *bg = BackgroundColor(YES_BTN_COLOR),
+        if ui_modal::modal_button_pressed(interaction, &mut bg, YES_BTN_COLOR, YES_BTN_HOVER) {
+            session.show_load_modal = false;
+            session.load_confirmed  = true;
         }
     }
+    let no_style = NoButtonStyle::Plain;
     for (interaction, mut bg) in &mut no_q {
-        match *interaction {
-            Interaction::Pressed => {
-                session.show_load_modal = false;
-                *bg = BackgroundColor(NO_BTN_HOVER);
-            }
-            Interaction::Hovered => *bg = BackgroundColor(NO_BTN_HOVER),
-            Interaction::None    => *bg = BackgroundColor(NO_BTN_COLOR),
+        if ui_modal::modal_button_pressed(interaction, &mut bg, no_style.base(), no_style.hover()) {
+            session.show_load_modal = false;
         }
     }
 }
@@ -460,7 +353,7 @@ fn spawn_error_modal(commands: &mut Commands, message: &str) {
                             justify_content: JustifyContent::Center,
                             ..default()
                         },
-                        BackgroundColor(NO_BTN_COLOR),
+                        BackgroundColor(NO_BTN_COLOR_PLAIN),
                     ))
                     .with_children(|btn| {
                         btn.spawn((
@@ -480,13 +373,8 @@ fn handle_error_ok_button(
     mut session: ResMut<EditorSession>,
 ) {
     for (interaction, mut bg) in &mut ok_q {
-        match *interaction {
-            Interaction::Pressed => {
-                session.load_error = None;
-                *bg = BackgroundColor(NO_BTN_HOVER);
-            }
-            Interaction::Hovered => *bg = BackgroundColor(NO_BTN_HOVER),
-            Interaction::None    => *bg = BackgroundColor(NO_BTN_COLOR),
+        if ui_modal::modal_button_pressed(interaction, &mut bg, NO_BTN_COLOR_PLAIN, NO_BTN_HOVER_PLAIN) {
+            session.load_error = None;
         }
     }
 }

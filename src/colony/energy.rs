@@ -106,6 +106,9 @@ fn herbivore_curve(e: f32) -> f32 {
 }
 
 /// Walk every organism, refresh its `hunger` field. Runs every frame.
+///
+/// Parallel: each organism's hunger depends only on its own state (entity-disjoint
+/// writes, no shared mutation, no Commands), so it fans out over `ComputeTaskPool`.
 fn update_hunger_levels(
     mut q: Query<(
         &mut crate::colony::Organism,
@@ -113,16 +116,17 @@ fn update_hunger_levels(
         Has<crate::colony::Carnivore>,
     )>,
 ) {
-    for (mut organism, is_photo, is_carn) in &mut q {
+    q.par_iter_mut().for_each(|(mut organism, is_photo, is_carn)| {
         let max_e = get_max_energy(&organism).max(1.0);
         let e_norm = (organism.energy / max_e).clamp(0.0, 1.0);
         let new_hunger = compute_hunger(e_norm, is_photo, is_carn);
         // Skip the write if unchanged so `Changed<Organism>` consumers
-        // aren't flagged dirty every frame. Bit-compare is exact here.
+        // aren't flagged dirty every frame (and so disjoint threads don't all
+        // mark their chunks dirty). Bit-compare is exact here.
         if organism.hunger.to_bits() != new_hunger.to_bits() {
             organism.hunger = new_hunger;
         }
-    }
+    });
 }
 
 fn manage_energy(
@@ -139,7 +143,16 @@ fn manage_energy(
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
-    for (entity, mut organism, transform, is_hetero) in organisms.iter_mut() {
+    // Per-organism upkeep is entity-disjoint, so the compute fans out over
+    // `ComputeTaskPool`. Despawning a starved organism needs deferred `Commands`
+    // (not usable inside a parallel closure), so starved entities are collected
+    // into a `Mutex<Vec>` — contention is near-zero since the push only fires for
+    // an organism that actually hit 0 energy this tick — then despawned serially.
+    let water_y = water.0;
+    let suppress_despawn = ai_training.0;
+    let starved: std::sync::Mutex<Vec<Entity>> = std::sync::Mutex::new(Vec::new());
+
+    organisms.par_iter_mut().for_each(|(entity, mut organism, transform, is_hetero)| {
         let max_energy = get_max_energy(&organism);
 
         // Per-cell upkeep is weighted by cell type (jelly = half, inert = 10%);
@@ -148,7 +161,7 @@ fn manage_energy(
 
         // Submersion ∈ [0, 1]: 0 = entirely above water, 1 = fully submerged.
         let bounding = organism.bounding_radius().max(1.0);
-        let depth           = water.0 - transform.translation.y;
+        let depth           = water_y - transform.translation.y;
         let submersion      = (depth / bounding).clamp(0.0, 1.0);
         let ground_fraction = 1.0 - submersion;
 
@@ -191,17 +204,19 @@ fn manage_energy(
 
         organism.energy = (organism.energy - consumption).clamp(0.0, max_energy);
 
-        if organism.energy <= 0.0 {
+        if organism.energy <= 0.0 && !suppress_despawn {
             // AI training mode keeps starved organisms alive (energy stays clamped at
             // 0) so the RL cohort isn't lost — and, critically, so the PREY don't go
             // extinct: loaded phototrophs were starving to 0 and despawning within ~1
             // min (no respawn), leaving herbivores nothing to seek/eat (prey crashed
             // 118→0; K_EAT never fired). Prey persist as a stable food source; real
             // predation still removes them (eaten body parts despawn the prey).
-            let suppress_despawn = ai_training.0;
-            if !suppress_despawn {
-                commands.entity(entity).despawn();
-            }
+            starved.lock().unwrap().push(entity);
         }
+    });
+
+    // Apply the collected despawns serially (Commands are deferred anyway).
+    for entity in starved.into_inner().unwrap() {
+        commands.entity(entity).despawn();
     }
 }

@@ -321,18 +321,18 @@ fn insert_limb_physics(
 /// → no floor re-clamp needed on the flat training world). Throttled per tick.
 /// Locomotion-only (skipped during the standing task).
 pub fn maintain_prey_near_herbivores(
+    mut commands: Commands,
     sim_running: Res<crate::simulation_settings::SimulationRunning>,
     heightmap:   Option<Res<HeightmapSampler>>,
     bases:       Query<(&bevy::prelude::ChildOf, &crate::cell::BodyPartIndex, &GlobalTransform)>,
     orgs:        Query<&Organism>,
     heteros:     Query<(), With<Heterotroph>>,
-    mut photos:  Query<(&mut Transform, &Organism), (With<Photoautotroph>, With<OrganismRoot>)>,
+    mut photos:  Query<(Entity, &mut Transform), (With<Photoautotroph>, With<OrganismRoot>)>,
 ) {
     if crate::simulation_settings::STANDING_TASK || !sim_running.0 { return; }
-    let Some(heightmap) = heightmap else { return };
+    let Some(_heightmap) = heightmap else { return };
     const MAINTAIN_RANGE: f32 = 220.0; // XZ dist from all herbivores beyond which a prey is relocated
     const MOVE_PER_TICK:  usize = 6;   // throttle relocations to avoid transform spikes
-    const PREY_Y_OFFSET:  f32 = 0.5;   // sit just on the terrain
     use rand::Rng;
 
     // Limb-herbivore base (body-part 0) world positions = where prey must stay near.
@@ -350,13 +350,18 @@ pub fn maintain_prey_near_herbivores(
     let mut rng = rand::rng();
     let r2 = MAINTAIN_RANGE * MAINTAIN_RANGE;
     let mut moved = 0;
-    for (mut tf, org) in &mut photos {
+    for (entity, mut tf) in &mut photos {
         // Relocate prey that drifted (or loaded) far from every herbivore to near a
         // random one, throttled. Prey don't respawn + the loaded field is sparse, so
         // without this herbivores disperse into permanently prey-empty space.
         let pxz = Vec2::new(tf.translation.x, tf.translation.z);
         let mut best = f32::MAX;
-        for h in &hp { best = best.min(pxz.distance_squared(*h)); }
+        for h in &hp {
+            best = best.min(pxz.distance_squared(*h));
+            // Already within range of some herbivore — no relocation needed, so
+            // stop scanning the rest (this prey can't trigger a move regardless).
+            if best <= r2 { break; }
+        }
         if best > r2 && moved < MOVE_PER_TICK {
             let h = hp[rng.random_range(0..hp.len())];
             let ang = rng.random_range(0.0..std::f32::consts::TAU);
@@ -367,17 +372,12 @@ pub fn maintain_prey_near_herbivores(
             tf.translation.x = h.x + r * ang.cos();
             tf.translation.z = h.y + r * ang.sin();
             moved += 1;
-        }
-        // CLAMP GROUND-BASED prey to the terrain surface. The loaded phototrophs sit
-        // ABOVE the (superflat) terrain and gravity-fall (apply_movement) to y<-500,
-        // where the kill-floor despawns them — the whole prey field vanished in ~30 s.
-        // Pinning their Y to the heightmap keeps them a stable, reachable food source.
-        // WATER-BASED prey (floating algae) are EXCLUDED: water-gated gravity already
-        // holds them at their depth (neither sinking nor surfacing), and clamping them
-        // to the terrain is exactly the bug that made them sink to the bottom.
-        if org.ground_based {
-            let surf = heightmap.height_at(tf.translation.x, tf.translation.z);
-            tf.translation.y = surf + PREY_Y_OFFSET;
+            // We only moved XZ. Sessile prey are seated on the floor once and
+            // never re-adhere, so drop their placement marker:
+            // `place_sessile_organisms` re-seats them at the new spot's terrain Y
+            // next frame. (Harmless on mobile prey — re-marked without moving;
+            // their Y is owned by `apply_surface_adhesion`.)
+            commands.entity(entity).remove::<crate::movement::SurfacePlaced>();
         }
     }
 }
@@ -421,7 +421,11 @@ impl Plugin for ColonyPlugin {
         app.add_systems(Update, cull_excess_limb_organisms_for_standing);
         // PostUpdate so the prey Y-clamp is the LAST write each frame (apply_movement
         // gravity-falls sliding prey in Update; clamping after pins them to terrain).
-        app.add_systems(PostUpdate, maintain_prey_near_herbivores);
+        // Throttled to ~1 Hz (same mechanism as auto_spawn_plankton below): the
+        // O(photos × herbivores) distance scan isn't needed per frame, and it already
+        // caps moves per tick — relocation/Y-clamp at 1 Hz keeps prey perceivable.
+        app.add_systems(PostUpdate, maintain_prey_near_herbivores
+            .run_if(bevy::time::common_conditions::on_timer(std::time::Duration::from_secs(1))));
         app.add_systems(Update, animate_limbs);
         app.add_systems(Update, tick_run_elapsed);
         app.add_systems(Update, save_colony_system);
@@ -1016,7 +1020,14 @@ fn spawn_species_instance(
     // organisms sit on the terrain floor (the seafloor, where it is underwater).
     let y = if species.movement.is_swimming() || !species.ground_based {
         submerged_spawn_y(terrain, limb_floor_top(heightmap), water_level)
+    } else if species.movement.is_sliding() {
+        // Ground/ocean-floor SLIDERS sit ON the terrain. (The old `+ 1.0` was an
+        // unscaled lift — huge at the 0.1 geometry scale — so a sessile slider,
+        // which never moves to re-seat, floated ~1 unit above the floor.)
+        terrain
     } else {
+        // LIMB walkers keep the `+ 1.0` clearance above the Rapier floor cuboid
+        // (spawning inside it makes the solver eject the body upward).
         terrain + 1.0
     };
 
@@ -1389,6 +1400,8 @@ pub fn spawn_organism(
         adult,
         photo_cell_count:     0,
         non_photo_cell_count: 0,
+        // Populated by recompute_cell_counts below (with the cell counts).
+        upkeep_weight: 0.0,
         energy: initial_energy.max(0.0),
         in_sunlight: false,
         reproduced: false,

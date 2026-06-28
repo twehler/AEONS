@@ -634,6 +634,7 @@ fn spawn_volumetric_mesh(
             adult:                false,
             photo_cell_count:     1,
             non_photo_cell_count: 0,
+            upkeep_weight:        0.0, // single photo cell ⇒ 0 upkeep
             energy: 0.0,
             in_sunlight: false,
             reproduced: false,

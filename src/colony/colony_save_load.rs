@@ -69,7 +69,7 @@ use crate::environment::{WaterLevel, DEFAULT_WATER_LEVEL};
 // Cached `PhotosyntheticCell` data is NOT serialised — fully derivable
 // from `cell_type` + `neighbour_count` on load.
 
-/// Current save format magic (v011). The loader accepts v001-v011;
+/// Current save format magic (v012). The loader accepts v001-v012;
 /// missing fields are synthesised from deterministic spawn-time rules,
 /// and brain blocks for an obsolete architecture are parsed-and-dropped
 /// (those organisms come up with fresh-init weights, but their structure
@@ -78,18 +78,31 @@ use crate::environment::{WaterLevel, DEFAULT_WATER_LEVEL};
 /// so species identity — and thus the per-species shared brain — survives a
 /// reload: on load the named species is resolved/created in the registry and
 /// `species_id` is pinned at spawn (older saves carry no name → classified fresh).
-const SAVE_MAGIC:             &[u8;8] = b"AEONS012";
-const SAVE_MAGIC_LEGACY_V011: &[u8;8] = b"AEONS011";
-const SAVE_MAGIC_LEGACY_V010: &[u8;8] = b"AEONS010";
-const SAVE_MAGIC_LEGACY_V009: &[u8;8] = b"AEONS009";
-const SAVE_MAGIC_LEGACY_V008: &[u8;8] = b"AEONS008";
-const SAVE_MAGIC_LEGACY_V007: &[u8;8] = b"AEONS007";
-const SAVE_MAGIC_LEGACY_V006: &[u8;8] = b"AEONS006";
-const SAVE_MAGIC_LEGACY_V005: &[u8;8] = b"AEONS005";
-const SAVE_MAGIC_LEGACY_V004: &[u8;8] = b"AEONS004";
-const SAVE_MAGIC_LEGACY_V003: &[u8;8] = b"AEONS003";
-const SAVE_MAGIC_LEGACY_V002: &[u8;8] = b"AEONS002";
-const SAVE_MAGIC_LEGACY_V001: &[u8;8] = b"AEONS001";
+const SAVE_MAGIC: &[u8;8] = b"AEONS012";
+
+/// Highest on-disk version the loader accepts. Bump together with `SAVE_MAGIC`
+/// (and add the new field's `version >= N` gate in `load_colony_from_file`).
+const MAX_SAVE_VERSION: u8 = 12;
+
+/// Parse the 8-byte file magic into a version number, accepting exactly the
+/// `b"AEONS0NN"` family for `NN` in `001..=MAX_SAVE_VERSION` — byte-identical to
+/// the former bank of `magic == SAVE_MAGIC_LEGACY_VNNN` equality checks. `None`
+/// for any foreign / unsupported magic (the caller turns that into a clean Err).
+fn parse_save_version(magic: &[u8]) -> Option<u8> {
+    let bytes: &[u8; 8] = magic.try_into().ok()?;
+    if &bytes[..5] != b"AEONS" { return None; }
+    // Three ASCII decimal digits in bytes 5..8 (e.g. "012" → 12).
+    let mut version: u32 = 0;
+    for &d in &bytes[5..8] {
+        if !d.is_ascii_digit() { return None; }
+        version = version * 10 + u32::from(d - b'0');
+    }
+    if (1..=u32::from(MAX_SAVE_VERSION)).contains(&version) {
+        Some(version as u8)
+    } else {
+        None
+    }
+}
 
 /// Elapsed virtual time stored in the v008 file (right after the magic)
 /// as h/m/s integers. On load the virtual clock is advanced to this
@@ -198,31 +211,18 @@ pub(crate) fn save_colony_system(
         put_f32(&mut buf, org.climb_energy_debt);
         put_i32(&mut buf, org.photo_cell_count);
         put_i32(&mut buf, org.non_photo_cell_count);
-        put_u8(&mut buf, match org.symmetry {
-            Symmetry::NoSymmetry => 0,
-            Symmetry::Bilateral  => 1,
-        });
+        put_u8(&mut buf, org.symmetry.to_tag());
         put_u8(&mut buf, org.is_sessile as u8);
         put_u8(&mut buf, org.has_variable_form as u8);
         // v006 addition — movement paradigm. v009: now a 4-way tag
         // (0=Sliding, 1=LimbBasedWalking, 2=Swimming, 3=Flying) in place
         // of the old sliding/limb bool.
-        put_u8(&mut buf, match org.movement_mode {
-            MovementMode::Sliding          => 0,
-            MovementMode::LimbBasedWalking => 1,
-            MovementMode::Swimming         => 2,
-            MovementMode::Flying           => 3,
-        });
+        put_u8(&mut buf, org.movement_mode.to_tag());
         // v010 addition — ground- vs water-based (floating phototrophs).
         put_u8(&mut buf, org.ground_based as u8);
         // v002 addition — saved so loaded organisms keep their
         // assigned intelligence level instead of being re-rolled.
-        put_u8(&mut buf, match org.intelligence_level {
-            IntelligenceLevel::Level0 => 0,
-            IntelligenceLevel::Level1 => 1,
-            IntelligenceLevel::Level2 => 2,
-            IntelligenceLevel::Level3 => 3,
-        });
+        put_u8(&mut buf, org.intelligence_level.to_tag());
         // v011 species name (u32 len + UTF-8). Empty when the organism is
         // unclassified or its species is gone — load treats empty as "no name"
         // and classifies it fresh.
@@ -234,13 +234,7 @@ pub(crate) fn save_colony_system(
 
         put_u32(&mut buf, org.body_parts.len() as u32);
         for bp in &org.body_parts {
-            put_u8(&mut buf, match bp.kind {
-                BodyPartKind::Body    => 0,
-                BodyPartKind::Limb    => 1,
-                BodyPartKind::Organ   => 2,
-                BodyPartKind::Segment => 3,
-                BodyPartKind::Static  => 4,
-            });
+            put_u8(&mut buf, bp.kind.to_tag());
             put_vec3(&mut buf, bp.local_offset);
             put_u8(&mut buf, bp.consumed   as u8);
             put_u8(&mut buf, bp.debug_blue as u8);
@@ -327,22 +321,28 @@ pub(crate) fn save_colony_system(
         let _ = is_carn;
     }
 
-    // Ensure the parent directory exists (autosave path may not yet).
-    if let Some(parent) = target_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                error!("failed to create save directory {}: {}", parent.display(), e);
-                return;
+    // Dir-create + write are BLOCKING I/O. The expensive serialization above had
+    // to run here on the main thread (it reads the World + the NonSend GPU brain
+    // pools), but the disk write doesn't — move it to the `IoTaskPool` and detach
+    // so an autosave no longer stalls the render thread. `buf`/`target_path`/`count`
+    // are owned and moved into the task; the result is logged from inside it.
+    let n_bytes = buf.len();
+    bevy::tasks::IoTaskPool::get().spawn(async move {
+        if let Some(parent) = target_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    error!("failed to create save directory {}: {}", parent.display(), e);
+                    return;
+                }
             }
         }
-    }
-
-    match std::fs::write(&target_path, &buf) {
-        Ok(())  => info!("colony saved to {} — {} organisms, {} bytes",
-                        target_path.display(), count, buf.len()),
-        Err(e)  => error!("failed to save colony to {}: {}",
-                          target_path.display(), e),
-    }
+        match std::fs::write(&target_path, &buf) {
+            Ok(())  => info!("colony saved to {} — {} organisms, {} bytes",
+                            target_path.display(), count, n_bytes),
+            Err(e)  => error!("failed to save colony to {}: {}",
+                              target_path.display(), e),
+        }
+    }).detach();
 }
 
 
@@ -450,50 +450,35 @@ pub(crate) fn load_colony_from_file(
         return Err(std::io::Error::other("file too short — missing magic"));
     }
     let magic = &bytes[..SAVE_MAGIC.len()];
-    let format_v012 = magic == SAVE_MAGIC;
-    // v012 == v011 LAYOUT + geometry-rescale marker. Treat format_v011 as "v011
-    // layout" so every v011 gate (incl. has_water_level) also covers v012;
-    // `format_v012` alone marks colonies already stored at the new 0.5 scale.
-    let format_v011 = format_v012 || magic == SAVE_MAGIC_LEGACY_V011;
-    let format_v010 = magic == SAVE_MAGIC_LEGACY_V010;
-    let format_v009 = magic == SAVE_MAGIC_LEGACY_V009;
-    let format_v008 = magic == SAVE_MAGIC_LEGACY_V008;
-    let format_v007 = magic == SAVE_MAGIC_LEGACY_V007;
-    let format_v006 = magic == SAVE_MAGIC_LEGACY_V006;
-    let format_v005 = magic == SAVE_MAGIC_LEGACY_V005;
-    let format_v004 = magic == SAVE_MAGIC_LEGACY_V004;
-    let format_v003 = magic == SAVE_MAGIC_LEGACY_V003;
-    let format_v002 = magic == SAVE_MAGIC_LEGACY_V002;
-    let format_v001 = magic == SAVE_MAGIC_LEGACY_V001;
-    if !format_v011 && !format_v010 && !format_v009 && !format_v008 && !format_v007 && !format_v006 && !format_v005 && !format_v004 && !format_v003 && !format_v002 && !format_v001 {
+    // Parse the 8-byte magic ("AEONS0NN") into a single version number ONCE; every
+    // format gate below derives from it as a `version >= N` threshold. This replaces
+    // the former per-version bool soup, whose hand-maintained OR-chains let a missed
+    // entry (v011 once absent from `has_water_level`) misalign the cursor and trigger
+    // a 684 GB OOM alloc. The byte semantics are unchanged — see the gate comments.
+    let Some(version) = parse_save_version(magic) else {
         return Err(std::io::Error::other(
             "magic mismatch — not an AEONS colony save (or unsupported version)",
         ));
-    }
-    // v008..v011 share the v007 per-organism record layout (apart from the
-    // movement byte's meaning, the v010 ground_based byte, and the v011 species
-    // name — all handled below), so every v007 feature flag also holds for them.
-    let format_v007_layout = format_v011 || format_v010 || format_v009 || format_v008 || format_v007;
-    // v002+ have the intelligence_level byte after has_variable_form.
-    let has_intelligence_byte = format_v007_layout || format_v006 || format_v005 || format_v004 || format_v003 || format_v002;
-    // v006+ have the movement byte (before intelligence_level). In v006..v008
-    // it is the old sliding/limb bool; in v009+ it is a 4-way movement_mode
-    // tag. Older saves default to Sliding.
-    let has_movement_byte = format_v007_layout || format_v006;
-    // v009+: the movement byte is the new 4-way tag (else the old bool).
-    let movement_byte_is_tag = format_v011 || format_v010 || format_v009;
-    // v010+: ground_based byte right after the movement byte.
-    let has_ground_byte = format_v011 || format_v010;
-    // v008+ carry the elapsed-time block right after the magic.
-    let has_time_block = format_v011 || format_v010 || format_v009 || format_v008;
-    // v009+ carry the global water level after the time block. (v011 was added
-    // to this set late — omitting it here mis-read the water f32 AS the organism
-    // count, yielding a ~1.1-billion-element allocation that aborted the process.)
-    let has_water_level = format_v011 || format_v010 || format_v009;
-    // v007+ append a limb-brain block after the sliding-brain block.
-    let has_limb_brain_section = format_v007_layout;
-    // v011: a per-organism species-name string right after the intelligence byte.
-    let has_species_name = format_v011;
+    };
+    // v012 == v011 LAYOUT + geometry-rescale marker; `version >= 12` alone marks
+    // colonies already stored at the new 0.5 scale (no load-time rescale).
+    // Per-feature gates (each = the version that introduced the on-disk field):
+    //   v002+: intelligence_level byte after has_variable_form.
+    //   v006+: movement byte (before intelligence_level) — old sliding/limb bool.
+    //   v007+: limb-brain block after the sliding-brain block (the "v007 layout").
+    //   v008+: elapsed-time block right after the magic.
+    //   v009+: global water level after the time block; movement byte becomes the
+    //          4-way movement_mode tag (else the old bool).
+    //   v010+: ground_based byte right after the movement byte.
+    //   v011+: per-organism species-name string right after the intelligence byte.
+    let has_intelligence_byte  = version >= 2;
+    let has_movement_byte      = version >= 6;
+    let movement_byte_is_tag   = version >= 9;
+    let has_ground_byte        = version >= 10;
+    let has_time_block         = version >= 8;
+    let has_water_level        = version >= 9;
+    let has_limb_brain_section = version >= 7;
+    let has_species_name       = version >= 11;
     c += SAVE_MAGIC.len();
 
     // v008+ time notation right after the magic; older formats → t=0.
@@ -539,13 +524,10 @@ pub(crate) fn load_colony_from_file(
         let climb_energy_debt  = read_f32(&bytes, &mut c)?;
         let photo_cell_count     = read_i32(&bytes, &mut c)?;
         let non_photo_cell_count = read_i32(&bytes, &mut c)?;
-        let symmetry = match read_u8(&bytes, &mut c)? {
-            0 => Symmetry::NoSymmetry,
-            1 => Symmetry::Bilateral,
-            other => return Err(std::io::Error::other(
-                format!("unknown symmetry tag: {other}"),
-            )),
-        };
+        let sym_byte = read_u8(&bytes, &mut c)?;
+        let symmetry = Symmetry::from_tag(sym_byte).ok_or_else(|| {
+            std::io::Error::other(format!("unknown symmetry tag: {sym_byte}"))
+        })?;
         let is_sessile        = read_u8(&bytes, &mut c)? != 0;
         let has_variable_form = read_u8(&bytes, &mut c)? != 0;
         // Movement byte (v006+); pre-v006 default to Sliding.
@@ -554,15 +536,9 @@ pub(crate) fn load_colony_from_file(
         let mut movement_mode = if has_movement_byte {
             let b = read_u8(&bytes, &mut c)?;
             if movement_byte_is_tag {
-                match b {
-                    0 => MovementMode::Sliding,
-                    1 => MovementMode::LimbBasedWalking,
-                    2 => MovementMode::Swimming,
-                    3 => MovementMode::Flying,
-                    other => return Err(std::io::Error::other(
-                        format!("unknown movement-mode tag: {other}"),
-                    )),
-                }
+                MovementMode::from_tag(b).ok_or_else(|| std::io::Error::other(
+                    format!("unknown movement-mode tag: {b}"),
+                ))?
             } else if b != 0 {
                 MovementMode::Sliding
             } else {
@@ -588,15 +564,10 @@ pub(crate) fn load_colony_from_file(
         // Intelligence level: explicit in v002+; synthesised for v001
         // via the deterministic spawn rule of the era.
         let intelligence_level = if has_intelligence_byte {
-            match read_u8(&bytes, &mut c)? {
-                0 => IntelligenceLevel::Level0,
-                1 => IntelligenceLevel::Level1,
-                2 => IntelligenceLevel::Level2,
-                3 => IntelligenceLevel::Level3,
-                other => return Err(std::io::Error::other(
-                    format!("unknown intelligence-level tag: {other}"),
-                )),
-            }
+            let il_byte = read_u8(&bytes, &mut c)?;
+            IntelligenceLevel::from_tag(il_byte).ok_or_else(|| std::io::Error::other(
+                format!("unknown intelligence-level tag: {il_byte}"),
+            ))?
         } else if is_sessile {
             IntelligenceLevel::Level0
         } else {
@@ -624,16 +595,10 @@ pub(crate) fn load_colony_from_file(
         let bp_count = checked_count(bp_count, 16, c, bytes.len(), "body-part count")?;
         let mut body_parts: Vec<BodyPart> = Vec::with_capacity(bp_count);
         for _ in 0..bp_count {
-            let bp_kind = match read_u8(&bytes, &mut c)? {
-                0 => BodyPartKind::Body,
-                1 => BodyPartKind::Limb,
-                2 => BodyPartKind::Organ,
-                3 => BodyPartKind::Segment,
-                4 => BodyPartKind::Static,
-                other => return Err(std::io::Error::other(
-                    format!("unknown body-part kind tag: {other}"),
-                )),
-            };
+            let bp_kind_byte = read_u8(&bytes, &mut c)?;
+            let bp_kind = BodyPartKind::from_tag(bp_kind_byte).ok_or_else(|| {
+                std::io::Error::other(format!("unknown body-part kind tag: {bp_kind_byte}"))
+            })?;
             let local_offset = read_vec3(&bytes, &mut c)?;
             let consumed     = read_u8(&bytes, &mut c)? != 0;
             let debug_blue   = read_u8(&bytes, &mut c)? != 0;
@@ -694,10 +659,8 @@ pub(crate) fn load_colony_from_file(
         // architectures whose bytes are consumed-and-dropped (those
         // organisms come up fresh-init); v001/v002 have no section.
         let brain: Option<crate::intelligence_level_herbivore_1_sliding::BrainRestoreHerbivore1>
-            = if format_v005 || format_v006 || format_v007_layout {
-                // v005+: present-byte + shared `BrainRestore`. (Gate must
-                // include v006/v007 or their blocks go unconsumed and
-                // mis-align every following record.)
+            = if version >= 5 {
+                // v005+: present-byte + shared `BrainRestore`.
                 let brain_present = read_u8(&bytes, &mut c)?;
                 if brain_present == 1 {
                     Some(crate::intelligence_level_herbivore_1_sliding::decode_brain_restore(
@@ -706,7 +669,7 @@ pub(crate) fn load_colony_from_file(
                 } else {
                     None
                 }
-            } else if format_v004 {
+            } else if version == 4 {
                 // Retired 12-tensor A2C block: present-byte, 14 length-
                 // prefixed f32 vectors, then 2 f32 scalars. Consume + drop.
                 let brain_present = read_u8(&bytes, &mut c)?;
@@ -719,7 +682,7 @@ pub(crate) fn load_colony_from_file(
                     let _ = read_f32(&bytes, &mut c)?; // prev_target_distance
                 }
                 None
-            } else if format_v003 {
+            } else if version == 3 {
                 // Retired single-MLP REINFORCE block: present-byte, 6
                 // f32 vectors, 2 f32 scalars, 1 u8. Consume + drop.
                 let brain_present = read_u8(&bytes, &mut c)?;
@@ -766,7 +729,7 @@ pub(crate) fn load_colony_from_file(
         // 1.0 scale; rescale internal geometry ×GEOMETRY_SCALE (NOT the world
         // transform) to match the current organism-geometry scale.
         // recompute_bounding_radius below then derives the correct (scaled) radius.
-        if !format_v012 {
+        if version < 12 {
             let g = crate::simulation_settings::GEOMETRY_SCALE;
             for bp in body_parts.iter_mut() {
                 bp.local_offset *= g;
@@ -788,6 +751,8 @@ pub(crate) fn load_colony_from_file(
             adult,
             photo_cell_count,
             non_photo_cell_count,
+            // Not serialised — re-derived from the loaded cells below.
+            upkeep_weight: 0.0,
             energy,
             in_sunlight,
             reproduced,
@@ -819,6 +784,8 @@ pub(crate) fn load_colony_from_file(
             species_id: None,
         };
         organism.recompute_bounding_radius();
+        // Cell counts come from the file; the upkeep weight is derived (not saved).
+        organism.recompute_upkeep_weight();
 
         out.push(LoadedRecord { pos, rotation, kind, organism, brain, brain_limb, species_name });
     }

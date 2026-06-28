@@ -1,4 +1,5 @@
 #[path = "world/world_geometry.rs"]    mod world_geometry;
+#[path = "world/world_format.rs"]      mod world_format;
 #[path = "world/environment.rs"]       mod environment;
 #[path = "world/water.rs"]             mod water;
 
@@ -22,6 +23,7 @@
 #[path = "behaviour/world_model.rs"]                mod world_model;
 #[path = "behaviour/rl_helpers.rs"]                 mod rl_helpers;
 #[path = "behaviour/intelligence_level_0.rs"]       mod intelligence_level_0;
+#[path = "behaviour/sliding_movement/sliding_reinforce.rs"]                  mod sliding_reinforce;
 #[path = "behaviour/sliding_movement/intelligence_level_2_sliding.rs"]       mod intelligence_level_2_sliding;
 #[path = "behaviour/sliding_movement/intelligence_level_3_sliding.rs"]       mod intelligence_level_3_sliding;
 #[path = "behaviour/sliding_movement/intelligence_level_herbivore_1_sliding.rs"] mod intelligence_level_herbivore_1_sliding;
@@ -54,6 +56,7 @@ mod simulation_settings;
 #[path = "frontend/individuum_navigator.rs"]    mod individuum_navigator;
 #[path = "frontend/species_navigator.rs"]       mod species_navigator;
 #[path = "frontend/tree_view.rs"]               mod tree_view;
+#[path = "frontend/ui_modal.rs"]                mod ui_modal;
 
 // Colony editor — alternate entry point: reuses `WorldPlugin`/`WaterPlugin`
 // for terrain, skips every simulation plugin. Doubles as the in-engine
@@ -64,6 +67,9 @@ mod simulation_settings;
 // Species editor — manual organism construction with `.species` save output.
 // Lives at `SPECIES_EDITOR_ORIGIN` so its visuals don't overlap the sim.
 #[path = "frontend/species_editor/mod.rs"]      mod species_editor;
+
+// Map editor — top-down terrain vertex-colour painting (visual-only, runtime-only).
+#[path = "frontend/map_editor/mod.rs"]          mod map_editor;
 
 use bevy::{
     prelude::*,
@@ -108,19 +114,19 @@ fn main() {
     // `--map-size X Z` — parse before collecting positionals so the two
     // numeric values don't end up in the positional list.
     let map_size = parse_map_size(&args).unwrap_or(world_geometry::MapSize::default());
-    let max_phototrophs        = parse_max_phototrophs(&args);
-    let max_herbivores         = parse_max_herbivores(&args);
-    let start_heterotrophs     = parse_start_heterotrophs(&args);
-    let start_photoautotrophs  = parse_start_photoautotrophs(&args);
+    let max_phototrophs        = parse_flag::<usize>(&args, "--max-phototrophs");
+    let max_herbivores         = parse_flag::<usize>(&args, "--max-herbivores");
+    let start_heterotrophs     = parse_flag::<usize>(&args, "--start-heteros");
+    let start_photoautotrophs  = parse_flag::<usize>(&args, "--start-photos");
     // Headless / batch run-control flags (used for autonomous data runs):
     //   --time-speed X        initial TimeSpeed multiplier (virtual time)
     //   --exit-after-secs N    auto-exit after N seconds of VIRTUAL time
-    let time_speed       = parse_f32_flag(&args, "--time-speed");
-    let exit_after_secs  = parse_f32_flag(&args, "--exit-after-secs");
+    let time_speed       = parse_flag::<f32>(&args, "--time-speed");
+    let exit_after_secs  = parse_flag::<f32>(&args, "--exit-after-secs");
     // `--water-level Y` — world-space Y of the global water surface (seeds the
     // `WaterLevel` resource). `--adjust-colony-dimensions` — when loading a
     // colony, override its saved dimensions with the launcher values.
-    let water_level      = parse_water_level(&args);
+    let water_level      = parse_flag::<f32>(&args, "--water-level");
     let adjust_colony_dimensions = args.iter().any(|a| a == "--adjust-colony-dimensions");
     let positional             = collect_positionals(&args);
 
@@ -233,21 +239,18 @@ fn exit_after_virtual_secs(
 
 /// Parse a `--flag VALUE` f32 out of argv (generic). Used by the
 /// autonomous-run controls `--time-speed` / `--exit-after-secs`.
-fn parse_f32_flag(args: &[String], flag: &str) -> Option<f32> {
+/// Parse `--flag VALUE` out of argv: find `flag`, then parse the single
+/// token that follows it as `T`. Returns `None` if the flag is absent,
+/// has no following token, or that token doesn't parse as `T` — so every
+/// caller's "missing or invalid ⇒ fall back to default" semantics holds.
+fn parse_flag<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
     let pos = args.iter().position(|a| a == flag)?;
-    args.get(pos + 1)?.parse::<f32>().ok()
-}
-
-/// Parse `--water-level Y` out of argv. Returns `None` if the flag is
-/// absent or the value doesn't parse as an f32; callers fall back to
-/// `DEFAULT_WATER_LEVEL`.
-fn parse_water_level(args: &[String]) -> Option<f32> {
-    let pos = args.iter().position(|a| a == "--water-level")?;
-    args.get(pos + 1)?.parse::<f32>().ok()
+    args.get(pos + 1)?.parse::<T>().ok()
 }
 
 /// Parse `--map-size X Z` out of argv. Returns `None` if the flag is
-/// absent or either value doesn't parse as a positive f32.
+/// absent or either value doesn't parse as a positive f32. (Two-value
+/// flag, so it can't use the single-value `parse_flag` helper.)
 fn parse_map_size(args: &[String]) -> Option<world_geometry::MapSize> {
     let pos = args.iter().position(|a| a == "--map-size")?;
     let x = args.get(pos + 1)?.parse::<f32>().ok()?;
@@ -256,69 +259,31 @@ fn parse_map_size(args: &[String]) -> Option<world_geometry::MapSize> {
     Some(world_geometry::MapSize { x, z })
 }
 
-/// Parse `--max-phototrophs N` out of argv. Returns `None` if the flag
-/// is missing or unparseable; callers fall back to
-/// `DEFAULT_MAX_PHOTOAUTOTROPHS` (via FrontendPlugin's `init_resource`).
-fn parse_max_phototrophs(args: &[String]) -> Option<usize> {
-    let pos = args.iter().position(|a| a == "--max-phototrophs")?;
-    args.get(pos + 1)?.parse::<usize>().ok()
-}
-
-/// Parse `--max-herbivores N` out of argv. Returns `None` if the flag
-/// is missing or unparseable; callers fall back to
-/// `DEFAULT_MAX_HERBIVORES` (via `MaxHerbivores::default()`).
-fn parse_max_herbivores(args: &[String]) -> Option<usize> {
-    let pos = args.iter().position(|a| a == "--max-herbivores")?;
-    args.get(pos + 1)?.parse::<usize>().ok()
-}
-
-/// Parse `--start-heteros N` out of argv. Returns `None` if the flag
-/// is missing or unparseable; callers fall back to
-/// `DEFAULT_START_HETEROTROPHS` via `StartHeterotrophs::default()`.
-fn parse_start_heterotrophs(args: &[String]) -> Option<usize> {
-    let pos = args.iter().position(|a| a == "--start-heteros")?;
-    args.get(pos + 1)?.parse::<usize>().ok()
-}
-
-/// Parse `--start-photos N` out of argv. Returns `None` if the flag
-/// is missing or unparseable; callers fall back to
-/// `DEFAULT_START_PHOTOAUTOTROPHS` via `StartPhotoautotrophs::default()`.
-fn parse_start_photoautotrophs(args: &[String]) -> Option<usize> {
-    let pos = args.iter().position(|a| a == "--start-photos")?;
-    args.get(pos + 1)?.parse::<usize>().ok()
-}
-
 
 /// Collect positional CLI arguments. Skips known `--flag` tokens AND
 /// the two values that follow `--map-size` (which are numeric and
 /// would otherwise be picked up as positionals).
 fn collect_positionals(args: &[String]) -> Vec<String> {
+    // Value-bearing flags → how many tokens *after* the flag are its values
+    // (and so must be skipped along with the flag). Boolean flags
+    // (--wireframe/--editor/--trainingmode/…) take 0 values and don't need an
+    // entry — they're caught by the generic `--`-prefix skip below. Adding a
+    // new value-bearing flag means adding one row here and nowhere else.
+    const VALUE_FLAGS: &[(&str, usize)] = &[
+        ("--map-size",        2),
+        ("--max-phototrophs", 1),
+        ("--max-herbivores",  1),
+        ("--start-heteros",   1),
+        ("--start-photos",    1),
+        ("--water-level",     1),
+    ];
+
     let mut out = Vec::new();
     let mut i = 1; // skip argv[0]
     while i < args.len() {
         let a = &args[i];
-        if a == "--map-size" {
-            i += 3; // skip flag + two values
-            continue;
-        }
-        if a == "--max-phototrophs" {
-            i += 2; // skip flag + value
-            continue;
-        }
-        if a == "--max-herbivores" {
-            i += 2; // skip flag + value
-            continue;
-        }
-        if a == "--start-heteros" {
-            i += 2; // skip flag + value
-            continue;
-        }
-        if a == "--start-photos" {
-            i += 2; // skip flag + value
-            continue;
-        }
-        if a == "--water-level" {
-            i += 2; // skip flag + value
+        if let Some((_, n_values)) = VALUE_FLAGS.iter().find(|(flag, _)| a == flag) {
+            i += 1 + n_values; // skip flag + its value tokens
             continue;
         }
         if a.starts_with("--") {
@@ -483,7 +448,8 @@ fn run_simulation(
         .add_plugins(predation::PredationPlugin)
         .add_plugins(behaviour::BehaviourPlugin)
         .add_plugins(lineages::LineagesPlugin)
-        .add_plugins(species_editor::SpeciesEditorPlugin);
+        .add_plugins(species_editor::SpeciesEditorPlugin)
+        .add_plugins(map_editor::MapEditorPlugin);
 
     //app.add_plugins(EguiPlugin::default());
     //app.add_plugins(WorldInspectorPlugin::new());

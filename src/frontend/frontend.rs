@@ -214,7 +214,8 @@ impl Plugin for FrontendPlugin {
         app.add_systems(
             Update,
             draw_orientation_gizmos.run_if(
-                |vs: Res<ViewportSettings>| vs.show_advanced_viewport
+                |vs: Res<ViewportSettings>, m: Res<WindowMode>|
+                    vs.show_advanced_viewport && *m == WindowMode::Simulation
             ),
         );
     }
@@ -390,6 +391,11 @@ fn setup_panes(
             // ── Species editor panels ────────────────────────────────
             // Spawn hidden; mode-transition flips them on WindowMode::SpeciesEditor.
             crate::species_editor::spawn_overlay_panels(root, TOP_BAR_HEIGHT_PX);
+
+            // ── Map editor panels ─────────────────────────────────────
+            // Spawn hidden; the map-editor visibility toggle flips them on
+            // WindowMode::MapEditor.
+            crate::map_editor::spawn_overlay_panels(root, TOP_BAR_HEIGHT_PX);
 
             // Lineages mode panel — full-content tree-of-life view. Spawned
             // hidden; mode-transition toggles its `Display`.
@@ -675,6 +681,7 @@ fn spawn_top_mode_bar(parent: &mut ChildSpawnerCommands) {
             mode_button(bar, "Edit Colony",     WindowMode::EditColony,   false);
             mode_button(bar, "Lineages",        WindowMode::Lineages,     false);
             mode_button(bar, "Species Editor",  WindowMode::SpeciesEditor, false);
+            mode_button(bar, "Map Editor",      WindowMode::MapEditor,     false);
         });
 }
 
@@ -830,6 +837,7 @@ fn apply_mode_transition(
     let editor_visible   = mode == WindowMode::EditColony;
     let lineages_visible = mode == WindowMode::Lineages;
     let species_visible  = mode == WindowMode::SpeciesEditor;
+    let map_visible      = mode == WindowMode::MapEditor;
     let to_display = |v| if v { Display::Flex } else { Display::None };
 
     for mut n in &mut stats_q        { n.display = to_display(sim_visible);      }
@@ -849,7 +857,7 @@ fn apply_mode_transition(
 
     // Non-Simulation modes pause on entry. Gated on an actual mode change so
     // a cinematic toggle (which also re-runs this) never pauses the sim.
-    if mode_changed && (editor_visible || lineages_visible || species_visible) {
+    if mode_changed && (editor_visible || lineages_visible || species_visible || map_visible) {
         sim_running.0 = false;
         virtual_time.pause();
         player_active.0 = false;

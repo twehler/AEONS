@@ -114,31 +114,41 @@ pub fn dispatch_save_requests(mut session: ResMut<SpeciesSession>) {
 }
 
 
-fn encode_species(session: &SpeciesSession) -> Vec<u8> {
-    let total_cells: usize = session.body_parts.iter().map(|p| p.ocg.len()).sum();
-    let mut buf: Vec<u8> = Vec::with_capacity(64 + total_cells * 17);
-    buf.extend_from_slice(MAGIC);
-
-    let kind_byte: u8 = match session.draft.metabolism {
+/// Write the shared 8-byte metadata header that BOTH writers
+/// (`encode_species` and `encode_species_with_brain`) emit identically: the
+/// 6 enum/flag bytes (metabolism, symmetry, intelligence, has_variable_form,
+/// is_sessile, classification), the v8 movement byte, and the v9/v13 grounding
+/// byte. Does NOT write the magic (the two writers both use `MAGIC` =
+/// `MAGIC_V13`, but emit it themselves to keep the layout explicit). The
+/// on-disk byte sequence MUST stay identical — `decode_species` reads exactly
+/// these bytes in this order.
+#[allow(clippy::too_many_arguments)]
+fn write_header(
+    buf:               &mut Vec<u8>,
+    metabolism:        Metabolism,
+    symmetry:          Symmetry,
+    intelligence:      IntelligenceLevel,
+    has_variable_form: bool,
+    is_sessile:        bool,
+    classification:    Classification,
+    movement:          MovementMode,
+    grounding_tag:     u8,
+) {
+    let kind_byte: u8 = match metabolism {
         Metabolism::Photoautotroph => 0,
         Metabolism::Heterotroph    => 1,
     };
-    let sym_byte: u8 = match session.draft.symmetry {
+    let sym_byte: u8 = match symmetry {
         Symmetry::NoSymmetry => 0,
         Symmetry::Bilateral  => 1,
     };
-    let intel_byte: u8 = match session.draft.intelligence {
+    let intel_byte: u8 = match intelligence {
         IntelligenceLevel::Level0 => 0,
         IntelligenceLevel::Level1 => 1,
         IntelligenceLevel::Level2 => 2,
         IntelligenceLevel::Level3 => 3,
     };
-    let var_byte: u8     = if session.draft.form.as_bool() { 1 } else { 0 };
-    // is_sessile comes from the Mobility cycler; the editor lets form and
-    // sessility be picked independently — spawn enforces the invariant.
-    let sessile_byte: u8 = if session.draft.mobility.is_sessile() { 1 } else { 0 };
-
-    let classification_byte: u8 = match session.draft.classification {
+    let classification_byte: u8 = match classification {
         Classification::Herbivore => 0,
         Classification::Carnivore => 1,
     };
@@ -146,20 +156,41 @@ fn encode_species(session: &SpeciesSession) -> Vec<u8> {
     buf.push(kind_byte);
     buf.push(sym_byte);
     buf.push(intel_byte);
-    buf.push(var_byte);
-    buf.push(sessile_byte);
+    buf.push(if has_variable_form { 1 } else { 0 });
+    buf.push(if is_sessile { 1 } else { 0 });
     buf.push(classification_byte);
     // v8: movement paradigm byte. Preserves the v6/v7 0/1 encoding
     // (LimbBasedWalking=0, Sliding=1) and extends it (Swimming=2, Flying=3).
     // NOTE: this is DELIBERATELY the inverse of the .colony format's tag
     // (Sliding=0, LimbBasedWalking=1 — see colony_save_load.rs), forced by
     // .species v6/v7 back-compat. Do NOT "align" the two — it breaks round-trips.
-    buf.push(movement_byte(session.draft.movement));
-    // v9/v13: grounding byte. The EFFECTIVE tri-state tag (phototroph cycler
-    // choice, heterotroph movement-derived, movement-clamped) so the byte
-    // equals the spawned organism's placement + behaviour. 0/1 match the
-    // pre-v13 bool (water/ground); 2 = ocean-floor (benthic).
-    buf.push(session.draft.effective_grounding().to_species_tag());
+    buf.push(movement_byte(movement));
+    // v9/v13: grounding byte (tri-state tag — 0 water, 1 ground, 2 ocean-floor).
+    buf.push(grounding_tag);
+}
+
+
+fn encode_species(session: &SpeciesSession) -> Vec<u8> {
+    let total_cells: usize = session.body_parts.iter().map(|p| p.ocg.len()).sum();
+    let mut buf: Vec<u8> = Vec::with_capacity(64 + total_cells * 17);
+    buf.extend_from_slice(MAGIC);
+
+    write_header(
+        &mut buf,
+        session.draft.metabolism,
+        session.draft.symmetry,
+        session.draft.intelligence,
+        session.draft.form.as_bool(),
+        // is_sessile comes from the Mobility cycler; the editor lets form and
+        // sessility be picked independently — spawn enforces the invariant.
+        session.draft.mobility.is_sessile(),
+        session.draft.classification,
+        session.draft.movement,
+        // The EFFECTIVE tri-state grounding tag (phototroph cycler choice,
+        // heterotroph movement-derived, movement-clamped) so the byte equals
+        // the spawned organism's placement + behaviour.
+        session.draft.effective_grounding().to_species_tag(),
+    );
 
     // Skip empty parts (appendage begun but never given a cell). Filtering
     // shifts indices, so each part's `parent` (index into the FULL list) must
@@ -254,40 +285,22 @@ pub fn encode_species_with_brain(
     let mut buf: Vec<u8> = Vec::with_capacity(64 + total_cells * 17 + 64 * 1024);
     buf.extend_from_slice(MAGIC_V13);
 
-    let kind_byte: u8 = match metabolism {
-        Metabolism::Photoautotroph => 0,
-        Metabolism::Heterotroph    => 1,
-    };
-    let sym_byte: u8 = match symmetry {
-        Symmetry::NoSymmetry => 0,
-        Symmetry::Bilateral  => 1,
-    };
-    let intel_byte: u8 = match intelligence {
-        IntelligenceLevel::Level0 => 0,
-        IntelligenceLevel::Level1 => 1,
-        IntelligenceLevel::Level2 => 2,
-        IntelligenceLevel::Level3 => 3,
-    };
-    buf.push(kind_byte);
-    buf.push(sym_byte);
-    buf.push(intel_byte);
-    buf.push(if has_variable_form { 1 } else { 0 });
-    buf.push(if is_sessile { 1 } else { 0 });
-    buf.push(match classification {
-        Classification::Herbivore => 0,
-        Classification::Carnivore => 1,
-    });
-    // Movement byte — 4-way `MovementMode` (v8+ mapping).
-    buf.push(match movement {
-        MovementMode::LimbBasedWalking => 0,
-        MovementMode::Sliding          => 1,
-        MovementMode::Swimming         => 2,
-        MovementMode::Flying           => 3,
-    });
-    // v9/v13: grounding byte (tri-state tag — 0 water, 1 ground, 2 ocean-floor).
-    // A live organism carries only the `ground_based` bool, so an export can only
-    // ever be water (0) or ground (1) — never ocean-floor (re-mark it in the editor).
-    buf.push(if ground_based { 1 } else { 0 });
+    // v9/v13 grounding byte: a live organism carries only the `ground_based`
+    // bool, so an export is only ever water (0) or ground (1) — never
+    // ocean-floor (re-mark it in the editor). Same byte sequence as
+    // `encode_species`'s `effective_grounding().to_species_tag()` for 0/1.
+    let grounding_tag: u8 = if ground_based { 1 } else { 0 };
+    write_header(
+        &mut buf,
+        metabolism,
+        symmetry,
+        intelligence,
+        has_variable_form,
+        is_sessile,
+        classification,
+        movement,
+        grounding_tag,
+    );
 
     buf.extend_from_slice(&(parts.len() as u32).to_le_bytes());
     for (name, kind, parent, ocg) in parts {

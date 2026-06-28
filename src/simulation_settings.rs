@@ -12,8 +12,8 @@ use std::time::Duration;
 /// sets it: the running-population cap on photoautotrophs only (heterotrophs use
 /// the independent `MaxHerbivores`; the GPU brain pool sizes off that instead).
 /// Higher counts bloat meshes + colliders + photosynthesis and cost frame rate;
-/// 5000 trades FPS for a very dense prey/algae field (the user-chosen running cap).
-pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 5000;
+/// 2000 balances a dense prey/algae field against FPS (the user-chosen running cap).
+pub const DEFAULT_MAX_PHOTOAUTOTROPHS: usize = 2000;
 
 /// Launcher-side default for the herbivore reproduction cap; reproduction stops
 /// scheduling herbivore births once reached. Each limb herbivore is many dynamic
@@ -52,8 +52,8 @@ impl Default for StartPhotoautotrophs {
     fn default() -> Self { Self(DEFAULT_START_PHOTOAUTOTROPHS) }
 }
 
-pub const DEFAULT_MAP_X:           f32        = 500.0;
-pub const DEFAULT_MAP_Z:           f32        = 500.0;
+pub const DEFAULT_MAP_X:           f32        = 250.0;
+pub const DEFAULT_MAP_Z:           f32        = 250.0;
 
 
 /// AI-training mode toggle (statistics-panel checkbox). When `true`, heterotrophs
@@ -109,6 +109,10 @@ pub enum WindowMode {
     /// Species editor — hides the world and presents a top+bottom panel UI for
     /// building an organism cell-by-cell, output to a `.species` binary.
     SpeciesEditor,
+    /// Map editor — top-down orthographic view over the whole terrain with all
+    /// organisms hidden; paint the terrain with vertex colours (visual-only,
+    /// runtime-only). See `frontend/map_editor/`.
+    MapEditor,
 }
 
 impl Default for WindowMode {
@@ -1061,6 +1065,15 @@ pub const SWIM_WARMSTART_AMP: f32 = 0.35;
 pub const ENERGY_TICK_INTERVAL: f32 = 0.5;
 pub const MAX_ENERGY_PER_CELL: f32 = 10.0;
 
+/// Fraction of each heterotroph's max energy it is reset to when the user
+/// DISABLES AI-training mode (`statistics_panel.rs::handle_ai_training_checkbox`).
+/// Training suppresses heterotroph starvation-despawn (`energy.rs::manage_energy`),
+/// so most of the cohort sits pinned at ~0% energy for the whole run. The instant
+/// training is turned off the despawn re-arms and would mass-wipe them on the next
+/// energy tick — so we give every heterotroph an energetical reset to a uniform
+/// 50% as the toggle flips, keeping the live sim populated.
+pub const AI_TRAINING_DISABLE_ENERGY_FRACTION: f32 = 0.5;
+
 /// Per-tick energy a fully-surrounded (18 RD neighbours) photo cell produces. Read by
 /// `physiology.rs::PhotosyntheticCell::new` for the per-cell `energy_production`
 /// cache; the photosynthesis tick runs in `physiology.rs`, not here.
@@ -1174,6 +1187,22 @@ pub const MAX_DIRECTION_INTERVAL: f32 = 10.0;
 
 pub const GRAVITY:          f32 = 9.8;
 pub const MAX_CLIMB_HEIGHT: f32 = 4.0;
+
+/// Nearest-surface query radius, shared by the two terrain-seating paths:
+/// MOBILE ground-based sliders that crawl every frame
+/// (`movement.rs::apply_surface_adhesion`) and the one-shot seating of SESSILE
+/// life forms (`movement.rs::place_sessile_organisms`). Both snap a body to the
+/// nearest world-mesh surface instead of using gravity / heightmap floor-lift /
+/// wall collision.
+/// * Kept small (a couple of cells) so the triangle scan stays cheap; an
+///   adhering body is always within ~`OFFSET` of its surface, so the surface is
+///   found in the immediate buckets. Farther than this from any surface ⇒ falls
+///   back to the heightmap as a flat floor.
+/// The root-to-surface offset itself is computed per-body at the call site (so
+/// the lowest cell's bottom sits on the surface), using the GEOMETRY-SCALED cell
+/// half-extent (`CELL_SPACING * 0.5`) — it tracks `GEOMETRY_SCALE` automatically
+/// and needs no constant here.
+pub const SURFACE_ADHESION_SEARCH: f32 = 2.5;
 
 /// Global kill-floor: any organism below this Y is despawned, reclaiming
 /// brain/physics cycles from ones that slipped off the map edge or through a mesh gap
@@ -1323,3 +1352,32 @@ pub const SPAWN_STRIDER_COUNT: usize = 0;
 // `MaxPhotoautotrophs` cap-cull and remain a stable prey field.
 pub const SPAWN_ALGAE_PATH:    &str  = "species/ball_plankton.species";
 pub const SPAWN_ALGAE_COUNT:   usize = 100;
+
+
+// ── Map Editor v2: terrain texture painting (frontend/map_editor/) ───────────
+
+/// Paint-texture resolution scaling. Reference: a 250-unit map gets a 2048²
+/// paint texture (2048 / 250 ≈ 8.19 texels per world unit). Change this one
+/// value to globally rescale paint fidelity; the (square) texture edge is
+/// `max(map_x, map_z) × this`, clamped to [MAP_PAINT_TEX_MIN, MAP_PAINT_TEX_MAX].
+///
+/// Higher = crisper sub-triangle detail, but the CPU brush re-uploads the WHOLE
+/// paint Image to the GPU on each dab, so cost scales with edge² (≈16 MB/dab at
+/// 2048², ≈64 MB/dab at 4096²). 2048² is a safe balance; push it up if your GPU
+/// can take the larger per-dab upload and you want a finer "picture".
+pub const MAP_PAINT_TEXELS_PER_WORLD_UNIT: f32 = 2048.0 / 250.0;
+pub const MAP_PAINT_TEX_MIN: u32 = 256;
+pub const MAP_PAINT_TEX_MAX: u32 = 8192;
+
+/// Default screen-space brush radius (pixels) and its editable clamp range.
+pub const DEFAULT_BRUSH_RADIUS_PX: f32 = 10.0;
+pub const BRUSH_RADIUS_PX_MIN:     f32 = 1.0;
+pub const BRUSH_RADIUS_PX_MAX:     f32 = 512.0;
+
+/// Dab spacing as a fraction of the brush radius: stamp a dab each time the
+/// cursor has travelled this × radius (in viewport px) since the last dab, so
+/// fast strokes stay continuous without over-stamping the same texels.
+pub const BRUSH_DAB_SPACING_FRAC: f32 = 0.4;
+
+/// Neutral base colour the paint texture is cleared to on creation (sRGB bytes).
+pub const MAP_PAINT_BASE_SRGB: [u8; 4] = [180, 180, 180, 255];

@@ -500,10 +500,13 @@ fn ray_hit_heightmap(
                     let alpha = if span.abs() > 1e-6 { dy_prev / span } else { 0.5 };
                     let alpha = alpha.clamp(0.0, 1.0);
                     let interp = prev_p.lerp(p, alpha);
-                    let final_y = heightmap.height_at(interp.x, interp.z) + 0.5;
+                    // Place ON the terrain. (A fixed `+ 0.5` lift is huge at the
+                    // 0.1 geometry scale, leaving sessile organisms — which never
+                    // move to re-seat — hovering above the floor.)
+                    let final_y = heightmap.height_at(interp.x, interp.z);
                     return Some(Vec3::new(interp.x, final_y, interp.z));
                 } else {
-                    return Some(Vec3::new(p.x, ground + 0.5, p.z));
+                    return Some(Vec3::new(p.x, ground, p.z));
                 }
             }
             prev_above = Some((p, ground));

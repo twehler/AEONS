@@ -184,29 +184,27 @@ pub fn export_dataset_system(
 ) {
     let Some(path) = req.0.take() else { return };
 
-    let file = match File::create(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            error!("export-dataset: failed to create {}: {}", path.display(), e);
-            return;
-        }
-    };
-    let mut out = BufWriter::new(file);
-
     // Single GPU forward pass; per-organism lookups are then pure CPU.
     let telemetry = pool.snapshot_telemetry();
 
-    if let Err(e) = write_csv(&mut out, &query, run_elapsed.0 as f32, &pool, &telemetry) {
+    // Build the (large) main CSV in memory on the main thread — `write_csv` reads
+    // the World query + the NonSend brain pool, so it can't move off-thread — then
+    // hand the finished bytes to the `IoTaskPool` so the blocking disk write
+    // doesn't stall the render thread on the milestone export.
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    if let Err(e) = write_csv(&mut buf, &query, run_elapsed.0 as f32, &pool, &telemetry) {
         error!("export-dataset: write failure on {}: {}", path.display(), e);
         return;
     }
-
-    if let Err(e) = out.flush() {
-        error!("export-dataset: flush failure on {}: {}", path.display(), e);
-        return;
+    {
+        let path = path.clone();
+        bevy::tasks::IoTaskPool::get().spawn(async move {
+            match std::fs::write(&path, &buf) {
+                Ok(())  => info!("exported simulation dataset to {}", path.display()),
+                Err(e)  => error!("export-dataset: failed to write {}: {}", path.display(), e),
+            }
+        }).detach();
     }
-
-    info!("exported simulation dataset to {}", path.display());
 
     // ── Side-car: `<stem>_training_stats.csv` — last
     // ≤ TRAINING_HISTORY_CAP completed training steps, one row each.

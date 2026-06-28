@@ -10,7 +10,7 @@
 use bevy::prelude::*;
 
 use crate::colony::{Carnivore, Heterotroph, Organism};
-use crate::world_model::{OrganismType, WorldModelGrid};
+use crate::world_model::{for_each_in_ring, OrganismType, WorldModelGrid};
 
 
 pub use crate::simulation_settings::SENSORY_RADIUS;
@@ -31,33 +31,31 @@ pub fn update_target_distance(
         (With<Heterotroph>, Without<Carnivore>),
     >,
 ) {
-    let bucket    = crate::world_model::WORLD_MODEL_RADIUS;
     let radius_sq = SENSORY_RADIUS * SENSORY_RADIUS;
 
-    for (transform, mut organism) in &mut heteros {
+    // Entity-disjoint per-herbivore writes; reads only `&world_grid` (HashMap read,
+    // Sync). `best_d2`/`found` are per-closure locals (not a shared `Local`), so this
+    // fans out over ComputeTaskPool with no shared mutable state.
+    let world_grid = &*world_grid;
+    heteros.par_iter_mut().for_each(|(transform, mut organism)| {
         let pos = transform.translation;
-        let kx  = (pos.x / bucket).floor() as i32;
-        let kz  = (pos.z / bucket).floor() as i32;
 
         let mut best_d2 = radius_sq;
         let mut found   = false;
-        for dx in -1..=1 {
-            for dz in -1..=1 {
-                let Some(entries) = world_grid.grid.get(&(kx + dx, kz + dz)) else { continue };
-                for &entry in entries {
-                    if !matches!(entry.ty, OrganismType::Photo) { continue; }
-                    let rel = entry.pos - pos;
-                    // XZ-plane distance — Y doesn't matter for the
-                    // herbivore's "can I reach this?" estimate.
-                    let d2  = rel.x * rel.x + rel.z * rel.z;
-                    if d2 > radius_sq { continue; }
-                    if d2 < best_d2 {
-                        best_d2 = d2;
-                        found   = true;
-                    }
-                }
+        // 3×3 bucket ring (span = 1): the grid's bucket = WORLD_MODEL_RADIUS
+        // ≥ SENSORY_RADIUS, so the ring covers the full query radius.
+        for_each_in_ring(world_grid, pos, 1, |entry| {
+            if !matches!(entry.ty, OrganismType::Photo) { return; }
+            let rel = entry.pos - pos;
+            // XZ-plane distance — Y doesn't matter for the
+            // herbivore's "can I reach this?" estimate.
+            let d2  = rel.x * rel.x + rel.z * rel.z;
+            if d2 > radius_sq { return; }
+            if d2 < best_d2 {
+                best_d2 = d2;
+                found   = true;
             }
-        }
+        });
 
         let new_td = if found { best_d2.sqrt() } else { SENSORY_RADIUS };
         // Only write when changed so Change<Organism>-keyed
@@ -65,5 +63,5 @@ pub fn update_target_distance(
         if organism.target_distance.to_bits() != new_td.to_bits() {
             organism.target_distance = new_td;
         }
-    }
+    });
 }

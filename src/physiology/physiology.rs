@@ -115,8 +115,10 @@ fn photosynthesise(
     timer.timer.tick(time.delta());
     if !timer.timer.just_finished() { return; }
 
-    for mut organism in &mut query {
-        if organism.photo_cell_count <= 0 { continue; }
+    // Each photoautotroph credits only its own energy from its own cached photo
+    // production — entity-disjoint, no Commands — so it fans out over `ComputeTaskPool`.
+    query.par_iter_mut().for_each(|mut organism| {
+        if organism.photo_cell_count <= 0 { return; }
 
         let mut produced = 0.0_f32;
         for bp in organism.body_parts.iter().filter(|bp| bp.is_alive()) {
@@ -134,5 +136,5 @@ fn photosynthesise(
         }
 
         organism.energy += produced;
-    }
+    });
 }

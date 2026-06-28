@@ -1467,13 +1467,34 @@ fn draw_line(buf: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32,
 // ── AI-training mode checkbox handlers ──────────────────────────────────────
 
 /// Toggle the `AiTrainingMode` resource on click of the checkbox.
+///
+/// When the toggle goes ON → OFF, every heterotroph's energy is reset to
+/// `AI_TRAINING_DISABLE_ENERGY_FRACTION` (50%) of its capacity, IN THE SAME
+/// SYSTEM RUN as the flip. This is the whole point of the reset: training
+/// suppresses heterotroph starvation-despawn (`energy.rs::manage_energy`), so
+/// most of the cohort sits pinned at ~0% energy for the whole run; the instant
+/// training is disabled the despawn re-arms and would wipe them all on the next
+/// energy tick. Doing the reset atomically with the flip (rather than in a
+/// separate edge-detecting system) means `manage_energy` can never observe
+/// `mode == false` with a near-0 heterotroph before the reset lands — no race,
+/// regardless of system ordering.
 pub fn handle_ai_training_checkbox(
     interactions: Query<&Interaction, (Changed<Interaction>, With<AiTrainingCheckbox>)>,
     mut mode:     ResMut<crate::simulation_settings::AiTrainingMode>,
+    mut heteros:  Query<&mut Organism, With<Heterotroph>>,
 ) {
     for interaction in &interactions {
         if matches!(interaction, Interaction::Pressed) {
+            let was_enabled = mode.0;
             mode.0 = !mode.0;
+            // ON → OFF: energetical reset so the cohort survives the despawn
+            // re-arming instead of mass-dying from training-pinned ~0% energy.
+            if was_enabled && !mode.0 {
+                let fraction = crate::simulation_settings::AI_TRAINING_DISABLE_ENERGY_FRACTION;
+                for mut organism in &mut heteros {
+                    organism.energy = crate::energy::get_max_energy(&organism) * fraction;
+                }
+            }
         }
     }
 }

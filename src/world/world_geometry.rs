@@ -20,17 +20,28 @@
 use bevy::prelude::*;
 use bevy::gltf::{Gltf, GltfMesh, GltfNode};
 use bevy::mesh::{Mesh, VertexAttributeValues, Indices, PrimitiveTopology};
-use bevy::asset::AssetId;
+use bevy::asset::{AssetId, RenderAssetUsages};
+use bevy::image::ImageSampler;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::scene::SceneRoot;
 use std::collections::{HashMap, HashSet};
+
+use crate::map_editor::gpu_paint::PaintState;
+use crate::map_editor::terrain_paint::{make_display_material, TerrainPaintTargets};
+use crate::world_format::WorldMeshEntry;
 
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 
 /// XZ resolution of the heightmap grid (world units). Larger = less
 /// terrain-following precision but smaller/cache-friendlier grid (at 4.0 a
-/// 2048² world is ~1 MB vs 16 MB at 1.0).
-pub const HEIGHTMAP_CELL_SIZE: f32 = 4.0;
+/// 2048² world is ~1 MB vs 16 MB at 1.0). Set to 1.0 to match the organism cell
+/// scale (`RD_HALF_SIZE = 0.5` ⇒ a 1.0-unit cell): at 4.0 each grid cell stored
+/// the MAX terrain Y over an 8×-larger-than-an-organism patch, so sliders (esp.
+/// ocean-floor/benthic ones) rested on the upslope peak of their cell and
+/// visibly hovered, or aliased below the surface at cell boundaries. Combined
+/// with the bilinear `height_at` below this makes the floor follow the mesh.
+pub const HEIGHTMAP_CELL_SIZE: f32 = 1.0;
 
 /// Bucket edge length (world units) of the XZ spatial grid used to accelerate
 /// triangle queries. Smaller = fewer triangles per query but more memory.
@@ -48,7 +59,10 @@ pub struct MapSize {
 
 impl Default for MapSize {
     fn default() -> Self {
-        Self { x: 500.0, z: 500.0 }
+        Self {
+            x: crate::simulation_settings::DEFAULT_MAP_X,
+            z: crate::simulation_settings::DEFAULT_MAP_Z,
+        }
     }
 }
 
@@ -67,13 +81,63 @@ pub struct WorldPlugin {
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(WorldSettings { world_path: self.world_path.clone() });
-        app.add_systems(Startup, begin_load_world);
-        app.add_systems(Update,  finish_load_world);
+        // Expose the source path so the Map Editor's Export derives its output.
+        app.insert_resource(LoadedWorldPath(self.world_path.clone()));
+
+        // Branch on the path extension (case-insensitive): a `.world` file is our
+        // own baked format (synchronous load); anything else (`.glb`/`.gltf`) goes
+        // through the existing async Gltf path, UNCHANGED.
+        let ext = std::path::Path::new(&self.world_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("world") => {
+                app.init_resource::<WorldFileLoaded>();
+                app.init_resource::<WorldPaintAdoption>();
+                app.add_systems(Update, load_world_file);
+                // Paint-state adoption only runs where the Map Editor exists
+                // (`run_simulation`); under `--editor` those resources are absent.
+                app.add_systems(
+                    Update,
+                    adopt_world_paint_state
+                        .after(load_world_file)
+                        .run_if(resource_exists::<PaintState>)
+                        .run_if(resource_exists::<TerrainPaintTargets>),
+                );
+            }
+            _ => {
+                app.add_systems(Startup, begin_load_world);
+                app.add_systems(Update,  finish_load_world);
+            }
+        }
     }
 }
 
 #[derive(Resource)]
 struct WorldSettings { world_path: String }
+
+/// The source world path this run loaded (the `.glb`/`.gltf`/`.world` argv).
+/// Read by the Map Editor's Export to derive the `.world` output path.
+#[derive(Resource, Clone)]
+pub struct LoadedWorldPath(pub String);
+
+/// Run-once guard for the synchronous `.world` loader.
+#[derive(Resource, Default)]
+struct WorldFileLoaded(bool);
+
+/// Handoff from the `.world` loader to the paint-state adopter (so the loader can
+/// stay free of the Map Editor's optional resources). `Some` for exactly one
+/// frame after a successful load; the adopter consumes and clears it.
+#[derive(Resource, Default)]
+struct WorldPaintAdoption(
+    Option<(
+        Handle<Image>,
+        Handle<StandardMaterial>,
+        u32,
+        Vec<(Handle<Mesh>, Entity)>,
+    )>,
+);
 
 #[derive(Resource)]
 struct PendingWorld {
@@ -98,12 +162,32 @@ pub struct HeightmapSampler {
 }
 
 impl HeightmapSampler {
-    /// Surface Y at (x, z). Clamps to the world's XZ bounds.
+    /// Surface Y at (x, z), bilinearly interpolated between the four nearest
+    /// grid samples. Clamps to the world's XZ bounds.
+    ///
+    /// Each stored height represents its cell CENTER (cell `c` is centred at
+    /// world `(min + c + 0.5) * cell`), so we work in cell-centre space: the
+    /// continuous coordinate `f = x/cell - 0.5 - min` puts integer values on
+    /// cell centres, and we lerp across the `[floor(f), floor(f)+1]` bracket.
+    /// Interpolating (vs the old nearest-cell pick) removes the stair-stepping
+    /// that made sliders alias above/below the rendered surface at cell edges.
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
         if self.width == 0 || self.depth == 0 { return 0.0; }
-        let xi = (((x / HEIGHTMAP_CELL_SIZE).floor() as i32 - self.min_x).max(0) as u32).min(self.width - 1);
-        let zi = (((z / HEIGHTMAP_CELL_SIZE).floor() as i32 - self.min_z).max(0) as u32).min(self.depth - 1);
-        self.heights[(zi * self.width + xi) as usize]
+        let cell = HEIGHTMAP_CELL_SIZE;
+        // Cell-centre-space coords, clamped into [0, dim-1] so the +1 neighbour
+        // and the interpolation weight both stay in range at the borders.
+        let fx = (x / cell - 0.5 - self.min_x as f32).clamp(0.0, (self.width - 1) as f32);
+        let fz = (z / cell - 0.5 - self.min_z as f32).clamp(0.0, (self.depth - 1) as f32);
+        let xi0 = fx.floor() as u32;
+        let zi0 = fz.floor() as u32;
+        let xi1 = (xi0 + 1).min(self.width - 1);
+        let zi1 = (zi0 + 1).min(self.depth - 1);
+        let tx = fx - xi0 as f32;
+        let tz = fz - zi0 as f32;
+        let at = |xi: u32, zi: u32| self.heights[(zi * self.width + xi) as usize];
+        let top = at(xi0, zi0) + (at(xi1, zi0) - at(xi0, zi0)) * tx;
+        let bot = at(xi0, zi1) + (at(xi1, zi1) - at(xi0, zi1)) * tx;
+        top + (bot - top) * tz
     }
 }
 
@@ -190,6 +274,134 @@ impl WorldMesh {
         let mut nearby = Vec::new();
         self.max_y_in_xz_with(min, max, &mut nearby)
     }
+
+    /// Nearest point on the world mesh to `pos` within `search` units, plus the
+    /// unit surface normal there (oriented toward `pos`). `None` if no triangle
+    /// lies within `search`. Localized via the XZ spatial grid (and the
+    /// grid is XZ-only, so triangles of vertical walls / overhangs at this XZ
+    /// are included regardless of their Y), so the cost is ~the triangles in the
+    /// surrounding buckets — cheap enough for per-organism, per-frame surface
+    /// adhesion with no physics solver. `scratch` is a caller-owned candidate
+    /// buffer reused across calls.
+    pub fn closest_surface(&self, pos: Vec3, search: f32, scratch: &mut Vec<u32>) -> Option<(Vec3, Vec3)> {
+        let half = Vec3::splat(search);
+        self.collect_nearby(pos - half, pos + half, scratch);
+        let mut best_d2 = search * search;
+        let mut best: Option<(Vec3, Vec3)> = None;
+        for &ti in scratch.iter() {
+            let [v0, v1, v2] = self.triangles[ti as usize];
+            let cp = closest_point_on_triangle(pos, v0, v1, v2);
+            let d2 = (cp - pos).length_squared();
+            if d2 < best_d2 {
+                let mut n = (v1 - v0).cross(v2 - v0).normalize_or_zero();
+                if n == Vec3::ZERO { continue; }           // degenerate triangle
+                if n.dot(pos - cp) < 0.0 { n = -n; }        // face the organism
+                best_d2 = d2;
+                best    = Some((cp, n));
+            }
+        }
+        best
+    }
+
+    /// Möller–Trumbore ray cast against terrain triangles, accelerated by the XZ
+    /// spatial grid. Returns `(hit point, unit normal oriented toward the ray
+    /// origin, toi)` of the NEAREST hit, or `None` if no triangle within `max`
+    /// units along the ray is struck. The grid is XZ-only, so triangles of
+    /// vertical walls / overhangs are included regardless of their Y — this makes
+    /// the cast cave/overhang-correct (it finds the front-most surface the ray
+    /// pierces). Used by the map editor's brush to obtain the cursor-center
+    /// surface hit (the rapier collider is a flat slab and useless for this).
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<(Vec3, Vec3, f32)> {
+        let dir = dir.normalize_or_zero();
+        if dir == Vec3::ZERO { return None; }
+        // Candidate buckets: the XZ AABB swept by the ray from origin to origin+dir*max.
+        let end = origin + dir * max;
+        let min = origin.min(end) - Vec3::splat(self.bucket);
+        let maxb = origin.max(end) + Vec3::splat(self.bucket);
+        let mut scratch = Vec::new();
+        self.collect_nearby(min, maxb, &mut scratch);
+
+        let mut best_toi = max;
+        let mut best: Option<(Vec3, Vec3, f32)> = None;
+        for &ti in scratch.iter() {
+            let [v0, v1, v2] = self.triangles[ti as usize];
+            if let Some(toi) = ray_triangle_toi(origin, dir, v0, v1, v2) {
+                if toi >= 0.0 && toi < best_toi {
+                    let mut n = (v1 - v0).cross(v2 - v0).normalize_or_zero();
+                    if n == Vec3::ZERO { continue; }       // degenerate triangle
+                    if n.dot(-dir) < 0.0 { n = -n; }        // face the ray origin
+                    best_toi = toi;
+                    best     = Some((origin + dir * toi, n, toi));
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Möller–Trumbore ray/triangle intersection. Returns the time-of-impact along
+/// the (unit) ray direction, or `None` for a miss / parallel ray. Double-sided.
+fn ray_triangle_toi(orig: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<f32> {
+    const EPS: f32 = 1e-7;
+    let e1 = v1 - v0;
+    let e2 = v2 - v0;
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < EPS { return None; }     // ray parallel to triangle
+    let inv = 1.0 / det;
+    let t = orig - v0;
+    let u = t.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) { return None; }
+    let q = t.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 { return None; }
+    let toi = e2.dot(q) * inv;
+    if toi > EPS { Some(toi) } else { None }
+}
+
+/// Closest point on triangle `(a, b, c)` to `p` (Ericson, *Real-Time Collision
+/// Detection*). Handles the vertex / edge / face Voronoi regions; no allocation,
+/// ~30 FLOPs.
+fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 { return a; }
+
+    let bp = p - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 { return b; }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return a + ab * v;
+    }
+
+    let cp = p - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 { return c; }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return a + ac * w;
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + (c - b) * w;
+    }
+
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    a + ab * v + ac * w
 }
 
 
@@ -271,6 +483,9 @@ fn finish_load_world(
         commands.spawn((
             SceneRoot(scene_handle.clone()),
             Transform::from_translation(translation).with_scale(Vec3::splat(scale)),
+            // Tagged so the map editor can find the terrain hierarchy + read its
+            // world transform for vertex-colour painting.
+            crate::map_editor::TerrainSceneRoot,
         ));
     } else {
         warn!("World glb has no scenes — spawning nothing visible.");
@@ -291,6 +506,185 @@ fn finish_load_world(
 
     commands.insert_resource(heightmap);
     commands.insert_resource(world_mesh);
+}
+
+
+// ── `.world` synchronous loader ──────────────────────────────────────────────
+//
+// A `.world` file bakes the terrain (every submesh's local geometry + its world
+// `Transform`), the painted atlas texture, and `MapSize`. Unlike the glb path it
+// needs no async asset wait, no node walk, and no re-normalisation — geometry is
+// already in final world space via the stored transforms. We rebuild the visible
+// terrain hierarchy + display material, derive `WorldMesh`/`HeightmapSampler` from
+// the world-space triangles (the SAME builders the glb path uses), insert the
+// file's `MapSize`, and hand the paint texture/material/targets to the Map Editor
+// (via `WorldPaintAdoption`) so re-entering the editor does NOT destructively
+// re-unwrap the loaded atlas.
+
+#[allow(clippy::too_many_arguments)]
+fn load_world_file(
+    settings:      Res<WorldSettings>,
+    mut done:      ResMut<WorldFileLoaded>,
+    mut adoption:  ResMut<WorldPaintAdoption>,
+    mut commands:  Commands,
+    mut meshes:    ResMut<Assets<Mesh>>,
+    mut images:    ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if done.0 { return; }
+    done.0 = true; // run-once (synchronous; no async gate)
+
+    // Resolve the real file location. Unlike the glb path (where the AssetServer
+    // re-prepends the assets root, so we strip it), a `.world` is read directly
+    // with `std::fs` relative to the cwd (repo root) — so we must NOT strip
+    // `assets/`. Try the path as given (handles `assets/foo.world` and absolute
+    // paths), then fall back to under `assets/` (handles a bare `foo.world`).
+    let Some(path) = resolve_world_file_path(&settings.world_path) else {
+        error!(
+            "Could not find .world file '{}' (tried as-given and under assets/) — booting a flat world.",
+            settings.world_path
+        );
+        commands.insert_resource(build_heightmap(&[]));
+        commands.insert_resource(build_world_mesh(Vec::new()));
+        return;
+    };
+    let data = match crate::world_format::read_world(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            error!("Failed to read .world '{path}': {e} — booting a flat world.");
+            // Same zero-triangle fallback the glb path produces (a flat plane at
+            // Y=0), so the app still boots and the sim has finite resources.
+            commands.insert_resource(build_heightmap(&[]));
+            commands.insert_resource(build_world_mesh(Vec::new()));
+            return;
+        }
+    };
+
+    // 1. Reconstruct the paint Image from the stored bytes (same recipe as
+    //    `uv_unwrap::create_paint_image`: Rgba8UnormSrgb, nearest sampler,
+    //    COPY_DST for CPU re-uploads, MAIN+RENDER usages via the default).
+    let tex = make_paint_image_from_bytes(
+        data.texture.width, data.texture.height, &data.texture.bytes, &mut images,
+    );
+
+    // 2. Shared display material (factored helper — cannot drift from the editor).
+    let display_mat = materials.add(make_display_material(tex.clone()));
+
+    // 3. Spawn the terrain hierarchy: an IDENTITY root + one child per submesh
+    //    (the submesh carries its own world Transform), and accumulate world-space
+    //    triangles for the runtime collision resources.
+    let mut tri: Vec<[Vec3; 3]> = Vec::new();
+    let mut paint_targets: Vec<(Handle<Mesh>, Entity)> = Vec::new();
+    let root = commands
+        .spawn((
+            crate::map_editor::TerrainSceneRoot,
+            Transform::IDENTITY,
+            Visibility::default(),
+        ))
+        .id();
+    for entry in &data.meshes {
+        // 3a. World-space triangles for the runtime resources.
+        let m = entry.transform.to_matrix();
+        for chunk in entry.indices.chunks_exact(3) {
+            let p = |i: u32| {
+                let a = entry.positions[i as usize];
+                m.transform_point3(Vec3::from_array(a))
+            };
+            let (a, b, c) = (chunk[0], chunk[1], chunk[2]);
+            // Guard against an out-of-range index (defensive — loader validated
+            // counts, not index values).
+            let n = entry.positions.len() as u32;
+            if a >= n || b >= n || c >= n { continue; }
+            tri.push([p(a), p(b), p(c)]);
+        }
+        // 3b. Bevy render mesh.
+        let mesh_handle = meshes.add(build_render_mesh(entry));
+        let child = commands
+            .spawn((
+                Mesh3d(mesh_handle.clone()),
+                MeshMaterial3d(display_mat.clone()),
+                entry.transform,
+                Visibility::default(),
+            ))
+            .id();
+        commands.entity(root).add_child(child);
+        paint_targets.push((mesh_handle, child));
+    }
+
+    // 4. Runtime resources from the world-space triangles (verbatim builders).
+    let heightmap  = build_heightmap(&tri); // borrow first
+    let world_mesh = build_world_mesh(tri);  // move
+
+    info!(
+        "World (.world) loaded: {} submeshes, {} triangles, {}x{} texture, heightmap {}x{}, max height {:.2}",
+        data.meshes.len(),
+        world_mesh.triangles.len(),
+        data.texture.width, data.texture.height,
+        heightmap.width, heightmap.depth,
+        heightmap.max_height,
+    );
+
+    commands.insert_resource(heightmap);
+    commands.insert_resource(world_mesh);
+
+    // 5. MapSize from the file overrides argv (the baked geometry is its source).
+    commands.insert_resource(MapSize { x: data.map_x, z: data.map_z });
+
+    // 6. Hand the paint state to `adopt_world_paint_state` (which only runs where
+    //    the Map Editor's resources exist) so a round-trip edit keeps the texture.
+    adoption.0 = Some((tex, display_mat, data.texture.width, paint_targets));
+}
+
+/// Populate the Map Editor's `PaintState` + `TerrainPaintTargets` from a loaded
+/// `.world` so re-entering the editor adopts the loaded atlas+texture instead of
+/// re-unwrapping (which would wipe the painted texture). Gated by
+/// `resource_exists` on both resources, so it is inert under `--editor` (which has
+/// no Map Editor) — the geometry/collision load above still happens there.
+fn adopt_world_paint_state(
+    mut adoption: ResMut<WorldPaintAdoption>,
+    mut paint:    ResMut<PaintState>,
+    mut targets:  ResMut<TerrainPaintTargets>,
+) {
+    let Some((tex, display_mat, atlas_edge, paint_targets)) = adoption.0.take() else { return };
+    paint.paint_image = Some(tex);
+    paint.display_mat = Some(display_mat);
+    paint.atlas_edge  = atlas_edge;
+    paint.last_dab_vp = None;
+    targets.meshes    = paint_targets;
+    targets.prepared  = true;
+}
+
+/// Build a Bevy render `Mesh` (TriangleList) from a `.world` submesh entry, with
+/// POSITION/NORMAL/UV_0 and U32 indices.
+fn build_render_mesh(entry: &WorldMeshEntry) -> Mesh {
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, entry.positions.clone());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL,   entry.normals.clone());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0,     entry.uv0.clone());
+    mesh.insert_indices(Indices::U32(entry.indices.clone()));
+    mesh
+}
+
+/// Reconstruct the paint `Image` from stored RGBA8 bytes — identical render-asset
+/// configuration to `uv_unwrap::create_paint_image` (Rgba8UnormSrgb, nearest
+/// sampler, COPY_DST, MAIN+RENDER usages via `RenderAssetUsages::default()`), so
+/// CPU byte writes re-upload to the GPU automatically.
+fn make_paint_image_from_bytes(
+    width:  u32,
+    height: u32,
+    bytes:  &[u8],
+    images: &mut Assets<Image>,
+) -> Handle<Image> {
+    let mut img = Image::new(
+        Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        bytes.to_vec(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    img.texture_descriptor.usage |= TextureUsages::COPY_DST;
+    img.sampler = ImageSampler::nearest();
+    images.add(img)
 }
 
 
@@ -344,6 +738,21 @@ fn compute_normalisation(triangles: &[[Vec3; 3]], map_size: MapSize) -> (f32, Ve
 ///   * absolute path (launcher "Open…" dialog)  → suffix after LAST `assets/`
 /// The third branch is required: dialog paths are absolute, and without it the
 /// AssetServer silently fails and the world never spawns.
+/// Resolve a `.world` path for a direct `std::fs` read. Returns the first of
+/// `[as-given, assets/<stripped>]` that is an existing file, or `None`. (The glb
+/// path can't reuse this — it hands the stripped path to the `AssetServer`, which
+/// re-prepends the assets root itself.)
+fn resolve_world_file_path(p: &str) -> Option<String> {
+    if std::path::Path::new(p).is_file() {
+        return Some(p.to_string());
+    }
+    let under = format!("assets/{}", strip_assets_prefix(p));
+    if std::path::Path::new(&under).is_file() {
+        return Some(under);
+    }
+    None
+}
+
 fn strip_assets_prefix(p: &str) -> String {
     let trimmed = p.trim_start_matches("./");
     if let Some(rest) = trimmed.strip_prefix("assets/")  { return rest.to_string(); }
@@ -560,7 +969,7 @@ fn tri_xz_height_at(v0: Vec3, v1: Vec3, v2: Vec3, px: f32, pz: f32) -> Option<f3
 
 // ── WorldMesh construction ──────────────────────────────────────────────────
 
-fn build_world_mesh(triangles: Vec<[Vec3; 3]>) -> WorldMesh {
+pub(crate) fn build_world_mesh(triangles: Vec<[Vec3; 3]>) -> WorldMesh {
     let bucket = TRIANGLE_GRID_BUCKET;
     let mut grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
 
@@ -645,4 +1054,56 @@ fn tri_aabb_overlap(tri: [Vec3; 3], aabb_min: Vec3, aabb_max: Vec3) -> bool {
     }
 
     true
+}
+
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod world_mesh_raycast_tests {
+    use super::*;
+
+    /// A single horizontal triangle on the Y=5 plane spanning the XZ origin.
+    fn one_flat_triangle() -> WorldMesh {
+        build_world_mesh(vec![[
+            Vec3::new(0.0, 5.0, 0.0),
+            Vec3::new(10.0, 5.0, 0.0),
+            Vec3::new(0.0, 5.0, 10.0),
+        ]])
+    }
+
+    #[test]
+    fn map_raycast_hits_known_triangle() {
+        let wm = one_flat_triangle();
+        // Cast straight down from above (2, 50, 2) — inside the triangle's XZ.
+        let hit = wm.raycast(Vec3::new(2.0, 50.0, 2.0), Vec3::NEG_Y, 1000.0);
+        let (point, normal, toi) = hit.expect("ray should hit the triangle");
+        assert!((point.y - 5.0).abs() < 1e-3, "hit Y = {}", point.y);
+        assert!((toi - 45.0).abs() < 1e-3, "toi = {}", toi);
+        // Normal points toward the ray origin (upward, +Y).
+        assert!(normal.y > 0.9, "normal = {normal:?}");
+    }
+
+    #[test]
+    fn map_raycast_misses_when_offset() {
+        let wm = one_flat_triangle();
+        // Cast down well outside the triangle's XZ footprint.
+        assert!(wm.raycast(Vec3::new(-50.0, 50.0, -50.0), Vec3::NEG_Y, 1000.0).is_none());
+        // Cast away from the triangle (upward) — never reaches it.
+        assert!(wm.raycast(Vec3::new(2.0, 50.0, 2.0), Vec3::Y, 1000.0).is_none());
+    }
+
+    #[test]
+    fn map_raycast_returns_nearest_of_stacked_surfaces() {
+        // Two horizontal triangles stacked at the same XZ (a "cave": ceiling +
+        // floor). A downward ray must report the upper one first.
+        let wm = build_world_mesh(vec![
+            [Vec3::new(0.0, 10.0, 0.0), Vec3::new(10.0, 10.0, 0.0), Vec3::new(0.0, 10.0, 10.0)],
+            [Vec3::new(0.0, 0.0, 0.0),  Vec3::new(10.0, 0.0, 0.0),  Vec3::new(0.0, 0.0, 10.0)],
+        ]);
+        let (point, _n, _toi) = wm
+            .raycast(Vec3::new(2.0, 50.0, 2.0), Vec3::NEG_Y, 1000.0)
+            .expect("hit");
+        assert!((point.y - 10.0).abs() < 1e-3, "nearest hit Y = {}", point.y);
+    }
 }

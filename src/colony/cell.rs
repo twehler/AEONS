@@ -379,6 +379,34 @@ pub enum BodyPartKind {
     Static,
 }
 
+impl BodyPartKind {
+    /// Stable `.colony`/`.species` serialisation tag
+    /// (Body=0, Limb=1, Organ=2, Segment=3, Static=4).
+    #[inline]
+    pub fn to_tag(self) -> u8 {
+        match self {
+            BodyPartKind::Body    => 0,
+            BodyPartKind::Limb    => 1,
+            BodyPartKind::Organ   => 2,
+            BodyPartKind::Segment => 3,
+            BodyPartKind::Static  => 4,
+        }
+    }
+    /// Inverse of [`BodyPartKind::to_tag`]; `None` on an unknown byte (corrupt
+    /// or newer-format file). Mirrors the original reader's error-on-unknown.
+    #[inline]
+    pub fn from_tag(tag: u8) -> Option<BodyPartKind> {
+        match tag {
+            0 => Some(BodyPartKind::Body),
+            1 => Some(BodyPartKind::Limb),
+            2 => Some(BodyPartKind::Organ),
+            3 => Some(BodyPartKind::Segment),
+            4 => Some(BodyPartKind::Static),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BodyPart {
     pub kind: BodyPartKind,

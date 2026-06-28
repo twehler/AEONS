@@ -22,6 +22,9 @@ use super::session::{
 use super::save::{load_species, LoadedSpecies};
 use super::mesh_import::{ImportMeshButton, IMPORT_BG};
 use super::TOP_PANEL_HEIGHT_PX;
+use crate::ui_modal::{
+    self, ConfirmModalSpec, NoButtonStyle, YES_BTN_COLOR, YES_BTN_HOVER,
+};
 
 
 // ── Colors ───────────────────────────────────────────────────────────────────
@@ -581,113 +584,32 @@ pub fn handle_load_species(
 
 // ── Load confirmation modal (unsaved changes) ───────────────────────────────
 
-const MODAL_BACKDROP:    Color = Color::srgba(0.0, 0.0, 0.0, 0.55);
-const MODAL_CARD:        Color = Color::srgb(0.15, 0.15, 0.18);
-const MODAL_CARD_BORDER: Color = Color::srgb(0.40, 0.40, 0.45);
-const MODAL_YES:         Color = Color::srgb(0.55, 0.18, 0.18); // muted red — discards changes
-const MODAL_YES_HOVER:   Color = Color::srgb(0.68, 0.22, 0.22);
-const MODAL_NO:          Color = Color::srgb(0.24, 0.56, 0.36); // green — safe default
-const MODAL_NO_HOVER:    Color = Color::srgb(0.32, 0.66, 0.42);
-const MODAL_NO_BORDER:   Color = Color::srgb(0.95, 0.95, 0.95);
-
 /// Spawn / despawn the modal in lock-step with `show_load_modal`.
 pub fn manage_load_modal_visibility(
     mut commands: Commands,
     session:      Res<SpeciesSession>,
     existing:     Query<Entity, With<LoadModalRoot>>,
 ) {
-    let want = session.show_load_modal;
-    let is   = !existing.is_empty();
-    if want && !is {
-        spawn_load_modal(&mut commands);
-    } else if !want && is {
-        for e in &existing { commands.entity(e).despawn(); }
-    }
+    ui_modal::sync_modal_visibility(
+        &mut commands, session.show_load_modal, &existing, spawn_load_modal);
 }
 
 fn spawn_load_modal(commands: &mut Commands) {
-    commands
-        .spawn((
-            LoadModalRoot,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(0.0), left: Val::Px(0.0),
-                width: Val::Percent(100.0), height: Val::Percent(100.0),
-                justify_content: JustifyContent::Center,
-                align_items:     AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(MODAL_BACKDROP),
-            GlobalZIndex(120),
-        ))
-        .with_children(|root| {
-            root.spawn((
-                Node {
-                    width: Val::Px(560.0),
-                    flex_direction: FlexDirection::Column,
-                    align_items: AlignItems::Center,
-                    padding: UiRect::all(Val::Px(22.0)),
-                    border:  UiRect::all(Val::Px(1.0)),
-                    ..default()
-                },
-                BackgroundColor(MODAL_CARD),
-                BorderColor::all(MODAL_CARD_BORDER),
-            ))
-            .with_children(|card| {
-                card.spawn((
-                    Text::new("There have been changes since the last save. Are you sure?"),
-                    TextFont { font_size: 15.0, ..default() },
-                    TextColor(Color::srgb(0.9, 0.9, 0.9)),
-                    Node { margin: UiRect::bottom(Val::Px(20.0)), ..default() },
-                    Pickable::IGNORE,
-                ));
-                card.spawn(Node {
-                    flex_direction:  FlexDirection::Row,
-                    justify_content: JustifyContent::Center,
-                    align_items:     AlignItems::Center,
-                    ..default()
-                })
-                .with_children(|row| {
-                    // "No" first (left), the safe default.
-                    row.spawn((
-                        LoadModalNoButton,
-                        Button,
-                        Node {
-                            width: Val::Px(110.0), height: Val::Px(36.0),
-                            margin: UiRect::right(Val::Px(16.0)),
-                            border: UiRect::all(Val::Px(2.0)),
-                            align_items: AlignItems::Center,
-                            justify_content: JustifyContent::Center,
-                            ..default()
-                        },
-                        BackgroundColor(MODAL_NO),
-                        BorderColor::all(MODAL_NO_BORDER),
-                    ))
-                    .with_children(|b| { b.spawn((
-                        Text::new("No"),
-                        TextFont { font_size: 16.0, ..default() },
-                        TextColor(Color::WHITE), Pickable::IGNORE,
-                    )); });
-                    // "Yes" — continue loading (discards unsaved changes).
-                    row.spawn((
-                        LoadModalYesButton,
-                        Button,
-                        Node {
-                            width: Val::Px(110.0), height: Val::Px(36.0),
-                            align_items: AlignItems::Center,
-                            justify_content: JustifyContent::Center,
-                            ..default()
-                        },
-                        BackgroundColor(MODAL_YES),
-                    ))
-                    .with_children(|b| { b.spawn((
-                        Text::new("Yes"),
-                        TextFont { font_size: 16.0, ..default() },
-                        TextColor(Color::WHITE), Pickable::IGNORE,
-                    )); });
-                });
-            });
-        });
+    ui_modal::spawn_confirm_modal(
+        commands,
+        &ConfirmModalSpec {
+            title:      None,
+            body:       "There have been changes since the last save. Are you sure?".to_string(),
+            body_font_size: ui_modal::BODY_FONT_SIZE_LG,
+            body_color:     ui_modal::BODY_COLOR_LG,
+            card_width: 560.0,
+            z_index:    120,
+            no_style:   NoButtonStyle::Safe,
+        },
+        LoadModalRoot,
+        LoadModalNoButton,
+        LoadModalYesButton,
+    );
 }
 
 /// Modal Yes/No. Yes → drop the flag and continue the load (file dialog +
@@ -700,24 +622,15 @@ pub fn handle_load_modal_buttons(
     mut session: ResMut<SpeciesSession>,
 ) {
     for (interaction, mut bg) in &mut yes_q {
-        match *interaction {
-            Interaction::Pressed => {
-                session.show_load_modal = false;
-                do_load(&mut session);
-                *bg = BackgroundColor(MODAL_YES_HOVER);
-            }
-            Interaction::Hovered => *bg = BackgroundColor(MODAL_YES_HOVER),
-            Interaction::None    => *bg = BackgroundColor(MODAL_YES),
+        if ui_modal::modal_button_pressed(interaction, &mut bg, YES_BTN_COLOR, YES_BTN_HOVER) {
+            session.show_load_modal = false;
+            do_load(&mut session);
         }
     }
+    let no_style = NoButtonStyle::Safe;
     for (interaction, mut bg) in &mut no_q {
-        match *interaction {
-            Interaction::Pressed => {
-                session.show_load_modal = false;
-                *bg = BackgroundColor(MODAL_NO_HOVER);
-            }
-            Interaction::Hovered => *bg = BackgroundColor(MODAL_NO_HOVER),
-            Interaction::None    => *bg = BackgroundColor(MODAL_NO),
+        if ui_modal::modal_button_pressed(interaction, &mut bg, no_style.base(), no_style.hover()) {
+            session.show_load_modal = false;
         }
     }
 }
