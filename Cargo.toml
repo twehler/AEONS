@@ -12,14 +12,24 @@ burn = { version = "0.20.1", features = ["autodiff"] }
 burn-cuda = "0.20"
 bevy-inspector-egui = "0.36.0"
 rand = "0.10.0"
+# Data-parallelism for hot CPU loops over plain Vecs/slices (collision snapshot,
+# brain observation gather) — uses the same GLOBAL rayon pool as rapier's
+# `parallel` solver, so the two share one thread pool rather than oversubscribing.
+rayon = "1"
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# Avian3d — pure-Rust, Bevy-native physics engine (XPBD over parry3d).
-# Used by limb-based organisms (Organism::sliding_movement = false) for
-# rigid-body chains driven by PD target-angle joints. Sliding organisms
-# get kinematic colliders so the two populations interact.
-avian3d = "0.6"
+# Rapier3d (via bevy_rapier3d) — impulse + REDUCED-COORDINATE MULTIBODY joints.
+# Limb-based organisms (Organism::sliding_movement = false) are rigid-body
+# chains connected by multibody revolute joints so the legs CANNOT separate
+# under load (the reason for migrating off Avian/XPBD). Sliding organisms get
+# kinematic colliders so the two populations still interact.
+# 0.34 targets Bevy 0.18 / Rapier 0.32.
+# `parallel` multi-threads rapier's island solver + broad/narrow phase across
+# the global rayon pool — distinct organisms are independent islands, so the
+# documented StepSimulation bottleneck scales with cores at thousands of bodies.
+bevy_rapier3d = { version = "0.34", features = ["simd-stable", "parallel"] }
+xatlas-rs-v2 = "0.1.4"
 
 
