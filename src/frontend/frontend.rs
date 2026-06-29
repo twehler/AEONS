@@ -546,15 +546,20 @@ fn viewport_click(
 /// editor modes (cleared on release by `player_plugin::release_editor_look_on_mmb_up`).
 /// A press over any UI panel routes to the panel instead, so it doesn't fire
 /// here — giving "press over UI suppresses rotation" semantics. Middle-hold
-/// rotates the shared flycam in both the Colony and Species editors; LMB stays
-/// free for placement/selection.
+/// rotates the shared flycam in the Colony, Species, and Map editors; LMB stays
+/// free for placement/selection (and painting in the Map editor).
 fn viewport_press(
     ev:              On<Pointer<Press>>,
     window_mode:     Res<WindowMode>,
     mut editor_look: ResMut<crate::player_plugin::EditorLookActive>,
 ) {
     if !matches!(ev.button, PointerButton::Middle) { return; }
-    if !matches!(*window_mode, WindowMode::EditColony | WindowMode::SpeciesEditor) { return; }
+    if !matches!(
+        *window_mode,
+        WindowMode::EditColony | WindowMode::SpeciesEditor | WindowMode::MapEditor
+    ) {
+        return;
+    }
     editor_look.0 = true;
 }
 

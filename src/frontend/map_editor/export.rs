@@ -1,18 +1,18 @@
-// Map editor — "Export" button: write the current painted terrain to a `.world`.
+// Map editor — "Export" button: write the current painted terrain to a `.aeonsw`.
 //
 // A one-shot button at the BOTTOM-RIGHT of the Map Editor viewport. On press (once
 // the terrain is prepared) it gathers every prepared atlas submesh's geometry
 // (POSITION/NORMAL/UV0/indices) in SUBMESH-LOCAL space plus its entity's world
 // `GlobalTransform`, the painted atlas `Image` bytes, and `MapSize`, then writes a
-// `.world` file (`world_format::write_world`). The output path is the loaded
-// world path with its extension swapped to `.world`, or `assets/world_export.world`
+// `.aeonsw` file (`aeonsw_format::write_aeonsw`). The output path is the loaded
+// world path with its extension swapped to `.aeonsw`, or `assets/world_export.aeonsw`
 // when the source is unknown. No-op (logged) if the terrain is not prepared.
 
 use bevy::mesh::{Indices, Mesh, VertexAttributeValues};
 use bevy::prelude::*;
 
 use crate::simulation_settings::WindowMode;
-use crate::world_format::{self, PaintTextureData, WorldData, WorldMeshEntry};
+use crate::aeonsw_format::{self, PaintTextureData, AeonswData, WorldMeshEntry};
 use crate::world_geometry::{LoadedWorldPath, MapSize};
 
 use super::gpu_paint::PaintState;
@@ -78,6 +78,8 @@ pub fn handle_export_click(
     meshes:      Res<Assets<Mesh>>,
     images:      Res<Assets<Image>>,
     transforms:  Query<&GlobalTransform>,
+    water:       Res<crate::environment::WaterLevel>,
+    colony:      crate::colony_save_load::ColonySerializeParams,
     mut buttons: Query<(&Interaction, &mut BackgroundColor),
                        (Changed<Interaction>, With<ExportWorldButton>)>,
 ) {
@@ -89,8 +91,53 @@ pub fn handle_export_click(
             Interaction::None    => { *bg = BackgroundColor(EXPORT_BG); }
             Interaction::Pressed => {
                 *bg = BackgroundColor(EXPORT_HOVER);
+                // Embed the live colony (terrain + colony in one `.aeonsw`); an
+                // empty colony (count 0) writes no block → loads to Colony Editor.
+                let (colony_bytes, n) = colony.to_colony_bytes();
+                let embedded = if n > 0 { Some(colony_bytes) } else { None };
                 export_world(&targets, &paint, &map_size, loaded_path.as_deref(),
-                             &meshes, &images, &transforms);
+                             &meshes, &images, &transforms, water.0, embedded);
+            }
+        }
+    }
+}
+
+/// Marker for the sim-side "Save World" button (lives in the stats panel; written
+/// here so it shares `write_combined_world` with the Map Editor Export).
+#[derive(Component)]
+pub struct SaveWorldButton;
+
+/// Sim-side "Save World": rfd "Save As" → write a combined terrain+colony `.aeonsw`.
+/// Runs in every mode (the button only exists/visible in Simulation's stats panel).
+#[allow(clippy::too_many_arguments)]
+pub fn handle_save_world_click(
+    targets:     Res<TerrainPaintTargets>,
+    paint:       Res<PaintState>,
+    map_size:    Res<MapSize>,
+    meshes:      Res<Assets<Mesh>>,
+    images:      Res<Assets<Image>>,
+    transforms:  Query<&GlobalTransform>,
+    water:       Res<crate::environment::WaterLevel>,
+    colony:      crate::colony_save_load::ColonySerializeParams,
+    mut buttons: Query<(&Interaction, &mut BackgroundColor),
+                       (Changed<Interaction>, With<SaveWorldButton>)>,
+) {
+    for (interaction, mut bg) in &mut buttons {
+        match *interaction {
+            Interaction::Hovered => { *bg = BackgroundColor(EXPORT_HOVER); }
+            Interaction::None    => { *bg = BackgroundColor(EXPORT_BG); }
+            Interaction::Pressed => {
+                *bg = BackgroundColor(EXPORT_HOVER);
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("AEONS world (.aeonsw)", &["aeonsw"])
+                    .set_file_name("world.aeonsw")
+                    .save_file()
+                else { return };
+                let out = path.to_string_lossy().into_owned();
+                let (colony_bytes, n) = colony.to_colony_bytes();
+                let embedded = if n > 0 { Some(colony_bytes) } else { None };
+                write_combined_world(&out, &targets, &paint, &map_size, &meshes, &images,
+                                     &transforms, water.0, embedded);
             }
         }
     }
@@ -105,14 +152,42 @@ fn export_world(
     meshes:      &Assets<Mesh>,
     images:      &Assets<Image>,
     transforms:  &Query<&GlobalTransform>,
+    water_level: f32,
+    embedded_colony: Option<Vec<u8>>,
+) {
+    // Derive the output path from the loaded world (extension → `.aeonsw`).
+    let out = match loaded_path {
+        Some(p) => std::path::Path::new(&p.0)
+            .with_extension("aeonsw").to_string_lossy().into_owned(),
+        None => "assets/world_export.aeonsw".to_string(),
+    };
+    write_combined_world(&out, targets, paint, map_size, meshes, images, transforms,
+                         water_level, embedded_colony);
+}
+
+/// Gather the prepared terrain (submesh geometry + painted atlas) + `MapSize` +
+/// water level + the embedded colony, and write a v2 `.aeonsw` to `out`. Shared by
+/// the Map Editor Export button and the sim-side "Save World" action. No-op (warns)
+/// if the terrain atlas isn't prepared yet (open the Map Editor once first).
+#[allow(clippy::too_many_arguments)]
+pub fn write_combined_world(
+    out:         &str,
+    targets:     &TerrainPaintTargets,
+    paint:       &PaintState,
+    map_size:    &MapSize,
+    meshes:      &Assets<Mesh>,
+    images:      &Assets<Image>,
+    transforms:  &Query<&GlobalTransform>,
+    water_level: f32,
+    embedded_colony: Option<Vec<u8>>,
 ) {
     // Readiness.
     let Some(image_handle) = paint.paint_image.as_ref() else {
-        warn!("Export: world not ready to export (no paint texture).");
+        warn!("Save World: terrain not prepared (open the Map Editor once first).");
         return;
     };
     if !targets.prepared {
-        warn!("Export: world not ready to export (terrain not prepared).");
+        warn!("Save World: terrain not prepared (open the Map Editor once first).");
         return;
     }
 
@@ -168,32 +243,26 @@ fn export_world(
         return;
     }
 
-    // 3. Derive the output path.
-    let out = match loaded_path {
-        Some(p) => std::path::Path::new(&p.0)
-            .with_extension("world")
-            .to_string_lossy()
-            .into_owned(),
-        None => "assets/world_export.world".to_string(),
-    };
-
-    let data = WorldData {
+    let data = AeonswData {
         map_x:   map_size.x,
         map_z:   map_size.z,
         texture: PaintTextureData { width, height, bytes },
         meshes:  entries,
+        water_level: Some(water_level),
+        embedded_colony,
     };
 
-    match world_format::write_world(&out, &data) {
+    match aeonsw_format::write_aeonsw(out, &data) {
         Ok(()) => {
-            let abs = std::fs::canonicalize(&out)
+            let abs = std::fs::canonicalize(out)
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(out);
+                .unwrap_or_else(|_| out.to_string());
             info!(
-                "Exported .world: {abs} ({} of {} submeshes, {}x{} texture)",
-                data.meshes.len(), targets.meshes.len(), width, height
+                "Wrote .aeonsw: {abs} ({} of {} submeshes, {}x{} texture, colony {})",
+                data.meshes.len(), targets.meshes.len(), width, height,
+                if data.embedded_colony.is_some() { "embedded" } else { "none" },
             );
         }
-        Err(e) => error!("Export: failed to write .world '{out}': {e}"),
+        Err(e) => error!("Save World: failed to write .aeonsw '{out}': {e}"),
     }
 }

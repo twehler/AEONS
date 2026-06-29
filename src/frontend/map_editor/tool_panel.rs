@@ -7,9 +7,11 @@ use bevy::prelude::*;
 use std::fmt::Write as _;
 
 use crate::frontend::PANEL_BG_COLOR;
-use crate::simulation_settings::{BRUSH_RADIUS_PX_MAX, BRUSH_RADIUS_PX_MIN, WindowMode};
+use crate::simulation_settings::{
+    BRUSH_RADIUS_PX_MAX, BRUSH_RADIUS_PX_MIN, BRUSH_SOFTNESS_MAX, BRUSH_SOFTNESS_MIN, WindowMode,
+};
 
-use super::gpu_paint::{self, BrushSizeEditState, PaintState};
+use super::gpu_paint::{self, BrushSizeEditState, PaintState, SoftnessEditState};
 use super::material::{MapBrush, MapEditorSession};
 use super::paint_upload::PaintDirtyRect;
 use super::{BOTTOM_PANEL_HEIGHT_PX, MapEditorPanel, TOP_PANEL_HEIGHT_PX};
@@ -54,6 +56,10 @@ pub struct ColorAllButton;
 pub struct BrushSizeInput;
 #[derive(Component)]
 pub struct BrushSizeText;
+#[derive(Component)]
+pub struct SoftnessInput;
+#[derive(Component)]
+pub struct SoftnessText;
 
 
 // ── Spawn ────────────────────────────────────────────────────────────────────
@@ -162,6 +168,38 @@ pub fn spawn_tool_panel(parent: &mut ChildSpawnerCommands, top_offset_px: f32) {
                     btn.spawn((
                         BrushSizeText,
                         Text::new("10"),
+                        TextFont { font_size: 14.0, ..default() },
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
+                });
+
+            // ── "Softness" editable field (Soft brush; under the brush-size field). ──
+            panel.spawn((
+                Text::new("Softness (0-1)"),
+                TextFont { font_size: 12.0, ..default() },
+                TextColor(Color::srgb(0.70, 0.70, 0.70)),
+                Node { margin: UiRect::top(Val::Px(6.0)), ..default() },
+                Pickable::IGNORE,
+            ));
+            panel
+                .spawn((
+                    SoftnessInput,
+                    Button,
+                    Node {
+                        width:           Val::Percent(100.0),
+                        height:          Val::Px(BRUSH_SIZE_HEIGHT_PX),
+                        padding:         UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                        align_items:     AlignItems::Center,
+                        justify_content: JustifyContent::FlexStart,
+                        ..default()
+                    },
+                    BackgroundColor(BRUSH_SIZE_BG_IDLE),
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        SoftnessText,
+                        Text::new("0.6"),
                         TextFont { font_size: 14.0, ..default() },
                         TextColor(Color::WHITE),
                         Pickable::IGNORE,
@@ -396,6 +434,104 @@ pub fn update_brush_size_text(
         format!("{}_", state.buffer)
     } else {
         format!("{:.0}", session.brush_radius_px)
+    };
+    for mut text in &mut text_q {
+        if text.0 != display { text.0 = display.clone(); }
+    }
+
+    let bg = if state.focused { BRUSH_SIZE_BG_FOCUSED } else { BRUSH_SIZE_BG_IDLE };
+    for mut b in &mut bg_q {
+        if b.0 != bg { *b = BackgroundColor(bg); }
+    }
+}
+
+
+// ── Softness field handlers (same shape as the brush-size field) ─────────────────
+
+/// Click + keyboard router for the "Softness" field. Identical flow to
+/// `handle_brush_size_input`; commits into `MapEditorSession::softness` (clamped to
+/// the `[BRUSH_SOFTNESS_MIN, BRUSH_SOFTNESS_MAX]` range).
+pub fn handle_softness_input(
+    mode:          Res<WindowMode>,
+    mouse:         Res<ButtonInput<MouseButton>>,
+    mut keyboard:  MessageReader<KeyboardInput>,
+    interaction_q: Query<&Interaction, With<SoftnessInput>>,
+    mut state:     ResMut<SoftnessEditState>,
+    mut session:   ResMut<MapEditorSession>,
+) {
+    if *mode != WindowMode::MapEditor {
+        if state.focused { state.focused = false; state.buffer.clear(); }
+        for _ in keyboard.read() {}
+        return;
+    }
+
+    let click_on_input = mouse.just_pressed(MouseButton::Left)
+        && interaction_q.iter().any(|i| matches!(i, Interaction::Pressed));
+    let click_outside  = mouse.just_pressed(MouseButton::Left) && !click_on_input;
+
+    if click_on_input && !state.focused {
+        state.focused = true;
+        state.buffer.clear();
+        let _ = write!(state.buffer, "{:.2}", session.softness);
+    }
+
+    if click_outside && state.focused {
+        commit_softness(&mut state, &mut session);
+    }
+
+    if !state.focused {
+        for _ in keyboard.read() {}
+        return;
+    }
+
+    for ev in keyboard.read() {
+        if !ev.state.is_pressed() { continue; }
+        match ev.key_code {
+            KeyCode::Enter | KeyCode::NumpadEnter => commit_softness(&mut state, &mut session),
+            KeyCode::Escape => { state.focused = false; state.buffer.clear(); }
+            KeyCode::Backspace => { state.buffer.pop(); }
+            _ => {
+                if let Some(text) = ev.text.as_ref() {
+                    for c in text.chars() {
+                        if state.buffer.len() >= BRUSH_SIZE_BUF_MAX { break; }
+                        if c.is_ascii_digit() {
+                            state.buffer.push(c);
+                        } else if c == '.' && !state.buffer.contains('.') {
+                            state.buffer.push(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse + clamp the buffer into `softness`. Always unfocus + clear.
+fn commit_softness(state: &mut SoftnessEditState, session: &mut MapEditorSession) {
+    if let Ok(v) = state.buffer.parse::<f32>() {
+        if v.is_finite() {
+            session.softness = v.clamp(BRUSH_SOFTNESS_MIN, BRUSH_SOFTNESS_MAX);
+        }
+    }
+    state.focused = false;
+    state.buffer.clear();
+}
+
+/// Sync the softness field's text + background colour with state.
+pub fn update_softness_text(
+    mode:       Res<WindowMode>,
+    state:      Res<SoftnessEditState>,
+    session:    Res<MapEditorSession>,
+    mut text_q: Query<&mut Text, With<SoftnessText>>,
+    mut bg_q:   Query<&mut BackgroundColor, With<SoftnessInput>>,
+) {
+    if *mode != WindowMode::MapEditor { return; }
+    if !state.is_changed() && !session.is_changed() { return; }
+
+    let display = if state.focused {
+        format!("{}_", state.buffer)
+    } else {
+        format!("{:.2}", session.softness)
     };
     for mut text in &mut text_q {
         if text.0 != display { text.0 = display.clone(); }

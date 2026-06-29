@@ -36,8 +36,8 @@ impl MapMaterial {
     /// sRGB display triple.
     pub fn srgb(self) -> (f32, f32, f32) {
         match self {
-            Self::Yellow     => (0.90, 0.82, 0.25),
-            Self::Brown      => (0.46, 0.31, 0.16),
+            Self::Yellow     => (0.749, 0.647, 0.278), // #bfa547
+            Self::Brown      => (0.310, 0.204, 0.137), // #4f3423
             Self::Grey       => (0.55, 0.55, 0.55),
             Self::DarkGreen  => (0.13, 0.35, 0.13),
             Self::LightGreen => (0.45, 0.72, 0.32),
@@ -81,20 +81,24 @@ impl MapMaterial {
 }
 
 
-/// The brush selector's backing enum. One brush today (`Basic`), modelled as an
-/// enum so further brushes can be added without reworking the dropdown.
+/// The brush selector's backing enum. `Basic` hard-replaces texels under the
+/// screen disc; `Soft` feathers the colour with a `softness`-controlled falloff
+/// (and single-pass-cap accumulation). Modelled as an enum so further brushes can
+/// be added without reworking the dropdown.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum MapBrush {
     #[default]
     Basic,
+    Soft,
 }
 
 impl MapBrush {
-    pub const ALL: [MapBrush; 1] = [Self::Basic];
+    pub const ALL: [MapBrush; 2] = [Self::Basic, Self::Soft];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Basic => "Basic Brush",
+            Self::Soft  => "Soft Brush",
         }
     }
 }
@@ -113,6 +117,10 @@ pub struct MapEditorSession {
     /// screen regardless of camera distance/zoom (derived from the live camera
     /// each stroke). Editable via the tool-panel "Brush size (px)" field.
     pub brush_radius_px:     f32,
+    /// Soft-brush edge softness in `[0,1]`: 0 = hard edge (identical to `Basic`),
+    /// 1 = fully feathered. Only consumed by `MapBrush::Soft`. Editable via the
+    /// tool-panel "Softness" field.
+    pub softness:            f32,
 }
 
 impl Default for MapEditorSession {
@@ -122,6 +130,7 @@ impl Default for MapEditorSession {
             selected_brush:      MapBrush::default(),
             brush_dropdown_open: false,
             brush_radius_px:     crate::simulation_settings::DEFAULT_BRUSH_RADIUS_PX,
+            softness:            crate::simulation_settings::DEFAULT_BRUSH_SOFTNESS,
         }
     }
 }

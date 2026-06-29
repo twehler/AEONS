@@ -135,37 +135,27 @@ impl TimeNotation {
 pub struct SaveRequested(pub Option<std::path::PathBuf>);
 
 
-pub(crate) fn save_colony_system(
-    mut save_requested: ResMut<SaveRequested>,
-    // Source of the v008 time-notation: WALL-clock run age (uncapped real
-    // time accumulated while running), not the capped virtual clock.
-    run_elapsed: Res<crate::simulation_settings::RunElapsed>,
-    // v009 global water level, written into the header after the time block.
-    water:        Res<WaterLevel>,
-    organisms: Query<
-        (Entity, &Transform, &Organism,
-         Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
+/// Serialise the live colony to `.colony` bytes (magic + header + every
+/// organism + brains). Factored from `save_colony_system` so BOTH the runtime
+/// `.colony` save AND an `.aeonsw`-embedded colony block produce identical bytes
+/// through one code path. Returns the buffer + the organism count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serialize_colony_bytes(
+    run_elapsed: &crate::simulation_settings::RunElapsed,
+    water:       &WaterLevel,
+    organisms:   &Query<
+        (Entity, &Transform, &Organism, Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
         With<OrganismRoot>,
     >,
-    // All three sliding pools — every brain's weights are persisted,
-    // pulled from whichever pool `intelligence_level` routes the organism to.
-    pool:    NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
-    pool_l2: NonSend<crate::intelligence_level_2_sliding::BrainPoolL2>,
-    pool_l3: NonSend<crate::intelligence_level_3_sliding::BrainPoolL3>,
-    // Limb pools. Snapshotted once before iterating (each = a GPU→CPU sync).
-    pool_limb_h:  NonSend<crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
-    pool_limb_l2: NonSend<crate::intelligence_level_2_limb::BrainPoolL2Limb>,
-    pool_limb_l3: NonSend<crate::intelligence_level_3_limb::BrainPoolL3Limb>,
-    // Swim pool — persisted in the limb-brain block as kind 4 (shares the
-    // `BrainRestoreLimb` payload struct; routed back to the swim pool on load
-    // by the organism's movement mode).
-    pool_swim:    NonSend<crate::intelligence_level_1_swimming::BrainPoolSwim1>,
-    // v011 species identity: maps each organism's `species_id` to its display
-    // name so the name (not the volatile id) is what gets persisted.
-    registry: Res<crate::lineages::species::SpeciesRegistry>,
-) {
-    let Some(target_path) = save_requested.0.take() else { return };
-
+    pool:    &crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1,
+    pool_l2: &crate::intelligence_level_2_sliding::BrainPoolL2,
+    pool_l3: &crate::intelligence_level_3_sliding::BrainPoolL3,
+    pool_limb_h:  &crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb,
+    pool_limb_l2: &crate::intelligence_level_2_limb::BrainPoolL2Limb,
+    pool_limb_l3: &crate::intelligence_level_3_limb::BrainPoolL3Limb,
+    pool_swim:    &crate::intelligence_level_1_swimming::BrainPoolSwim1,
+    registry: &crate::lineages::species::SpeciesRegistry,
+) -> (Vec<u8>, u32) {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     buf.extend_from_slice(SAVE_MAGIC);
 
@@ -321,6 +311,48 @@ pub(crate) fn save_colony_system(
         let _ = is_carn;
     }
 
+    (buf, count)
+}
+
+
+pub(crate) fn save_colony_system(
+    mut save_requested: ResMut<SaveRequested>,
+    // Source of the v008 time-notation: WALL-clock run age (uncapped real
+    // time accumulated while running), not the capped virtual clock.
+    run_elapsed: Res<crate::simulation_settings::RunElapsed>,
+    // v009 global water level, written into the header after the time block.
+    water:        Res<WaterLevel>,
+    organisms: Query<
+        (Entity, &Transform, &Organism,
+         Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
+        With<OrganismRoot>,
+    >,
+    // All three sliding pools — every brain's weights are persisted,
+    // pulled from whichever pool `intelligence_level` routes the organism to.
+    pool:    NonSend<crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
+    pool_l2: NonSend<crate::intelligence_level_2_sliding::BrainPoolL2>,
+    pool_l3: NonSend<crate::intelligence_level_3_sliding::BrainPoolL3>,
+    // Limb pools. Snapshotted once before iterating (each = a GPU→CPU sync).
+    pool_limb_h:  NonSend<crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
+    pool_limb_l2: NonSend<crate::intelligence_level_2_limb::BrainPoolL2Limb>,
+    pool_limb_l3: NonSend<crate::intelligence_level_3_limb::BrainPoolL3Limb>,
+    // Swim pool — persisted in the limb-brain block as kind 4 (shares the
+    // `BrainRestoreLimb` payload struct; routed back to the swim pool on load
+    // by the organism's movement mode).
+    pool_swim:    NonSend<crate::intelligence_level_1_swimming::BrainPoolSwim1>,
+    // v011 species identity: maps each organism's `species_id` to its display
+    // name so the name (not the volatile id) is what gets persisted.
+    registry: Res<crate::lineages::species::SpeciesRegistry>,
+) {
+    let Some(target_path) = save_requested.0.take() else { return };
+
+    let (buf, count) = serialize_colony_bytes(
+        &run_elapsed, &water, &organisms,
+        &pool, &pool_l2, &pool_l3,
+        &pool_limb_h, &pool_limb_l2, &pool_limb_l3, &pool_swim,
+        &registry,
+    );
+
     // Dir-create + write are BLOCKING I/O. The expensive serialization above had
     // to run here on the main thread (it reads the World + the NonSend GPU brain
     // pools), but the disk write doesn't — move it to the `IoTaskPool` and detach
@@ -442,6 +474,15 @@ pub(crate) fn load_colony_from_file(
     path: &str,
 ) -> std::io::Result<(TimeNotation, f32, Vec<LoadedRecord>)> {
     let bytes = std::fs::read(path)?;
+    load_colony_from_bytes(&bytes)
+}
+
+/// Decode a `.colony` byte buffer (the same bytes `load_colony_from_file` reads from
+/// disk). Factored so an `.aeonsw`-embedded colony block can be decoded through the
+/// exact same path — no logic duplication, identical version gating.
+pub(crate) fn load_colony_from_bytes(
+    bytes: &[u8],
+) -> std::io::Result<(TimeNotation, f32, Vec<LoadedRecord>)> {
     let mut c = 0usize;
 
     // Magic header check. All of v001-v010 load; obsolete brain blocks
@@ -860,4 +901,41 @@ fn cell_type_byte(ct: CellType) -> u8 {
 }
 #[inline] fn put_quat(b: &mut Vec<u8>, q: Quat) {
     put_f32(b, q.x); put_f32(b, q.y); put_f32(b, q.z); put_f32(b, q.w);
+}
+
+
+// ── Combined-save helper: serialize the live colony as one SystemParam ──────────
+//
+// Bundles every input `serialize_colony_bytes` needs (live organisms + the seven
+// GPU brain pools + species registry + elapsed/water) into ONE SystemParam, so the
+// Map Editor Export and the sim-side "Save World" can each embed the colony into an
+// `.aeonsw` with a single param. The bytes are byte-identical to a `.colony` save.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct ColonySerializeParams<'w, 's> {
+    run_elapsed: Res<'w, crate::simulation_settings::RunElapsed>,
+    water:       Res<'w, WaterLevel>,
+    organisms:   Query<'w, 's,
+        (Entity, &'static Transform, &'static Organism,
+         Has<Photoautotroph>, Has<Heterotroph>, Has<Carnivore>),
+        With<OrganismRoot>>,
+    pool:    NonSend<'w, crate::intelligence_level_herbivore_1_sliding::BrainPoolHerbivore1>,
+    pool_l2: NonSend<'w, crate::intelligence_level_2_sliding::BrainPoolL2>,
+    pool_l3: NonSend<'w, crate::intelligence_level_3_sliding::BrainPoolL3>,
+    pool_limb_h:  NonSend<'w, crate::intelligence_level_herbivore_1_limb::BrainPoolHerbivore1Limb>,
+    pool_limb_l2: NonSend<'w, crate::intelligence_level_2_limb::BrainPoolL2Limb>,
+    pool_limb_l3: NonSend<'w, crate::intelligence_level_3_limb::BrainPoolL3Limb>,
+    pool_swim:    NonSend<'w, crate::intelligence_level_1_swimming::BrainPoolSwim1>,
+    registry: Res<'w, crate::lineages::species::SpeciesRegistry>,
+}
+
+impl ColonySerializeParams<'_, '_> {
+    /// `.colony` bytes for the current live colony, plus the organism count.
+    pub fn to_colony_bytes(&self) -> (Vec<u8>, u32) {
+        serialize_colony_bytes(
+            &self.run_elapsed, &self.water, &self.organisms,
+            &self.pool, &self.pool_l2, &self.pool_l3,
+            &self.pool_limb_h, &self.pool_limb_l2, &self.pool_limb_l3, &self.pool_swim,
+            &self.registry,
+        )
+    }
 }

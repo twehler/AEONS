@@ -651,6 +651,32 @@ pub fn spawn_panel(
                 ));
             });
 
+        // ── Save World button (combined terrain+colony `.aeonsw`), left of Save. ──
+        panel
+            .spawn((
+                crate::map_editor::export::SaveWorldButton,
+                Button,
+                Node {
+                    position_type: PositionType::Absolute,
+                    bottom: Val::Px(BUTTON_GAP_PX),
+                    right:  Val::Px(BUTTON_GAP_PX * 2.0 + BUTTON_WIDTH_PX),
+                    width:  Val::Px(BUTTON_WIDTH_PX * 1.4),
+                    height: Val::Px(BUTTON_HEIGHT_PX),
+                    justify_content: JustifyContent::Center,
+                    align_items:     AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(BUTTON_COLOR_SAVE),
+            ))
+            .with_children(|btn| {
+                btn.spawn((
+                    Text::new("Save World"),
+                    TextFont { font_size: 14.0, ..default() },
+                    TextColor(Color::WHITE),
+                    Pickable::IGNORE,
+                ));
+            });
+
         // ── Start/Stop button (absolute, top-centred in the lounge
         //    space above the graph). ────────────────────────────────
         panel

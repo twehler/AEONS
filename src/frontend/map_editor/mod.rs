@@ -58,12 +58,14 @@ impl Plugin for MapEditorPlugin {
             .init_resource::<terrain_paint::TerrainPaintTargets>()
             .init_resource::<gpu_paint::PaintState>()
             .init_resource::<gpu_paint::BrushSizeEditState>()
+            .init_resource::<gpu_paint::SoftnessEditState>()
             // Mode-transition: panel Display + organism/water hide, and the
             // top-down ortho camera. The camera snap is ordered AFTER the species
             // editor's snap so a direct SpeciesEditor→MapEditor switch lands on
             // our pose (both write the shared `Transform`).
             .add_systems(Update, (
                 visibility::toggle_map_editor_visuals,
+                visibility::enforce_water_hidden_in_map_editor,
                 camera::snap_map_camera_on_mode_entry
                     .after(crate::species_editor::camera::snap_camera_on_mode_entry),
             ))
@@ -78,6 +80,8 @@ impl Plugin for MapEditorPlugin {
                 tool_panel::sync_brush_widget,
                 tool_panel::handle_brush_size_input,
                 tool_panel::update_brush_size_text,
+                tool_panel::handle_softness_input,
+                tool_panel::update_softness_text,
                 tool_panel::handle_color_all_click,
             ))
             // Terrain prep + brush painting (paint reads the async `WorldMesh` and
@@ -87,8 +91,11 @@ impl Plugin for MapEditorPlugin {
                 gpu_paint::brush_stroke
                     .after(terrain_paint::prepare_terrain_paint)
                     .run_if(resource_exists::<WorldMesh>),
-                // Bottom-right "Export" → write a `.world` file.
+                // Bottom-right "Export" → write a `.aeonsw` file.
                 export::handle_export_click,
+                // Sim-side "Save World" (stats panel) → combined terrain+colony
+                // `.aeonsw`; runs in every mode (self-gated by the button's presence).
+                export::handle_save_world_click,
             ));
     }
 }

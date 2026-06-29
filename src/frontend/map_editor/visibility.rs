@@ -62,3 +62,23 @@ pub fn toggle_map_editor_visuals(
         if let Ok(mut v) = vis_q.get_mut(e) { *v = target; }
     }
 }
+
+
+/// Keep the water plane hidden for as long as the Map Editor is open.
+///
+/// `toggle_map_editor_visuals` hides the water once, on the mode change — but the
+/// water plane spawns asynchronously (gated on `HeightmapSampler`), so on the
+/// `--setup` path that boots straight into the Map Editor the plane can spawn
+/// (visible) AFTER that one-shot toggle already ran, leaving it on screen. This
+/// runs every frame, but early-returns instantly outside the Map Editor and only
+/// writes on a mismatch, so it is effectively free. Restore-to-`Visible` on exit
+/// stays with `toggle_map_editor_visuals`.
+pub fn enforce_water_hidden_in_map_editor(
+    mode:    Res<WindowMode>,
+    mut water_q: Query<&mut Visibility, With<WaterPlane>>,
+) {
+    if *mode != WindowMode::MapEditor { return; }
+    for mut v in &mut water_q {
+        if *v != Visibility::Hidden { *v = Visibility::Hidden; }
+    }
+}

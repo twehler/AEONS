@@ -15,10 +15,11 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
+use bevy::mesh::{Indices, VertexAttributeValues};
 
 use crate::simulation_settings::WindowMode;
 
-use super::gpu_paint::PaintState;
+use super::gpu_paint::{self, PaintState};
 use super::uv_unwrap;
 use crate::world_geometry::MapSize;
 
@@ -69,7 +70,7 @@ pub struct TerrainPaintTargets {
 // ── Shared display material ────────────────────────────────────────────────────
 
 /// The terrain's painting display material: white `base_color` modulated by the
-/// shared paint texture. Factored so `prepare_terrain_paint` and the `.world`
+/// shared paint texture. Factored so `prepare_terrain_paint` and the `.aeonsw`
 /// loader (`world_geometry::load_world_file`) build an identical material and
 /// cannot drift.
 pub fn make_display_material(paint_image: Handle<Image>) -> StandardMaterial {
@@ -133,6 +134,29 @@ pub fn prepare_terrain_paint(
         .and_then(|img| img.data.clone())
         .unwrap_or_default();
 
+    // 2b. Precompute the seam-fill (gutter dilation) map over the shared atlas, so
+    //     the brush can bleed painted charts into their gutter texels and avoid the
+    //     unpainted "No Man's Land" lines between UV charts. One-time (terrain is
+    //     static); read the rebuilt atlas UVs + indices straight back from Assets.
+    let mut sm_uv:  Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut sm_idx: Vec<Vec<u32>>      = Vec::new();
+    for r in &result.remapped {
+        let Some(mesh) = meshes.get(&r.new_handle) else { continue };
+        let Some(VertexAttributeValues::Float32x2(uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0)
+        else { continue };
+        let idx: Vec<u32> = match mesh.indices() {
+            Some(Indices::U32(v)) => v.clone(),
+            Some(Indices::U16(v)) => v.iter().map(|&i| i as u32).collect(),
+            None                  => continue,
+        };
+        sm_uv.push(uv.clone());
+        sm_idx.push(idx);
+    }
+    let submeshes: Vec<(&[[f32; 2]], &[u32])> =
+        sm_uv.iter().zip(sm_idx.iter()).map(|(u, i)| (u.as_slice(), i.as_slice())).collect();
+    let seam_fill =
+        gpu_paint::compute_seam_fill(&submeshes, result.atlas_edge, gpu_paint::SEAM_FILL_MARGIN);
+
     // 3. Swap each terrain entity to the rebuilt mesh + paint material, and record
     //    the remapped (Handle<Mesh>, Entity) for the brush / Color All.
     targets.meshes.clear();
@@ -150,11 +174,14 @@ pub fn prepare_terrain_paint(
     paint.atlas_edge  = result.atlas_edge;
     paint.last_dab_vp = None;
     paint.mirror      = mirror;
+    paint.seam_fill   = seam_fill;
 
     targets.prepared = true;
     info!(
-        "Map editor: unwrapped {} terrain submeshes into a {}² paint atlas.",
+        "Map editor: unwrapped {} terrain submeshes into a {}² paint atlas; \
+         seam-fill map has {} source texels (gutter dilation).",
         result.remapped.len(),
-        result.atlas_edge
+        result.atlas_edge,
+        paint.seam_fill.len(),
     );
 }

@@ -391,6 +391,8 @@ impl Plugin for ColonyPlugin {
         // `init_resource` (not `insert_resource`) preserves the load path
         // main.rs sets before add_plugins; this is the no-load fallback.
         app.init_resource::<ColonyLoadPath>();
+        app.init_resource::<ColonyEmbedded>();
+        app.init_resource::<crate::simulation_settings::StartEmptyColony>();
         app.init_resource::<crate::simulation_settings::AutoSpawnHeteros>();
         // Default false; phase 5 inserts the real value from argv. `init_resource`
         // (not insert) preserves any argv-set value that ran before the plugin.
@@ -485,6 +487,13 @@ fn assign_lineage_records(
 /// the second positional CLI argument; defaults to `None`.
 #[derive(Resource, Default)]
 pub struct ColonyLoadPath(pub Option<String>);
+
+/// Colony bytes embedded in a loaded `.aeonsw` (v2). When `Some`, the first
+/// `spawn_colony` decodes + spawns it via the same path as a `.colony` file,
+/// taking precedence over `ColonyLoadPath`. Set by the world loader's boot
+/// routing; defaults to `None`.
+#[derive(Resource, Default)]
+pub struct ColonyEmbedded(pub Option<Vec<u8>>);
 
 
 
@@ -674,6 +683,8 @@ fn spawn_colony(
     mut materials:   ResMut<Assets<StandardMaterial>>,
     heightmap:       Res<HeightmapSampler>,
     load_path:       Res<ColonyLoadPath>,
+    embedded:        Res<ColonyEmbedded>,
+    start_empty:     Res<crate::simulation_settings::StartEmptyColony>,
     smoothing:       Res<crate::simulation_settings::Smoothing>,
     map_size:        Res<MapSize>,
     // Loaded .colony files carry a water level; apply it unless the user
@@ -701,10 +712,16 @@ fn spawn_colony(
     });
     let mut rng = rand::rng();
 
-    // If a save file was supplied, try to restore it; on any failure
-    // fall through to fresh generation so the run still produces output.
-    if let Some(path) = &load_path.0 {
-        match load_colony_from_file(path) {
+    // Restore from an embedded colony (.aeonsw v2) first, else a `.colony` file.
+    // On any failure (incl. corrupt embedded bytes) fall through to fresh
+    // generation so the run still produces output (graceful degradation).
+    let loaded = if let Some(bytes) = &embedded.0 {
+        Some(("embedded .aeonsw colony".to_string(), load_colony_from_bytes(bytes)))
+    } else {
+        load_path.0.as_ref().map(|path| (format!("save file {path}"), load_colony_from_file(path)))
+    };
+    if let Some((source, result)) = loaded {
+        match result {
             Ok((notation, loaded_water_level, records)) => {
                 let n = records.len();
                 // Apply the file's water level unless the user requested the
@@ -736,13 +753,20 @@ fn spawn_colony(
                 // saved elapsed time (the header is written from `RunElapsed`).
                 run_elapsed.0 = total as f64;
                 info!("loaded colony from {} — {} organisms restored, virtual time resumed at {}h{}m{}s",
-                      path, n, notation.hours, notation.minutes, notation.seconds);
+                      source, n, notation.hours, notation.minutes, notation.seconds);
                 return;
             }
             Err(e) => {
-                error!("failed to load colony from {}: {} — falling back to fresh generation", path, e);
+                error!("failed to load colony from {}: {} — falling back to fresh generation", source, e);
             }
         }
+    }
+
+    // New world (`--setup`): boot with an EMPTY colony — the user builds it in the
+    // editors. Materials are already set up above, so just skip the fresh cohort.
+    if start_empty.0 {
+        info!("starting with an empty colony (new-world setup)");
+        return;
     }
 
     // Fresh-start cohort: seed from authored `.species` files at fixed
