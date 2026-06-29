@@ -71,6 +71,13 @@ pub struct AiTrainingMode(pub bool);
 #[derive(Resource, Default)]
 pub struct AdjustColonyDimensions(pub bool);
 
+/// When true, `spawn_colony` does NOT seed the default `.species` cohort — the
+/// world boots with an EMPTY colony for the user to build in the editors. Set by
+/// the `--setup` "new world" path (and the in-engine setup dialogue); default
+/// false (normal runs seed the fresh cohort as before).
+#[derive(Resource, Default)]
+pub struct StartEmptyColony(pub bool);
+
 /// When true, saved limb-brain weights are honoured even under the STANDING task
 /// (`--reload-limb-brains`). Default false: standing fresh-inits because legacy
 /// colonies hold locomotion-trained, tanh-saturated brains that freeze a stand.
@@ -1381,3 +1388,38 @@ pub const BRUSH_DAB_SPACING_FRAC: f32 = 0.4;
 
 /// Neutral base colour the paint texture is cleared to on creation (sRGB bytes).
 pub const MAP_PAINT_BASE_SRGB: [u8; 4] = [180, 180, 180, 255];
+
+/// Soft-brush edge softness: default + editable clamp. 0 = hard edge (identical
+/// to the Basic brush), 1 = fully feathered. The brush is `1.0` out to an inner
+/// radius `radius_px * (1 - softness)`, then a smoothstep falloff to `0.0` at the
+/// brush edge. Only consumed by `MapBrush::Soft`.
+pub const DEFAULT_BRUSH_SOFTNESS: f32 = 0.6;
+pub const BRUSH_SOFTNESS_MIN:     f32 = 0.0;
+pub const BRUSH_SOFTNESS_MAX:     f32 = 1.0;
+
+
+// ── Terrain properties (texture-driven, per heightmap cell — world/terrain_properties.rs) ──
+
+/// Half-thickness (world units) of the "top surface" band used when averaging a
+/// heightmap cell's painted colour: a paint texel contributes to its XZ cell only
+/// if its world Y is within this of the heightmap's stored max-Y for that cell, so
+/// a cave ceiling / overhang underside never pollutes the floor cell's average.
+pub const TERRAIN_PROP_TOP_SURFACE_TOL: f32 = 1.5;
+
+/// Nutrient mapping range. `props_from_color` returns `NUTRIENT_BASELINE` for any
+/// non-brown cell, and `NUTRIENT_BASELINE + NUTRIENT_MAX * saturation * centrality`
+/// for a brown cell (richer/more-central brown ⇒ more nutrients).
+pub const NUTRIENT_BASELINE: f32 = 0.0;
+pub const NUTRIENT_MAX:      f32 = 1.0;
+
+/// Brown hue band (degrees) + centre/half-width for the hue-centrality weight, and
+/// saturation/value gates. Anchored on the palette Brown `#4f3423` (HSV ≈ H 23°,
+/// S 0.56, V 0.31). A colour is "brown" iff `h ∈ [MIN,MAX] ∧ s ≥ SAT_MIN ∧
+/// v ∈ [VAL_MIN,VAL_MAX]`.
+pub const BROWN_HUE_MIN:        f32 = 10.0;
+pub const BROWN_HUE_MAX:        f32 = 40.0;
+pub const BROWN_HUE_CENTER:     f32 = 23.0;
+pub const BROWN_HUE_HALF_WIDTH: f32 = 15.0;
+pub const BROWN_SAT_MIN:        f32 = 0.25;
+pub const BROWN_VAL_MIN:        f32 = 0.10;
+pub const BROWN_VAL_MAX:        f32 = 0.60;

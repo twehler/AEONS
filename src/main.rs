@@ -1,5 +1,6 @@
 #[path = "world/world_geometry.rs"]    mod world_geometry;
-#[path = "world/world_format.rs"]      mod world_format;
+#[path = "world/aeonsw_format.rs"]     mod aeonsw_format;
+#[path = "world/terrain_properties.rs"] mod terrain_properties;
 #[path = "world/environment.rs"]       mod environment;
 #[path = "world/water.rs"]             mod water;
 
@@ -51,6 +52,7 @@ mod player_plugin;
 
 #[path = "frontend/frontend.rs"]                mod frontend;
 #[path = "frontend/launcher.rs"]                mod launcher;
+#[path = "frontend/setup_dialogue.rs"]          mod setup_dialogue;
 #[path = "frontend/statistics_panel.rs"]        mod statistics_panel;
 mod simulation_settings;
 #[path = "frontend/individuum_navigator.rs"]    mod individuum_navigator;
@@ -128,56 +130,40 @@ fn main() {
     // colony, override its saved dimensions with the launcher values.
     let water_level      = parse_flag::<f32>(&args, "--water-level");
     let adjust_colony_dimensions = args.iter().any(|a| a == "--adjust-colony-dimensions");
+    // `--setup` — no world file: boot into the in-engine setup dialogue (choose a
+    // `.glb` or flat world + water + map dims), then into the Map Editor.
+    let setup_flag       = args.iter().any(|a| a == "--setup");
     let positional             = collect_positionals(&args);
 
-    if positional.is_empty() && !editor_flag {
+    if positional.is_empty() && !editor_flag && !setup_flag {
         // Launcher mode — chosen mode is forwarded to a freshly-spawned
         // child (winit EventLoop is a singleton, so re-spawn is required).
         let Some(mode) = run_launcher() else { return; };
         match mode {
-            LaunchMode::RunSimulation {
-                map_path, colony_path, wireframe, map_x, map_z,
-                max_phototrophs, max_herbivores,
-                start_heterotrophs, start_photoautotrophs,
-                training_mode: launcher_training_mode,
-                water_level, adjust_colony_dimensions,
-            } => {
+            LaunchMode::RunSimulation { map_path, wireframe, training_mode: launcher_training_mode } => {
+                // The `.aeonsw` is self-contained + authoritative (its own MapSize,
+                // water level, and colony), so the child only needs the path plus
+                // the two passthroughs. MapSize/water/caps fall back to defaults the
+                // file overrides on load.
                 respawn(&[
                     Some(map_path),
-                    colony_path,
                     if wireframe { Some("--wireframe".into()) } else { None },
-                    Some("--map-size".into()),
-                    Some(map_x.to_string()),
-                    Some(map_z.to_string()),
-                    Some("--max-phototrophs".into()),
-                    Some(max_phototrophs.to_string()),
-                    Some("--max-herbivores".into()),
-                    Some(max_herbivores.to_string()),
-                    Some("--start-heteros".into()),
-                    Some(start_heterotrophs.to_string()),
-                    Some("--start-photos".into()),
-                    Some(start_photoautotrophs.to_string()),
-                    // World-space water-surface Y for the `WaterLevel` resource.
-                    Some("--water-level".into()),
-                    Some(water_level.to_string()),
-                    // Override a loaded colony's saved dimensions with the
-                    // launcher values (currently the water level).
-                    if adjust_colony_dimensions { Some("--adjust-colony-dimensions".into()) } else { None },
-                    // Launcher's checkbox is the source of truth for the
-                    // child, overriding the parent's `--trainingmode`.
                     if launcher_training_mode { Some("--trainingmode".into()) } else { None },
                 ]);
             }
-            LaunchMode::RunEditor { map_path, map_x, map_z } => {
-                respawn(&[
-                    Some(map_path),
-                    Some("--editor".into()),
-                    Some("--map-size".into()),
-                    Some(map_x.to_string()),
-                    Some(map_z.to_string()),
-                ]);
+            LaunchMode::NewWorld => {
+                // No file: re-spawn into the in-engine setup dialogue.
+                respawn(&[Some("--setup".into())]);
             }
         }
+    } else if setup_flag {
+        // New-world setup dialogue: defer world load (empty world path →
+        // WorldSource::Pending); the dialogue chooses glb/flat + water + map dims.
+        run_simulation(String::new(), None, show_wireframe, map_size,
+                       max_phototrophs, max_herbivores,
+                       start_heterotrophs, start_photoautotrophs,
+                       training_mode, time_speed, exit_after_secs, reload_limb_brains,
+                       water_level, adjust_colony_dimensions, true);
     } else if editor_flag {
         // Editor mode (re-spawned child or direct CLI invocation).
         let map_path = positional.first().cloned().unwrap_or_else(|| "assets/waterworld1.glb".into());
@@ -190,7 +176,7 @@ fn main() {
                        max_phototrophs, max_herbivores,
                        start_heterotrophs, start_photoautotrophs,
                        training_mode, time_speed, exit_after_secs, reload_limb_brains,
-                       water_level, adjust_colony_dimensions);
+                       water_level, adjust_colony_dimensions, false);
     }
 }
 
@@ -334,6 +320,7 @@ fn run_simulation(
     reload_limb_brains:     bool,
     water_level:            Option<f32>,
     adjust_colony_dimensions: bool,
+    setup_mode:             bool,
 ) {
     if let Ok(mut cache_path) = std::env::current_dir() {
         cache_path.push("caches");
@@ -449,7 +436,15 @@ fn run_simulation(
         .add_plugins(behaviour::BehaviourPlugin)
         .add_plugins(lineages::LineagesPlugin)
         .add_plugins(species_editor::SpeciesEditorPlugin)
-        .add_plugins(map_editor::MapEditorPlugin);
+        .add_plugins(map_editor::MapEditorPlugin)
+        .add_plugins(setup_dialogue::SetupDialoguePlugin);
+
+    // New-world setup path: activate the in-engine dialogue (deferred world load)
+    // and start with an empty colony (the user builds it in the editors).
+    if setup_mode {
+        app.insert_resource(setup_dialogue::SetupActive(true));
+        app.insert_resource(simulation_settings::StartEmptyColony(true));
+    }
 
     //app.add_plugins(EguiPlugin::default());
     //app.add_plugins(WorldInspectorPlugin::new());

@@ -160,8 +160,9 @@ fn player_move(
         // Lineages mode hides the viewport entirely (tree view
         // covers it) — no point letting WASD drive the camera.
         WindowMode::Lineages      => false,
-        // Map editor parks the camera top-down; movement is disabled.
-        WindowMode::MapEditor     => false,
+        // Map editor flies the camera with WASD like the colony editor;
+        // middle-hold adds rotation via `player_look`, LMB stays free to paint.
+        WindowMode::MapEditor     => true,
     };
     if !active { return; }
 
@@ -205,12 +206,14 @@ fn player_look(
         WindowMode::EditColony    => editor_look.0,
         WindowMode::SpeciesEditor => editor_look.0 && species_flycam.0,
         WindowMode::Lineages      => false,
-        // Map editor parks the camera top-down; look is disabled.
-        WindowMode::MapEditor     => false,
+        // Map editor: hold-middle-mouse rotates the flycam (same as the editors).
+        WindowMode::MapEditor     => editor_look.0,
     };
     // Editors get a higher look sensitivity than the simulation flycam.
     let sens_mult = match *window_mode {
-        WindowMode::EditColony | WindowMode::SpeciesEditor => EDITOR_LOOK_SENSITIVITY_MULT,
+        WindowMode::EditColony | WindowMode::SpeciesEditor | WindowMode::MapEditor => {
+            EDITOR_LOOK_SENSITIVITY_MULT
+        }
         _ => 1.0,
     };
     if !active {

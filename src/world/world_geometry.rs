@@ -1,4 +1,7 @@
-// World geometry: load the simulation world from a Blender-exported `.glb`.
+// World geometry: load the simulation world from a Blender-exported `.glb`, an
+// AEONS-baked `.aeonsw` (terrain + painted texture + water + optional colony), or
+// a generated flat plane. The source is a runtime `WorldSource` resource, so the
+// in-engine setup dialogue can choose it after boot (deferred load).
 //
 // At load: spawn the scene as a `SceneRoot`, walk the glTF node hierarchy
 // accumulating transforms to collect every mesh primitive's triangles in world
@@ -28,7 +31,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::map_editor::gpu_paint::PaintState;
 use crate::map_editor::terrain_paint::{make_display_material, TerrainPaintTargets};
-use crate::world_format::WorldMeshEntry;
+use crate::terrain_properties::{self, TerrainProperties};
+use crate::aeonsw_format::{AeonswData, WorldMeshEntry};
 
 
 // ── Tunables ────────────────────────────────────────────────────────────────
@@ -46,6 +50,13 @@ pub const HEIGHTMAP_CELL_SIZE: f32 = 1.0;
 /// Bucket edge length (world units) of the XZ spatial grid used to accelerate
 /// triangle queries. Smaller = fewer triangles per query but more memory.
 const TRIANGLE_GRID_BUCKET: f32 = 4.0;
+
+/// Flat-world generator quad size (world units per grid quad). A 250×250 map at
+/// 4.0 is ~63×63 quads ≈ 7.9k triangles — enough for collision buckets + a clean
+/// xatlas paint unwrap, without a heavy mesh. The plane is flat at Y=0, so the
+/// heightmap is trivially flat regardless; this density is about paint/collision
+/// granularity, not height detail.
+const FLAT_WORLD_QUAD_SIZE: f32 = 4.0;
 
 /// Per-axis minimum world extent enforced at load, and the spawn-area upper
 /// bound used by `colony.rs`, `reproduction.rs`, the IL1 photo brain, and the
@@ -73,60 +84,93 @@ pub use crate::simulation_settings::WORLD_SAFETY_MARGIN;
 // ── Plugin ──────────────────────────────────────────────────────────────────
 
 pub struct WorldPlugin {
-    /// Path to a `.glb` under the assets root. `assets/foo.glb` and
-    /// `foo.glb` are both accepted.
+    /// World source path: a `.glb`/`.gltf` (under the assets root; `assets/foo.glb`
+    /// and `foo.glb` both accepted), an AEONS `.aeonsw`, or **empty** to defer the
+    /// choice to the in-engine setup dialogue (`WorldSource::Pending`). The
+    /// extension is mapped to a `WorldSource` variant at plugin build.
     pub world_path: String,
 }
 
 impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(WorldSettings { world_path: self.world_path.clone() });
-        // Expose the source path so the Map Editor's Export derives its output.
+        // What to load is a RUNTIME resource, not fixed at construction — so the
+        // in-engine setup dialogue can choose a `.glb`/flat world AFTER boot
+        // (deferred load). An empty `world_path` ⇒ `WorldSource::Pending` (wait for
+        // the dialogue); a non-empty path is derived to `Aeonsw`/`Glb` immediately
+        // (the direct launcher/CLI path — unchanged behaviour).
+        let source = WorldSource::from_path(&self.world_path);
         app.insert_resource(LoadedWorldPath(self.world_path.clone()));
+        app.insert_resource(source);
+        app.init_resource::<WorldFileLoaded>();
+        app.init_resource::<GlbLoadStarted>();
+        app.init_resource::<WorldPaintAdoption>();
 
-        // Branch on the path extension (case-insensitive): a `.world` file is our
-        // own baked format (synchronous load); anything else (`.glb`/`.gltf`) goes
-        // through the existing async Gltf path, UNCHANGED.
-        let ext = std::path::Path::new(&self.world_path)
+        // Every load path is registered and gated on the current `WorldSource`;
+        // each carries its own run-once guard so it fires exactly once when (and
+        // only when) its variant is active. While `Pending`, none of them run.
+        app.add_systems(Update, (
+            start_glb_load.run_if(world_source_is_glb),
+            finish_load_world.run_if(resource_exists::<PendingWorld>),
+            load_world_file.run_if(world_source_is_aeonsw),
+            generate_flat_world.run_if(world_source_is_flat),
+            // Paint-state adoption only runs where the Map Editor exists
+            // (`run_simulation`); under `--editor` those resources are absent.
+            adopt_world_paint_state
+                .after(load_world_file)
+                .run_if(resource_exists::<PaintState>)
+                .run_if(resource_exists::<TerrainPaintTargets>),
+        ));
+    }
+}
+
+/// What world to load. A RUNTIME resource so the setup dialogue can set it after
+/// boot. `Pending` ⇒ nothing loads yet (the setup dialogue will choose).
+#[derive(Resource, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WorldSource {
+    #[default]
+    Pending,
+    Glb(String),
+    Aeonsw(String),
+    Flat,
+}
+
+impl WorldSource {
+    /// Derive the initial source from a constructor path: empty ⇒ `Pending`
+    /// (setup), `.aeonsw` ⇒ `Aeonsw`, anything else ⇒ `Glb`.
+    pub fn from_path(path: &str) -> Self {
+        if path.trim().is_empty() {
+            return WorldSource::Pending;
+        }
+        let ext = std::path::Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         match ext.as_deref() {
-            Some("world") => {
-                app.init_resource::<WorldFileLoaded>();
-                app.init_resource::<WorldPaintAdoption>();
-                app.add_systems(Update, load_world_file);
-                // Paint-state adoption only runs where the Map Editor exists
-                // (`run_simulation`); under `--editor` those resources are absent.
-                app.add_systems(
-                    Update,
-                    adopt_world_paint_state
-                        .after(load_world_file)
-                        .run_if(resource_exists::<PaintState>)
-                        .run_if(resource_exists::<TerrainPaintTargets>),
-                );
-            }
-            _ => {
-                app.add_systems(Startup, begin_load_world);
-                app.add_systems(Update,  finish_load_world);
-            }
+            Some("aeonsw") => WorldSource::Aeonsw(path.to_string()),
+            _ => WorldSource::Glb(path.to_string()),
         }
     }
 }
 
-#[derive(Resource)]
-struct WorldSettings { world_path: String }
+// Run-condition predicates (gate each loader on the active `WorldSource`).
+fn world_source_is_glb(s: Res<WorldSource>) -> bool { matches!(*s, WorldSource::Glb(_)) }
+fn world_source_is_aeonsw(s: Res<WorldSource>) -> bool { matches!(*s, WorldSource::Aeonsw(_)) }
+fn world_source_is_flat(s: Res<WorldSource>) -> bool { matches!(*s, WorldSource::Flat) }
 
-/// The source world path this run loaded (the `.glb`/`.gltf`/`.world` argv).
-/// Read by the Map Editor's Export to derive the `.world` output path.
+/// Run-once guard for the async `.glb` load kickoff.
+#[derive(Resource, Default)]
+struct GlbLoadStarted(bool);
+
+/// The source world path this run loaded (the `.glb`/`.gltf`/`.aeonsw` argv).
+/// Read by the Map Editor's Export to derive the `.aeonsw` output path.
 #[derive(Resource, Clone)]
 pub struct LoadedWorldPath(pub String);
 
-/// Run-once guard for the synchronous `.world` loader.
+/// Run-once guard for the synchronous `.aeonsw` loader.
 #[derive(Resource, Default)]
 struct WorldFileLoaded(bool);
 
-/// Handoff from the `.world` loader to the paint-state adopter (so the loader can
+/// Handoff from the `.aeonsw` loader to the paint-state adopter (so the loader can
 /// stay free of the Map Editor's optional resources). `Some` for exactly one
 /// frame after a successful load; the adopter consumes and clears it.
 #[derive(Resource, Default)]
@@ -136,6 +180,7 @@ struct WorldPaintAdoption(
         Handle<StandardMaterial>,
         u32,
         Vec<(Handle<Mesh>, Entity)>,
+        std::collections::HashMap<u32, Vec<u32>>, // seam-fill (gutter dilation) map
     )>,
 );
 
@@ -407,12 +452,140 @@ fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
 
 // ── Loading ────────────────────────────────────────────────────────────────
 
-fn begin_load_world(
-    settings:     Res<WorldSettings>,
+/// Generate a flat seafloor world (no `.glb`, no `.aeonsw`): a subdivided plane at
+/// Y=0 spanning `[0,map_x] × [0,map_z]`, spawned under a `TerrainSceneRoot` so the
+/// Map Editor can unwrap/paint it, plus the collision resources built from its
+/// world-space triangles. With the default water level (200) this is a deep sea.
+/// Run-once via `WorldFileLoaded` (the shared sync-world guard).
+fn generate_flat_world(
+    mut done:        ResMut<WorldFileLoaded>,
+    map_size:        Res<MapSize>,
+    mut commands:    Commands,
+    mut meshes:      ResMut<Assets<Mesh>>,
+    mut materials:   ResMut<Assets<StandardMaterial>>,
+    mut loaded_path: ResMut<LoadedWorldPath>,
+) {
+    if done.0 { return; }
+    done.0 = true;
+
+    spawn_flat_world(&mut commands, &mut meshes, &mut materials, map_size.x, map_size.z);
+
+    // Export default (no source file) → a fresh `.aeonsw` name.
+    loaded_path.0 = "assets/world_export.aeonsw".to_string();
+}
+
+/// Spawn a flat seafloor world: a subdivided plane at Y=0 spanning the map under a
+/// `TerrainSceneRoot` (so the Map Editor can unwrap/paint it) + the collision
+/// resources (`HeightmapSampler`/`WorldMesh`) and neutral `TerrainProperties`.
+/// Shared by `generate_flat_world` and the `.aeonsw` error fallbacks (so a missing/
+/// corrupt file boots a real, paintable flat world — not a meshless empty one).
+fn spawn_flat_world(
+    commands:  &mut Commands,
+    meshes:    &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    map_x:     f32,
+    map_z:     f32,
+) {
+    let (positions, normals, uvs, indices, tris) = build_flat_plane(map_x, map_z);
+
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(indices));
+    let mesh_handle = meshes.add(mesh);
+
+    // A plain material so the flat world is visible before the Map Editor swaps in
+    // the paint material on first entry.
+    let mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.45, 0.42, 0.35),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+
+    let root = commands
+        .spawn((crate::map_editor::TerrainSceneRoot, Transform::IDENTITY, Visibility::default()))
+        .id();
+    let child = commands
+        .spawn((Mesh3d(mesh_handle), MeshMaterial3d(mat), Transform::IDENTITY, Visibility::default()))
+        .id();
+    commands.entity(root).add_child(child);
+
+    let heightmap = build_heightmap(&tris);
+    let world_mesh = build_world_mesh(tris);
+    let props = TerrainProperties::neutral(
+        heightmap.width, heightmap.depth, heightmap.min_x, heightmap.min_z,
+    );
+    info!(
+        "Flat world generated: {map_x}x{map_z} units, heightmap {}x{} at Y=0.",
+        heightmap.width, heightmap.depth,
+    );
+    commands.insert_resource(heightmap);
+    commands.insert_resource(world_mesh);
+    commands.insert_resource(props);
+}
+
+/// Build a subdivided flat plane at Y=0 spanning `[0,map_x] × [0,map_z]`. Returns
+/// the Bevy attribute arrays (positions/normals/uv0/indices) AND the world-space
+/// triangles for the collision builders (the mesh is at IDENTITY, so local==world).
+#[allow(clippy::type_complexity)]
+fn build_flat_plane(
+    map_x: f32,
+    map_z: f32,
+) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>, Vec<[Vec3; 3]>) {
+    let q = FLAT_WORLD_QUAD_SIZE.max(1.0);
+    let cols = (map_x / q).ceil().max(1.0) as u32;
+    let rows = (map_z / q).ceil().max(1.0) as u32;
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals:   Vec<[f32; 3]> = Vec::new();
+    let mut uvs:       Vec<[f32; 2]> = Vec::new();
+    let mut indices:   Vec<u32>      = Vec::new();
+
+    // (cols+1) × (rows+1) grid of vertices, clamped to the map extent.
+    for r in 0..=rows {
+        for c in 0..=cols {
+            let x = (c as f32 * q).min(map_x);
+            let z = (r as f32 * q).min(map_z);
+            positions.push([x, 0.0, z]);
+            normals.push([0.0, 1.0, 0.0]);
+            uvs.push([x / map_x.max(1.0), z / map_z.max(1.0)]);
+        }
+    }
+    let stride = cols + 1;
+    for r in 0..rows {
+        for c in 0..cols {
+            let i0 = r * stride + c;
+            let i1 = i0 + 1;
+            let i2 = i0 + stride;
+            let i3 = i2 + 1;
+            indices.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
+        }
+    }
+
+    // World-space triangles (IDENTITY transform) for build_heightmap/build_world_mesh.
+    let mut tris: Vec<[Vec3; 3]> = Vec::with_capacity(indices.len() / 3);
+    for t in indices.chunks_exact(3) {
+        let p = |i: u32| Vec3::from_array(positions[i as usize]);
+        tris.push([p(t[0]), p(t[1]), p(t[2])]);
+    }
+
+    (positions, normals, uvs, indices, tris)
+}
+
+/// Kick off the async `.glb`/`.gltf` load once `WorldSource::Glb` is active
+/// (immediately for the direct path; after the setup dialogue otherwise). Run-once
+/// via `GlbLoadStarted`; `finish_load_world` then completes it when the asset is in.
+fn start_glb_load(
+    world_source: Res<WorldSource>,
+    mut started:  ResMut<GlbLoadStarted>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
 ) {
-    let asset_path = strip_assets_prefix(&settings.world_path);
+    if started.0 { return; }
+    let WorldSource::Glb(path) = &*world_source else { return; };
+    started.0 = true;
+    let asset_path = strip_assets_prefix(path);
     let handle: Handle<Gltf> = asset_server.load(asset_path);
     commands.insert_resource(PendingWorld { handle, done: false });
 }
@@ -504,14 +677,21 @@ fn finish_load_world(
         heightmap.max_height
     );
 
+    // A `.glb` world carries no painted texture, so terrain properties are neutral
+    // (baseline). The resource is still inserted so future readers can rely on it.
+    let props = TerrainProperties::neutral(
+        heightmap.width, heightmap.depth, heightmap.min_x, heightmap.min_z,
+    );
+
     commands.insert_resource(heightmap);
     commands.insert_resource(world_mesh);
+    commands.insert_resource(props);
 }
 
 
-// ── `.world` synchronous loader ──────────────────────────────────────────────
+// ── `.aeonsw` synchronous loader ──────────────────────────────────────────────
 //
-// A `.world` file bakes the terrain (every submesh's local geometry + its world
+// A `.aeonsw` file bakes the terrain (every submesh's local geometry + its world
 // `Transform`), the painted atlas texture, and `MapSize`. Unlike the glb path it
 // needs no async asset wait, no node walk, and no re-normalisation — geometry is
 // already in final world space via the stored transforms. We rebuild the visible
@@ -523,7 +703,8 @@ fn finish_load_world(
 
 #[allow(clippy::too_many_arguments)]
 fn load_world_file(
-    settings:      Res<WorldSettings>,
+    world_source:  Res<WorldSource>,
+    map_size:      Res<MapSize>,
     mut done:      ResMut<WorldFileLoaded>,
     mut adoption:  ResMut<WorldPaintAdoption>,
     mut commands:  Commands,
@@ -532,30 +713,29 @@ fn load_world_file(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     if done.0 { return; }
+    // Gated by `world_source_is_aeonsw`, so this is always the Aeonsw variant.
+    let WorldSource::Aeonsw(src_path) = &*world_source else { return };
     done.0 = true; // run-once (synchronous; no async gate)
 
     // Resolve the real file location. Unlike the glb path (where the AssetServer
-    // re-prepends the assets root, so we strip it), a `.world` is read directly
+    // re-prepends the assets root, so we strip it), a `.aeonsw` is read directly
     // with `std::fs` relative to the cwd (repo root) — so we must NOT strip
-    // `assets/`. Try the path as given (handles `assets/foo.world` and absolute
-    // paths), then fall back to under `assets/` (handles a bare `foo.world`).
-    let Some(path) = resolve_world_file_path(&settings.world_path) else {
+    // `assets/`. Try the path as given (handles `assets/foo.aeonsw` and absolute
+    // paths), then fall back to under `assets/` (handles a bare `foo.aeonsw`).
+    let Some(path) = resolve_world_file_path(src_path) else {
         error!(
-            "Could not find .world file '{}' (tried as-given and under assets/) — booting a flat world.",
-            settings.world_path
+            "Could not find .aeonsw file '{src_path}' (tried as-given and under assets/) — booting a flat world.",
         );
-        commands.insert_resource(build_heightmap(&[]));
-        commands.insert_resource(build_world_mesh(Vec::new()));
+        spawn_flat_world(&mut commands, &mut meshes, &mut materials, map_size.x, map_size.z);
         return;
     };
-    let data = match crate::world_format::read_world(&path) {
+    let mut data = match crate::aeonsw_format::read_aeonsw(&path) {
         Ok(d) => d,
         Err(e) => {
-            error!("Failed to read .world '{path}': {e} — booting a flat world.");
-            // Same zero-triangle fallback the glb path produces (a flat plane at
-            // Y=0), so the app still boots and the sim has finite resources.
-            commands.insert_resource(build_heightmap(&[]));
-            commands.insert_resource(build_world_mesh(Vec::new()));
+            error!("Failed to read .aeonsw '{path}': {e} — booting a flat world.");
+            // A real flat world (paintable + collidable) rather than a meshless
+            // empty plane, so a corrupt file degrades gracefully into something usable.
+            spawn_flat_world(&mut commands, &mut meshes, &mut materials, map_size.x, map_size.z);
             return;
         }
     };
@@ -615,8 +795,12 @@ fn load_world_file(
     let heightmap  = build_heightmap(&tri); // borrow first
     let world_mesh = build_world_mesh(tri);  // move
 
+    // 4b. Per-cell terrain properties, averaged from the painted texture over each
+    //     cell's top surface (infrastructure for texture-driven terrain effects).
+    let props = build_props_from_world(&data, &heightmap);
+
     info!(
-        "World (.world) loaded: {} submeshes, {} triangles, {}x{} texture, heightmap {}x{}, max height {:.2}",
+        "World (.aeonsw) loaded: {} submeshes, {} triangles, {}x{} texture, heightmap {}x{}, max height {:.2}",
         data.meshes.len(),
         world_mesh.triangles.len(),
         data.texture.width, data.texture.height,
@@ -626,17 +810,49 @@ fn load_world_file(
 
     commands.insert_resource(heightmap);
     commands.insert_resource(world_mesh);
+    commands.insert_resource(props);
 
     // 5. MapSize from the file overrides argv (the baked geometry is its source).
     commands.insert_resource(MapSize { x: data.map_x, z: data.map_z });
 
-    // 6. Hand the paint state to `adopt_world_paint_state` (which only runs where
+    // 6. Precompute the seam-fill (gutter dilation) map over the loaded atlas, so a
+    //    round-trip edit's brush avoids the unpainted "No Man's Land" chart lines.
+    let submeshes: Vec<(&[[f32; 2]], &[u32])> = data
+        .meshes
+        .iter()
+        .map(|e| (e.uv0.as_slice(), e.indices.as_slice()))
+        .collect();
+    let seam_fill = crate::map_editor::gpu_paint::compute_seam_fill(
+        &submeshes,
+        data.texture.width,
+        crate::map_editor::gpu_paint::SEAM_FILL_MARGIN,
+    );
+
+    // 7. Hand the paint state to `adopt_world_paint_state` (which only runs where
     //    the Map Editor's resources exist) so a round-trip edit keeps the texture.
-    adoption.0 = Some((tex, display_mat, data.texture.width, paint_targets));
+    adoption.0 = Some((tex, display_mat, data.texture.width, paint_targets, seam_fill));
+
+    // 8. The `.aeonsw` is authoritative: apply its baked water level (v2+).
+    if let Some(w) = data.water_level {
+        commands.insert_resource(crate::environment::WaterLevel(w));
+    }
+
+    // 9. Boot routing: a colony embedded in the file → spawn it + boot the running
+    //    Simulation (the default mode/state). Terrain only (terrain-only export or a
+    //    v1 file) → boot into the Colony Editor so the user builds a colony first.
+    match data.embedded_colony.take() {
+        Some(bytes) => {
+            commands.insert_resource(crate::colony::ColonyEmbedded(Some(bytes)));
+            // WindowMode stays Simulation (default) + SimulationRunning stays true.
+        }
+        None => {
+            commands.insert_resource(crate::simulation_settings::WindowMode::EditColony);
+        }
+    }
 }
 
 /// Populate the Map Editor's `PaintState` + `TerrainPaintTargets` from a loaded
-/// `.world` so re-entering the editor adopts the loaded atlas+texture instead of
+/// `.aeonsw` so re-entering the editor adopts the loaded atlas+texture instead of
 /// re-unwrapping (which would wipe the painted texture). Gated by
 /// `resource_exists` on both resources, so it is inert under `--editor` (which has
 /// no Map Editor) — the geometry/collision load above still happens there.
@@ -644,17 +860,47 @@ fn adopt_world_paint_state(
     mut adoption: ResMut<WorldPaintAdoption>,
     mut paint:    ResMut<PaintState>,
     mut targets:  ResMut<TerrainPaintTargets>,
+    images:       Res<Assets<Image>>,
 ) {
-    let Some((tex, display_mat, atlas_edge, paint_targets)) = adoption.0.take() else { return };
+    let Some((tex, display_mat, atlas_edge, paint_targets, seam_fill)) = adoption.0.take()
+    else { return };
+    // Seed the authoritative CPU mirror from the loaded atlas's bytes BEFORE moving
+    // `tex` into `paint_image`. Without this the mirror stays empty and every
+    // brush/Color-All write hits its `mirror.len() < edge²·4` guard and no-ops —
+    // the bug where the Map Editor silently stopped painting after a `.aeonsw` load
+    // (adoption set `targets.prepared`, so `prepare_terrain_paint`, which normally
+    // seeds the mirror, skipped). Same access pattern as `prepare_terrain_paint`.
+    paint.mirror      = images.get(&tex).and_then(|img| img.data.clone()).unwrap_or_default();
     paint.paint_image = Some(tex);
     paint.display_mat = Some(display_mat);
     paint.atlas_edge  = atlas_edge;
     paint.last_dab_vp = None;
+    paint.seam_fill   = seam_fill;
     targets.meshes    = paint_targets;
     targets.prepared  = true;
 }
 
-/// Build a Bevy render `Mesh` (TriangleList) from a `.world` submesh entry, with
+/// Build the per-cell `TerrainProperties` from a loaded `.aeonsw` (painted texture +
+/// geometry) using the heightmap grid for dims + the top-surface filter. The atlas
+/// is square, so `texture.width` is the atlas edge.
+fn build_props_from_world(data: &AeonswData, heightmap: &HeightmapSampler) -> TerrainProperties {
+    let pm: Vec<terrain_properties::PropMesh> = data
+        .meshes
+        .iter()
+        .map(|e| terrain_properties::PropMesh {
+            model:     e.transform.to_matrix(),
+            positions: &e.positions,
+            uv0:       &e.uv0,
+            indices:   &e.indices,
+        })
+        .collect();
+    terrain_properties::build_terrain_properties(
+        heightmap.width, heightmap.depth, heightmap.min_x, heightmap.min_z,
+        &heightmap.heights, &data.texture.bytes, data.texture.width, &pm,
+    )
+}
+
+/// Build a Bevy render `Mesh` (TriangleList) from a `.aeonsw` submesh entry, with
 /// POSITION/NORMAL/UV_0 and U32 indices.
 fn build_render_mesh(entry: &WorldMeshEntry) -> Mesh {
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
@@ -738,7 +984,7 @@ fn compute_normalisation(triangles: &[[Vec3; 3]], map_size: MapSize) -> (f32, Ve
 ///   * absolute path (launcher "Open…" dialog)  → suffix after LAST `assets/`
 /// The third branch is required: dialog paths are absolute, and without it the
 /// AssetServer silently fails and the world never spawns.
-/// Resolve a `.world` path for a direct `std::fs` read. Returns the first of
+/// Resolve a `.aeonsw` path for a direct `std::fs` read. Returns the first of
 /// `[as-given, assets/<stripped>]` that is an existing file, or `None`. (The glb
 /// path can't reuse this — it hands the stripped path to the `AssetServer`, which
 /// re-prepends the assets root itself.)
