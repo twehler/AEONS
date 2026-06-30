@@ -247,6 +247,14 @@ pub struct WorldMesh {
     pub triangles: Vec<[Vec3; 3]>,
     grid:          HashMap<(i32, i32), Vec<u32>>,
     bucket:        f32,
+    /// Bounding box of the POPULATED bucket keys `((min_kx, min_kz), (max_kx,
+    /// max_kz))`, or `None` if there are no triangles. `collect_nearby` clamps its
+    /// query range to this: out-of-range buckets are always empty, so the clamp
+    /// never changes results, but it bounds the iteration to the terrain footprint.
+    /// Without it, a near-horizontal `raycast`'s swept AABB
+    /// (`origin .. origin + dir*RAYCAST_MAX`, 1e6) spans ~`1e6/bucket` buckets per
+    /// axis → ~1e10 empty lookups → freeze.
+    key_bounds:    Option<((i32, i32), (i32, i32))>,
 }
 
 impl WorldMesh {
@@ -256,8 +264,21 @@ impl WorldMesh {
 
     fn collect_nearby(&self, min: Vec3, max: Vec3, out: &mut Vec<u32>) {
         out.clear();
-        let (kx0, kz0) = Self::key(min.x, min.z, self.bucket);
-        let (kx1, kz1) = Self::key(max.x, max.z, self.bucket);
+        // No triangles ⇒ no populated buckets ⇒ nothing to collect.
+        let Some(((bx0, bz0), (bx1, bz1))) = self.key_bounds else { return };
+        let (qkx0, qkz0) = Self::key(min.x, min.z, self.bucket);
+        let (qkx1, qkz1) = Self::key(max.x, max.z, self.bucket);
+        // Clamp the query range to the populated bucket bounds. A populated
+        // bucket's key lies within `key_bounds` by construction, so buckets
+        // outside it are ALWAYS empty — this only removes guaranteed-empty
+        // iterations and never changes `out`. It bounds the loop to the terrain
+        // footprint, so a near-horizontal `raycast` (swept AABB ~1e6 wide) can't
+        // iterate ~1e10 empty buckets and freeze.
+        let kx0 = qkx0.max(bx0);
+        let kz0 = qkz0.max(bz0);
+        let kx1 = qkx1.min(bx1);
+        let kz1 = qkz1.min(bz1);
+        if kx0 > kx1 || kz0 > kz1 { return; } // query AABB misses the terrain footprint
         // Single-bucket fast path: AABB fits one cell, so no duplicate indices
         // and sort/dedup can be skipped. Common case (~1u cells, 4u buckets).
         if kx0 == kx1 && kz0 == kz1 {
@@ -1237,7 +1258,15 @@ pub(crate) fn build_world_mesh(triangles: Vec<[Vec3; 3]>) -> WorldMesh {
         }
     }
 
-    WorldMesh { triangles, grid, bucket }
+    // Populated-bucket bounding box (min/max keys) — `collect_nearby` clamps to it.
+    let key_bounds = grid.keys().copied().fold(None, |acc, (kx, kz)| match acc {
+        None => Some(((kx, kz), (kx, kz))),
+        Some(((nx, nz), (xx, xz))) => {
+            Some(((nx.min(kx), nz.min(kz)), (xx.max(kx), xz.max(kz))))
+        }
+    });
+
+    WorldMesh { triangles, grid, bucket, key_bounds }
 }
 
 

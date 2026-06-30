@@ -1092,6 +1092,17 @@ pub const NON_PHOTO_CONSUMPTION_PER_CELL: f32 = 0.01;
 pub const K_GROUND_FRICTION: f32 = 0.003;
 pub const K_FLUID_DRAG:      f32 = 0.03;
 
+/// Upper bound on a heterotroph's per-tick MOVEMENT energy cost (friction + fluid
+/// drag), as a fraction of its MAX energy. Defense-in-depth: the cubic `speed³`
+/// fluid-drag term is unbounded, so a fully-submerged mover (a benthic slider on a
+/// deep-sea floor, or any fast swimmer) can be charged more than its whole reserve
+/// in ONE 0.5 s tick → instant starvation despawn outside AiTrainingMode. This
+/// clamp guarantees a moving creature survives at least `~1/this` ticks (time to
+/// decelerate or feed). It is INERT in the normal regime — terrestrial / low-speed
+/// movement costs are <1% of max energy, far under this bound — so the realistic
+/// cost gradient (faster ⇒ more expensive) is fully preserved below the cap.
+pub const MOVEMENT_COST_MAX_FRACTION_PER_TICK: f32 = 0.05;
+
 /// Max random wander speed of a GROUND-BASED, non-sessile photoautotroph
 /// (`movement.rs::random_2d_direction`). Kept SMALL on purpose: the energy tick
 /// charges submerged movement a cubic `K_FLUID_DRAG · weight^(2/3) · speed³`
