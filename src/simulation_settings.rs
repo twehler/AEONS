@@ -1409,6 +1409,38 @@ pub const BRUSH_SOFTNESS_MIN:     f32 = 0.0;
 pub const BRUSH_SOFTNESS_MAX:     f32 = 1.0;
 
 
+// ── Species-editor sculpt brush (frontend/species_editor/sculpt.rs) ──────────
+
+/// Center-to-center distance of two TOUCHING cells — the "one cell length" unit
+/// the Species Editor sculpt brush measures its radius in. It is the
+/// face-adjacent nearest-neighbour distance on the RD lattice
+/// (= 2 × cell inradius), NOT the edge length `cell::CELL_SPACING` (= 0.1).
+///
+/// Derived from the master scale so it tracks `GEOMETRY_SCALE`:
+///   `center_scale(GEOMETRY_SCALE) * sqrt(0.5)`
+///   = (4·GEOMETRY_SCALE/√3) · √0.5
+/// ≈ 0.163_299 world units at `GEOMETRY_SCALE = 0.1`.
+pub const SCULPT_CELL_LENGTH: f32 =
+    (4.0 * GEOMETRY_SCALE / 1.732_050_8) * 0.707_106_77;
+
+/// Sculpt brush radius (in cell lengths) default + editable clamp range.
+pub const SCULPT_RADIUS_CELLS_DEFAULT: f32 = 2.0;
+pub const SCULPT_RADIUS_CELLS_MIN:     f32 = 0.5;
+pub const SCULPT_RADIUS_CELLS_MAX:     f32 = 8.0;
+
+/// Fixed screen-px radius of the sculpt cursor-guide ring (decoupled from the
+/// cell-length radius — it is only a cursor hint).
+pub const SCULPT_RING_PX: f32 = 24.0;
+
+/// Pixel window for snapping the sculpt sphere centre to the nearest rendered
+/// cell under the cursor.
+pub const SCULPT_PICK_RADIUS_PX: f32 = 80.0;
+
+/// Hard cap on lattice points enumerated per sculpt stamp (safeguard against a
+/// pathological radius); logged (not panicked) if exceeded.
+pub const SCULPT_MAX_CELLS_PER_STAMP: usize = 4096;
+
+
 // ── Terrain properties (texture-driven, per heightmap cell — world/terrain_properties.rs) ──
 
 /// Half-thickness (world units) of the "top surface" band used when averaging a
@@ -1434,3 +1466,15 @@ pub const BROWN_HUE_HALF_WIDTH: f32 = 15.0;
 pub const BROWN_SAT_MIN:        f32 = 0.25;
 pub const BROWN_VAL_MIN:        f32 = 0.10;
 pub const BROWN_VAL_MAX:        f32 = 0.60;
+
+/// Yellow hue band (degrees) + centre/half-width + saturation/value gates, anchored
+/// on the palette Yellow `#bfa547` (HSV ≈ H 47°, S 0.63, V 0.75). A colour is
+/// "yellow" iff `h ∈ [MIN,MAX] ∧ s ≥ SAT_MIN ∧ v ≥ VAL_MIN`. The high `VAL_MIN`
+/// (> `BROWN_VAL_MAX`) separates bright yellow (calcium) from dark brown (nitrogen)
+/// even though their hues are adjacent, so a colour never counts as both.
+pub const YELLOW_HUE_MIN:        f32 = 42.0;
+pub const YELLOW_HUE_MAX:        f32 = 70.0;
+pub const YELLOW_HUE_CENTER:     f32 = 50.0;
+pub const YELLOW_HUE_HALF_WIDTH: f32 = 18.0;
+pub const YELLOW_SAT_MIN:        f32 = 0.30;
+pub const YELLOW_VAL_MIN:        f32 = 0.55;

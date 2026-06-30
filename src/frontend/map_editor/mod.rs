@@ -71,6 +71,9 @@ impl Plugin for MapEditorPlugin {
                 visibility::enforce_water_hidden_in_map_editor,
                 camera::snap_map_camera_on_mode_entry
                     .after(crate::species_editor::camera::snap_camera_on_mode_entry),
+                // Recompute the ground-nutrient table from the live painted atlas
+                // when the user LEAVES the Map Editor, so the resource reflects edits.
+                recompute_nutrients_on_map_editor_exit,
             ))
             // Bottom-panel swatches.
             .add_systems(Update, (
@@ -104,6 +107,65 @@ impl Plugin for MapEditorPlugin {
                 brush_cursor::update_brush_cursor_ring,
             ));
     }
+}
+
+
+/// On LEAVING the Map Editor, rebuild the `TerrainProperties` (ground nutrients)
+/// resource from the LIVE painted atlas (`PaintState.mirror`) + the prepared
+/// submesh geometry + the heightmap, so the in-memory table tracks the edits the
+/// user just painted. No-ops cleanly when the atlas/heightmap/resource isn't ready
+/// (e.g. `.glb`/flat worlds, pre-load frames). The `.aeonsw` save path recomputes
+/// independently (`export::write_combined_world`).
+#[allow(clippy::too_many_arguments)]
+fn recompute_nutrients_on_map_editor_exit(
+    mode:       Res<crate::simulation_settings::WindowMode>,
+    targets:    Res<terrain_paint::TerrainPaintTargets>,
+    paint:      Res<gpu_paint::PaintState>,
+    meshes:     Res<Assets<Mesh>>,
+    transforms: Query<&GlobalTransform>,
+    heightmap:  Option<Res<crate::world_geometry::HeightmapSampler>>,
+    props:      Option<ResMut<crate::terrain_properties::TerrainProperties>>,
+) {
+    use bevy::mesh::{Indices, VertexAttributeValues};
+    use crate::simulation_settings::WindowMode;
+
+    // Only on the transition AWAY from MapEditor.
+    if !mode.is_changed() || *mode == WindowMode::MapEditor { return; }
+    let (Some(hm), Some(mut props)) = (heightmap, props) else { return };
+    if !targets.prepared { return; }
+    let edge = paint.atlas_edge;
+    if edge == 0 || paint.mirror.len() < (edge as usize) * (edge as usize) * 4 { return; }
+
+    // Gather the prepared atlas submeshes (own the buffers so the borrows outlive
+    // the build call). Same geometry the Export path serialises.
+    let mut owned: Vec<(Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>, Mat4)> = Vec::new();
+    for (mesh_handle, entity) in &targets.meshes {
+        let Some(mesh) = meshes.get(mesh_handle) else { continue };
+        let Some(VertexAttributeValues::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else { continue };
+        let Some(VertexAttributeValues::Float32x2(uv)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0)
+        else { continue };
+        if uv.len() != pos.len() { continue; }
+        let idx: Vec<u32> = match mesh.indices() {
+            Some(Indices::U32(v)) => v.clone(),
+            Some(Indices::U16(v)) => v.iter().map(|&i| i as u32).collect(),
+            None                  => (0..pos.len() as u32).collect(),
+        };
+        let model = transforms.get(*entity).copied().unwrap_or_default()
+            .compute_transform().to_matrix();
+        owned.push((pos.clone(), uv.clone(), idx, model));
+    }
+    if owned.is_empty() { return; }
+
+    let pm: Vec<crate::terrain_properties::PropMesh> = owned
+        .iter()
+        .map(|(p, u, i, m)| crate::terrain_properties::PropMesh {
+            model: *m, positions: p, uv0: u, indices: i,
+        })
+        .collect();
+    *props = crate::terrain_properties::build_terrain_properties(
+        hm.width, hm.depth, hm.min_x, hm.min_z, &hm.heights, &paint.mirror, edge, &pm,
+    );
 }
 
 

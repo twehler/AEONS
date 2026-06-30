@@ -14,6 +14,7 @@ pub mod editor_mode;
 pub mod mesh_import;
 pub mod placement;
 pub mod save;
+pub mod sculpt;
 pub mod session;
 pub mod top_panel;
 pub mod undo;
@@ -65,6 +66,8 @@ impl Plugin for SpeciesEditorPlugin {
             .init_resource::<deletion::DeletionTarget>()
             .init_resource::<camera::StashedSimCameraTransform>()
             .init_resource::<undo::SpeciesUndo>()
+            .init_resource::<session::SculptRadiusEditState>()
+            .init_resource::<sculpt::SculptStrokeActive>()
             // Top-panel button + cycler handlers.
             .add_systems(Update, (
                 top_panel::handle_cycler_clicks,
@@ -136,6 +139,17 @@ impl Plugin for SpeciesEditorPlugin {
             .add_systems(Update, (
                 convert_to_cellular_mesh::manage_convert_button_visibility,
                 convert_to_cellular_mesh::handle_convert_button,
+            ))
+            // Sculpt Mode: radius field + Add/Erase toggle + the continuous
+            // sphere-fill/erase stroke. `apply_sculpt_stroke` mutates the OCG, so
+            // it is ordered BEFORE `track_species_undo` (which coalesces the whole
+            // drag into one undo entry via the stroke-active flag).
+            .add_systems(Update, (
+                sculpt::handle_sculpt_radius_input,
+                sculpt::update_sculpt_radius_text,
+                sculpt::handle_sculpt_op_toggle,
+                sculpt::sync_sculpt_op_text,
+                sculpt::apply_sculpt_stroke.before(undo::track_species_undo),
             ))
             // Undo (Ctrl+Z). `track` records prior states; `handle`
             // restores. `track` is ordered AFTER the mutating systems and

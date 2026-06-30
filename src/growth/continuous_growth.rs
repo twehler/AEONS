@@ -199,6 +199,13 @@ fn grow_new_branch(
         rotation: Quat::IDENTITY,
     };
     let mut new_part = body_part::create_branch_body_part(seed_ct, attachment, outward);
+    // `create_branch_body_part` folds the flush FCC displacement into the
+    // attachment (`origin_local += outward·flush`) and seeds the OCG at the
+    // local origin, so the rendered child Transform MUST read the displaced
+    // attachment value — NOT the pre-displacement `origin_local` local var, which
+    // would glue the seed onto the parent cell (zero gap) and then jump by the
+    // displacement on save+reload (the snapshot reads `a.origin_local`).
+    let branch_origin = new_part.attachment.as_ref().map_or(origin_local, |a| a.origin_local);
 
     // Grow 1→2 cells for visibility.
     let grown_ocg = crate::mutation::mutate_ocg(&new_part.ocg, rng);
@@ -224,7 +231,7 @@ fn grow_new_branch(
     let child_entity = commands.spawn((
         Mesh3d(mesh_handle),
         MeshMaterial3d(mat),
-        Transform { translation: origin_local, rotation: Quat::IDENTITY, ..default() },
+        Transform { translation: branch_origin, rotation: Quat::IDENTITY, ..default() },
         Visibility::Visible,
         OrganismMesh,
         BodyPartIndex(new_idx),

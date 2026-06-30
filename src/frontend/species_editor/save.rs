@@ -222,6 +222,7 @@ fn movement_byte(m: MovementMode) -> u8 {
         MovementMode::Sliding          => 1,
         MovementMode::Swimming         => 2,
         MovementMode::Flying           => 3,
+        MovementMode::SimpleAquatic    => 4,
     }
 }
 
@@ -448,6 +449,7 @@ fn decode_species(bytes: &[u8]) -> std::io::Result<LoadedSpecies> {
             1 => MovementMode::Sliding,
             2 => MovementMode::Swimming,
             3 => MovementMode::Flying,
+            4 => MovementMode::SimpleAquatic,
             _ => return Err(err("unknown movement tag")),
         }
     } else if is_v6 || is_v7 {

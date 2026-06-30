@@ -122,6 +122,11 @@ pub struct SlidingConfig {
     /// Prey filter given an organism's carnivore flag. herbivore_1 ignores the
     /// flag (always `Photo`); L2/L3 hunt `Hetero` when carnivore else `Photo`.
     pub prey_type: fn(is_carnivore: bool) -> OrganismType,
+    /// When `false` (all terrestrial/benthic sliding pools), the geometric pursuit
+    /// direction is XZ-only (Y forced to 0) — sliders crawl on a surface. When
+    /// `true` (the SimpleAquatic 3D pool), the toward-target direction preserves its
+    /// Y component so the mover pursues prey in full 3D through the water volume.
+    pub direction_3d: bool,
 }
 
 
@@ -782,6 +787,8 @@ impl BrainPoolSliding {
     {
         if time.is_paused() { return; }
         let n = self.n();
+        // Captured once (Copy) to avoid borrowing `self` inside the per-organism loop.
+        let direction_3d = self.cfg.direction_3d;
 
         input_buf.clear();
         input_buf.resize(n * IN, 0.0);
@@ -1093,8 +1100,17 @@ impl BrainPoolSliding {
                     let dz = rel.z;
                     let mag2 = dx * dx + dz * dz;
                     if mag2 > L1_DIRECTION_FREEZE_DIST * L1_DIRECTION_FREEZE_DIST {
-                        let inv = mag2.sqrt().recip();
-                        org.movement_direction = Vec3::new(dx * inv, 0.0, dz * inv);
+                        if direction_3d {
+                            // 3D pursuit (SimpleAquatic): keep the Y component so the
+                            // mover climbs/descends toward prey through the water column.
+                            let d3 = Vec3::new(dx, rel.y, dz);
+                            if let Some(unit) = d3.try_normalize() {
+                                org.movement_direction = unit;
+                            }
+                        } else {
+                            let inv = mag2.sqrt().recip();
+                            org.movement_direction = Vec3::new(dx * inv, 0.0, dz * inv);
+                        }
                     }
                 }
                 None => {

@@ -13,7 +13,7 @@ use bevy::prelude::*;
 
 use crate::simulation_settings::WindowMode;
 use crate::aeonsw_format::{self, PaintTextureData, AeonswData, WorldMeshEntry};
-use crate::world_geometry::{LoadedWorldPath, MapSize};
+use crate::world_geometry::{HeightmapSampler, LoadedWorldPath, MapSize};
 
 use super::gpu_paint::PaintState;
 use super::terrain_paint::TerrainPaintTargets;
@@ -79,6 +79,7 @@ pub fn handle_export_click(
     images:      Res<Assets<Image>>,
     transforms:  Query<&GlobalTransform>,
     water:       Res<crate::environment::WaterLevel>,
+    heightmap:   Option<Res<HeightmapSampler>>,
     colony:      crate::colony_save_load::ColonySerializeParams,
     mut buttons: Query<(&Interaction, &mut BackgroundColor),
                        (Changed<Interaction>, With<ExportWorldButton>)>,
@@ -96,7 +97,8 @@ pub fn handle_export_click(
                 let (colony_bytes, n) = colony.to_colony_bytes();
                 let embedded = if n > 0 { Some(colony_bytes) } else { None };
                 export_world(&targets, &paint, &map_size, loaded_path.as_deref(),
-                             &meshes, &images, &transforms, water.0, embedded);
+                             &meshes, &images, &transforms, water.0,
+                             heightmap.as_deref(), embedded);
             }
         }
     }
@@ -118,6 +120,7 @@ pub fn handle_save_world_click(
     images:      Res<Assets<Image>>,
     transforms:  Query<&GlobalTransform>,
     water:       Res<crate::environment::WaterLevel>,
+    heightmap:   Option<Res<HeightmapSampler>>,
     colony:      crate::colony_save_load::ColonySerializeParams,
     mut buttons: Query<(&Interaction, &mut BackgroundColor),
                        (Changed<Interaction>, With<SaveWorldButton>)>,
@@ -137,7 +140,7 @@ pub fn handle_save_world_click(
                 let (colony_bytes, n) = colony.to_colony_bytes();
                 let embedded = if n > 0 { Some(colony_bytes) } else { None };
                 write_combined_world(&out, &targets, &paint, &map_size, &meshes, &images,
-                                     &transforms, water.0, embedded);
+                                     &transforms, water.0, heightmap.as_deref(), embedded);
             }
         }
     }
@@ -153,6 +156,7 @@ fn export_world(
     images:      &Assets<Image>,
     transforms:  &Query<&GlobalTransform>,
     water_level: f32,
+    heightmap:   Option<&HeightmapSampler>,
     embedded_colony: Option<Vec<u8>>,
 ) {
     // Derive the output path from the loaded world (extension → `.aeonsw`).
@@ -162,7 +166,7 @@ fn export_world(
         None => "assets/world_export.aeonsw".to_string(),
     };
     write_combined_world(&out, targets, paint, map_size, meshes, images, transforms,
-                         water_level, embedded_colony);
+                         water_level, heightmap, embedded_colony);
 }
 
 /// Gather the prepared terrain (submesh geometry + painted atlas) + `MapSize` +
@@ -179,6 +183,7 @@ pub fn write_combined_world(
     images:      &Assets<Image>,
     transforms:  &Query<&GlobalTransform>,
     water_level: f32,
+    heightmap:   Option<&HeightmapSampler>,
     embedded_colony: Option<Vec<u8>>,
 ) {
     // Readiness.
@@ -243,6 +248,25 @@ pub fn write_combined_world(
         return;
     }
 
+    // Recompute the per-cell nutrient table from the LIVE painted atlas + geometry
+    // so the saved table is fresh (the atlas is square, so `width` is the edge).
+    // Borrows `entries`/`bytes` — done BEFORE they move into `AeonswData`.
+    let nutrients_table: Option<Vec<f32>> = heightmap.map(|hm| {
+        let pm: Vec<crate::terrain_properties::PropMesh> = entries
+            .iter()
+            .map(|e| crate::terrain_properties::PropMesh {
+                model:     e.transform.to_matrix(),
+                positions: &e.positions,
+                uv0:       &e.uv0,
+                indices:   &e.indices,
+            })
+            .collect();
+        let props = crate::terrain_properties::build_terrain_properties(
+            hm.width, hm.depth, hm.min_x, hm.min_z, &hm.heights, &bytes, width, &pm,
+        );
+        props.cells.iter().flat_map(|c| [c.nitrogen, c.calcium]).collect()
+    });
+
     let data = AeonswData {
         map_x:   map_size.x,
         map_z:   map_size.z,
@@ -250,6 +274,7 @@ pub fn write_combined_world(
         meshes:  entries,
         water_level: Some(water_level),
         embedded_colony,
+        nutrients_table,
     };
 
     match aeonsw_format::write_aeonsw(out, &data) {

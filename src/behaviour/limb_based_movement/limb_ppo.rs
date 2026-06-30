@@ -329,6 +329,8 @@ macro_rules! define_limb_pool_assign {
                 if organism.movement_mode.is_sliding() { continue; }
                 // Swimmers train in their own pool (intelligence_level_1_swimming).
                 if organism.movement_mode.is_swimming() { continue; }
+                // SimpleAquatic movers train in the basic_3d_movement pool.
+                if organism.movement_mode.is_simple_aquatic() { continue; }
                 let Some(s) = pool.0.enrol(e) else { continue };
                 // Saved weights (loaded `.colony`) → overwrite this organism's SPECIES
                 // net (keyed by species_id, UNCLASSIFIED until first classified).

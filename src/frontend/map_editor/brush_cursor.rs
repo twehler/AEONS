@@ -26,7 +26,8 @@ use bevy::ui::{ComputedNode, UiGlobalTransform};
 use bevy::window::PrimaryWindow;
 
 use crate::frontend::ViewportImage;
-use crate::simulation_settings::WindowMode;
+use crate::simulation_settings::{SCULPT_RING_PX, WindowMode};
+use crate::species_editor::session::{SculptRadiusEditState, SpeciesSession};
 
 use super::gpu_paint::{BrushSizeEditState, SoftnessEditState};
 use super::material::MapEditorSession;
@@ -117,15 +118,24 @@ pub fn spawn_brush_cursor_ring(
     commands.entity(vp).add_child(ring);
 }
 
-/// Each frame: gate visibility (Map Editor + cursor over the viewport + no brush
-/// field focused), and when shown, centre + size the node on the cursor and push
-/// the radius / line width into the material uniform.
+/// Each frame: gate visibility and, when shown, centre + size the node on the
+/// cursor and push the radius / line width into the material uniform.
+///
+/// Mode-aware (the ring node is shared by both editors, both parenting UI to the
+/// same `ViewportImage`):
+///   * MapEditor    → radius = `MapEditorSession::brush_radius_px`, suppressed
+///     when a Map-Editor brush/softness field is focused.
+///   * SpeciesEditor + Sculpt mode → radius = fixed `SCULPT_RING_PX`, suppressed
+///     when the sculpt-radius field is focused.
+///   * Otherwise hidden.
 #[allow(clippy::type_complexity)]
 pub fn update_brush_cursor_ring(
     mode: Res<WindowMode>,
     session: Res<MapEditorSession>,
     brush_edit: Res<BrushSizeEditState>,
     softness_edit: Res<SoftnessEditState>,
+    species: Res<SpeciesSession>,
+    sculpt_edit: Res<SculptRadiusEditState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     viewport_q: Query<(&ComputedNode, &UiGlobalTransform), With<ViewportImage>>,
     mut ring: Query<(&mut Node, &mut Visibility, &MaterialNode<BrushCursorMaterial>), With<BrushCursorRing>>,
@@ -137,12 +147,19 @@ pub fn update_brush_cursor_ring(
 
     // Compute show/position; `break 'show false` for any reason to hide.
     let show = 'show: {
-        if *mode != WindowMode::MapEditor {
-            break 'show false;
-        }
-        if brush_edit.focused || softness_edit.focused {
-            break 'show false;
-        }
+        // Per-mode radius + focus-suppression gate.
+        let radius_px = match *mode {
+            WindowMode::MapEditor => {
+                if brush_edit.focused || softness_edit.focused { break 'show false; }
+                session.brush_radius_px.max(0.5)
+            }
+            WindowMode::SpeciesEditor if species.is_sculpt() => {
+                if sculpt_edit.focused { break 'show false; }
+                SCULPT_RING_PX.max(0.5)
+            }
+            _ => break 'show false,
+        };
+
         let Ok(window) = windows.single() else { break 'show false };
         let Some(cursor) = window.cursor_position() else { break 'show false };
         let Ok((vp_node, vp_xf)) = viewport_q.single() else { break 'show false };
@@ -153,12 +170,12 @@ pub fn update_brush_cursor_ring(
         let top_left = vp_xf.translation * inv - size * 0.5;
         let local = cursor - top_left;
 
-        // Hide unless the cursor is over the paintable viewport rect.
+        // Hide unless the cursor is over the viewport rect.
         if local.x < 0.0 || local.y < 0.0 || local.x > size.x || local.y > size.y {
             break 'show false;
         }
 
-        let radius = session.brush_radius_px.max(0.5);
+        let radius = radius_px;
         let half = radius + LINE_WIDTH_PX + NODE_PAD_PX;
         let dim = half * 2.0;
         node.width = Val::Px(dim);

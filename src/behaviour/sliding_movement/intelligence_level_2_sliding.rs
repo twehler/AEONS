@@ -32,6 +32,7 @@ const HIDDEN: usize = 16;
 const CONFIG: SlidingConfig = SlidingConfig {
     hidden:    HIDDEN,
     prey_type: |is_carnivore| if is_carnivore { OrganismType::Hetero } else { OrganismType::Photo },
+    direction_3d: false,
 };
 
 

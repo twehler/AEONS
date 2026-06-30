@@ -114,12 +114,12 @@ impl Mobility {
 /// `Diagnostics` highlights the hovered cell and reports its `CellType` in a
 /// text field; it never mutates the body. Placement is only live in `Addition`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EditorMode { Addition, Deletion, Diagnostics }
+pub enum EditorMode { Addition, Deletion, Diagnostics, Sculpt }
 
 impl EditorMode {
     /// Every mode, in dropdown display order.
-    pub const ALL: [EditorMode; 3] =
-        [EditorMode::Addition, EditorMode::Deletion, EditorMode::Diagnostics];
+    pub const ALL: [EditorMode; 4] =
+        [EditorMode::Addition, EditorMode::Deletion, EditorMode::Diagnostics, EditorMode::Sculpt];
 
     /// Full label for the dropdown option rows.
     pub fn label(self) -> &'static str {
@@ -127,6 +127,7 @@ impl EditorMode {
             EditorMode::Addition    => "Addition Mode",
             EditorMode::Deletion    => "Deletion Mode",
             EditorMode::Diagnostics => "Diagnostics Mode",
+            EditorMode::Sculpt      => "Sculpt Mode",
         }
     }
 
@@ -136,8 +137,41 @@ impl EditorMode {
             EditorMode::Addition    => "Addition",
             EditorMode::Deletion    => "Deletion",
             EditorMode::Diagnostics => "Diagnostics",
+            EditorMode::Sculpt      => "Sculpt",
         }
     }
+}
+
+/// Sculpt sub-operation (Add / Erase), toggled by the Add/Erase button in the
+/// tool panel. The LMB-drag always performs the active sub-op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SculptOp {
+    #[default]
+    Add,
+    Erase,
+}
+
+impl SculptOp {
+    pub fn label(self) -> &'static str {
+        match self {
+            SculptOp::Add   => "Add",
+            SculptOp::Erase => "Erase",
+        }
+    }
+    pub fn toggle(self) -> Self {
+        match self {
+            SculptOp::Add   => SculptOp::Erase,
+            SculptOp::Erase => SculptOp::Add,
+        }
+    }
+}
+
+/// Edit-buffer state for the sculpt "Brush radius (cell lengths)" field
+/// (mirrors `map_editor::gpu_paint::BrushSizeEditState`).
+#[derive(Resource, Default)]
+pub struct SculptRadiusEditState {
+    pub buffer:  String,
+    pub focused: bool,
 }
 
 /// Species-editor camera-movement style, toggled from the tool panel.
@@ -440,6 +474,14 @@ pub struct SpeciesSession {
 
     /// Camera-movement style (tool-panel toggle). See [`CameraMode`].
     pub camera_mode: CameraMode,
+
+    /// Sculpt brush radius, in cell lengths (`SCULPT_CELL_LENGTH`). Edited via
+    /// the tool-panel "Brush radius" field; consumed by `apply_sculpt_stroke`.
+    pub sculpt_radius_cells: f32,
+
+    /// Active sculpt sub-operation (Add / Erase). Toggled by the Add/Erase
+    /// button; LMB-drag performs this op.
+    pub sculpt_op: SculptOp,
 }
 
 impl Default for SpeciesSession {
@@ -460,6 +502,8 @@ impl Default for SpeciesSession {
             rename_buffer:      String::new(),
             kind_dropdown_open: None,
             camera_mode:        CameraMode::Free,
+            sculpt_radius_cells: crate::simulation_settings::SCULPT_RADIUS_CELLS_DEFAULT,
+            sculpt_op:          SculptOp::Add,
         };
         s.seed_base();
         s
@@ -503,6 +547,7 @@ impl SpeciesSession {
     pub fn is_addition(&self)    -> bool { self.editor_mode == EditorMode::Addition }
     pub fn is_deletion(&self)    -> bool { self.editor_mode == EditorMode::Deletion }
     pub fn is_diagnostics(&self) -> bool { self.editor_mode == EditorMode::Diagnostics }
+    pub fn is_sculpt(&self)      -> bool { self.editor_mode == EditorMode::Sculpt }
 
     /// The body part new cells are placed on, if any exists.
     pub fn active_part(&self) -> Option<&EditorBodyPart> {

@@ -1,6 +1,6 @@
 #[path = "world/world_geometry.rs"]    mod world_geometry;
 #[path = "world/aeonsw_format.rs"]     mod aeonsw_format;
-#[path = "world/terrain_properties.rs"] mod terrain_properties;
+#[path = "environment/terrain_properties.rs"] mod terrain_properties;
 #[path = "world/environment.rs"]       mod environment;
 #[path = "world/water.rs"]             mod water;
 
@@ -34,6 +34,7 @@
 #[path = "behaviour/limb_based_movement/intelligence_level_3_limb.rs"]               mod intelligence_level_3_limb;
 #[path = "behaviour/swimming_movement/swim_ppo.rs"]                                  mod swim_ppo;
 #[path = "behaviour/swimming_movement/intelligence_level_1_swimming.rs"]             mod intelligence_level_1_swimming;
+#[path = "behaviour/basic_3d_movement/intelligence_level_simple_aquatic.rs"]         mod intelligence_level_simple_aquatic;
 #[path = "behaviour/predation.rs"]                  mod predation;
 #[path = "behaviour/photosynthesis.rs"]             mod photosynthesis;
 #[path = "behaviour/sensory.rs"]                    mod sensory;
@@ -262,6 +263,8 @@ fn collect_positionals(args: &[String]) -> Vec<String> {
         ("--start-heteros",   1),
         ("--start-photos",    1),
         ("--water-level",     1),
+        ("--time-speed",      1),
+        ("--exit-after-secs", 1),
     ];
 
     let mut out = Vec::new();

@@ -9,6 +9,7 @@ use bevy::prelude::*;
 
 use crate::simulation_settings::WindowMode;
 
+use super::sculpt::SculptStrokeActive;
 use super::session::{EditorBodyPart, SpeciesSession};
 
 
@@ -32,9 +33,16 @@ pub struct SpeciesUndo {
 pub fn track_species_undo(
     mode:    Res<WindowMode>,
     session: Res<SpeciesSession>,
+    stroke:  Res<SculptStrokeActive>,
     mut undo: ResMut<SpeciesUndo>,
 ) {
     if *mode != WindowMode::SpeciesEditor { return; }
+
+    // Coalesce a whole sculpt drag into ONE undo entry: while LMB is held the
+    // tracker neither pushes nor updates the baseline, so the pre-stroke `last`
+    // is preserved. On release, the accumulated change is recorded as a single
+    // entry against that pre-stroke baseline.
+    if stroke.0 && !undo.suppress { return; }
 
     if undo.suppress {
         // Change came from a restore — adopt as the new baseline, don't record.

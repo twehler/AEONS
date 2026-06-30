@@ -53,6 +53,10 @@ use crate::intelligence_level_1_swimming::{
     BrainPoolSwim1, assign_brains_swim_1, free_brains_swim_1,
     apply_intelligence_level_swim_1,
 };
+use crate::intelligence_level_simple_aquatic::{
+    BrainPoolSimpleAquatic, assign_brains_simple_aquatic, free_brains_simple_aquatic,
+    apply_intelligence_level_simple_aquatic,
+};
 use crate::photosynthesis::PhotosynthesisPlugin;
 use crate::world_model::{WorldModelGrid, rebuild_world_model_grid};
 
@@ -95,6 +99,8 @@ impl Plugin for BehaviourPlugin {
         app.init_non_send_resource::<BrainPoolL3Limb>();
         // Swimming pool (PPO, ball-joint 3-axis control), Level1 only.
         app.init_non_send_resource::<BrainPoolSwim1>();
+        // SimpleAquatic pool (REINFORCE, kinematic 3D mover), Level1 only.
+        app.init_non_send_resource::<BrainPoolSimpleAquatic>();
 
         // PreUpdate: assign / free for every active pool.
         app.add_systems(PreUpdate, (assign_brains_herbivore_1, free_brains_herbivore_1).chain());
@@ -111,6 +117,9 @@ impl Plugin for BehaviourPlugin {
         // Swimming pool — `is_swimming()` filter keeps it disjoint from both
         // the sliding and the limb populations.
         app.add_systems(PreUpdate, (assign_brains_swim_1,           free_brains_swim_1)          .chain());
+        // SimpleAquatic pool — `is_simple_aquatic()` filter keeps it disjoint from
+        // the sliding, limb, and swim populations.
+        app.add_systems(PreUpdate, (assign_brains_simple_aquatic,   free_brains_simple_aquatic)  .chain());
 
         // FixedUpdate (NOT Update) so the brain cadence is driven by
         // virtual time, not frame rate: FixedUpdate runs as many times
@@ -134,6 +143,7 @@ impl Plugin for BehaviourPlugin {
                 apply_intelligence_level_2_limb,
                 apply_intelligence_level_3_limb,
                 apply_intelligence_level_swim_1,
+                apply_intelligence_level_simple_aquatic,
                 brain_tick_end,
             )
                 .chain()

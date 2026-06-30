@@ -259,7 +259,8 @@ fn cycle_movement(m: MovementMode) -> MovementMode {
     match m {
         MovementMode::Sliding          => MovementMode::LimbBasedWalking,
         MovementMode::LimbBasedWalking => MovementMode::Swimming,
-        MovementMode::Swimming         => MovementMode::Sliding,
+        MovementMode::Swimming         => MovementMode::SimpleAquatic,
+        MovementMode::SimpleAquatic    => MovementMode::Sliding,
         MovementMode::Flying           => MovementMode::Sliding,
     }
 }

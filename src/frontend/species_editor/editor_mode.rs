@@ -45,6 +45,13 @@ const OPT_HOVER:    Color = Color::srgb(0.28, 0.32, 0.38);
 const OPT_ACTIVE:   Color = Color::srgb(0.20, 0.45, 0.55);
 const FIELD_BG:     Color = Color::srgb(0.12, 0.13, 0.16);
 
+/// Sculpt numeric-field backgrounds (mirror the Map-Editor brush-size field).
+pub const SCULPT_FIELD_BG_IDLE:    Color = Color::srgb(0.20, 0.20, 0.22);
+pub const SCULPT_FIELD_BG_FOCUSED: Color = Color::srgb(0.32, 0.30, 0.18);
+/// Add/Erase toggle backgrounds (green-ish for Add, red-ish for Erase).
+pub const SCULPT_OP_ADD_BG:   Color = Color::srgb(0.20, 0.45, 0.40);
+pub const SCULPT_OP_ERASE_BG: Color = Color::srgb(0.50, 0.22, 0.22);
+
 /// Cyan overlay painted over the hovered cell in Diagnostics mode (distinct from
 /// deletion's red).
 const DIAG_HILITE: Color = Color::srgb(0.10, 0.85, 0.95);
@@ -78,6 +85,21 @@ pub struct DiagnosticsField;
 /// The text inside the diagnostics field.
 #[derive(Component)]
 pub struct DiagnosticsLabel;
+/// Sculpt-mode "Brush radius (cell lengths)" caption (shown only in Sculpt mode).
+#[derive(Component)]
+pub struct SculptRadiusCaption;
+/// Sculpt-mode "Brush radius" numeric input box (shown only in Sculpt mode).
+#[derive(Component)]
+pub struct SculptRadiusInput;
+/// The text inside the sculpt-radius input box.
+#[derive(Component)]
+pub struct SculptRadiusText;
+/// Sculpt-mode Add/Erase toggle button (shown only in Sculpt mode).
+#[derive(Component)]
+pub struct SculptOpToggle;
+/// The text inside the Add/Erase toggle ("Add" / "Erase").
+#[derive(Component)]
+pub struct SculptOpText;
 /// The 3D overlay highlighting the hovered cell in Diagnostics mode.
 #[derive(Component)]
 pub struct DiagnosticsHighlight;
@@ -230,6 +252,71 @@ pub fn spawn_tool_panel(parent: &mut ChildSpawnerCommands, top_offset_px: f32) {
                     ));
                 });
 
+            // ── Sculpt-mode widgets (shown only in Sculpt mode by sync). ──
+            // Brush-radius caption.
+            panel.spawn((
+                SculptRadiusCaption,
+                Text::new("Brush radius (cell lengths)"),
+                TextFont { font_size: 12.0, ..default() },
+                TextColor(Color::srgb(0.70, 0.70, 0.70)),
+                Node {
+                    margin:  UiRect::top(Val::Px(6.0)),
+                    display: Display::None,
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ));
+            // Brush-radius numeric input (copies the Map-Editor BrushSizeInput shape).
+            panel
+                .spawn((
+                    SculptRadiusInput,
+                    Button,
+                    Node {
+                        width:           Val::Percent(100.0),
+                        height:          Val::Px(FIELD_HEIGHT),
+                        padding:         UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                        align_items:     AlignItems::Center,
+                        justify_content: JustifyContent::FlexStart,
+                        display:         Display::None,
+                        ..default()
+                    },
+                    BackgroundColor(SCULPT_FIELD_BG_IDLE),
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        SculptRadiusText,
+                        Text::new("2.0"),
+                        TextFont { font_size: 14.0, ..default() },
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
+                });
+            // Add/Erase toggle button.
+            panel
+                .spawn((
+                    SculptOpToggle,
+                    Button,
+                    Node {
+                        width:           Val::Percent(100.0),
+                        height:          Val::Px(FIELD_HEIGHT),
+                        align_items:     AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        margin:          UiRect::top(Val::Px(6.0)),
+                        display:         Display::None,
+                        ..default()
+                    },
+                    BackgroundColor(SCULPT_OP_ADD_BG),
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        SculptOpText,
+                        Text::new("Add"),
+                        TextFont { font_size: 13.0, ..default() },
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
+                });
+
             // Flexible spacer, then the camera-movement toggle pinned to the
             // very bottom of the panel.
             panel.spawn(Node { flex_grow: 1.0, ..default() });
@@ -280,6 +367,15 @@ pub fn sync_editor_mode_widget(
     mut options:   Query<(&Interaction, &EditorModeOption, &mut BackgroundColor, &mut Node),
                          Without<EditorModeHeaderButton>>,
     mut field:     Query<&mut Node, (With<DiagnosticsField>, Without<EditorModeOption>)>,
+    mut sc_cap:    Query<&mut Node, (With<SculptRadiusCaption>, Without<EditorModeOption>,
+                                     Without<DiagnosticsField>, Without<SculptRadiusInput>,
+                                     Without<SculptOpToggle>)>,
+    mut sc_inp:    Query<&mut Node, (With<SculptRadiusInput>, Without<EditorModeOption>,
+                                     Without<DiagnosticsField>, Without<SculptRadiusCaption>,
+                                     Without<SculptOpToggle>)>,
+    mut sc_op:     Query<&mut Node, (With<SculptOpToggle>, Without<EditorModeOption>,
+                                     Without<DiagnosticsField>, Without<SculptRadiusCaption>,
+                                     Without<SculptRadiusInput>)>,
 ) {
     if *mode != WindowMode::SpeciesEditor {
         // Force-close so the dropdown is collapsed on the next entry; the
@@ -288,6 +384,9 @@ pub fn sync_editor_mode_widget(
         for mut node in &mut field {
             if node.display != Display::None { node.display = Display::None; }
         }
+        for mut node in &mut sc_cap { if node.display != Display::None { node.display = Display::None; } }
+        for mut node in &mut sc_inp { if node.display != Display::None { node.display = Display::None; } }
+        for mut node in &mut sc_op  { if node.display != Display::None { node.display = Display::None; } }
         return;
     }
 
@@ -323,6 +422,11 @@ pub fn sync_editor_mode_widget(
     for mut node in &mut field {
         if node.display != want { node.display = want; }
     }
+    // Sculpt widgets (radius caption + input + Add/Erase toggle): Sculpt mode only.
+    let want_sculpt = if session.is_sculpt() { Display::Flex } else { Display::None };
+    for mut node in &mut sc_cap { if node.display != want_sculpt { node.display = want_sculpt; } }
+    for mut node in &mut sc_inp { if node.display != want_sculpt { node.display = want_sculpt; } }
+    for mut node in &mut sc_op  { if node.display != want_sculpt { node.display = want_sculpt; } }
 }
 
 

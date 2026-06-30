@@ -53,6 +53,8 @@ pub fn assign_brains_herbivore_1_limb(
         if organism.movement_mode.is_sliding() { continue; }
         // Swimmers train in their own pool (intelligence_level_1_swimming).
         if organism.movement_mode.is_swimming() { continue; }
+        // SimpleAquatic movers train in the basic_3d_movement pool (kinematic, no limbs).
+        if organism.movement_mode.is_simple_aquatic() { continue; }
         let Some(s) = pool.0.enrol(e) else { continue };
         // STANDING task: by default ignore the saved Runner brains — they are
         // locomotion-trained and tanh-SATURATED (μ pinned at ±1 → zero actor

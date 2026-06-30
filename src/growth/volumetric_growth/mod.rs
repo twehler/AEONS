@@ -18,11 +18,13 @@ use rand::RngExt;
 use crate::cell::CellType;
 use crate::colony::Organism;
 
-type LatticeKey = (i32, i32, i32);
+pub type LatticeKey = (i32, i32, i32);
 
-/// RD lattice quantization: resolution 1/2048 world units.
+/// RD lattice quantization: resolution 1/2048 world units. Exposed `pub` so the
+/// Species Editor sculpt brush can dedup lattice points the same way the growth
+/// pipeline does.
 #[inline]
-fn lattice_key(v: Vec3) -> LatticeKey {
+pub fn lattice_key(v: Vec3) -> LatticeKey {
     const S: f32 = 2048.0;
     ((v.x * S).round() as i32, (v.y * S).round() as i32, (v.z * S).round() as i32)
 }
