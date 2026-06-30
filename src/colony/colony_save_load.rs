@@ -154,6 +154,7 @@ pub(crate) fn serialize_colony_bytes(
     pool_limb_l2: &crate::intelligence_level_2_limb::BrainPoolL2Limb,
     pool_limb_l3: &crate::intelligence_level_3_limb::BrainPoolL3Limb,
     pool_swim:    &crate::intelligence_level_1_swimming::BrainPoolSwim1,
+    pool_aquatic: &crate::intelligence_level_simple_aquatic::BrainPoolSimpleAquatic,
     registry: &crate::lineages::species::SpeciesRegistry,
 ) -> (Vec<u8>, u32) {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -177,6 +178,7 @@ pub(crate) fn serialize_colony_bytes(
     let snap_l2 = pool_limb_l2.0.snapshot();
     let snap_l3 = pool_limb_l3.0.snapshot();
     let snap_swim = pool_swim.0.snapshot();
+    let snap_aquatic = pool_aquatic.snapshot();
 
     // Two-pass to write the count up front.
     let count = organisms.iter()
@@ -260,12 +262,25 @@ pub(crate) fn serialize_colony_bytes(
         // `BrainRestore` payload. Pool routed by `intelligence_level`
         // (also serialised), so no pool tag in the file. Limb organisms
         // and photoautotrophs emit 0 here.
-        let sliding_brain = if org.movement_mode.is_sliding() && is_hetero {
-            match org.intelligence_level {
-                IntelligenceLevel::Level1 if !is_carn => snap_sl_h.extract(entity),
-                IntelligenceLevel::Level2             => snap_sl_l2.extract(entity),
-                IntelligenceLevel::Level3             => snap_sl_l3.extract(entity),
-                _ => None,
+        let sliding_brain = if (org.movement_mode.is_sliding()
+            || org.movement_mode.is_simple_aquatic()) && is_hetero
+        {
+            if org.movement_mode.is_simple_aquatic() {
+                // SimpleAquatic (kinematic 3D mover) reuses the sliding REINFORCE
+                // engine, so its brain serialises through this same section; routed
+                // back to `BrainPoolSimpleAquatic` on load by the organism's
+                // movement_mode. Level1 only.
+                match org.intelligence_level {
+                    IntelligenceLevel::Level1 if !is_carn => snap_aquatic.extract(entity),
+                    _ => None,
+                }
+            } else {
+                match org.intelligence_level {
+                    IntelligenceLevel::Level1 if !is_carn => snap_sl_h.extract(entity),
+                    IntelligenceLevel::Level2             => snap_sl_l2.extract(entity),
+                    IntelligenceLevel::Level3             => snap_sl_l3.extract(entity),
+                    _ => None,
+                }
             }
         } else {
             None
@@ -284,7 +299,9 @@ pub(crate) fn serialize_colony_bytes(
         // 1=herbivore_1_limb, 2=l2_limb, 3=l3_limb (routed by intelligence_level
         // + carnivore marker), 4=swim (v011 — same `BrainRestoreLimb` payload,
         // swim dims). Non-PPO organisms write 0.
-        let limb_brain = if !org.movement_mode.is_sliding() && is_hetero {
+        let limb_brain = if !org.movement_mode.is_sliding()
+            && !org.movement_mode.is_simple_aquatic() && is_hetero
+        {
             if org.movement_mode.is_swimming() {
                 snap_swim.extract(entity).map(|b| (4u8, b))
             } else {
@@ -340,6 +357,9 @@ pub(crate) fn save_colony_system(
     // `BrainRestoreLimb` payload struct; routed back to the swim pool on load
     // by the organism's movement mode).
     pool_swim:    NonSend<crate::intelligence_level_1_swimming::BrainPoolSwim1>,
+    // SimpleAquatic pool — its REINFORCE brain persists via the sliding-brain
+    // section (same engine payload), routed back by movement_mode on load.
+    pool_aquatic: NonSend<crate::intelligence_level_simple_aquatic::BrainPoolSimpleAquatic>,
     // v011 species identity: maps each organism's `species_id` to its display
     // name so the name (not the volatile id) is what gets persisted.
     registry: Res<crate::lineages::species::SpeciesRegistry>,
@@ -350,6 +370,7 @@ pub(crate) fn save_colony_system(
         &run_elapsed, &water, &organisms,
         &pool, &pool_l2, &pool_l3,
         &pool_limb_h, &pool_limb_l2, &pool_limb_l3, &pool_swim,
+        &pool_aquatic,
         &registry,
     );
 
@@ -925,6 +946,7 @@ pub struct ColonySerializeParams<'w, 's> {
     pool_limb_l2: NonSend<'w, crate::intelligence_level_2_limb::BrainPoolL2Limb>,
     pool_limb_l3: NonSend<'w, crate::intelligence_level_3_limb::BrainPoolL3Limb>,
     pool_swim:    NonSend<'w, crate::intelligence_level_1_swimming::BrainPoolSwim1>,
+    pool_aquatic: NonSend<'w, crate::intelligence_level_simple_aquatic::BrainPoolSimpleAquatic>,
     registry: Res<'w, crate::lineages::species::SpeciesRegistry>,
 }
 
@@ -935,6 +957,7 @@ impl ColonySerializeParams<'_, '_> {
             &self.run_elapsed, &self.water, &self.organisms,
             &self.pool, &self.pool_l2, &self.pool_l3,
             &self.pool_limb_h, &self.pool_limb_l2, &self.pool_limb_l3, &self.pool_swim,
+            &self.pool_aquatic,
             &self.registry,
         )
     }

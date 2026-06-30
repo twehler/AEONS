@@ -868,6 +868,14 @@ fn load_world_file(
         }
         None => {
             commands.insert_resource(crate::simulation_settings::WindowMode::EditColony);
+            // A terrain-only `.aeonsw` boots the Colony Editor so the user builds a
+            // colony from scratch — it must start EMPTY. Without this, `spawn_colony`
+            // (no embedded colony, no `ColonyLoadPath`, `StartEmptyColony` false)
+            // falls through to the procedural fresh-start cohort — the
+            // "standard colony spawned from a colony-less .aeonsw" bug. Setting it
+            // here mirrors the `--setup` new-world path. (The fresh `.glb`/flat CLI
+            // start deliberately leaves this false, so it keeps the procedural cohort.)
+            commands.insert_resource(crate::simulation_settings::StartEmptyColony(true));
         }
     }
 }
@@ -905,6 +913,15 @@ fn adopt_world_paint_state(
 /// geometry) using the heightmap grid for dims + the top-surface filter. The atlas
 /// is square, so `texture.width` is the atlas edge.
 fn build_props_from_world(data: &AeonswData, heightmap: &HeightmapSampler) -> TerrainProperties {
+    // v3+: if the file carries a persisted nutrient table that matches the grid,
+    // ADOPT it directly (skip the texture re-scan). Else recompute from the texture.
+    if let Some(table) = data.nutrients_table.as_ref() {
+        if let Some(props) = TerrainProperties::from_nutrients_table(
+            heightmap.width, heightmap.depth, heightmap.min_x, heightmap.min_z, table,
+        ) {
+            return props;
+        }
+    }
     let pm: Vec<terrain_properties::PropMesh> = data
         .meshes
         .iter()

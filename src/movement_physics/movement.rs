@@ -115,6 +115,19 @@ impl Plugin for MovementPlugin {
             apply_gravity
                 .after(random_2d_direction)
                 .before(apply_movement));
+
+        // SimpleAquatic: phototroph drift sets direction/speed, then the unified
+        // kinematic step translates + auto-rotates + contains in the water column.
+        // Disjoint organism set from apply_movement/adhesion (those skip
+        // SimpleAquatic), and before Propagate so the (collider-less) transform is
+        // current the same frame.
+        app.add_systems(PostUpdate,
+            apply_simple_aquatic_movement
+                .after(drive_simple_aquatic_photo_drift)
+                .before(TransformSystems::Propagate)
+                .run_if(resource_exists::<HeightmapSampler>)
+                .run_if(resource_exists::<MapSize>));
+        app.add_systems(PostUpdate, drive_simple_aquatic_photo_drift);
     }
 }
 
@@ -128,6 +141,10 @@ fn random_2d_direction(
     let dt = time.delta();
 
     for (mut organism, mut timer) in &mut query {
+        // SimpleAquatic phototroph drifters get a 3D wander from
+        // `drive_simple_aquatic_photo_drift` instead — leave their speed/direction
+        // alone here (do NOT pin to 0).
+        if organism.movement_mode.is_simple_aquatic() { continue; }
         // Active wander is only for organisms that actually translate under it:
         // GROUND-BASED, non-sessile photoautotrophs. Sessile ones are skipped by
         // `apply_movement` (they never move), and water-based floaters drift via
@@ -156,6 +173,96 @@ fn random_2d_direction(
             + rand::random::<f32>() * (MAX_DIRECTION_INTERVAL - MIN_DIRECTION_INTERVAL);
         timer.timer = Timer::from_seconds(next, TimerMode::Repeating);
     }
+}
+
+
+// ── SimpleAquatic: 3D phototroph drift + kinematic move + containment ─────────
+
+/// Gentle 3D random wander for SimpleAquatic PHOTOTROPH drifters (heterotrophs get
+/// their direction/speed from the brain). Periodically picks a random unit 3D
+/// direction and a small speed (≤ `PHOTO_WANDER_MAX_SPEED`). Phototrophs pay no
+/// energy cost (the `is_hetero` gate in `energy.rs`), so the drift is free.
+fn drive_simple_aquatic_photo_drift(
+    time:      Res<Time>,
+    mut query: Query<(&mut Organism, &mut DirectionTimer), (With<OrganismRoot>, With<Photoautotroph>)>,
+) {
+    let dt = time.delta();
+    for (mut organism, mut timer) in &mut query {
+        if !organism.movement_mode.is_simple_aquatic() { continue; }
+        if organism.is_sessile {
+            if organism.movement_speed != 0.0 { organism.movement_speed = 0.0; }
+            continue;
+        }
+        timer.timer.tick(dt);
+        if !timer.timer.just_finished() { continue; }
+
+        // Random unit 3D direction (rejection-free: spherical from two angles).
+        let theta = rand::random::<f32>() * std::f32::consts::TAU;     // azimuth
+        let z     = rand::random::<f32>() * 2.0 - 1.0;                 // cos(polar) ∈ [-1,1]
+        let r     = (1.0 - z * z).max(0.0).sqrt();
+        organism.movement_direction = Vec3::new(r * theta.cos(), z, r * theta.sin());
+        organism.movement_speed     = rand::random::<f32>() * PHOTO_WANDER_MAX_SPEED;
+
+        let next = MIN_DIRECTION_INTERVAL
+            + rand::random::<f32>() * (MAX_DIRECTION_INTERVAL - MIN_DIRECTION_INTERVAL);
+        timer.timer = Timer::from_seconds(next, TimerMode::Repeating);
+    }
+}
+
+/// The whole SimpleAquatic kinematic step in ONE cheap pass: translate the root in
+/// full 3D by `movement_direction * movement_speed`, auto-rotate local +Z to face
+/// travel, then CONTAIN the body in the water column (clamp Y between
+/// `seafloor + clearance` and `surface − clearance`, and XZ to the map). No physics
+/// solver, no collider — O(1) per organism. Runs before `TransformSystems::Propagate`
+/// so the (collider-less) render transform is current.
+fn apply_simple_aquatic_movement(
+    time:      Res<Time>,
+    heightmap: Res<HeightmapSampler>,
+    water:     Res<WaterLevel>,
+    map_size:  Res<MapSize>,
+    mut query: Query<(&mut Transform, &Organism), With<OrganismRoot>>,
+) {
+    let dt      = time.delta_secs();
+    let water_y = water.0;
+    let max_x   = map_size.x.max(0.0);
+    let max_z   = map_size.z.max(0.0);
+
+    query.par_iter_mut().for_each(|(mut transform, organism)| {
+        if !organism.movement_mode.is_simple_aquatic() { return; }
+        if organism.is_sessile { return; }
+
+        // Translate + auto-rotate to face the (full-3D) travel direction.
+        let speed = organism.movement_speed;
+        let dir   = organism.movement_direction;
+        if speed > 0.0 && dir.length_squared() > 1e-9 {
+            let fwd = dir.normalize();
+            transform.translation += fwd * speed * dt;
+
+            // Orthonormal basis → quat: local +Z = fwd; up ≈ +Y (fall back to +X
+            // when fwd is ~parallel to Y, to avoid a degenerate basis).
+            let mut up = Vec3::Y;
+            if fwd.cross(up).length_squared() < 1e-6 { up = Vec3::X; }
+            let right = up.cross(fwd).normalize_or_zero();
+            if right != Vec3::ZERO {
+                let new_up = fwd.cross(right).normalize_or_zero();
+                if new_up != Vec3::ZERO {
+                    transform.rotation = Quat::from_mat3(&Mat3::from_cols(right, new_up, fwd));
+                }
+            }
+        }
+
+        // Containment: keep the body inside the water column + map bounds. The
+        // position clamp is idempotent (a creature steering into a boundary is
+        // pinned there, not bounced), so it never gets stuck IN the terrain and
+        // never jitters. `height_at` clamps off-map input, so no NaN.
+        let clr   = organism.bounding_radius().max(0.5);
+        let floor = heightmap.height_at(transform.translation.x, transform.translation.z);
+        let lo    = floor + clr;
+        let hi    = (water_y - clr).max(lo);   // shallow water: keep hi ≥ lo
+        transform.translation.y = transform.translation.y.clamp(lo, hi);
+        transform.translation.x = transform.translation.x.clamp(0.0, max_x);
+        transform.translation.z = transform.translation.z.clamp(0.0, max_z);
+    });
 }
 
 

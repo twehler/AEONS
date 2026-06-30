@@ -33,9 +33,11 @@ pub const MAX_BODY_PARTS: usize = 3;
 // its value at scale 1.0 (= 2/√3), so it tracks the knob ∝ scale.
 pub const MIN_X_BILATERAL: f32 = 1.154_700_5 * crate::simulation_settings::GEOMETRY_SCALE;
 
-/// RD edge length. Mirrors `volumetric_growth::EDGE_LEN` (private there) —
-/// keep in sync or the seed-cell offset stops matching the lattice.
-const EDGE_LEN: f32 = 1.0;
+/// RD edge length. Mirrors `volumetric_growth::EDGE_LEN` (private there, =
+/// `GEOMETRY_SCALE`) — keep in sync or the seed-cell offset stops matching the
+/// lattice. (Was a stale `1.0`, ~10× the real spacing, which floated grown
+/// branches far off the parent.)
+const EDGE_LEN: f32 = crate::simulation_settings::GEOMETRY_SCALE;
 
 
 /// How a body part hangs off its parent. The child entity is a Bevy child of
@@ -100,18 +102,28 @@ pub fn pick_attachment(
 }
 
 
-/// Build a fresh branch BodyPart. The seed sits at `outward_dir * EDGE_LEN`
-/// in the new part's frame; since the part's origin coincides with
-/// `attachment.origin_local`, this lands the seed flush against the parent as
-/// an FCC-neighbour. `regrowable: true` so future ticks can grow it.
+/// Build a fresh branch BodyPart. The seed (OCG index 0) sits at the new part's
+/// LOCAL ORIGIN, and the flush FCC-neighbour displacement off the parent is
+/// folded into `attachment.origin_local` instead. Callers pass
+/// `attachment.origin_local = parent pick-point` (the chosen parent cell pos);
+/// here we add `outward_dir * center_scale(EDGE_LEN)` — the lattice flush
+/// spacing — so the seed lands adjacent to the parent without floating. Keeping
+/// index 0 at the origin matches `kinded_appendage_from_ocg`, so the spawn-time
+/// normalization (`normalize_appendage_anchor`) is a no-op on grown branches.
+/// `regrowable: true` so future ticks can grow it.
 pub fn create_branch_body_part(
-    seed_cell_type: CellType,
-    attachment:     Attachment,
-    outward_dir:    Vec3,
+    seed_cell_type:  CellType,
+    mut attachment:  Attachment,
+    outward_dir:     Vec3,
 ) -> BodyPart {
-    let seed_local = outward_dir * EDGE_LEN;
-    let cells = vec![Cell::new(seed_local, seed_cell_type)];
-    let ocg = vec![(0usize, seed_local, seed_cell_type)];
+    // Flush lattice displacement (`center_scale(EDGE_LEN) = 4·EDGE_LEN/√3`):
+    // axis slots land exactly, FCC slots are slightly long but still adjacent
+    // (and the spawn-time anchor normalization tolerates any index-0 offset).
+    let flush = crate::volumetric_growth::dodecahedron::center_scale(EDGE_LEN);
+    attachment.origin_local += outward_dir * flush;
+
+    let cells = vec![Cell::new(Vec3::ZERO, seed_cell_type)];
+    let ocg = vec![(0usize, Vec3::ZERO, seed_cell_type)];
 
     BodyPart {
         kind:         BodyPartKind::Limb,

@@ -510,12 +510,22 @@ fn spawn_loaded_organism(
     materials: &OrganismMaterials,
     rng:       &mut impl rand::Rng,
 ) -> Entity {
-    let LoadedRecord { pos, rotation, kind, organism, brain, brain_limb, species_name } = record;
+    let LoadedRecord { pos, rotation, kind, mut organism, brain, brain_limb, species_name } = record;
     if organism.body_parts.is_empty() {
         // Defensive — should never happen on a valid save.
         return commands.spawn_empty().id();
     }
 
+    // Re-anchor appendages on the LIVE component first, migrating legacy
+    // `.colony` plant frames (no-op on already-anchored swimmer/limb parts), then
+    // snapshot the normalized parts. Normalizing the component too (matching
+    // `spawn_organism`, which normalizes before building the component) keeps the
+    // component, the rendered child Transforms, the sliding collider, AND the
+    // continuous-growth mesh refresh (which rebuilds meshes from the COMPONENT
+    // OCG onto child entities posed from the snapshot) all in one frame — a
+    // snapshot-only normalize left a legacy plant's component double-shifted from
+    // its render transform, jumping on the first smoothing/growth tick.
+    for bp in organism.body_parts.iter_mut() { normalize_appendage_anchor(bp); }
     let body_parts_snapshot = organism.body_parts.clone();
     // Capture before `organism` is moved into the spawn bundle.
     let intelligence_level = organism.intelligence_level;
@@ -809,6 +819,26 @@ pub fn kinded_appendage_from_ocg(ocg: Vec<(usize, Vec3, CellType)>, parent_idx: 
         debug_blue: false,
         regrowable: true,
     }
+}
+
+/// Re-anchor an appendage so its OCG index-0 cell sits at the local origin,
+/// folding the shift into `attachment.origin_local` (`origin_local += old_idx0`).
+/// World cell positions (`origin_local + cell.local_pos`) are invariant under
+/// this shift, so the rendered mesh and sliding collider stay matched.
+///
+/// IDEMPOTENT no-op when index-0 is already at the origin — so swimmer/limb
+/// parts and any `kinded_appendage_from_ocg` output (all already anchored at 0)
+/// stay byte-identical. SKIPS attachment-less parts (the trunk `body_parts[0]`
+/// and Bilateral COMBINED parts), preserving their midline frame. The actual
+/// fix targets legacy `.colony` plant frames and grown branches whose index-0
+/// is offset.
+pub fn normalize_appendage_anchor(bp: &mut BodyPart) {
+    let Some(att) = bp.attachment.as_mut() else { return };
+    let Some(&(_, idx0, _)) = bp.ocg.first() else { return };
+    if idx0 == Vec3::ZERO { return; }
+    for e in bp.ocg.iter_mut() { e.1 -= idx0; }
+    for c in bp.cells.iter_mut() { c.local_pos -= idx0; }
+    att.origin_local += idx0;
 }
 
 /// Combine a Bilateral right-half OCG with its mirror into ONE midline part's
@@ -1401,6 +1431,12 @@ pub fn spawn_organism(
     // skipping this would make every cell produce zero energy.
     crate::physiology::recompute_body_parts(&mut body_parts);
 
+    // Re-anchor every appendage so its OCG index-0 sits at the local origin
+    // (no-op on already-anchored parts → swimmers/limbs untouched). Runs before
+    // the Organism is built so the component, mesh loop, and sliding collider
+    // all see anchored parts.
+    for bp in body_parts.iter_mut() { normalize_appendage_anchor(bp); }
+
     let angle     = rng.random::<f32>() * std::f32::consts::TAU;
     let direction = Vec3::new(angle.cos(), 0.0, angle.sin());
     let speed     = match kind {
@@ -1568,7 +1604,12 @@ pub fn spawn_organism(
     // `apply_movement`) + one compound collider from all cells (offset by
     // attachment origin to match world positions). Limb-based: per-part
     // Dynamic body + collider, plus one hinge joint per appendage.
-    if movement_mode.is_sliding() {
+    if movement_mode.is_simple_aquatic() {
+        // SimpleAquatic: pure KINEMATIC Transform — NO Rapier body, collider, or
+        // joints (the cheapest possible mover). `apply_3d_kinematic_movement`
+        // writes the Transform; the world-model grid + proximity predation read
+        // the Transform directly, so no collider is needed for the brain or eating.
+    } else if movement_mode.is_sliding() {
         insert_sliding_collider(commands, root, &body_parts);
     } else {
         insert_limb_physics(commands, root, &bp_entities, &body_parts, movement_mode.is_swimming());

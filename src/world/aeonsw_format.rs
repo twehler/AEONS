@@ -46,9 +46,11 @@ use bevy::prelude::*; // Transform, Vec3, Quat
 // ── Format constants ──────────────────────────────────────────────────────────
 
 /// Current writer magic. v2 adds an optional tail (water level + embedded colony)
-/// AFTER the v1 body, so v1 is a strict byte prefix and still decodes.
-pub const AEONSW_MAGIC: &[u8; 8] = b"AEONSW02";
-pub const MAX_AEONSW_VERSION: u8 = 2;
+/// AFTER the v1 body; v3 appends the nutrient table after that — each version is a
+/// strict byte prefix of the next, so older files still decode (missing tails →
+/// `None`).
+pub const AEONSW_MAGIC: &[u8; 8] = b"AEONSW03";
+pub const MAX_AEONSW_VERSION: u8 = 3;
 /// `tex_format` tag for `Rgba8UnormSrgb` (the only format this version stores).
 pub const TEX_FORMAT_RGBA8_SRGB: u32 = 0;
 
@@ -84,6 +86,11 @@ pub struct AeonswData {
     pub water_level: Option<f32>,
     /// Embedded colony as verbatim `.colony` bytes (v2+). `None` ⇒ terrain only.
     pub embedded_colony: Option<Vec<u8>>,
+    /// Per-grid-cell nutrient table (v3+): a flat row-major `width*depth*2` f32 array
+    /// (`…, nitrogen, calcium, …` per cell, each ∈ [0,1]), dimensioned 1:1 with the
+    /// heightmap. `None` ⇒ v1/v2 (recompute from the texture on load) or terrain with
+    /// no nutrient data.
+    pub nutrients_table: Option<Vec<f32>>,
 }
 
 
@@ -176,6 +183,18 @@ fn write_aeonsw_bytes(data: &AeonswData) -> Vec<u8> {
         Some(bytes) => {
             put_u32(&mut out, bytes.len() as u32);
             out.extend_from_slice(bytes);
+        }
+        None => put_u32(&mut out, 0),
+    }
+
+    // ── v3 tail (appended after the v2 tail, so v2 stays a strict prefix) ──
+    // nutrient table: count-prefixed f32 array (0 = none).
+    match &data.nutrients_table {
+        Some(table) => {
+            put_u32(&mut out, table.len() as u32);
+            for &val in table {
+                put_f32(&mut out, val);
+            }
         }
         None => put_u32(&mut out, 0),
     }
@@ -390,6 +409,25 @@ fn read_aeonsw_bytes(bytes: &[u8]) -> std::io::Result<AeonswData> {
         (None, None)
     };
 
+    // ── v3 tail (gated on version; v1/v2 files end above → None) ──
+    let nutrients_table = if version >= 3 {
+        let table_len = read_u32(bytes, &mut c)?;
+        if table_len > 0 {
+            // 4 bytes per f32; `checked_count` rejects a corrupt/huge length BEFORE
+            // allocating (clean Err, never a giant alloc).
+            let table_len = checked_count(table_len, 4, c, total, "nutrients table")?;
+            let mut table = Vec::with_capacity(table_len);
+            for _ in 0..table_len {
+                table.push(read_f32(bytes, &mut c)?);
+            }
+            Some(table)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(AeonswData {
         map_x,
         map_z,
@@ -397,6 +435,7 @@ fn read_aeonsw_bytes(bytes: &[u8]) -> std::io::Result<AeonswData> {
         meshes,
         water_level,
         embedded_colony,
+        nutrients_table,
     })
 }
 
@@ -439,6 +478,7 @@ mod aeonsw_format_tests {
             meshes: vec![entry],
             water_level: None,
             embedded_colony: None,
+            nutrients_table: None,
         }
     }
 
@@ -484,16 +524,44 @@ mod aeonsw_format_tests {
 
     #[test]
     fn v1_prefix_decodes_with_none_tail() {
-        // A v1 file is a strict prefix: take the v2 bytes for the None/None sample
-        // (tail = water_present(1) + colony_len(4) = 5 bytes), patch the magic to
-        // AEONSW01, and drop the 5-byte tail. It must decode with both fields None.
+        // A v1 file is a strict prefix: take the v3 bytes for the all-None sample
+        // (tail = water_present(1) + colony_len(4) + nutrients_len(4) = 9 bytes),
+        // patch the magic to AEONSW01, and drop the 9-byte tail. It must decode with
+        // every optional field None.
         let mut buf = write_aeonsw_bytes(&sample());
         buf[6] = b'0';
         buf[7] = b'1';
-        buf.truncate(buf.len() - 5);
+        buf.truncate(buf.len() - 9);
         let r = read_aeonsw_bytes(&buf).expect("v1 prefix should decode");
         assert!(r.water_level.is_none(), "v1 must yield water_level None");
         assert!(r.embedded_colony.is_none(), "v1 must yield embedded_colony None");
+        assert!(r.nutrients_table.is_none(), "v1 must yield nutrients_table None");
+        assert_eq!(r.meshes.len(), 1);
+    }
+
+    #[test]
+    fn round_trip_v3_nutrients() {
+        let mut d = sample();
+        d.water_level = Some(200.0);
+        d.nutrients_table = Some(vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.0, 0.0]);
+        let buf = write_aeonsw_bytes(&d);
+        let r = read_aeonsw_bytes(&buf).expect("v3 round-trip");
+        assert_eq!(r.nutrients_table, d.nutrients_table);
+        assert_eq!(r.water_level, Some(200.0));
+        assert_eq!(r.texture.bytes, d.texture.bytes);
+    }
+
+    #[test]
+    fn v2_file_decodes_with_none_nutrients() {
+        // A v2 file (water+colony tail, NO nutrients section) must still load under
+        // the v3 reader, yielding nutrients_table None. Build a v3 buffer for an
+        // all-None sample, patch magic to AEONSW02, and drop the 4-byte v3 tail.
+        let mut buf = write_aeonsw_bytes(&sample());
+        buf[6] = b'0';
+        buf[7] = b'2';
+        buf.truncate(buf.len() - 4);
+        let r = read_aeonsw_bytes(&buf).expect("v2 should decode under v3 reader");
+        assert!(r.nutrients_table.is_none(), "v2 must yield nutrients_table None");
         assert_eq!(r.meshes.len(), 1);
     }
 

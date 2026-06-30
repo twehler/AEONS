@@ -198,18 +198,30 @@ fn manage_energy(
         // floaters — none are sliding heteros today, but kept future-safe) pay the
         // cubic fluid drag for moving through the water column instead.
         let (friction_cost, fluid_cost) =
-            if crate::simulation_settings::MOVEMENT_ENERGY_COSTS_ENABLED
-                && is_hetero
-                && organism.movement_mode.is_sliding()
-            {
-                if organism.ground_based {
+            if crate::simulation_settings::MOVEMENT_ENERGY_COSTS_ENABLED && is_hetero {
+                if organism.movement_mode.is_sliding() {
+                    if organism.ground_based {
+                        let friction = K_GROUND_FRICTION * weight * speed * ENERGY_TICK_INTERVAL;
+                        (friction, 0.0)
+                    } else {
+                        let fluid = submersion
+                            * (K_FLUID_DRAG * weight.powf(2.0 / 3.0) * speed.powi(3))
+                            * ENERGY_TICK_INTERVAL;
+                        (0.0, fluid)
+                    }
+                } else if organism.movement_mode.is_simple_aquatic() {
+                    // SimpleAquatic pays a LINEAR cost (like a crawler), NOT the cubic
+                    // fluid drag: this is a cheap kinematic mover, and the cubic term at
+                    // its commanded speeds would annihilate its reserve in ~1 tick (the
+                    // exact starvation that bites water-based sliders). Charging it
+                    // explicitly (vs. falling through to 0) is REQUIRED — a zero movement
+                    // cost would let it sprint for free and dominate the ecosystem.
                     let friction = K_GROUND_FRICTION * weight * speed * ENERGY_TICK_INTERVAL;
                     (friction, 0.0)
                 } else {
-                    let fluid = submersion
-                        * (K_FLUID_DRAG * weight.powf(2.0 / 3.0) * speed.powi(3))
-                        * ENERGY_TICK_INTERVAL;
-                    (0.0, fluid)
+                    // Limb/swimming: locomotion is via joint motors; `movement_speed` is a
+                    // stale phantom for them, so no movement_speed-based cost.
+                    (0.0, 0.0)
                 }
             } else {
                 (0.0, 0.0)

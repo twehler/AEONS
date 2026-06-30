@@ -70,19 +70,28 @@ pub enum MovementMode {
     Swimming,
     /// Placeholder for a future fluid-flight mode; currently routed to the dynamic path, inert.
     Flying,
+    /// Limbless KINEMATIC free-3D movement through the water volume (the simplest
+    /// mode: "ocean slider in 3D"). REINFORCE brain (basic_3d_movement/) writes
+    /// movement_speed/direction; `apply_simple_aquatic_movement` translates the root
+    /// in full 3D, auto-rotates it to face travel, and contains it between the
+    /// seafloor and the water surface. NO Rapier body/collider; eats via proximity
+    /// predation. Water-based.
+    SimpleAquatic,
 }
 impl MovementMode {
-    /// Kinematic-root family: REINFORCE brain pool, apply_movement-driven, manual collision separation, contact predation. True for Sliding only (Swimming is now a dynamic limb-physics mode).
+    /// Kinematic-root family: REINFORCE brain pool, apply_movement-driven, manual collision separation, contact predation. True for Sliding only (Swimming is a dynamic limb-physics mode; SimpleAquatic is a DISTINCT kinematic 3D mode — deliberately NOT folded in here, so the sliding movement/collision/energy/predation gates never act on it).
     pub fn is_sliding(self) -> bool { matches!(self, MovementMode::Sliding) }
     /// 3D-free, gravity-exempt, water-confined. True only for Swimming.
     pub fn is_swimming(self) -> bool { matches!(self, MovementMode::Swimming) }
+    /// Limbless kinematic free-3D water mover (the new "basic 3D movement" mode).
+    pub fn is_simple_aquatic(self) -> bool { matches!(self, MovementMode::SimpleAquatic) }
     /// Canonical `Organism::ground_based` value for this movement paradigm:
     /// sliders/walkers live on the ground (`true`); swimmers (and future
     /// flyers) live in the fluid volume (`false`). Phototrophs may OVERRIDE
     /// this to `false` via the species editor (floating algae) — every other
     /// organism derives it from here.
     pub fn default_ground_based(self) -> bool {
-        !matches!(self, MovementMode::Swimming | MovementMode::Flying)
+        !matches!(self, MovementMode::Swimming | MovementMode::Flying | MovementMode::SimpleAquatic)
     }
     /// Display label for the species-editor cycler / UI.
     pub fn label(self) -> &'static str {
@@ -91,6 +100,7 @@ impl MovementMode {
             MovementMode::LimbBasedWalking  => "Limb-Movement",
             MovementMode::Swimming          => "Swimming",
             MovementMode::Flying            => "Flying",
+            MovementMode::SimpleAquatic     => "Simple-Aquatic",
         }
     }
     /// Stable `.colony`/`.species` serialisation tag (v009+ 4-way movement_mode:
@@ -103,6 +113,7 @@ impl MovementMode {
             MovementMode::LimbBasedWalking => 1,
             MovementMode::Swimming         => 2,
             MovementMode::Flying           => 3,
+            MovementMode::SimpleAquatic    => 4,
         }
     }
     /// Inverse of [`MovementMode::to_tag`]; `None` on an unknown byte (corrupt
@@ -114,6 +125,7 @@ impl MovementMode {
             1 => Some(MovementMode::LimbBasedWalking),
             2 => Some(MovementMode::Swimming),
             3 => Some(MovementMode::Flying),
+            4 => Some(MovementMode::SimpleAquatic),
             _ => None,
         }
     }
