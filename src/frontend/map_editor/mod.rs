@@ -6,6 +6,7 @@
 // simulation or any save format.
 
 pub mod bottom_panel;
+pub mod brush_cursor;
 pub mod camera;
 pub mod export;
 pub mod gpu_paint;
@@ -53,6 +54,8 @@ impl Plugin for MapEditorPlugin {
         // bind-group rebuild). See `gpu_paint::brush_stroke` + `paint_upload`.
         app
             .add_plugins(paint_upload::PaintUploadPlugin)
+            // Brush-radius cursor ring (invert-blend outline) — custom UI material.
+            .add_plugins(UiMaterialPlugin::<brush_cursor::BrushCursorMaterial>::default())
             .init_resource::<MapEditorSession>()
             .init_resource::<camera::StashedMapCamera>()
             .init_resource::<terrain_paint::TerrainPaintTargets>()
@@ -96,6 +99,9 @@ impl Plugin for MapEditorPlugin {
                 // Sim-side "Save World" (stats panel) → combined terrain+colony
                 // `.aeonsw`; runs in every mode (self-gated by the button's presence).
                 export::handle_save_world_click,
+                // Brush-radius cursor ring: spawn-once + per-frame follow/gate.
+                brush_cursor::spawn_brush_cursor_ring,
+                brush_cursor::update_brush_cursor_ring,
             ));
     }
 }

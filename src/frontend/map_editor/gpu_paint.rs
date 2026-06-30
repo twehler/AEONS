@@ -526,6 +526,7 @@ fn ensure_cull_cache(
             cull.model = transforms.get(*entity).copied().unwrap_or_default().to_matrix();
             cull.indices = decode_indices(mesh);
             build_tri_grid(mesh, &cull.indices, cull.model, &mut cull.grid);
+            cull.key_bounds = grid_key_bounds(&cull.grid);
         }
         out.push(cull);
     }
@@ -551,6 +552,18 @@ fn decode_indices(mesh: &Mesh) -> Vec<u32> {
 #[inline]
 fn tri_bucket_key(x: f32, z: f32) -> (i32, i32) {
     ((x / PAINT_TRI_GRID_BUCKET).floor() as i32, (z / PAINT_TRI_GRID_BUCKET).floor() as i32)
+}
+
+/// Bounding box of a grid's POPULATED bucket keys `((min_kx, min_kz), (max_kx,
+/// max_kz))`, or `None` if empty. Used to clamp `collect_cull_triangles`'s query
+/// range to the terrain footprint (out-of-range buckets are always empty).
+fn grid_key_bounds(
+    grid: &std::collections::HashMap<(i32, i32), Vec<u32>>,
+) -> Option<((i32, i32), (i32, i32))> {
+    grid.keys().copied().fold(None, |acc, (kx, kz)| match acc {
+        None => Some(((kx, kz), (kx, kz))),
+        Some(((nx, nz), (xx, xz))) => Some(((nx.min(kx), nz.min(kz)), (xx.max(kx), xz.max(kz)))),
+    })
 }
 
 /// Build the world-XZ bucket grid mapping bucket → triangle indices (triangle `t`
@@ -593,8 +606,19 @@ fn collect_cull_triangles(
     out:     &mut Vec<u32>,
 ) {
     out.clear();
-    let (kx0, kz0) = tri_bucket_key(bx0, bz0);
-    let (kx1, kz1) = tri_bucket_key(bx1, bz1);
+    // No triangles ⇒ no populated buckets ⇒ nothing to collect.
+    let Some(((bkx0, bkz0), (bkx1, bkz1))) = cull.key_bounds else { return };
+    let (qkx0, qkz0) = tri_bucket_key(bx0, bz0);
+    let (qkx1, qkz1) = tri_bucket_key(bx1, bz1);
+    // Clamp the query range to the populated bucket bounds (out-of-range buckets
+    // are always empty, so this never changes the collected set) — bounds the loop
+    // to the terrain footprint so a large `world_radius` can't iterate a huge band
+    // of empty buckets and freeze.
+    let kx0 = qkx0.max(bkx0);
+    let kz0 = qkz0.max(bkz0);
+    let kx1 = qkx1.min(bkx1);
+    let kz1 = qkz1.min(bkz1);
+    if kx0 > kx1 || kz0 > kz1 { return; } // query AABB misses the terrain footprint
     if kx0 == kx1 && kz0 == kz1 {
         if let Some(idxs) = cull.grid.get(&(kx0, kz0)) {
             out.extend_from_slice(idxs);
@@ -1387,7 +1411,8 @@ mod tests {
         let total_tris = indices.len() / 3;
         let mut grid = std::collections::HashMap::new();
         build_tri_grid(&mesh, &indices, model, &mut grid);
-        let cull = SubmeshCull { indices, model, grid };
+        let key_bounds = grid_key_bounds(&grid);
+        let cull = SubmeshCull { indices, model, grid, key_bounds };
 
         let world_radius = 6.0;
         let (bx0, bz0) = (hit.x - world_radius, hit.z - world_radius);

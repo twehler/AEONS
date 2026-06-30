@@ -9,6 +9,7 @@ pub use crate::simulation_settings::PHOTO_PRODUCTION_PER_CELL;
 use crate::simulation_settings::NON_PHOTO_CONSUMPTION_PER_CELL;
 
 use crate::simulation_settings::{K_GROUND_FRICTION, K_FLUID_DRAG};
+use crate::simulation_settings::MOVEMENT_COST_MAX_FRACTION_PER_TICK;
 
 pub use crate::simulation_settings::ELEVATION_ENERGY_PER_UNIT;
 
@@ -160,36 +161,56 @@ fn manage_energy(
         let upkeep_weight = organism.upkeep_cell_weight();
 
         // Submersion ∈ [0, 1]: 0 = entirely above water, 1 = fully submerged.
+        // Used only by the water-based (swimmer/floater) fluid-drag branch below;
+        // ground-based crawlers pay full friction regardless of water depth.
         let bounding = organism.bounding_radius().max(1.0);
-        let depth           = water_y - transform.translation.y;
-        let submersion      = (depth / bounding).clamp(0.0, 1.0);
-        let ground_fraction = 1.0 - submersion;
+        let depth      = water_y - transform.translation.y;
+        let submersion = (depth / bounding).clamp(0.0, 1.0);
 
         let speed  = organism.movement_speed;
         let weight = organism.weight();
 
-        // Ground friction ∝ weight × speed; fluid drag ∝ weight^(2/3) × speed³
-        // (square–cube area, drag ∝ v²). Both gated by
-        // `MOVEMENT_ENERGY_COSTS_ENABLED` (off for RL training); per-cell
-        // upkeep and climb cost are not gated.
+        // Ground friction ∝ weight × speed (linear); fluid drag ∝ weight^(2/3) ×
+        // speed³ (cubic — square–cube area, drag ∝ v²). Gated by
+        // `MOVEMENT_ENERGY_COSTS_ENABLED` (off for RL training); per-cell upkeep
+        // and climb cost are not gated.
         //
-        // HETEROTROPHS ONLY: this propulsion cost penalises active locomotion
-        // (RL realism). Phototrophs are passive drifters — charging a wandering
-        // ground-based phototroph the cubic `speed³` drag while it's submerged
-        // produces a cost that dwarfs photosynthesis and starves it in a tick or
-        // two → mass despawn + reproduction-refill churn + lag when many are
-        // spawned. So a phototroph never pays a movement cost (its upkeep is its
-        // only outgo, and photo cells have ~zero upkeep). (`PHOTO_WANDER_MAX_SPEED`
-        // also keeps the wander slow for realism.)
+        // HETEROTROPHS ONLY (`is_hetero`): this propulsion cost penalises active
+        // locomotion (RL realism). Phototrophs are passive drifters — charging a
+        // wandering ground-based phototroph the cubic `speed³` drag while submerged
+        // dwarfs photosynthesis and starves it in a tick or two, so they never pay.
+        //
+        // SLIDING ONLY (`is_sliding`): `movement_speed` is a meaningful self-
+        // propulsion measure only for sliders (their brain writes it; `apply_movement`
+        // / `apply_surface_adhesion` translate them by it). Limb/swimming/flying
+        // creatures locomote via joint motors and NOTHING resets `movement_speed`
+        // for them — it keeps its spawn value (heteros spawn at 15..25) forever, and
+        // charging cubic drag on that PHANTOM speed annihilated a submerged limb/swim
+        // hetero in one tick. So the field (and this cost) is only used for sliders.
+        //
+        // CRAWLER vs SWIMMER split keys on `ground_based`, NOT water depth: a
+        // ground-based slider is glued to and slides ALONG the terrain surface
+        // (`apply_surface_adhesion`) whether that surface is above or below water —
+        // it never swims, so it pays full LINEAR ground friction and no fluid drag.
+        // (The old split scaled friction by `1 - submersion` and fluid by
+        // `submersion`, so a SUBMERGED benthic crawler wrongly paid full cubic drag
+        // and zero friction → starved in ~1 tick.) Water-based movers (swimmers/
+        // floaters — none are sliding heteros today, but kept future-safe) pay the
+        // cubic fluid drag for moving through the water column instead.
         let (friction_cost, fluid_cost) =
-            if crate::simulation_settings::MOVEMENT_ENERGY_COSTS_ENABLED && is_hetero {
-                let friction = ground_fraction
-                    * (K_GROUND_FRICTION * weight * speed)
-                    * ENERGY_TICK_INTERVAL;
-                let fluid = submersion
-                    * (K_FLUID_DRAG * weight.powf(2.0 / 3.0) * speed.powi(3))
-                    * ENERGY_TICK_INTERVAL;
-                (friction, fluid)
+            if crate::simulation_settings::MOVEMENT_ENERGY_COSTS_ENABLED
+                && is_hetero
+                && organism.movement_mode.is_sliding()
+            {
+                if organism.ground_based {
+                    let friction = K_GROUND_FRICTION * weight * speed * ENERGY_TICK_INTERVAL;
+                    (friction, 0.0)
+                } else {
+                    let fluid = submersion
+                        * (K_FLUID_DRAG * weight.powf(2.0 / 3.0) * speed.powi(3))
+                        * ENERGY_TICK_INTERVAL;
+                    (0.0, fluid)
+                }
             } else {
                 (0.0, 0.0)
             };
@@ -199,8 +220,16 @@ fn manage_energy(
         let elevation_cost = organism.climb_energy_debt * ELEVATION_ENERGY_PER_UNIT;
         organism.climb_energy_debt = 0.0;
 
+        // Defense-in-depth: bound the (unbounded, cubic) movement cost so NO mover
+        // can lose more than a fixed fraction of its reserve per tick. Catches the
+        // submerged-slider latent twin (a benthic sliding hetero on a deep-sea floor
+        // still pays cubic fluid drag on a real, floored `movement_speed`) and any
+        // future high-speed/heavy case. Inert in the normal regime (see the const).
+        let movement_cost =
+            (friction_cost + fluid_cost).min(max_energy * MOVEMENT_COST_MAX_FRACTION_PER_TICK);
+
         let consumption = upkeep_weight * NON_PHOTO_CONSUMPTION_PER_CELL
-                          + friction_cost + fluid_cost + elevation_cost;
+                          + movement_cost + elevation_cost;
 
         organism.energy = (organism.energy - consumption).clamp(0.0, max_energy);
 

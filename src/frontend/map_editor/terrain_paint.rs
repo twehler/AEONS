@@ -50,6 +50,12 @@ pub struct SubmeshCull {
     pub model:   Mat4,
     /// World-XZ bucket → triangle indices (triangle `t` spans `indices[3t..3t+3]`).
     pub grid:    HashMap<(i32, i32), Vec<u32>>,
+    /// Bounding box of the POPULATED bucket keys `((min_kx, min_kz), (max_kx,
+    /// max_kz))`, or `None` if empty. `collect_cull_triangles` clamps its query
+    /// range to this so a large brush `world_radius` (grazing-angle perspective)
+    /// can't iterate a huge band of empty buckets. Out-of-range buckets are always
+    /// empty, so the clamp never changes the collected set.
+    pub key_bounds: Option<((i32, i32), (i32, i32))>,
 }
 
 /// The terrain meshes prepared for painting. After unwrap these are the REMAPPED
